@@ -6,7 +6,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use roon_api::{
     browse::{
-        Browse, BrowseOpts, BrowseResult, Item as BrowseItem, ItemHint, LoadOpts, LoadResult,
+        Action as BrowseAction, Browse, BrowseOpts, BrowseResult, Item as BrowseItem, ItemHint,
+        LoadOpts, LoadResult,
     },
     image::{Args as ImageArgs, Format as ImageFormat, Image, Scale, Scaling},
     status::{self, Status},
@@ -88,14 +89,72 @@ impl PlayAction {
         }
     }
 
-    /// Get the Roon action title
-    fn action_title(&self) -> &'static str {
+    /// Whether an action row's title (from a Roon `hint: action`/`action_list`
+    /// item) expresses this intent.
+    ///
+    /// #545: a real Core does not always offer the generic three-item menu
+    /// `tests/mock_servers/roon_core.rs::play_actions()` models ("Play Now",
+    /// "Queue", "Start Radio") -- browsing a playlist or album entry can put
+    /// a context verb ("Play Playlist", "Play Album", "Shuffle") directly
+    /// alongside real content one level up from that menu. The live repro
+    /// that drove this fix hit exactly that: the adapter searched for the
+    /// literal string "Play Now" among `["Play Playlist", <track titles>]`
+    /// and never found it, even though "Play Playlist" was right there and
+    /// the Core had already acted on it (see `resolve_item_key`'s docs for
+    /// why the play still succeeded despite the error). Matching by prefix/
+    /// substring instead of an exact literal is what makes this find the
+    /// right row regardless of which noun Roon puts after the verb.
+    fn matches_title(self, title: &str) -> bool {
+        let lower = title.to_lowercase();
+        match self {
+            // "Play Now", "Play Album", "Play Playlist", "Play Artist",
+            // "Play Track", "Play Radio Station", ... -- every context verb
+            // observed or documented for immediate playback starts with
+            // "play".
+            Self::Play => lower.starts_with("play"),
+            Self::Queue => lower.contains("queue"),
+            Self::Radio => lower.contains("radio"),
+        }
+    }
+
+    /// The canonical verb text `tests/mock_servers/roon_core.rs::play_actions()`
+    /// models this intent with, for error messages only (not for matching --
+    /// see [`Self::matches_title`], which a real Core's context verbs may
+    /// not equal literally).
+    fn canonical_verb(self) -> &'static str {
         match self {
             Self::Play => "Play Now",
             Self::Queue => "Queue",
             Self::Radio => "Start Radio",
         }
     }
+}
+
+/// Pick the action row (from a level's `hint: action`/`action_list` items)
+/// that best matches the requested [`PlayAction`].
+///
+/// Only [`PlayAction::Play`] falls back to the first action-hinted row when
+/// none matches by name, per #545's acceptance criteria ("intent mapping or
+/// first play-action") -- Roon's vocabulary for "play this" is genuinely
+/// varied ("Play Now", "Play Album", "Play Playlist", ...) so a Play request
+/// should still succeed against an unrecognised verb. Queue and Radio stay
+/// strict: asking to queue or start radio when the Core only offers a Play
+/// verb is a real "not available" case, not something to silently downgrade
+/// to Play -- see `an_action_the_core_does_not_offer_is_reported_with_what_
+/// is_available` (`tests/roon_protocol.rs`), which predates #545 and still
+/// expects that refusal.
+fn find_action_item(items: &[BrowseItem], action: PlayAction) -> Option<&BrowseItem> {
+    let candidates: Vec<&BrowseItem> = items
+        .iter()
+        .filter(|item| matches!(item.hint, Some(ItemHint::Action) | Some(ItemHint::ActionList)))
+        .collect();
+    if let Some(found) = candidates.iter().find(|item| action.matches_title(&item.title)) {
+        return Some(found);
+    }
+    if matches!(action, PlayAction::Play) {
+        return candidates.first().copied();
+    }
+    None
 }
 
 /// Find the first playable item in a list (hint is Action or ActionList)
@@ -1978,7 +2037,82 @@ impl RoonAdapter {
             })
             .await?;
 
-        Ok((session_key, load.items, load.list.count))
+        // #545: a level must never hand back the very item it was just
+        // entered through as one of its own children -- browsing that child
+        // would just re-enter the same node, which is how "browse a
+        // playlist, see the playlist again as a child of itself" nesting
+        // was reported. Whatever upstream Roon behavior produces this
+        // (a self-referential header row, a session bug) is not something
+        // this adapter can distinguish from here, but the guard is correct
+        // either way: nothing can legitimately contain itself.
+        let items = match item_key {
+            Some(parent_key) => load
+                .items
+                .into_iter()
+                .filter(|item| item.item_key.as_deref() != Some(parent_key))
+                .collect(),
+            None => load.items,
+        };
+
+        Ok((session_key, items, load.list.count))
+    }
+
+    /// Peek one level into a navigable (`hint: list`) item to learn whether
+    /// Roon also exposes it as directly playable, and whether that peek
+    /// finds any real content besides the play action(s) themselves.
+    ///
+    /// Returns `(playable, has_other_content)`.
+    ///
+    /// #545: Roon puts play actions one level *below* the browsable item
+    /// itself (see `resolve_item_key`'s docs on `enter_item`) -- there is no
+    /// hint on the item's own row that says "you can also play this without
+    /// navigating in". The only way to know is to look: browse `item_key` in
+    /// a disposable session (so this never disturbs the caller's own browse
+    /// position -- `browse_collection`'s session may still be paging through
+    /// the level this item came from) and check the first few rows of what
+    /// comes back.
+    ///
+    /// Bounded to a small peek (`PEEK_COUNT`) rather than the whole level:
+    /// every fixture and the live #545 repro both put the action row(s)
+    /// first, so a short prefix answers both questions at a fraction of the
+    /// cost of loading the full page, and `list.count` (not the prefix
+    /// length) is what `has_other_content` is actually judged against.
+    async fn peek_playability(&self, zone_id: &str, item_key: &str) -> Result<(bool, bool)> {
+        const PEEK_COUNT: usize = 5;
+        let peek_session = format!(
+            "peek_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let browse_result = self
+            .browse(BrowseOpts {
+                multi_session_key: Some(peek_session.clone()),
+                item_key: Some(item_key.to_string()),
+                zone_or_output_id: Some(zone_id.to_string()),
+                ..Default::default()
+            })
+            .await?;
+        if !matches!(browse_result.action, BrowseAction::List) {
+            // Not expected for a `hint: list` item -- nothing to peek into.
+            return Ok((false, false));
+        }
+        let loaded = self
+            .load(LoadOpts {
+                multi_session_key: Some(peek_session),
+                count: Some(PEEK_COUNT),
+                ..Default::default()
+            })
+            .await?;
+        let action_rows_seen = loaded
+            .items
+            .iter()
+            .filter(|item| matches!(item.hint, Some(ItemHint::Action) | Some(ItemHint::ActionList)))
+            .count();
+        let playable = action_rows_seen > 0;
+        let has_other_content = loaded.list.count > action_rows_seen;
+        Ok((playable, has_other_content))
     }
 
     /// Enter a named top-level browse node (`"Playlists"`, ...) in a fresh
@@ -2395,7 +2529,7 @@ impl RoonAdapter {
         );
 
         let bare_zone_id = strip_roon_prefix(zone_id);
-        self.resolve_item_key(&session_key, item_key, bare_zone_id, action)
+        self.resolve_item_key(&session_key, item_key, bare_zone_id, action, None)
             .await
     }
 
@@ -2432,12 +2566,20 @@ impl RoonAdapter {
     /// So this is now `play_item`'s exact resolution logic, unchanged, with
     /// only `multi_session_key` swapped for the caller-supplied minting
     /// session instead of a fresh one.
+    ///
+    /// `fallback_title` is the ref's own title (`hifi_play_ref`'s `title`
+    /// field, e.g. a playlist or album name) -- seeded into the result
+    /// message before browsing finds anything more specific, so a caller
+    /// that plays a top-level item whose own action fires immediately (see
+    /// [`Self::resolve_item_key`]'s docs) still gets a human-readable
+    /// message instead of the raw `item_key`.
     pub async fn play_ref(
         &self,
         item_key: &str,
         multi_session_key: &str,
         zone_id: &str,
         action: PlayAction,
+        fallback_title: &str,
     ) -> Result<String> {
         if item_key.is_empty() {
             return Err(anyhow::anyhow!("item_key cannot be empty"));
@@ -2447,8 +2589,64 @@ impl RoonAdapter {
         }
 
         let bare_zone_id = strip_roon_prefix(zone_id);
-        self.resolve_item_key(multi_session_key, item_key, bare_zone_id, action)
-            .await
+        self.resolve_item_key(
+            multi_session_key,
+            item_key,
+            bare_zone_id,
+            action,
+            Some(fallback_title),
+        )
+        .await
+    }
+
+    /// Browse `item_key` within `session_key` and report what came back:
+    /// either the Core already invoked it (see below), or a new list to
+    /// search/descend.
+    ///
+    /// # Browsing an `Action` item invokes it -- it does not open a menu
+    ///
+    /// Confirmed by `tests/mock_servers/roon_core.rs::handle_browse`'s own
+    /// "Invoking an action does not produce a list" case (its comment there
+    /// records that nothing in this repo read `BrowseResult::action` before
+    /// #545, so this was never caught): a `hint: action` item's browse
+    /// response carries `action: none`/`message`, not `action: list`, and
+    /// the load-bearing fact is which *response* came back, not the item's
+    /// own `hint` -- a `hint: action_list` item behaves the same way once
+    /// its own children resolve to a single directly-invokable action.
+    /// Checking `browse_result.action` here, instead of unconditionally
+    /// calling `load()` afterward the way this method's predecessor did, is
+    /// what fixes #545's play-matcher bug: the old code always reloaded and
+    /// searched the *current* list for a literal `"Play Now"` -- which,
+    /// after an `Action` item's browse, is still whatever list was active
+    /// beforehand (the Core pushed nothing new), one level too deep, mixed
+    /// with unrelated titles (track names). The play had already happened;
+    /// only the bookkeeping afterward was wrong, which is why it "worked"
+    /// while also reporting an error.
+    async fn enter_item(
+        &self,
+        session_key: &str,
+        zone_id: &str,
+        item_key: &str,
+    ) -> Result<Option<Vec<BrowseItem>>> {
+        let browse_result = self
+            .browse(BrowseOpts {
+                multi_session_key: Some(session_key.to_string()),
+                item_key: Some(item_key.to_string()),
+                zone_or_output_id: Some(zone_id.to_string()),
+                ..Default::default()
+            })
+            .await?;
+        if !matches!(browse_result.action, BrowseAction::List) {
+            return Ok(None);
+        }
+        let items = self
+            .load(LoadOpts {
+                multi_session_key: Some(session_key.to_string()),
+                count: Some(20),
+                ..Default::default()
+            })
+            .await?;
+        Ok(Some(items.items))
     }
 
     /// Shared body of [`Self::play_item`] and [`Self::play_ref`]: browse into
@@ -2464,93 +2662,141 @@ impl RoonAdapter {
         item_key: &str,
         bare_zone_id: &str,
         action: PlayAction,
+        fallback_title: Option<&str>,
     ) -> Result<String> {
-        let session_key = session_key.to_string();
-        let bare_zone_id = bare_zone_id.to_string();
+        let mut container_title = fallback_title.unwrap_or(item_key).to_string();
+        let mut next_key = item_key.to_string();
 
-        self.browse(BrowseOpts {
-            multi_session_key: Some(session_key.clone()),
-            item_key: Some(item_key.to_string()),
-            zone_or_output_id: Some(bare_zone_id.clone()),
-            ..Default::default()
-        })
-        .await?;
+        // Bounded "no action row here -- descend into the first item and try
+        // again" loop, for a plain container that needs one more hop before
+        // reaching real content (mirrors `try_navigate_to_playable`'s same
+        // one-hop assumption for search). #545's live repro needed zero hops
+        // (the playlist's own item_key already led to a mixed action+track
+        // level); this stays bounded rather than unbounded purely as a
+        // safety margin against an unexpected Core shape looping forever.
+        for _ in 0..4 {
+            let Some(items) = self
+                .enter_item(session_key, bare_zone_id, &next_key)
+                .await?
+            else {
+                // `next_key` itself was directly invokable -- see
+                // `enter_item`'s docs. Nothing else to do.
+                return Ok(container_title);
+            };
 
-        let items = self
-            .load(LoadOpts {
-                multi_session_key: Some(session_key.clone()),
-                count: Some(20),
-                ..Default::default()
-            })
-            .await?;
+            if let Some(matched) = find_action_item(&items, action) {
+                let verb = matched.title.clone();
+                let key = matched
+                    .item_key
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("Action has no item_key"))?;
 
-        if let Some(playable) = find_playable_item(&items.items) {
-            let title = playable.title.clone();
-            let key = playable
-                .item_key
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
-            return self
-                .execute_play_action(&session_key, &bare_zone_id, &title, &key, action)
-                .await;
-        }
+                match self.enter_item(session_key, bare_zone_id, &key).await? {
+                    // `matched` was itself directly invokable (the common
+                    // case: a `hint: action` row like "Play Playlist", or a
+                    // `hint: action_list` row whose own browse turns out to
+                    // invoke rather than list -- Roon does not promise which,
+                    // so this is decided by the response either way).
+                    None => return Ok(format!("{verb}: {container_title}")),
+                    // `matched` was an `action_list` wrapper needing one more
+                    // descent (the "double-nested action_list" case: e.g.
+                    // "Play Album" opens a menu of "Play Now"/"Queue"/"Start
+                    // Radio"). Search that menu for the same intent and
+                    // invoke it; do not check its own response further --
+                    // this is as deep as any known Roon shape nests.
+                    Some(inner_items) => {
+                        let Some(inner_matched) = find_action_item(&inner_items, action) else {
+                            let available: Vec<_> =
+                                inner_items.iter().map(|i| &i.title).collect();
+                            return Err(anyhow::anyhow!(
+                                "Action '{}' not available. Available: {:?}",
+                                action.canonical_verb(),
+                                available
+                            ));
+                        };
+                        let inner_verb = inner_matched.title.clone();
+                        let inner_key = inner_matched
+                            .item_key
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("Action has no item_key"))?;
+                        self.browse(BrowseOpts {
+                            multi_session_key: Some(session_key.to_string()),
+                            item_key: Some(inner_key),
+                            zone_or_output_id: Some(bare_zone_id.to_string()),
+                            ..Default::default()
+                        })
+                        .await?;
+                        return Ok(format!("{inner_verb}: {verb}"));
+                    }
+                }
+            }
 
-        // Try "Play Album" action
-        if let Some(play_album) = items.items.iter().find(|i| i.title == "Play Album") {
-            let key = play_album
-                .item_key
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("Play Album has no key"))?;
-            return self
-                .execute_play_action(&session_key, &bare_zone_id, "Album", &key, action)
-                .await;
-        }
-
-        // Try navigating into first item
-        if let Some(first) = items.items.first() {
-            if let Some(key) = &first.item_key {
-                self.browse(BrowseOpts {
-                    multi_session_key: Some(session_key.clone()),
-                    item_key: Some(key.clone()),
-                    zone_or_output_id: Some(bare_zone_id.clone()),
-                    ..Default::default()
-                })
-                .await?;
-
-                let deeper = self
-                    .load(LoadOpts {
-                        multi_session_key: Some(session_key.clone()),
-                        count: Some(20),
+            // No row at this level directly names the requested intent --
+            // before giving up, peek inside any `action_list` wrapper here
+            // (e.g. "Play Album" wrapping "Play Now"/"Queue"/"Start Radio",
+            // #545's own `album()` fixture shape). Peeking is safe: browsing
+            // a `hint: action_list` item never invokes anything by itself
+            // (only `hint: action` does -- see `enter_item`'s docs), it just
+            // opens the menu, so trying each wrapper in turn has no
+            // side effect beyond the one that actually matches.
+            for wrapper in items
+                .iter()
+                .filter(|item| matches!(item.hint, Some(ItemHint::ActionList)))
+            {
+                let Some(wrapper_key) = wrapper.item_key.clone() else {
+                    continue;
+                };
+                let Some(inner_items) = self
+                    .enter_item(session_key, bare_zone_id, &wrapper_key)
+                    .await?
+                else {
+                    continue;
+                };
+                if let Some(inner_matched) = find_action_item(&inner_items, action) {
+                    let inner_verb = inner_matched.title.clone();
+                    let inner_key = inner_matched
+                        .item_key
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("Action has no item_key"))?;
+                    self.browse(BrowseOpts {
+                        multi_session_key: Some(session_key.to_string()),
+                        item_key: Some(inner_key),
+                        zone_or_output_id: Some(bare_zone_id.to_string()),
                         ..Default::default()
                     })
                     .await?;
-
-                if let Some(playable) = find_playable_item(&deeper.items) {
-                    let title = playable.title.clone();
-                    let item_key = playable
-                        .item_key
-                        .clone()
-                        .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
-                    return self
-                        .execute_play_action(&session_key, &bare_zone_id, &title, &item_key, action)
-                        .await;
+                    return Ok(format!("{inner_verb}: {}", wrapper.title));
                 }
+            }
 
-                if let Some(play_album) = deeper.items.iter().find(|i| i.title == "Play Album") {
-                    let key = play_album
-                        .item_key
-                        .clone()
-                        .ok_or_else(|| anyhow::anyhow!("Play Album has no key"))?;
-                    return self
-                        .execute_play_action(
-                            &session_key,
-                            &bare_zone_id,
-                            &first.title,
-                            &key,
-                            action,
-                        )
-                        .await;
+            // This level *does* offer at least one action (directly, or
+            // inside a wrapper this just peeked and found no match in),
+            // just not one matching the requested intent (e.g. Queue/Radio
+            // requested against a level that only offers "Play Playlist")
+            // -- that is a real "not available" refusal, not an invitation
+            // to descend into a bare `action` row and invoke the wrong
+            // thing. See `roon_play_ref_does_not_silently_substitute_
+            // queue_for_an_unavailable_action` (`tests/roon_protocol.rs`).
+            if items
+                .iter()
+                .any(|item| matches!(item.hint, Some(ItemHint::Action) | Some(ItemHint::ActionList)))
+            {
+                let available: Vec<_> = items.iter().map(|i| &i.title).collect();
+                return Err(anyhow::anyhow!(
+                    "Action '{}' not available. Available: {:?}",
+                    action.canonical_verb(),
+                    available
+                ));
+            }
+
+            // No action row at this level at all -- a plain container.
+            // Descend into the first item and look again.
+            match items.first().and_then(|item| item.item_key.clone()) {
+                Some(key) => {
+                    container_title = items[0].title.clone();
+                    next_key = key;
                 }
+                None => break,
             }
         }
 
@@ -2560,7 +2806,13 @@ impl RoonAdapter {
         ))
     }
 
-    /// Execute a play action on a specific item
+    /// Invoke the action row at `item_key` (`item_title` is that row's own
+    /// title, e.g. "Play Album"), matching `action`'s intent rather than an
+    /// exact literal. Shared by `search_and_play`'s fallbacks below --
+    /// `resolve_item_key` above inlines the same `enter_item`+
+    /// [`find_action_item`] steps itself, since it also needs to thread a
+    /// human-readable container title through that this method's older,
+    /// narrower call sites never had.
     async fn execute_play_action(
         &self,
         session_key: &str,
@@ -2569,76 +2821,57 @@ impl RoonAdapter {
         item_key: &str,
         action: PlayAction,
     ) -> Result<String> {
-        self.browse(BrowseOpts {
-            multi_session_key: Some(session_key.to_string()),
-            item_key: Some(item_key.to_string()),
-            zone_or_output_id: Some(zone_id.to_string()),
-            ..Default::default()
-        })
-        .await?;
+        let Some(items) = self.enter_item(session_key, zone_id, item_key).await? else {
+            // #545: `item_key` itself was directly invokable -- see
+            // `enter_item`'s docs. None of this method's pre-#545 call sites
+            // could hit this (they only ever passed an `action_list` item's
+            // key, which always produced a menu) but a future caller might.
+            return Ok(item_title.to_string());
+        };
 
-        let mut actions = self
-            .load(LoadOpts {
-                multi_session_key: Some(session_key.to_string()),
-                count: Some(10),
-                ..Default::default()
-            })
-            .await?;
-
-        // Handle double-nested action_list
-        if actions.items.len() == 1 {
-            if let Some(item) = actions.items.first() {
-                if matches!(item.hint, Some(ItemHint::ActionList)) {
-                    if let Some(key) = &item.item_key {
-                        self.browse(BrowseOpts {
-                            multi_session_key: Some(session_key.to_string()),
-                            item_key: Some(key.clone()),
-                            zone_or_output_id: Some(zone_id.to_string()),
-                            ..Default::default()
-                        })
-                        .await?;
-
-                        actions = self
-                            .load(LoadOpts {
-                                multi_session_key: Some(session_key.to_string()),
-                                count: Some(10),
-                                ..Default::default()
-                            })
-                            .await?;
-                    }
-                }
-            }
-        }
-
-        let action_title = action.action_title();
-
-        let action_item = actions
-            .items
-            .iter()
-            .find(|item| item.title == action_title)
-            .ok_or_else(|| {
-                let available: Vec<_> = actions.items.iter().map(|i| &i.title).collect();
-                anyhow::anyhow!(
-                    "Action '{}' not available. Available: {:?}",
-                    action_title,
-                    available
-                )
-            })?;
-
-        let action_key = action_item
+        let Some(matched) = find_action_item(&items, action) else {
+            let available: Vec<_> = items.iter().map(|i| &i.title).collect();
+            return Err(anyhow::anyhow!(
+                "Action '{}' not available. Available: {:?}",
+                action.canonical_verb(),
+                available
+            ));
+        };
+        let verb = matched.title.clone();
+        let key = matched
             .item_key
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Action has no item_key"))?;
 
-        self.browse(BrowseOpts {
-            multi_session_key: Some(session_key.to_string()),
-            item_key: Some(action_key),
-            zone_or_output_id: Some(zone_id.to_string()),
-            ..Default::default()
-        })
-        .await?;
-
-        Ok(format!("{}: {}", action_title, item_title))
+        match self.enter_item(session_key, zone_id, &key).await? {
+            None => Ok(format!("{verb}: {item_title}")),
+            // Double-nested action_list: `matched` was itself a wrapper
+            // (e.g. an inner "Play Album" opening "Play Now"/"Queue"/"Start
+            // Radio") -- search that menu for the same intent.
+            Some(inner_items) => {
+                let Some(inner_matched) = find_action_item(&inner_items, action) else {
+                    let available: Vec<_> = inner_items.iter().map(|i| &i.title).collect();
+                    return Err(anyhow::anyhow!(
+                        "Action '{}' not available. Available: {:?}",
+                        action.canonical_verb(),
+                        available
+                    ));
+                };
+                let inner_verb = inner_matched.title.clone();
+                let inner_key = inner_matched
+                    .item_key
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("Action has no item_key"))?;
+                self.browse(BrowseOpts {
+                    multi_session_key: Some(session_key.to_string()),
+                    item_key: Some(inner_key),
+                    zone_or_output_id: Some(zone_id.to_string()),
+                    ..Default::default()
+                })
+                .await?;
+                Ok(format!("{inner_verb}: {verb}"))
+            }
+        }
     }
 }
 
@@ -2749,19 +2982,54 @@ impl LibraryAdapter for RoonAdapter {
                     self.browse_named_root_node(zone_id, "Playlists", offset, limit)
                         .await?
                 };
-                let mapped: Vec<Value> = items
-                    .into_iter()
-                    .filter(|item| !is_ungrounded_grouping(item))
-                    .map(|item| {
-                        let navigable = matches!(item.hint, Some(ItemHint::List));
-                        serde_json::json!({
-                            "title": item.title,
-                            "subtitle": item.subtitle,
-                            "item_key": item.item_key,
-                            "navigable": navigable,
-                        })
-                    })
-                    .collect();
+                let mut mapped: Vec<Value> = Vec::new();
+                for item in items {
+                    if is_ungrounded_grouping(&item) {
+                        continue;
+                    }
+                    // #545: Header/Action/ActionList rows are the
+                    // implementation detail `resolve_item_key` walks to
+                    // invoke a play action, not addressable content -- a
+                    // real Core mixes them into an otherwise-ordinary level
+                    // (e.g. a playlist's own browse: `["Play Playlist",
+                    // <track>, <track>, ...]`), and rendering them as plain
+                    // browse rows is what put a stray "Play Album"/"Play
+                    // Playlist" entry in the list next to real content.
+                    if matches!(
+                        item.hint,
+                        Some(ItemHint::Header) | Some(ItemHint::Action) | Some(ItemHint::ActionList)
+                    ) {
+                        continue;
+                    }
+                    let list_hinted = matches!(item.hint, Some(ItemHint::List));
+                    let (playable, has_other_content) = if list_hinted {
+                        match item.item_key.as_deref() {
+                            Some(key) => self
+                                .peek_playability(zone_id, key)
+                                .await
+                                .unwrap_or((false, true)),
+                            None => (false, true),
+                        }
+                    } else {
+                        (item.item_key.is_some(), true)
+                    };
+                    // A pure leaf whose only content one level down is an
+                    // action list (a track: "Play Track" and nothing else)
+                    // has nothing left to navigate into once that action row
+                    // is filtered out above -- classify it as playable only,
+                    // not also navigable, so "Open" doesn't land on an empty
+                    // level. A container that offers both real content *and*
+                    // a play action (an album, a playlist) stays navigable
+                    // too.
+                    let navigable = list_hinted && (!playable || has_other_content);
+                    mapped.push(serde_json::json!({
+                        "title": item.title,
+                        "subtitle": item.subtitle,
+                        "item_key": item.item_key,
+                        "navigable": navigable,
+                        "playable": playable,
+                    }));
+                }
                 let next_offset = (total > offset + limit).then_some((offset + limit) as u64);
                 Ok(serde_json::json!({
                     "session_key": session_key,

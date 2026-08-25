@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mock_servers::roon_core::{
-    album, zone_with_grouping, FakeItem, FakeLibrary, FakeRoonCore, Hint, ItemKeyScope,
+    album, playlist, zone_with_grouping, FakeItem, FakeLibrary, FakeRoonCore, Hint, ItemKeyScope,
 };
 use roon_api::browse::{BrowseOpts, LoadOpts};
 use unified_hifi_control::adapters::roon::{PlayAction, RoonAdapter, SearchSource};
@@ -1441,6 +1441,308 @@ async fn roon_collections_named_root_node_not_found_is_a_clean_error() {
         .await
         .expect_err("Playlists does not exist in this root");
     assert!(error.to_string().contains("Playlists"));
+
+    core.stop().await;
+}
+
+// =============================================================================
+// #545: infinite playlist nesting, missing Play buttons, wrong action matching
+//
+// `playlist()` (`tests/mock_servers/roon_core.rs`) models the exact shape the
+// issue's live repro captured: browsing a playlist's own item_key returns a
+// mixed level -- an immediately-invokable "Play Playlist" action sitting
+// directly alongside the track list, not wrapped in a further submenu the
+// way `album()`'s "Play Album" is.
+// =============================================================================
+
+use serde_json::json;
+use unified_hifi_control::adapters::traits::LibraryAdapter;
+
+/// `hifi_collections browse` into a playlist must show its tracks and never
+/// hand back the playlist's own item_key as one of its own children -- the
+/// literal shape of "browse a playlist, see the playlist again as a child of
+/// itself".
+#[tokio::test]
+async fn roon_collections_browse_of_a_playlist_never_contains_itself() {
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![FakeItem::list("Playlists").with_children(vec![playlist(
+        "An Introduction to Qobuz",
+        &["Laundromat (Remastered 2017)", "Second Track"],
+    )])];
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let (session, root_items, _count) = adapter
+        .browse_collection("zone_1", None, None, 0, 20)
+        .await
+        .expect("root browse");
+    let playlists_key = root_items[0].item_key.clone().unwrap();
+    let (session, level_two, _count) = adapter
+        .browse_collection("zone_1", Some(&playlists_key), Some(&session), 0, 20)
+        .await
+        .expect("Playlists node browse");
+    let playlist_key = level_two[0].item_key.clone().unwrap();
+
+    let (_session, children, _count) = adapter
+        .browse_collection("zone_1", Some(&playlist_key), Some(&session), 0, 20)
+        .await
+        .expect("playlist browse");
+
+    assert!(
+        children
+            .iter()
+            .all(|item| item.item_key.as_deref() != Some(playlist_key.as_str())),
+        "a level must never contain its own item_key as a child: {:?}",
+        children.iter().map(|i| &i.title).collect::<Vec<_>>()
+    );
+    // The tracks are real content, not the playlist appearing again under
+    // its own name.
+    let titles: Vec<&str> = children.iter().map(|i| i.title.as_str()).collect();
+    assert!(titles.contains(&"Laundromat (Remastered 2017)"));
+    assert!(titles.contains(&"Second Track"));
+    assert!(
+        !titles.contains(&"An Introduction to Qobuz"),
+        "the playlist must not appear as its own child: {titles:?}"
+    );
+
+    core.stop().await;
+}
+
+/// `hifi_collections`' Roon `content()` mapping (`RoonAdapter::content`) is
+/// what `handle_roon` (`src/mcp/tools/collections.rs`) reads `navigable`/
+/// `playable` from to decide whether to mint a browse path, a play ref, or
+/// both. This exercises that mapping directly, end to end through the
+/// `LibraryAdapter` trait `hifi_collections`/the web UI both call through.
+#[tokio::test]
+async fn roon_collections_content_classifies_playlist_and_tracks_correctly() {
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![FakeItem::list("Playlists").with_children(vec![playlist(
+        "An Introduction to Qobuz",
+        &["Laundromat (Remastered 2017)"],
+    )])];
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    // Browse to "Playlists", then into the playlist itself.
+    let root = adapter
+        .content(
+            "collections_browse",
+            &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
+        )
+        .await
+        .expect("root browse");
+    let session_key = root["session_key"].as_str().unwrap().to_string();
+    let playlists_key = root["items"][0]["item_key"].as_str().unwrap().to_string();
+
+    let playlists_level = adapter
+        .content(
+            "collections_browse",
+            &json!({
+                "zone_id": "roon:zone_1",
+                "item_key": playlists_key,
+                "session_key": session_key,
+                "limit": 20,
+                "offset": 0,
+            }),
+        )
+        .await
+        .expect("Playlists node browse");
+    let playlist_item = &playlists_level["items"][0];
+    assert_eq!(playlist_item["title"], "An Introduction to Qobuz");
+    // Missing-Play-button bug (#545): a playlist is both a container (has
+    // real tracks to browse into) *and* directly playable (Roon puts "Play
+    // Playlist" one level below it) -- it must get both, not one or the
+    // other.
+    assert_eq!(
+        playlist_item["navigable"], true,
+        "a playlist must stay navigable: {playlist_item:?}"
+    );
+    assert_eq!(
+        playlist_item["playable"], true,
+        "a playlist must also be directly playable: {playlist_item:?}"
+    );
+
+    let session_key = playlists_level["session_key"].as_str().unwrap().to_string();
+    let playlist_key = playlist_item["item_key"].as_str().unwrap().to_string();
+
+    let tracks_level = adapter
+        .content(
+            "collections_browse",
+            &json!({
+                "zone_id": "roon:zone_1",
+                "item_key": playlist_key,
+                "session_key": session_key,
+                "limit": 20,
+                "offset": 0,
+            }),
+        )
+        .await
+        .expect("playlist browse");
+    let items = tracks_level["items"].as_array().unwrap();
+    // The "Play Playlist" action row itself must never appear as an
+    // ordinary browsable/playable row -- it is implementation detail of
+    // play resolution, not addressable content.
+    assert!(
+        items.iter().all(|item| item["title"] != "Play Playlist"),
+        "the action row must be filtered out of the listing: {items:?}"
+    );
+    let track = items
+        .iter()
+        .find(|item| item["title"] == "Laundromat (Remastered 2017)")
+        .expect("the track must be present");
+    // Missing-Play-button bug (#545): a track's only child is its own
+    // action list ("Play Track"), so it must be playable...
+    assert_eq!(track["playable"], true, "a track must be playable: {track:?}");
+    // ...and, once that action row is filtered out, browsing further would
+    // land on nothing -- so it must not also claim to be navigable.
+    assert_eq!(
+        track["navigable"], false,
+        "a leaf track must not also be navigable: {track:?}"
+    );
+
+    core.stop().await;
+}
+
+/// The literal #545 repro: playing a Roon playlist by ref used to fail with
+/// `Action 'Play Now' not available. Available: ["Play Playlist", <track
+/// titles>]` -- even though the Core had already started playing. Roon's
+/// context verb ("Play Playlist") must be matched, and no error must surface
+/// on success.
+#[tokio::test]
+async fn roon_play_ref_matches_playlist_verb_and_reports_no_error() {
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![FakeItem::list("Playlists").with_children(vec![playlist(
+        "An Introduction to Qobuz",
+        &["Laundromat (Remastered 2017)", "Second Track"],
+    )])];
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let (session, root_items, _count) = adapter
+        .browse_collection("zone_1", None, None, 0, 20)
+        .await
+        .expect("root browse");
+    let playlists_key = root_items[0].item_key.clone().unwrap();
+    let (session, level_two, _count) = adapter
+        .browse_collection("zone_1", Some(&playlists_key), Some(&session), 0, 20)
+        .await
+        .expect("Playlists node browse");
+    let playlist_key = level_two[0].item_key.clone().unwrap();
+
+    let message = adapter
+        .play_ref(
+            &playlist_key,
+            &session,
+            "roon:zone_fake_1",
+            PlayAction::Play,
+            "An Introduction to Qobuz",
+        )
+        .await
+        .expect("playing a playlist ref must succeed, not report a false error");
+
+    assert!(
+        message.contains("Play Playlist"),
+        "the message should name Roon's own verb, not a literal 'Play Now': {message}"
+    );
+    assert!(
+        message.contains("An Introduction to Qobuz"),
+        "the message should name what was played: {message}"
+    );
+
+    core.stop().await;
+}
+
+/// Requesting Queue/Radio against a playlist that only offers a "Play
+/// Playlist" verb must still fail honestly -- #545's broadened Play matching
+/// must not silently substitute a different action the caller did not ask
+/// for.
+#[tokio::test]
+async fn roon_play_ref_does_not_silently_substitute_queue_for_an_unavailable_action() {
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![FakeItem::list("Playlists")
+        .with_children(vec![playlist("Solo Playlist", &["Only Track"])])];
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let (session, root_items, _count) = adapter
+        .browse_collection("zone_1", None, None, 0, 20)
+        .await
+        .expect("root browse");
+    let playlists_key = root_items[0].item_key.clone().unwrap();
+    let (session, level_two, _count) = adapter
+        .browse_collection("zone_1", Some(&playlists_key), Some(&session), 0, 20)
+        .await
+        .expect("Playlists node browse");
+    let playlist_key = level_two[0].item_key.clone().unwrap();
+
+    let error = adapter
+        .play_ref(
+            &playlist_key,
+            &session,
+            "roon:zone_fake_1",
+            PlayAction::Queue,
+            "Solo Playlist",
+        )
+        .await
+        .expect_err("Queue is not offered by this playlist");
+    let text = error.to_string();
+    assert!(text.contains("Queue"), "got {text}");
+    assert!(
+        text.contains("Play Playlist"),
+        "should list what is available: {text}"
+    );
+
+    core.stop().await;
+}
+
+/// Category grouping rows (`is_ungrounded_grouping`, unchanged by #545) stay
+/// excluded from `hifi_collections browse` results alongside the new
+/// Header/Action/ActionList filtering.
+#[tokio::test]
+async fn roon_collections_browse_still_excludes_category_grouping_rows() {
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![FakeItem::list("Search Results").with_children(vec![
+        FakeItem::list("Kind of Blue").with_subtitle("Miles Davis"),
+        FakeItem::list("Albums").with_subtitle("32 Results"),
+    ])];
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let root = adapter
+        .content(
+            "collections_browse",
+            &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
+        )
+        .await
+        .unwrap();
+    let results_key = root["items"][0]["item_key"].as_str().unwrap().to_string();
+    let session_key = root["session_key"].as_str().unwrap().to_string();
+
+    let level = adapter
+        .content(
+            "collections_browse",
+            &json!({
+                "zone_id": "roon:zone_1",
+                "item_key": results_key,
+                "session_key": session_key,
+                "limit": 20,
+                "offset": 0,
+            }),
+        )
+        .await
+        .unwrap();
+    let titles: Vec<String> = level["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["title"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(titles, vec!["Kind of Blue"]);
 
     core.stop().await;
 }

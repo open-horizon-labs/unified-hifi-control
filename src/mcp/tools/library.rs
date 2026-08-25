@@ -1016,7 +1016,7 @@ async fn play_ref_roon(
     mut env: Envelope,
     args: &HifiPlayRefTool,
     target: RoonRefTarget,
-    _title: String,
+    title: String,
 ) -> Result<CallToolResult, CallToolError> {
     use crate::adapters::roon::PlayAction;
 
@@ -1052,6 +1052,7 @@ async fn play_ref_roon(
             &target.multi_session_key,
             &args.zone_id,
             action,
+            &title,
         )
         .await
     {
