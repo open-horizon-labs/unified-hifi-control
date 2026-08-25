@@ -1758,6 +1758,43 @@ async fn roon_collections_browse_still_excludes_category_grouping_rows() {
     core.stop().await;
 }
 
+/// #566 (live install): Roon's own browse root carries a "Settings" node
+/// (extension configuration inside Roon's hierarchy, not music content) that
+/// was leaking through `hifi_collections browse`'s root listing as a
+/// permanently inert row -- no `item_key`, so it could not be played or
+/// browsed into. `FakeLibrary::standard()`'s root already models this
+/// (`FakeItem::new("Settings").unkeyed()`), matching the live evidence.
+///
+/// The filter is scoped to the true collection root only (`item_key: None`)
+/// -- real music nodes (`Library`, `TIDAL`, `Qobuz`) at that same root stay,
+/// and nothing deeper in the hierarchy is touched.
+#[tokio::test]
+async fn roon_collections_browse_root_excludes_settings() {
+    let core = FakeRoonCore::start().await;
+    let adapter = connected(&core).await;
+
+    let root = adapter
+        .content(
+            "collections_browse",
+            &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
+        )
+        .await
+        .unwrap();
+    let titles: Vec<String> = root["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["title"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["Library", "TIDAL", "Qobuz"],
+        "the root's own utility node (Settings) must not appear as an inert row"
+    );
+
+    core.stop().await;
+}
+
 // =============================================================================
 // AppState for the HTTP-boundary test
 // =============================================================================

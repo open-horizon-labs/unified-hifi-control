@@ -67,12 +67,25 @@ pub struct McpNowPlaying {
 /// results genuinely have no safe way to be addressed later, and minting one
 /// anyway would trade "no ref" for "a ref that might play the wrong thing".
 /// `title`/`subtitle` are unchanged from before this issue.
+///
+/// `path` (#566) is the same addition PR #533/#547 made for
+/// `hifi_collections`: a `RefTarget::RoonBrowse` token, present exactly when
+/// the result is navigable (a real hit that can be browsed into, or a
+/// grouping row like "Albums · 35 Results" that names a bucket in the
+/// search session). `path` and `ref` are independent — a result can carry
+/// either, both, or neither, never conflated into one slot. Only Roon mints
+/// it today: LMS's search drills straight to leaf results server-side and
+/// Spotify/Apple Music/Music Assistant's generic search has no grouping or
+/// browse concept, so they always leave this `None` (see
+/// `crate::mcp::tools::library::handle_search`'s per-route docs).
 #[derive(Debug, Serialize)]
 pub struct McpSearchResult {
     pub title: String,
     pub subtitle: Option<String>,
     #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
     pub r#ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// `hifi_play`'s structured payload: the adapter's own message about what it

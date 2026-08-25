@@ -540,6 +540,11 @@ pub struct SearchResult {
     pub subtitle: Option<String>,
     #[serde(rename = "ref", default)]
     pub item_ref: Option<String>,
+    /// Opaque browse-continuation ref (#566), present when this result is
+    /// navigable -- same convention as `CollectionItem::path`, consumed the
+    /// same way (open into browse, push a breadcrumb).
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

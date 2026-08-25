@@ -844,13 +844,40 @@ pub fn Library(
                                             p { class: "text-sm text-muted truncate", "{subtitle}" }
                                         }
                                     }
-                                    if let Some(item_ref) = result.item_ref.clone() {
-                                        button {
-                                            class: "library-play-btn",
-                                            aria_label: "Play {result.title}",
-                                            r#type: "button",
-                                            onclick: move |_| play_item((item_ref.clone(), "play")),
-                                            "▶"
+                                    div { class: "library-row-actions",
+                                        if let Some(item_ref) = result.item_ref.clone() {
+                                            button {
+                                                class: "library-play-btn",
+                                                aria_label: "Play {result.title}",
+                                                r#type: "button",
+                                                onclick: move |_| play_item((item_ref.clone(), "play")),
+                                                "▶"
+                                            }
+                                        }
+                                        // #566: a navigable result (a real
+                                        // hit like an artist, or a grouping
+                                        // row like "Albums · 35 Results")
+                                        // carries a `path` -- open it the
+                                        // same way a browse row does: push a
+                                        // breadcrumb and navigate into it,
+                                        // rather than leaving the row a dead
+                                        // end. Independent of the play
+                                        // button above: a result can have
+                                        // either, both, or neither.
+                                        if let Some(path) = result.path.clone() {
+                                            button {
+                                                class: "library-chevron-btn",
+                                                aria_label: "Open {result.title}",
+                                                r#type: "button",
+                                                onclick: {
+                                                    let title = result.title.clone();
+                                                    let path = path.clone();
+                                                    move |_| open_folder((title.clone(), path.clone()))
+                                                },
+                                                svg { class: "w-5 h-5", fill: "none", view_box: "0 0 24 24", stroke: "currentColor", "stroke-width": "2",
+                                                    path { "stroke-linecap": "round", "stroke-linejoin": "round", d: "M9 5l7 7-7 7" }
+                                                }
+                                            }
                                         }
                                     }
                                 }
