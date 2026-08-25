@@ -2144,6 +2144,43 @@ impl Drop for SseConnectionGuard {
     }
 }
 
+/// Patches a serialized `BusEvent`'s embedded zone with the live
+/// `browse_supported` derivation (#557).
+///
+/// `bus::events::Zone` -- the wire type embedded in `ZoneDiscovered` and
+/// broadcast to every SSE subscriber -- predates #531's per-provider
+/// `browse_supported` flag and has no field for it, unlike the REST
+/// `/zones` and `/knob/zones` projections (`knobs::routes::ZoneInfo`),
+/// which compute it correctly via
+/// [`crate::mcp::tools::collections::zone_supports_hifi_collections`].
+/// Every adapter's zone-discovery path would need a matching edit to add
+/// a field that doesn't exist yet, so instead this patches the
+/// already-serialized JSON at the one point a `ZoneDiscovered` event
+/// leaves the process. The frontend's `crate::app::api::Zone` treats a
+/// missing `browse_supported` as `false` (`#[serde(default)]`), so an
+/// unpatched payload silently told every client -- Roon zones included --
+/// that no zone could browse. A no-op for every other event: none of them
+/// carry a `/payload/zone` pointer.
+fn patch_zone_discovered_browse_supported(value: &mut serde_json::Value) {
+    let Some(zone_id) = value
+        .pointer("/payload/zone/zone_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let supported = crate::mcp::tools::collections::zone_supports_hifi_collections(&zone_id);
+    if let Some(zone) = value
+        .pointer_mut("/payload/zone")
+        .and_then(|v| v.as_object_mut())
+    {
+        zone.insert(
+            "browse_supported".to_string(),
+            serde_json::Value::Bool(supported),
+        );
+    }
+}
+
 pub async fn events_handler(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -2166,9 +2203,17 @@ pub async fn events_handler(
     let stream = with_shutdown
         .filter_map(|result| match result {
             Ok(event) => {
-                // Serialize event to JSON
-                match serde_json::to_string(&event) {
-                    Ok(json) => Some(Ok(Event::default().data(json))),
+                // Serialize event to a Value first so ZoneDiscovered's embedded
+                // zone can be patched with the live browse_supported derivation
+                // (#557) before going out as JSON.
+                match serde_json::to_value(&event) {
+                    Ok(mut value) => {
+                        patch_zone_discovered_browse_supported(&mut value);
+                        match serde_json::to_string(&value) {
+                            Ok(json) => Some(Ok(Event::default().data(json))),
+                            Err(_) => None,
+                        }
+                    }
                     Err(_) => None,
                 }
             }
@@ -3709,6 +3754,69 @@ mod tests {
             .expect("response body must be readable")
             .to_bytes();
         serde_json::from_slice(&bytes).expect("response body must be valid JSON")
+    }
+
+    /// Builds a minimal `bus::events::Zone` for a given zone id, for tests
+    /// that only care about the id -> `browse_supported` derivation.
+    fn test_zone(zone_id: &str) -> Zone {
+        Zone {
+            zone_id: zone_id.to_string(),
+            zone_name: "Test Zone".to_string(),
+            state: PlaybackState::Stopped,
+            volume_control: None,
+            now_playing: None,
+            source: "test".to_string(),
+            is_controllable: true,
+            is_seekable: false,
+            last_updated: 0,
+            is_play_allowed: true,
+            is_pause_allowed: true,
+            is_next_allowed: true,
+            is_previous_allowed: true,
+        }
+    }
+
+    /// #557: a `ZoneDiscovered` event's embedded zone predates #531's
+    /// `browse_supported` flag on the wire, so it must be patched into the
+    /// serialized JSON rather than read off the struct (which has no such
+    /// field). Every provider #531 wired -- Roon included -- must come out
+    /// `true`; a provider it did not wire must come out `false`.
+    #[test]
+    fn zone_discovered_sse_payload_reports_browse_supported() {
+        for (zone_id, expected) in [
+            ("roon:zone-1", true),
+            ("lms:zone-1", true),
+            ("musicassistant:zone-1", true),
+            ("openhome:zone-1", false),
+            ("upnp:zone-1", false),
+            ("hqplayer:zone-1", false),
+        ] {
+            let event = BusEvent::ZoneDiscovered {
+                zone: test_zone(zone_id),
+            };
+            let mut value = serde_json::to_value(&event).expect("event serializes");
+            patch_zone_discovered_browse_supported(&mut value);
+            assert_eq!(
+                value.pointer("/payload/zone/browse_supported"),
+                Some(&serde_json::Value::Bool(expected)),
+                "zone_id={zone_id}"
+            );
+        }
+    }
+
+    /// Non-`ZoneDiscovered` events have no `/payload/zone` pointer, so the
+    /// patch must be a no-op rather than panicking or inserting a stray
+    /// field.
+    #[test]
+    fn patch_is_noop_for_events_without_a_zone() {
+        let event = BusEvent::RoonConnected {
+            core_name: "Test Core".to_string(),
+            version: "1.0".to_string(),
+        };
+        let mut value = serde_json::to_value(&event).expect("event serializes");
+        let before = value.clone();
+        patch_zone_discovered_browse_supported(&mut value);
+        assert_eq!(value, before);
     }
 
     struct FakeAdapter(&'static str);

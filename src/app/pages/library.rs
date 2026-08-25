@@ -211,6 +211,54 @@ fn resolve_source(
     browsable.first().and_then(|z| z.source.clone())
 }
 
+/// Whether an SSE event should trigger `zones.restart()` -- i.e. a fresh
+/// `/zones` fetch (#557).
+///
+/// Deliberately narrower than [`crate::app::sse::SseContext::should_refresh_zones`]
+/// and than `pages::zones`'s own restart condition: STRUCTURAL changes only
+/// (a zone appearing/disappearing, or a provider connecting/disconnecting).
+/// `ZoneUpdated` is excluded on purpose -- a playing zone's `ZoneUpdated`
+/// stream is effectively continuous, and restarting the zones resource on
+/// every one of them is exactly the fetch loop #557 reports (see this
+/// module's doc comment). This page has no need for the fresh `Zone.state`
+/// a restart would buy: `is_playing` is read from `now_playing`, which is
+/// refreshed on `ZoneUpdated` separately (a single per-zone `GET`, not a
+/// zones-list refetch).
+fn should_restart_zones(event: Option<&SseEvent>) -> bool {
+    matches!(
+        event,
+        Some(
+            SseEvent::ZoneDiscovered { .. }
+                | SseEvent::ZoneRemoved { .. }
+                | SseEvent::RoonConnected
+                | SseEvent::RoonDisconnected
+                | SseEvent::LmsConnected
+                | SseEvent::LmsDisconnected
+        )
+    )
+}
+
+/// Zones present in `list` with no entry yet in `now_playing` -- the ones
+/// worth fetching (#557).
+///
+/// Used instead of unconditionally re-fetching every zone's now-playing
+/// state whenever `zones_list()` changes: `Zone` carries a `state` field
+/// that legitimately changes on every `ZoneUpdated`, so a naive "refetch
+/// everything when the zone list changes" effect reruns on every such
+/// event even though no zone was actually added or removed. Filtering to
+/// zones missing from `now_playing` makes a rerun with no new zones a
+/// true no-op -- no request, no whole-map replace, no downstream
+/// re-render cascade.
+fn missing_now_playing_zones(
+    list: &[Zone],
+    now_playing: &HashMap<String, NowPlaying>,
+) -> Vec<Zone> {
+    list.iter()
+        .filter(|z| !now_playing.contains_key(&z.zone_id))
+        .cloned()
+        .collect()
+}
+
 /// Fetch one page of the current level and apply it.
 #[allow(clippy::too_many_arguments)]
 async fn load_page(
@@ -298,41 +346,48 @@ pub fn Library(
             .collect::<Vec<_>>()
     });
 
+    // Fetch now_playing for any zone we don't have it for yet: the initial
+    // load, or a zone newly added by a structural SSE event. Selective
+    // inserts (`with_mut`) rather than a whole-map `.set()` -- #557: `Zone`
+    // carries a `state` field that legitimately changes on every
+    // `ZoneUpdated`, so `zones_list()` (and this effect, if it depended on
+    // the full zone content) would rerun on every such event even though no
+    // zone was added or removed. Filtering to zones missing from
+    // `now_playing` makes a rerun with no new zones a no-op: no request, no
+    // map replace, no downstream re-render cascade. See this module's doc
+    // comment and #557's issue body for the loop this replaces.
     use_effect(move || {
         let list = zones_list();
-        if !list.is_empty() {
+        let missing = missing_now_playing_zones(&list, &now_playing.peek());
+        if !missing.is_empty() {
             spawn(async move {
-                let mut map = HashMap::new();
-                for zone in list {
+                for zone in missing {
                     let url = format!(
                         "/now_playing?zone_id={}",
                         urlencoding::encode(&zone.zone_id)
                     );
                     if let Ok(np) = api::fetch_json::<NowPlaying>(&url).await {
-                        map.insert(zone.zone_id, np);
+                        now_playing.with_mut(|map| {
+                            map.insert(zone.zone_id, np);
+                        });
                     }
                 }
-                now_playing.set(map);
             });
         }
     });
 
-    // Refresh on SSE events (structural + playback), mirroring pages::zones.
+    // Refresh on SSE events (structural + playback), mirroring pages::zones
+    // -- but stricter (#557): `zones.restart()` only on STRUCTURAL events
+    // (a zone appearing/disappearing, or a provider connecting/
+    // disconnecting), never on `ZoneUpdated`. A playing zone's `ZoneUpdated`
+    // stream is effectively continuous (play/pause, track, position-adjacent
+    // state), and this page has no need for the fresh `Zone.state` a restart
+    // would buy -- is_playing comes from `now_playing`, refreshed below on
+    // exactly this event.
     use_effect(move || {
         let _ = (sse.event_count)();
         let event = (sse.last_event)();
-        if matches!(
-            event.as_ref(),
-            Some(
-                SseEvent::ZoneDiscovered { .. }
-                    | SseEvent::ZoneUpdated { .. }
-                    | SseEvent::ZoneRemoved { .. }
-                    | SseEvent::RoonConnected
-                    | SseEvent::RoonDisconnected
-                    | SseEvent::LmsConnected
-                    | SseEvent::LmsDisconnected
-            )
-        ) {
+        if should_restart_zones(event.as_ref()) {
             zones.restart();
         }
         if let Some(evt) = event {
@@ -1172,5 +1227,140 @@ fn LibraryTile(
                 }
             }
         }
+    }
+}
+
+/// #557 regression guards for the fetch/render loop that pinned the
+/// browser: the render-loop root cause lived in two effects
+/// (`use_effect` bodies that spawn network requests on `zones_list()` and
+/// SSE event changes), which can't be driven directly without a full
+/// Dioxus VDOM test harness. These tests instead exercise the pure
+/// decision functions those effects delegate to -- `should_restart_zones`
+/// gates the `/zones` refetch, `missing_now_playing_zones` gates the
+/// `/now_playing` fan-out -- so the loop-breaking logic itself has direct
+/// coverage even though the effects' wiring does not. A scripted
+/// fullstack run against `tests/mock_servers` (seek events on a playing
+/// zone, counted `/zones` + `/now_playing` hits over time) would cover the
+/// wiring too, but is infeasible in this sandbox (no browser/wasm runtime
+/// to drive the SSE + effect loop end-to-end); see #557's PR description
+/// for this substitution.
+#[cfg(test)]
+mod loop_regression_tests {
+    use super::*;
+    use crate::app::sse::{VolumePayload, ZonePayload};
+
+    fn zone(id: &str) -> Zone {
+        Zone {
+            zone_id: id.to_string(),
+            ..Zone::default()
+        }
+    }
+
+    fn zone_payload(zone_id: &str) -> ZonePayload {
+        ZonePayload {
+            zone_id: zone_id.to_string(),
+        }
+    }
+
+    // ---- should_restart_zones: structural events only ----
+
+    #[test]
+    fn structural_events_restart_zones() {
+        for event in [
+            SseEvent::ZoneRemoved {
+                payload: zone_payload("roon:1"),
+            },
+            SseEvent::RoonConnected,
+            SseEvent::RoonDisconnected,
+            SseEvent::LmsConnected,
+            SseEvent::LmsDisconnected,
+        ] {
+            assert!(
+                should_restart_zones(Some(&event)),
+                "expected {event:?} to restart the zones resource"
+            );
+        }
+    }
+
+    /// The exact regression #557 reports: a playing zone's `ZoneUpdated`
+    /// stream must NOT restart the zones resource, or every one of those
+    /// events re-triggers the `/zones` -> `/now_playing`-fan-out chain --
+    /// the fetch loop that pinned the browser.
+    #[test]
+    fn zone_updated_does_not_restart_zones() {
+        let event = SseEvent::ZoneUpdated {
+            payload: zone_payload("roon:1"),
+        };
+        assert!(!should_restart_zones(Some(&event)));
+    }
+
+    #[test]
+    fn playback_and_volume_events_do_not_restart_zones() {
+        for event in [
+            SseEvent::NowPlayingChanged {
+                payload: zone_payload("roon:1"),
+            },
+            SseEvent::SeekPositionChanged {
+                payload: zone_payload("roon:1"),
+            },
+            SseEvent::VolumeChanged {
+                payload: VolumePayload {
+                    output_id: "roon:1".to_string(),
+                    value: 10.0,
+                    is_muted: false,
+                },
+            },
+        ] {
+            assert!(
+                !should_restart_zones(Some(&event)),
+                "expected {event:?} not to restart the zones resource"
+            );
+        }
+    }
+
+    #[test]
+    fn no_event_does_not_restart_zones() {
+        assert!(!should_restart_zones(None));
+    }
+
+    // ---- missing_now_playing_zones: the loop-breaking no-op guard ----
+
+    #[test]
+    fn all_zones_missing_on_first_load() {
+        let list = vec![zone("roon:1"), zone("roon:2")];
+        let now_playing = HashMap::new();
+        let missing = missing_now_playing_zones(&list, &now_playing);
+        assert_eq!(missing.len(), 2);
+    }
+
+    /// The other half of #557's regression: once every known zone has a
+    /// `now_playing` entry, a `zones_list()` rerun triggered by a restart
+    /// (e.g. a genuine `ZoneDiscovered` for an unrelated zone) must not
+    /// re-fetch zones that were already fetched -- that whole-map refetch
+    /// on every rerun was the other engine of the loop.
+    #[test]
+    fn already_known_zones_are_not_refetched() {
+        let list = vec![zone("roon:1"), zone("roon:2")];
+        let mut now_playing = HashMap::new();
+        now_playing.insert("roon:1".to_string(), NowPlaying::default());
+        now_playing.insert("roon:2".to_string(), NowPlaying::default());
+        let missing = missing_now_playing_zones(&list, &now_playing);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn only_the_newly_discovered_zone_is_fetched() {
+        let list = vec![zone("roon:1"), zone("roon:2")];
+        let mut now_playing = HashMap::new();
+        now_playing.insert("roon:1".to_string(), NowPlaying::default());
+        let missing = missing_now_playing_zones(&list, &now_playing);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].zone_id, "roon:2");
+    }
+
+    #[test]
+    fn empty_zone_list_fetches_nothing() {
+        let missing = missing_now_playing_zones(&[], &HashMap::new());
+        assert!(missing.is_empty());
     }
 }
