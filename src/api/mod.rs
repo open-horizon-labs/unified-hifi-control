@@ -45,6 +45,7 @@ pub mod controller_auth;
 pub mod credentials;
 pub mod mqtt_settings;
 pub mod provider_auth;
+pub mod spotify_tunnel;
 
 const MAX_REMOTE_ARTWORK_BYTES: usize = 10 * 1024 * 1024;
 
@@ -338,6 +339,12 @@ impl AppState {
             adapter_registry.clone(),
             knobs.clone(),
         ));
+        let provider_auth = Arc::new(provider_auth::ProviderAuthState::default());
+        // The Spotify tunnel (#538) spawns an `ssh` child process; wire the
+        // server's own shutdown token in so a graceful shutdown kills it
+        // too, instead of relying solely on the manual stop / OAuth
+        // completion / fifteen-minute cap paths.
+        provider_auth.bind_shutdown(shutdown.clone());
         Self {
             roon,
             hqplayer,
@@ -349,7 +356,7 @@ impl AppState {
             upnp,
             musicassistant: Arc::new(ReconfigurableMusicAssistant::new(bus.clone())),
             adapter_registry,
-            provider_auth: Arc::new(provider_auth::ProviderAuthState::default()),
+            provider_auth,
             controller_auth: controller_auth::ControllerAuthState::new(),
             apple_bridges: apple_bridge::AppleBridgeRegistry::from_env().unwrap_or_else(|error| {
                 tracing::error!("Apple Music companion credential store is unavailable: {error}");

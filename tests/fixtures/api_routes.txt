@@ -24,6 +24,7 @@ GET /api/controller/status
 GET /api/mqtt/status
 GET /api/providers/musicassistant/status
 GET /api/providers/spotify/account
+GET /api/providers/spotify/tunnel/status
 GET /api/providers/{provider}/oauth/callback
 GET /api/providers/{provider}/oauth/start
 GET /api/settings
@@ -85,6 +86,8 @@ POST /api/collections
 POST /api/controller/bootstrap
 POST /api/mqtt/configure
 POST /api/play_ref
+POST /api/providers/spotify/tunnel/start
+POST /api/providers/spotify/tunnel/stop
 POST /api/providers/{provider}/configure
 POST /api/providers/{provider}/oauth/revoke
 POST /api/queue

@@ -112,6 +112,38 @@ pub struct SpotifyConfigureResponse {
     pub has_client_secret: bool,
 }
 
+/// Status of the temporary HTTPS tunnel to the Spotify OAuth callback
+/// (#538). `phase` is one of `"idle"`, `"starting"`, `"active"`, `"error"`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SpotifyTunnelStatus {
+    #[serde(default)]
+    pub phase: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    #[serde(default)]
+    pub seconds_remaining: Option<u64>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+impl SpotifyTunnelStatus {
+    pub fn is_active(&self) -> bool {
+        self.phase == "active"
+    }
+
+    pub fn is_starting(&self) -> bool {
+        self.phase == "starting"
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.phase == "error"
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct MusicAssistantConfigureRequest {
     pub host: String,
