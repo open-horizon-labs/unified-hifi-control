@@ -3267,27 +3267,46 @@ pub async fn api_settings_post_handler(
         // Find the adapter and start/stop it
         if let Some(adapter) = adapters_list.iter().find(|a| a.name() == *name) {
             if now_enabled {
-                tracing::info!("Dynamically enabling adapter: {}", name);
-                if let Err(error) = coord.start_adapter_and_companions(adapter.as_ref()).await {
-                    tracing::warn!("Failed to start adapter {}: {}", name, error);
-                    // Do not persist a feature as enabled when its runtime
-                    // could not be started. The Settings client will restore
-                    // its last confirmed switch position from this response.
-                    coord
-                        .rollback_adapter_transitions(
-                            adapters_list.as_ref(),
-                            old_adapters,
-                            &applied_transitions,
-                        )
-                        .await;
-                    // The new settings were already persisted (inside the write
-                    // lock, for the hidden-zones carry-forward); put the old
-                    // ones back so disk matches the rolled-back runtime.
-                    let _ = mutate_app_settings(|current| *current = old_settings.clone());
-                    return Json(serde_json::json!({
-                        "ok": false,
-                        "error": format!("Could not enable {name}: {error}"),
-                    }));
+                // An adapter that is not yet configured (no host, no
+                // credentials, ...) is not a startup failure -- it is the
+                // ordinary state of "enabled, waiting to be configured".
+                // `start_all_enabled`/`start_enabled` already treat
+                // `can_start() == false` as a skip rather than an error; this
+                // toggle path used to reach `start_adapter_and_companions`
+                // unconditionally, which raised "adapter cannot start" and
+                // rolled the whole settings write back (see issue #544).
+                // Mirror the skip here so enabling an unconfigured adapter
+                // succeeds and leaves it idle, matching v3's behavior, and
+                // only a genuine start failure of a *configured* adapter
+                // triggers rollback.
+                if !adapter.can_start().await {
+                    tracing::info!(
+                        "Adapter {} enabled but not yet configured; leaving idle until configured",
+                        name
+                    );
+                } else {
+                    tracing::info!("Dynamically enabling adapter: {}", name);
+                    if let Err(error) = coord.start_adapter_and_companions(adapter.as_ref()).await {
+                        tracing::warn!("Failed to start adapter {}: {}", name, error);
+                        // Do not persist a feature as enabled when its runtime
+                        // could not be started. The Settings client will restore
+                        // its last confirmed switch position from this response.
+                        coord
+                            .rollback_adapter_transitions(
+                                adapters_list.as_ref(),
+                                old_adapters,
+                                &applied_transitions,
+                            )
+                            .await;
+                        // The new settings were already persisted (inside the write
+                        // lock, for the hidden-zones carry-forward); put the old
+                        // ones back so disk matches the rolled-back runtime.
+                        let _ = mutate_app_settings(|current| *current = old_settings.clone());
+                        return Json(serde_json::json!({
+                            "ok": false,
+                            "error": format!("Could not enable {name}: {error}"),
+                        }));
+                    }
                 }
             } else {
                 tracing::info!("Dynamically disabling adapter: {}", name);
@@ -3571,9 +3590,24 @@ fn adapter_enabled(settings: &AdapterSettings, name: &str) -> Option<bool> {
 mod tests {
     use super::*;
     use crate::bus::{create_bus, BusEvent, PlaybackState, Zone};
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
     use serial_test::serial;
     use std::env;
     use std::time::Duration;
+
+    /// Pulls the JSON body out of a handler's `impl IntoResponse`, for tests
+    /// that need to assert on `{"ok": ..., "error": ...}` rather than only
+    /// on the settings file the handler wrote.
+    async fn response_json(response: impl IntoResponse) -> serde_json::Value {
+        let body = response.into_response().into_body();
+        let bytes = body
+            .collect()
+            .await
+            .expect("response body must be readable")
+            .to_bytes();
+        serde_json::from_slice(&bytes).expect("response body must be valid JSON")
+    }
 
     struct FakeAdapter(&'static str);
 
@@ -3584,6 +3618,41 @@ mod tests {
         }
         async fn start(&self) -> anyhow::Result<()> {
             Ok(())
+        }
+        async fn stop(&self) {}
+    }
+
+    /// Stands in for an adapter that has never been configured -- like a
+    /// fresh HQPlayer instance with no host set. `can_start()` false is the
+    /// normal state of "enabled but not yet set up", not a failure.
+    struct UnconfiguredAdapter(&'static str);
+
+    #[async_trait::async_trait]
+    impl Startable for UnconfiguredAdapter {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        async fn start(&self) -> anyhow::Result<()> {
+            panic!("start() must not be called when can_start() is false");
+        }
+        async fn stop(&self) {}
+        async fn can_start(&self) -> bool {
+            false
+        }
+    }
+
+    /// Stands in for a *configured* adapter whose runtime genuinely fails to
+    /// start (bad network, crashed process, ...) -- the one case where the
+    /// settings write should still roll back.
+    struct FailingAdapter(&'static str);
+
+    #[async_trait::async_trait]
+    impl Startable for FailingAdapter {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        async fn start(&self) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("connection refused"))
         }
         async fn stop(&self) {}
     }
@@ -3913,6 +3982,100 @@ mod tests {
             after.hidden_zone_ids().is_empty(),
             "an explicit empty list must clear the hide list, got {:?}",
             after.hidden_zone_ids()
+        );
+    }
+
+    /// Issue #544: enabling an adapter that has never been configured (e.g. a
+    /// fresh HQPlayer instance with no host set) must succeed and leave the
+    /// adapter idle, exactly like v3's `if adapter.can_start().await { ... }`
+    /// guard did. The integration merge routed this toggle through
+    /// `start_adapter_and_companions`, which raises "adapter cannot start"
+    /// for an unconfigured adapter and used to trip the settings rollback --
+    /// surfacing a generic error to the user and undoing the whole write.
+    #[tokio::test]
+    #[serial]
+    async fn enabling_an_unconfigured_adapter_succeeds_and_stays_idle() {
+        env::set_var(
+            "UHC_CONFIG_DIR",
+            "/tmp/uhc-test-issue-544-unconfigured-enable",
+        );
+
+        let mut seeded = AppSettings::default();
+        seeded.hidden_zones = Some(vec!["roon:phone".to_string()]);
+        seeded.adapters.hqplayer = false;
+        assert!(save_app_settings(&seeded), "failed to seed test settings");
+
+        let state = app_state_with_startable(Arc::new(UnconfiguredAdapter("hqplayer"))).await;
+        state.coordinator.register("hqplayer", false).await;
+
+        let mut enabling = AppSettings::default();
+        enabling.adapters.hqplayer = true;
+        let response = api_settings_post_handler(State(state.clone()), Json(enabling)).await;
+        let body = response_json(response).await;
+
+        assert_eq!(
+            body["ok"], true,
+            "enabling an unconfigured adapter must not be reported as an error, got {body:?}"
+        );
+
+        let after = load_app_settings();
+        env::remove_var("UHC_CONFIG_DIR");
+
+        assert!(
+            after.adapters.hqplayer,
+            "the toggle itself must still take effect and persist"
+        );
+        assert_eq!(
+            after.hidden_zone_ids(),
+            ["roon:phone".to_string()],
+            "the hide list must survive enabling an unconfigured adapter"
+        );
+        assert!(
+            !state.coordinator.is_running("hqplayer").await,
+            "an unconfigured adapter must stay idle, not be marked running"
+        );
+    }
+
+    /// The other half of issue #544: a *configured* adapter whose runtime
+    /// genuinely fails to start must still roll the settings write back --
+    /// and that rollback must not take the user's hide list down with it.
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_adapter_start_rolls_back_without_erasing_the_hide_list() {
+        env::set_var(
+            "UHC_CONFIG_DIR",
+            "/tmp/uhc-test-issue-544-failed-start-rollback",
+        );
+
+        let mut seeded = AppSettings::default();
+        seeded.hidden_zones = Some(vec!["roon:phone".to_string()]);
+        seeded.adapters.lms = false;
+        assert!(save_app_settings(&seeded), "failed to seed test settings");
+
+        let state = app_state_with_startable(Arc::new(FailingAdapter("lms"))).await;
+        state.coordinator.register("lms", false).await;
+
+        let mut enabling = AppSettings::default();
+        enabling.adapters.lms = true;
+        let response = api_settings_post_handler(State(state.clone()), Json(enabling)).await;
+        let body = response_json(response).await;
+
+        assert_eq!(
+            body["ok"], false,
+            "a genuine start failure of a configured adapter must still be reported"
+        );
+
+        let after = load_app_settings();
+        env::remove_var("UHC_CONFIG_DIR");
+
+        assert!(
+            !after.adapters.lms,
+            "a failed start must roll the toggle back to its previous state"
+        );
+        assert_eq!(
+            after.hidden_zone_ids(),
+            ["roon:phone".to_string()],
+            "rolling back a failed adapter start must not erase the hide list"
         );
     }
 
