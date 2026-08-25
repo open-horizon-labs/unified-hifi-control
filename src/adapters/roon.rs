@@ -146,9 +146,17 @@ impl PlayAction {
 fn find_action_item(items: &[BrowseItem], action: PlayAction) -> Option<&BrowseItem> {
     let candidates: Vec<&BrowseItem> = items
         .iter()
-        .filter(|item| matches!(item.hint, Some(ItemHint::Action) | Some(ItemHint::ActionList)))
+        .filter(|item| {
+            matches!(
+                item.hint,
+                Some(ItemHint::Action) | Some(ItemHint::ActionList)
+            )
+        })
         .collect();
-    if let Some(found) = candidates.iter().find(|item| action.matches_title(&item.title)) {
+    if let Some(found) = candidates
+        .iter()
+        .find(|item| action.matches_title(&item.title))
+    {
         return Some(found);
     }
     if matches!(action, PlayAction::Play) {
@@ -2108,7 +2116,12 @@ impl RoonAdapter {
         let action_rows_seen = loaded
             .items
             .iter()
-            .filter(|item| matches!(item.hint, Some(ItemHint::Action) | Some(ItemHint::ActionList)))
+            .filter(|item| {
+                matches!(
+                    item.hint,
+                    Some(ItemHint::Action) | Some(ItemHint::ActionList)
+                )
+            })
             .count();
         let playable = action_rows_seen > 0;
         let has_other_content = loaded.list.count > action_rows_seen;
@@ -2706,8 +2719,7 @@ impl RoonAdapter {
                     // this is as deep as any known Roon shape nests.
                     Some(inner_items) => {
                         let Some(inner_matched) = find_action_item(&inner_items, action) else {
-                            let available: Vec<_> =
-                                inner_items.iter().map(|i| &i.title).collect();
+                            let available: Vec<_> = inner_items.iter().map(|i| &i.title).collect();
                             return Err(anyhow::anyhow!(
                                 "Action '{}' not available. Available: {:?}",
                                 action.canonical_verb(),
@@ -2777,10 +2789,12 @@ impl RoonAdapter {
             // to descend into a bare `action` row and invoke the wrong
             // thing. See `roon_play_ref_does_not_silently_substitute_
             // queue_for_an_unavailable_action` (`tests/roon_protocol.rs`).
-            if items
-                .iter()
-                .any(|item| matches!(item.hint, Some(ItemHint::Action) | Some(ItemHint::ActionList)))
-            {
+            if items.iter().any(|item| {
+                matches!(
+                    item.hint,
+                    Some(ItemHint::Action) | Some(ItemHint::ActionList)
+                )
+            }) {
                 let available: Vec<_> = items.iter().map(|i| &i.title).collect();
                 return Err(anyhow::anyhow!(
                     "Action '{}' not available. Available: {:?}",
@@ -2997,7 +3011,9 @@ impl LibraryAdapter for RoonAdapter {
                     // Playlist" entry in the list next to real content.
                     if matches!(
                         item.hint,
-                        Some(ItemHint::Header) | Some(ItemHint::Action) | Some(ItemHint::ActionList)
+                        Some(ItemHint::Header)
+                            | Some(ItemHint::Action)
+                            | Some(ItemHint::ActionList)
                     ) {
                         continue;
                     }

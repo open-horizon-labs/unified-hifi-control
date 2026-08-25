@@ -1594,7 +1594,10 @@ async fn roon_collections_content_classifies_playlist_and_tracks_correctly() {
         .expect("the track must be present");
     // Missing-Play-button bug (#545): a track's only child is its own
     // action list ("Play Track"), so it must be playable...
-    assert_eq!(track["playable"], true, "a track must be playable: {track:?}");
+    assert_eq!(
+        track["playable"], true,
+        "a track must be playable: {track:?}"
+    );
     // ...and, once that action row is filtered out, browsing further would
     // land on nothing -- so it must not also claim to be navigable.
     assert_eq!(
@@ -1662,8 +1665,9 @@ async fn roon_play_ref_matches_playlist_verb_and_reports_no_error() {
 #[tokio::test]
 async fn roon_play_ref_does_not_silently_substitute_queue_for_an_unavailable_action() {
     let mut library = FakeLibrary::standard();
-    library.root_items = vec![FakeItem::list("Playlists")
-        .with_children(vec![playlist("Solo Playlist", &["Only Track"])])];
+    library.root_items =
+        vec![FakeItem::list("Playlists")
+            .with_children(vec![playlist("Solo Playlist", &["Only Track"])])];
 
     let core = FakeRoonCore::start_with(library).await;
     let adapter = connected(&core).await;
