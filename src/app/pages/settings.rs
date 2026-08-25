@@ -1750,7 +1750,7 @@ pub fn Settings() -> Element {
                                 }
                                 div { class: "mt-4 rounded-md border border-default bg-elevated p-3", aria_label: "Remote UHC setup instructions",
                                     h5 { class: "font-medium", "Using UHC from another device or a NAS?" }
-                                    p { class: "mt-1 text-sm text-secondary", "Spotify requires HTTPS for anything other than 127.0.0.1/::1. Get a temporary HTTPS address for this UHC server -- nothing to install, no terminal needed. While it's open, this server is briefly reachable from the public internet at that address; only the in-progress Spotify sign-in is accepted through it." }
+                                    p { class: "mt-1 text-sm text-secondary", "Spotify requires HTTPS for anything other than 127.0.0.1/::1. Get a temporary HTTPS address for this UHC server -- nothing to install, no terminal needed. While it's open, this server is briefly reachable from the public internet at that address; only the in-progress Spotify sign-in is accepted through it. UHC closes it after 15 minutes either way, well inside the free tunnel provider's own 60-minute limit." }
                                     if spotify_tunnel_status.is_active() {
                                         div { class: "mt-3 rounded-md border border-default bg-hover p-3",
                                             p { class: "text-sm text-secondary",

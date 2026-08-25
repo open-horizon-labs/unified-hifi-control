@@ -124,12 +124,44 @@ impl TunnelProviderKind {
     }
 }
 
+/// Pinggy's free tier does not actually use `pinggy.link` for the anonymous
+/// (no-account) tunnels this module opens -- confirmed against a live
+/// `ssh -p 443 -R0:localhost:<port> a.pinggy.io` run, whose stdout was:
+///
+/// ```text
+/// Allocated port 9 for remote forward to localhost:8091
+/// You are not authenticated.
+/// Your tunnel will expire in 60 minutes. Upgrade to Pinggy Pro to get unrestricted tunnels. https://dashboard.pinggy.io
+/// https://lgidn-2603-6010-e300-381a-352c-943-c7fa-76a9.run.pinggy-free.link
+/// https://rjvqd-2603-6010-e300-381a-352c-943-c7fa-76a9.free.pinggy.net
+/// ```
+///
+/// i.e. `pinggy-free.link` and `free.pinggy.net`, plus a `dashboard.pinggy.io`
+/// upsell link on the expiry-notice line that must NOT be picked up. `.link`
+/// is kept for a possible authenticated/Pro tunnel, which is documented to
+/// use plain `pinggy.link`, even though this module never authenticates.
 #[allow(clippy::unwrap_used)] // Regex pattern is a compile-time constant
 fn pinggy_url_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
-    PATTERN.get_or_init(|| Regex::new(r"https://[a-zA-Z0-9.-]+\.pinggy\.link\S*").unwrap())
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r"https://[a-zA-Z0-9.-]+\.(?:pinggy\.link|pinggy-free\.link|free\.pinggy\.net)\S*",
+        )
+        .unwrap()
+    })
 }
 
+/// NOT verified against a live `localhost.run` tunnel URL: a live `ssh -R
+/// 80:localhost:<port> localhost.run` run reached the server and printed its
+/// welcome banner (which is why this pattern deliberately stays scoped to
+/// `lhr.life` rather than "first https:// line" -- the banner alone contains
+/// `https://admin.localhost.run/`, `https://localhost.run/docs/...` several
+/// times over, none of which are the tunnel URL), but did not yield the
+/// actual forwarded `https://…lhr.life` line within a 15s connection before
+/// timing out. If this pattern turns out to be wrong the same way the pinggy
+/// one was, the fix is the same: capture a real run's stdout and widen this
+/// regex to match it, the way `pinggy_url_pattern` now covers
+/// `pinggy-free.link` and `free.pinggy.net` alongside `pinggy.link`.
 #[allow(clippy::unwrap_used)] // Regex pattern is a compile-time constant
 fn localhost_run_url_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
@@ -979,6 +1011,74 @@ mod tests {
             TunnelProviderKind::LocalhostRun.extract_url(line),
             Some("https://ab12cd.lhr.life".to_string())
         );
+    }
+
+    /// Regression test for a live-smoke defect: `ssh -p 443
+    /// -R0:localhost:<port> a.pinggy.io`'s actual anonymous-tunnel stdout
+    /// never contains a bare `pinggy.link` host, so the original
+    /// `\.pinggy\.link` pattern never matched and the manager timed out
+    /// despite a live tunnel. This is the exact captured output (only the
+    /// per-connection subdomains are illustrative).
+    const LIVE_PINGGY_ANONYMOUS_STDOUT: [&str; 5] = [
+        "Allocated port 9 for remote forward to localhost:8091",
+        "You are not authenticated.",
+        "Your tunnel will expire in 60 minutes. Upgrade to Pinggy Pro to get unrestricted tunnels. https://dashboard.pinggy.io",
+        "https://lgidn-2603-6010-e300-381a-352c-943-c7fa-76a9.run.pinggy-free.link",
+        "https://rjvqd-2603-6010-e300-381a-352c-943-c7fa-76a9.free.pinggy.net",
+    ];
+
+    #[test]
+    fn pinggy_extraction_matches_the_live_anonymous_tunnel_domains() {
+        let matches: Vec<Option<String>> = LIVE_PINGGY_ANONYMOUS_STDOUT
+            .iter()
+            .map(|line| TunnelProviderKind::Pinggy.extract_url(line))
+            .collect();
+        assert_eq!(
+            matches,
+            vec![
+                None,
+                None,
+                // The Pinggy Pro upsell link on the expiry-notice line must
+                // not be mistaken for the tunnel URL.
+                None,
+                Some(
+                    "https://lgidn-2603-6010-e300-381a-352c-943-c7fa-76a9.run.pinggy-free.link"
+                        .to_string()
+                ),
+                Some(
+                    "https://rjvqd-2603-6010-e300-381a-352c-943-c7fa-76a9.free.pinggy.net"
+                        .to_string()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn start_reaches_active_on_the_live_captured_pinggy_banner() {
+        let launcher = FakeLauncher::new(vec![(
+            TunnelProviderKind::Pinggy,
+            ScriptedLaunch {
+                lines: LIVE_PINGGY_ANONYMOUS_STDOUT
+                    .iter()
+                    .map(|line| line.to_string())
+                    .collect(),
+                exit_with_stderr: None,
+                launch_error: None,
+            },
+        )]);
+        let manager = Arc::new(SpotifyTunnelManager::with_launcher(launcher));
+        manager.start(8091).await;
+        let status = wait_until(&manager, |s| matches!(s, TunnelStatus::Active { .. })).await;
+        match status {
+            TunnelStatus::Active { url, provider, .. } => {
+                assert_eq!(
+                    url,
+                    "https://lgidn-2603-6010-e300-381a-352c-943-c7fa-76a9.run.pinggy-free.link"
+                );
+                assert_eq!(provider, "pinggy.io");
+            }
+            other => panic!("expected Active, got {other:?}"),
+        }
     }
 
     #[test]

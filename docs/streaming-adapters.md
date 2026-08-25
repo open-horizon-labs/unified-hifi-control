@@ -133,10 +133,16 @@ NAS install — falling back automatically to
 providers mint a fresh random subdomain on every connection, so a new tunnel
 always means a newly registered callback URL; that expectation and the retry
 logic live in `SpotifyTunnelManager` (`src/api/spotify_tunnel.rs`), which is
-tested against a scripted fake process rather than a live tunnel provider. If
-`ssh` is missing, both providers are unreachable, or outbound `ssh` traffic is
-blocked, the panel reports why in the same beginner-readable style as the
-rest of Settings, and the collapsed **Advanced: bring your own HTTPS** note
+tested against a scripted fake process rather than a live tunnel provider
+(the pinggy URL-parsing test fixture is an exact capture of a live anonymous
+tunnel's stdout, though, since a first live-smoke pass found the original
+`pinggy.link`-only pattern never matched pinggy's real anonymous-tier hosts —
+`pinggy-free.link` and `free.pinggy.net`). Pinggy's free tier also caps an
+anonymous tunnel at 60 minutes before it expires on its own; UHC's own
+15-minute cap closes it well before that regardless. If `ssh` is missing,
+both providers are unreachable, or outbound `ssh` traffic is blocked, the
+panel reports why in the same beginner-readable style as the rest of
+Settings, and the collapsed **Advanced: bring your own HTTPS** note
 underneath still covers running your own tunnel by hand (for example
 `cloudflared tunnel --url http://127.0.0.1:8088` or Tailscale Funnel) and
 pasting its callback URL into the Redirect URI field yourself. Reauthorizing
