@@ -86,6 +86,7 @@ POST /api/play_ref
 POST /api/providers/{provider}/configure
 POST /api/providers/{provider}/oauth/revoke
 POST /api/queue
+POST /api/search
 POST /api/settings
 POST /api/zones/name
 POST /api/zones/order

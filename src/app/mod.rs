@@ -13,7 +13,7 @@ pub mod settings_context;
 pub mod sse;
 pub mod theme;
 
-use pages::{HqPlayer, Knobs, Lms, Settings, Spotify, Zones};
+use pages::{HqPlayer, Knobs, Library, Lms, Settings, Spotify, Zones};
 use settings_context::use_settings_provider;
 use sse::use_sse_provider;
 use theme::use_theme_provider;
@@ -113,10 +113,28 @@ pub fn App() -> Element {
     }
 }
 
-/// Application routes
+/// Application routes.
+///
+/// Library is the home page (#550): a full-page browse/search surface that
+/// replaced the old per-zone-card browse panel. Its state -- which
+/// provider/zone is being browsed, which tab, and the breadcrumb path -- is
+/// carried entirely in the query string so a level is refresh/back/share
+/// safe, per the issue's URL-addressability requirement. `path` is a
+/// base64url-encoded JSON breadcrumb stack (`Vec<(String, Option<String>)>`,
+/// see `pages::library::BreadcrumbEntry`) rather than raw path segments:
+/// provider browse paths are opaque tokens that may contain characters a URL
+/// path segment can't carry safely, and a flat list of segments would lose
+/// the breadcrumb titles on a fresh (deep-linked) load.
 #[derive(Clone, Routable, Debug, PartialEq)]
 pub enum Route {
-    #[route("/")]
+    #[route("/?:source&:tab&:path&:zone")]
+    Library {
+        source: Option<String>,
+        tab: Option<String>,
+        path: Option<String>,
+        zone: Option<String>,
+    },
+    #[route("/zones")]
     Zones {},
     #[route("/hqplayer")]
     HqPlayer {},
