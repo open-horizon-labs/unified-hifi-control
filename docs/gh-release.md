@@ -28,6 +28,7 @@ Add labels to your PR to enable optional builds:
 | `build:docker` | Docker x64 image |
 | `build:linux-arm` | Linux arm64 + armv7 binaries |
 | `build:macos` | macOS universal binary |
+| `build:applemusic-macos` | Apple Music companion DMG (macOS arm64 only) |
 | `build:windows` | Windows exe |
 | `build:linux-packages` | deb/rpm packages |
 | `build:all` | Everything |
@@ -254,6 +255,42 @@ The QDK 2.5.3 release assets used here are:
 - `qdk_2.5.3_amd64.deb`: `17b3841b7d4590a4ee025844ba583304b5e3c497d9fa8934d5175131d3908022`
 - `qdk_2.5.3_arm64.deb`: `4b00c009cb48c0ffa7e4b7b00c5a6a1982a0955d663c0c6ec57020353e68eeb9` (available from the release, not used by CI)
 
+### Apple Music Companion DMG
+
+`build-applemusic-companion-dmg` builds the macOS companion app
+(`companion/apple_music/XcodeMac/AppleMusicCompanionMac.xcworkspace`) with
+`xcodebuild`, forcing `ARCHS=arm64` — Apple Silicon only, no x86_64 or
+universal build, by explicit project decision. The job runs
+`companion/apple_music/build-dmg.sh`, which also verifies the built
+executable is arm64-only (via `lipo -archs`) before wrapping it with
+`hdiutil create` into a `.dmg` containing the `.app` and an `Applications`
+symlink.
+
+No code-signing identity is available in CI, so the DMG ships **unsigned**
+(ad-hoc signed with `codesign --sign -`). Notarization is tracked as a
+follow-up, not a blocker (see issue #535). Because the app is unsigned,
+Gatekeeper quarantines it on download; users must either right-click the
+`.app` and choose **Open** (confirming the dialog) on first launch, or run:
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/AppleMusicCompanionMac.app"
+```
+
+This is documented in `companion/apple_music/README.md` and linked from the
+release notes' Download Guide.
+
+To reproduce the CI artifact locally on Apple Silicon:
+
+```sh
+make companion-apple-music-dmg
+# or directly:
+VERSION=0.1.0 companion/apple_music/build-dmg.sh
+```
+
+The DMG lands in `companion/apple_music/dist/`. Set `CODE_SIGN_IDENTITY` (and
+`DEVELOPMENT_TEAM`) to build with a local Developer ID or Apple Development
+identity instead of the unsigned default.
+
 ## Build Matrix
 
 | Target | Caching | Build Tool | Default | Label |
@@ -264,6 +301,7 @@ The QDK 2.5.3 release assets used here are:
 | Linux aarch64-musl | rust-cache | cargo-zigbuild | Release | `build:linux-arm` |
 | Linux armv7-musl | rust-cache | cargo-zigbuild | Release | `build:linux-arm` |
 | macOS universal | sccache + rust-cache | cargo + lipo | Release | `build:macos` |
+| Apple Music companion DMG (macOS arm64) | N/A | xcodebuild + hdiutil | Release | `build:applemusic-macos` |
 | Windows x86_64 | sccache + rust-cache | cargo | Release | `build:windows` |
 | Docker x64 | N/A | pre-built binary | Release | `build:docker` |
 | Docker multi-arch | N/A | pre-built binaries | Release | - |

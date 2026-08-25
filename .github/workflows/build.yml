@@ -36,6 +36,10 @@ on:
         description: 'Build macOS universal'
         type: boolean
         default: false
+      build_applemusic_macos:
+        description: 'Build Apple Music companion DMG (macOS arm64)'
+        type: boolean
+        default: false
       build_windows:
         description: 'Build Windows'
         type: boolean
@@ -69,6 +73,7 @@ jobs:
       is_beta: ${{ steps.decide.outputs.is_beta }}
       build_linux_arm: ${{ steps.decide.outputs.build_linux_arm }}
       build_macos: ${{ steps.decide.outputs.build_macos }}
+      build_applemusic_macos: ${{ steps.decide.outputs.build_applemusic_macos }}
       build_windows: ${{ steps.decide.outputs.build_windows }}
       build_lms: ${{ steps.decide.outputs.build_lms }}
       build_synology: ${{ steps.decide.outputs.build_synology }}
@@ -116,6 +121,7 @@ jobs:
           HAS_LABEL_ALL: ${{ contains(github.event.pull_request.labels.*.name, 'build:all') }}
           HAS_LABEL_LINUX_ARM: ${{ contains(github.event.pull_request.labels.*.name, 'build:linux-arm') }}
           HAS_LABEL_MACOS: ${{ contains(github.event.pull_request.labels.*.name, 'build:macos') }}
+          HAS_LABEL_APPLEMUSIC_MACOS: ${{ contains(github.event.pull_request.labels.*.name, 'build:applemusic-macos') }}
           HAS_LABEL_WINDOWS: ${{ contains(github.event.pull_request.labels.*.name, 'build:windows') }}
           HAS_LABEL_LMS: ${{ contains(github.event.pull_request.labels.*.name, 'build:lms') }}
           HAS_LABEL_LMS_MACOS: ${{ contains(github.event.pull_request.labels.*.name, 'build:lms-macos') }}
@@ -127,6 +133,7 @@ jobs:
           # Inputs (only present on workflow_dispatch)
           INPUT_LINUX_ARM: ${{ inputs.build_linux_arm }}
           INPUT_MACOS: ${{ inputs.build_macos }}
+          INPUT_APPLEMUSIC_MACOS: ${{ inputs.build_applemusic_macos }}
           INPUT_WINDOWS: ${{ inputs.build_windows }}
           INPUT_LMS: ${{ inputs.build_lms }}
           INPUT_SYNOLOGY: ${{ inputs.build_synology }}
@@ -145,6 +152,7 @@ jobs:
             echo "is_release=false" >> $GITHUB_OUTPUT
             echo "build_linux_arm=false" >> $GITHUB_OUTPUT
             echo "build_macos=false" >> $GITHUB_OUTPUT
+            echo "build_applemusic_macos=false" >> $GITHUB_OUTPUT
             echo "build_windows=false" >> $GITHUB_OUTPUT
             echo "build_lms=false" >> $GITHUB_OUTPUT
             echo "build_synology=false" >> $GITHUB_OUTPUT
@@ -199,6 +207,14 @@ jobs:
           if [[ "$HAS_LABEL_LMS_MACOS" == "true" ]]; then BUILD_MACOS="true"; fi
           if [[ "$INPUT_MACOS" == "true" ]]; then BUILD_MACOS="true"; fi
           echo "build_macos=$BUILD_MACOS" >> $GITHUB_OUTPUT
+
+          # Apple Music companion DMG (macOS arm64-only). Independent of the
+          # main macOS binary build - it packages the Xcode companion app.
+          BUILD_APPLEMUSIC_MACOS="false"
+          if should_build; then BUILD_APPLEMUSIC_MACOS="true"; fi
+          if [[ "$HAS_LABEL_APPLEMUSIC_MACOS" == "true" ]]; then BUILD_APPLEMUSIC_MACOS="true"; fi
+          if [[ "$INPUT_APPLEMUSIC_MACOS" == "true" ]]; then BUILD_APPLEMUSIC_MACOS="true"; fi
+          echo "build_applemusic_macos=$BUILD_APPLEMUSIC_MACOS" >> $GITHUB_OUTPUT
 
           # Windows
           BUILD_WINDOWS="false"
@@ -286,6 +302,11 @@ jobs:
             if [[ "$IS_RELEASE_TRIGGER" == "true" ]]; then add_row "macos" "$RELEASE_TRIGGER_NAME"
             elif [[ "$HAS_LABEL_LMS_MACOS" == "true" ]]; then add_row "macos" "build:lms-macos"
             elif [[ "$HAS_LABEL_MACOS" == "true" ]]; then add_row "macos" "build:macos"
+            fi
+          fi
+          if [[ "$BUILD_APPLEMUSIC_MACOS" == "true" ]]; then
+            if [[ "$IS_RELEASE_TRIGGER" == "true" ]]; then add_row "applemusic-macos" "$RELEASE_TRIGGER_NAME"
+            elif [[ "$HAS_LABEL_APPLEMUSIC_MACOS" == "true" ]]; then add_row "applemusic-macos" "build:applemusic-macos"
             fi
           fi
           if [[ "$BUILD_LINUX_ARM" == "true" ]]; then
@@ -1002,6 +1023,30 @@ jobs:
           path: dist/bin/
           retention-days: 5
 
+  build-applemusic-companion-dmg:
+    name: Build Apple Music Companion DMG (macOS arm64)
+    needs: [plan]
+    if: needs.plan.outputs.build_applemusic_macos == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # No signing identity is available in CI, so this produces an
+      # unsigned/ad-hoc DMG. ARM64 (Apple Silicon) only - by design, not a
+      # gap: see companion/apple_music/README.md for the right-click-Open /
+      # xattr workaround users need on first launch.
+      - name: Build arm64-only DMG
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: companion/apple_music/build-dmg.sh
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v7
+        with:
+          name: applemusic-companion-dmg
+          path: companion/apple_music/dist/*.dmg
+          retention-days: 5
+
   build-windows:
     name: Build Windows
     needs: [plan, build-wasm]
@@ -1641,7 +1686,7 @@ jobs:
   # Note: Web assets are embedded in the binary (ADR 002)
   upload-release:
     name: Upload to Release
-    needs: [plan, build-linux-x64, build-linux-arm, build-macos-universal, build-windows, build-linux-packages, build-lms-universal, build-synology, build-qnap-x64, build-qnap-arm]
+    needs: [plan, build-linux-x64, build-linux-arm, build-macos-universal, build-applemusic-companion-dmg, build-windows, build-linux-packages, build-lms-universal, build-synology, build-qnap-x64, build-qnap-arm]
     if: needs.plan.outputs.is_release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -1666,6 +1711,7 @@ jobs:
           find artifacts -name "*.zip" -type f -exec cp {} release/ \;
           find artifacts -name "*.spk" -type f -exec cp {} release/ \;
           find artifacts -name "*.qpkg" -type f -exec cp {} release/ \;
+          find artifacts -name "*.dmg" -type f -exec cp {} release/ \;
           ls -la release/
 
       - name: Generate asset list
@@ -1691,6 +1737,12 @@ jobs:
           ### NAS Packages
           - `.spk` for Synology DSM 7+
           - `.qpkg` for QNAP
+
+          ### macOS Companion Apps
+          - `unified-hifi-applemusic-companion-macos-arm64-*.dmg` - Apple Music
+            companion (Apple Silicon only). Unsigned: see the "Unsigned app"
+            note in [companion/apple_music/README.md](https://github.com/${{ github.repository }}/blob/v3/companion/apple_music/README.md)
+            for the right-click-Open / xattr workaround required on first launch.
 
           ### LMS Plugin
           - `lms-unified-hifi-control-*.zip` - Install via LMS Settings > Plugins
@@ -1893,6 +1945,7 @@ jobs:
       - smoke-test
       - build-linux-arm
       - build-macos-universal
+      - build-applemusic-companion-dmg
       - build-windows
       - build-lms-universal
       - build-synology

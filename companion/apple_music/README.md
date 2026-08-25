@@ -35,3 +35,43 @@ stable companion ID, bridge ID, and UHC URL in Keychain; inject
 Signed-host lifecycle, Keychain identity, and physical validation remain
 required by #486/#487. Linux, QNAP, and other non-macOS builds do not compile
 this package.
+
+## Building a distributable DMG (Apple Silicon only)
+
+`build-dmg.sh` builds the Xcode app
+(`XcodeMac/AppleMusicCompanionMac.xcworkspace`, scheme
+`AppleMusicCompanionMac`) for **arm64 only** — no x86_64 or universal build,
+by explicit project decision — and wraps it in a `.dmg` with `hdiutil`. It
+verifies the built executable is arm64-only before packaging. Run it via:
+
+```sh
+make companion-apple-music-dmg
+# or directly, from this directory:
+VERSION=0.1.0 ./build-dmg.sh
+```
+
+The DMG is written to `companion/apple_music/dist/` (gitignored). This
+mirrors the `build-applemusic-companion-dmg` CI job in
+`.github/workflows/build.yml`; see `docs/gh-release.md` for how it's wired
+into label-gated PR builds and releases.
+
+By default the app is built **unsigned** (ad-hoc, `codesign --sign -`),
+since CI has no code-signing identity available. Set `CODE_SIGN_IDENTITY`
+(and `DEVELOPMENT_TEAM`) to build with a local Developer ID or Apple
+Development identity instead.
+
+### Unsigned app: first-launch workaround
+
+Because the shipped DMG is unsigned, macOS Gatekeeper quarantines the app on
+download and blocks a normal double-click launch. After copying
+`AppleMusicCompanionMac.app` to `/Applications`, either:
+
+- Right-click (Control-click) the app and choose **Open**, then confirm the
+  dialog, or
+- Remove the quarantine attribute from Terminal:
+  ```sh
+  xattr -dr com.apple.quarantine "/Applications/AppleMusicCompanionMac.app"
+  ```
+
+Notarization is tracked as a follow-up (not a blocker for distributing this
+DMG) — see issue #535.
