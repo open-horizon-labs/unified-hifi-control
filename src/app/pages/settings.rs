@@ -222,7 +222,7 @@ fn FeatureToggle(label: &'static str, enabled: bool, onclick: EventHandler<Mouse
                 "Enable Spotify" => "adapters.spotify",
                 "Enable Apple Music" => "adapters.applemusic",
                 "Enable MQTT/Home Assistant" => "adapters.mqtt",
-                "Show Knobs page" => "hide_knobs_page",
+                "Show Controllers page" => "hide_knobs_page",
                 _ => "",
             },
             onclick: move |event| onclick.call(event),
@@ -1451,18 +1451,18 @@ pub fn Settings() -> Element {
                                     } else { span { class: "text-muted", "-" } }
                                 }
                             }
-                            // Knobs (page only, no adapter)
+                            // Controllers (page only, no adapter)
                             tr { class: "border-b border-default",
                                 td { class: "py-2 px-3",
                                     FeatureToggle {
-                                        label: "Show Knobs page",
+                                        label: "Show Controllers page",
                                         enabled: !hide_knobs(),
                                         onclick: move |_| {
                                             toggle_setting(SettingsToggle::HideKnobs(hide_knobs()));
                                         }
                                     }
                                 }
-                                td { class: "py-2 px-3", "Knobs" }
+                                td { class: "py-2 px-3", "Controllers" }
                                 td { class: "py-2 px-3 text-muted", "-" }
                             }
                         }
@@ -2474,7 +2474,7 @@ pub fn Settings() -> Element {
                         match theme_ctx.get() {
                             Theme::System => "Using your system's color scheme preference.",
                             Theme::Light => "Light theme for bright environments.",
-                            Theme::Dark => "Dark theme for low-light environments.",
+                            Theme::Dark => "The HiPhi look: navy surfaces, cyan accent. Default theme.",
                             Theme::Oled => "Pure black theme for AMOLED displays.",
                         }
                     }
