@@ -110,17 +110,53 @@ secret blank to use Authorization Code with PKCE.
 
 If the browser is not on the UHC host, Spotify accepts plain HTTP only for
 explicit loopback callbacks (`127.0.0.1` or `::1`); anything else — a remote
-QNAP, a different machine on the LAN — needs HTTPS. Until a built-in tunnel
-ships (tracked as a fast-follow in #538), start a temporary HTTPS tunnel to
-port 8088 by hand (for example with `cloudflared tunnel --url
-http://127.0.0.1:8088` or Tailscale Funnel), open its HTTPS URL in the
-browser, and set the Redirect URI field to that tunnel's callback address
-before registering it in the Spotify dashboard. Saving the form persists the
-client configuration in the encrypted credential envelope, after which
-**Connect Spotify** starts the browser authorization flow. Stop the tunnel
-after authorization; reauthorization creates a new callback URL and needs a
-new tunnel and a newly registered callback, and reuses the same in-Settings
-guidance. This is the first-run onboarding path tracked in #469 and #534.
+QNAP, a different machine on the LAN — needs HTTPS. The "Using UHC from
+another device or a NAS?" panel below the callback URL has a **Get an HTTPS
+address** button for this: it asks UHC's server to open a temporary tunnel to
+itself and shows the resulting `https://…` callback URL with a copy button,
+so a first-time user never has to install or run anything. The Redirect URI
+field is pre-filled with that URL's callback path; paste the same URL into
+the Spotify dashboard's Redirect URIs, save client settings, then Connect.
+The tunnel closes itself automatically once authorization completes (success
+or failure), after 15 minutes, or via its own "Stop tunnel" button — while it
+is open, this UHC server is briefly reachable from the public internet at
+that address, though the callback endpoint behind it only ever accepts the
+single in-flight OAuth `state` token, so no extra trust is extended to
+traffic that arrives through it (see `oauth_callback_json` in
+`src/api/provider_auth.rs`).
+
+Under the hood this is a plain `ssh -R` reverse tunnel to
+[pinggy.io](https://pinggy.io)'s free tier — no account and no bundled binary
+beyond the `ssh` client already present on essentially every Linux, macOS, or
+NAS install — falling back automatically to
+[localhost.run](https://localhost.run) if pinggy.io cannot be reached. Both
+providers mint a fresh random subdomain on every connection, so a new tunnel
+always means a newly registered callback URL; that expectation and the retry
+logic live in `SpotifyTunnelManager` (`src/api/spotify_tunnel.rs`), which is
+tested against a scripted fake process rather than a live tunnel provider
+(the pinggy URL-parsing test fixture is an exact capture of a live anonymous
+tunnel's stdout, though, since a first live-smoke pass found the original
+`pinggy.link`-only pattern never matched pinggy's real anonymous-tier hosts —
+`pinggy-free.link` and `free.pinggy.net`). Pinggy's free tier also caps an
+anonymous tunnel at 60 minutes before it expires on its own; UHC's own
+15-minute cap closes it well before that regardless. If `ssh` is missing,
+both providers are unreachable, or outbound `ssh` traffic is blocked, the
+panel reports why in the same beginner-readable style as the rest of
+Settings, and the collapsed **Advanced: bring your own HTTPS** note
+underneath still covers running your own tunnel by hand (for example
+`cloudflared tunnel --url http://127.0.0.1:8088` or Tailscale Funnel) and
+pasting its callback URL into the Redirect URI field yourself. Reauthorizing
+later always needs a new tunnel (built-in or your own) and a newly registered
+callback URL either way. This is the first-run onboarding path tracked in
+#469, #534, and #538.
+
+New endpoints backing the built-in tunnel — `POST
+/api/providers/spotify/tunnel/start`, `GET
+/api/providers/spotify/tunnel/status`, and `POST
+/api/providers/spotify/tunnel/stop` — are controller-authenticated the same
+as the rest of `/api/providers/*` (see `requires_controller_auth` in
+`src/api/controller_auth.rs`) and registered in
+`tests/fixtures/api_routes.txt`.
 
 If authorization does not complete, Settings shows an actionable message
 instead of a generic failure: an expired or already-used sign-in link, a

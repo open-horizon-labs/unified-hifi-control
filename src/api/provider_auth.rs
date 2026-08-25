@@ -14,9 +14,10 @@ use crate::api::credentials::{
     EncryptedCredentialStore, MusicAssistantCredentialRecord, MusicAssistantCredentialStore,
     SpotifyCredentialRecord,
 };
+use crate::api::spotify_tunnel::{SpotifyTunnelManager, TunnelStatusResponse};
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header::HOST, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
     Json,
 };
@@ -31,6 +32,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use super::AppState;
 
@@ -48,6 +50,8 @@ pub struct ProviderAuthState {
     oauth: Arc<RwLock<Option<Arc<SpotifyOAuthConfig>>>>,
     musicassistant: Arc<RwLock<Option<Arc<ReconfigurableMusicAssistant>>>>,
     musicassistant_credentials: Option<Arc<MusicAssistantCredentialStore>>,
+    /// Temporary HTTPS tunnel for the Spotify OAuth callback (#538).
+    pub spotify_tunnel: Arc<SpotifyTunnelManager>,
 }
 
 #[derive(Clone)]
@@ -80,6 +84,7 @@ impl Default for ProviderAuthState {
             oauth: Arc::new(RwLock::new(oauth)),
             musicassistant: Arc::new(RwLock::new(None)),
             musicassistant_credentials,
+            spotify_tunnel: Arc::new(SpotifyTunnelManager::default()),
         }
     }
 }
@@ -101,7 +106,15 @@ impl ProviderAuthState {
             musicassistant_credentials: MusicAssistantCredentialStore::from_env()
                 .ok()
                 .map(Arc::new),
+            spotify_tunnel: Arc::new(SpotifyTunnelManager::default()),
         }
+    }
+
+    /// Wires the server's graceful-shutdown token into the Spotify tunnel
+    /// manager so a leftover tunnel process is killed on shutdown too, not
+    /// just on the user-facing stop paths. Called once from `AppState::new`.
+    pub fn bind_shutdown(&self, token: CancellationToken) {
+        self.spotify_tunnel.bind_shutdown(token);
     }
 
     /// Construct provider auth with an explicit Music Assistant credential
@@ -674,6 +687,14 @@ pub async fn oauth_callback(
     Query(query): Query<OAuthCallbackQuery>,
 ) -> Response {
     let machine = query.format.as_deref() == Some("json");
+    // The tunnel exists only to carry this one callback across the public
+    // internet; once the callback has been processed (whether Spotify
+    // accepted or rejected it), there is nothing left for it to do. Tear it
+    // down here regardless of outcome so a failed exchange does not leave it
+    // running until the fifteen-minute cap.
+    if provider == "spotify" {
+        state.provider_auth.spotify_tunnel.stop().await;
+    }
     match oauth_callback_json(State(state), Path(provider), Query(query)).await {
         Ok(Json(response)) if machine => Json(response).into_response(),
         Ok(Json(_)) => Redirect::to("/settings?spotify=connected").into_response(),
@@ -879,6 +900,59 @@ pub async fn oauth_revoke(
         authorized: false,
         expires_at: None,
     }))
+}
+
+/// The port a temporary HTTPS tunnel should forward to: this server's own
+/// listening port. Read from the request's `Host` header first -- that is
+/// exactly what the browser used to reach this server, so it is correct
+/// even behind an unusual bind address -- falling back to the `PORT`
+/// environment variable UHC itself starts from, then the documented
+/// default (`config::default_port`, kept in sync here since pulling the
+/// live `Config` into `AppState` is out of scope for this endpoint).
+fn local_tunnel_port(headers: &HeaderMap) -> u16 {
+    headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|host| {
+            // `Host` is `host` or `host:port`; an IPv6 literal host looks
+            // like `[::1]:8088`, so split from the right on the last colon.
+            host.rsplit_once(':')
+                .and_then(|(_, port)| port.parse().ok())
+        })
+        .or_else(|| {
+            std::env::var("PORT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(8088)
+}
+
+/// POST /api/providers/spotify/tunnel/start - Start (or report the existing)
+/// temporary HTTPS tunnel to this server's Spotify OAuth callback.
+pub async fn spotify_tunnel_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<TunnelStatusResponse> {
+    let port = local_tunnel_port(&headers);
+    let status = state.provider_auth.spotify_tunnel.start(port).await;
+    Json(status.into())
+}
+
+/// GET /api/providers/spotify/tunnel/status - Current tunnel phase, without
+/// starting or stopping anything.
+pub async fn spotify_tunnel_status(State(state): State<AppState>) -> Json<TunnelStatusResponse> {
+    let status = state.provider_auth.spotify_tunnel.status().await;
+    Json(status.into())
+}
+
+/// POST /api/providers/spotify/tunnel/stop - Stop the tunnel, if any, and
+/// return to idle. Also called automatically when the OAuth callback
+/// completes; exposed here for a manual "Stop tunnel" action and so a user
+/// who abandons the flow does not have to wait for the fifteen-minute cap.
+pub async fn spotify_tunnel_stop(State(state): State<AppState>) -> Json<TunnelStatusResponse> {
+    state.provider_auth.spotify_tunnel.stop().await;
+    let status = state.provider_auth.spotify_tunnel.status().await;
+    Json(status.into())
 }
 
 fn spotify_oauth_config(

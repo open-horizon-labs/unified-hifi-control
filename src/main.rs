@@ -663,6 +663,9 @@ mod server {
         let api_oauth_revoke = api::provider_auth::oauth_revoke;
         let api_provider_configure = api::provider_auth::configure_provider;
         let api_spotify_account = api::spotify_account_handler;
+        let api_spotify_tunnel_start = api::provider_auth::spotify_tunnel_start;
+        let api_spotify_tunnel_status = api::provider_auth::spotify_tunnel_status;
+        let api_spotify_tunnel_stop = api::provider_auth::spotify_tunnel_stop;
         let api_musicassistant_status = api::provider_auth::musicassistant_status;
         let api_bridge_pair = api::apple_bridge::pair;
         let api_bridge_discover_pairing = api::apple_bridge::discover_pairing;
@@ -693,6 +696,9 @@ mod server {
             .route("/api/providers/{provider}/oauth/revoke", post(api_oauth_revoke))
             .route("/api/providers/{provider}/configure", post(api_provider_configure))
             .route("/api/providers/spotify/account", get(api_spotify_account))
+            .route("/api/providers/spotify/tunnel/start", post(api_spotify_tunnel_start))
+            .route("/api/providers/spotify/tunnel/status", get(api_spotify_tunnel_status))
+            .route("/api/providers/spotify/tunnel/stop", post(api_spotify_tunnel_stop))
             .route("/api/providers/musicassistant/status", get(api_musicassistant_status))
             // MQTT/Home Assistant discovery publisher settings (#508)
             .route("/api/mqtt/status", get(api_mqtt_status))
