@@ -1043,17 +1043,103 @@ jobs:
     needs: [plan]
     if: needs.plan.outputs.build_applemusic_macos == 'true'
     runs-on: macos-latest
+    # `secrets` isn't allowed directly in step `if:` conditions, so surface
+    # presence checks as job-level env vars instead.
+    env:
+      HAS_APPLE_CERT: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12 != '' && secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD != '' }}
+      HAS_APPLE_NOTARY: ${{ secrets.APPLE_NOTARY_KEY_P8 != '' && secrets.APPLE_NOTARY_KEY_ID != '' && secrets.APPLE_NOTARY_KEY_ISSUER_ID != '' }}
     steps:
       - uses: actions/checkout@v6
 
-      # No signing identity is available in CI, so this produces an
-      # unsigned/ad-hoc DMG. ARM64 (Apple Silicon) only - by design, not a
-      # gap: see companion/apple_music/README.md for the right-click-Open /
-      # xattr workaround users need on first launch.
-      - name: Build arm64-only DMG
+      # macOS signing/notarization (issue #561): the owner already has an
+      # Apple Developer Program membership, so this only needs the two
+      # secret groups below - no code changes once they're added.
+      #   APPLE_DEVELOPER_ID_CERT_P12       - base64 of a "Developer ID
+      #                                        Application" .p12 export
+      #   APPLE_DEVELOPER_ID_CERT_PASSWORD  - password for that .p12
+      #   APPLE_DEVELOPMENT_TEAM_ID         - 10-char Apple Team ID
+      #   APPLE_NOTARY_KEY_P8               - base64 App Store Connect API
+      #                                        key (.p8) for notarytool
+      #   APPLE_NOTARY_KEY_ID               - key ID for the API key above
+      #   APPLE_NOTARY_KEY_ISSUER_ID        - issuer ID for the API key
+      # Until they exist, this falls back to the same unsigned/ad-hoc build
+      # CI has always produced - no behavior change.
+      - name: Import Developer ID signing certificate
+        id: import-cert
+        if: ${{ env.HAS_APPLE_CERT == 'true' }}
+        env:
+          CERT_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          echo "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN_PATH" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          # shellcheck disable=SC2046  # word splitting is intentional: each existing keychain path becomes its own -s argument
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep 'Developer ID Application' | head -1 | sed -E 's/.*"(.+)"/\1/')
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::No 'Developer ID Application' identity found in the imported certificate."
+            exit 1
+          fi
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+          echo "has_cert=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build signed arm64 DMG
+        if: steps.import-cert.outputs.has_cert == 'true'
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          CODE_SIGN_IDENTITY: ${{ steps.import-cert.outputs.identity }}
+          CODE_SIGN_STYLE: Manual
+          DEVELOPMENT_TEAM: ${{ secrets.APPLE_DEVELOPMENT_TEAM_ID }}
+          CODE_SIGNING_REQUIRED: "YES"
+        run: companion/apple_music/build-dmg.sh
+
+      # No signing identity is available, so this produces an unsigned/ad-hoc
+      # DMG - the same thing CI has always shipped. ARM64 (Apple Silicon)
+      # only - by design, not a gap: see companion/apple_music/README.md for
+      # the right-click-Open / xattr workaround users need on first launch.
+      - name: Build unsigned arm64-only DMG
+        if: steps.import-cert.outputs.has_cert != 'true'
         env:
           VERSION: ${{ needs.plan.outputs.version }}
         run: companion/apple_music/build-dmg.sh
+
+      - name: Notarize and staple DMG
+        if: steps.import-cert.outputs.has_cert == 'true' && env.HAS_APPLE_NOTARY == 'true'
+        env:
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_KEY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_KEY_ISSUER_ID }}
+        run: |
+          DMG_PATH=$(ls companion/apple_music/dist/*.dmg)
+          KEY_PATH="$RUNNER_TEMP/notary-key.p8"
+          echo "$APPLE_NOTARY_KEY_P8" | base64 --decode > "$KEY_PATH"
+
+          xcrun notarytool submit "$DMG_PATH" \
+            --key "$KEY_PATH" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_KEY_ISSUER_ID" \
+            --wait
+
+          xcrun stapler staple "$DMG_PATH"
+          rm -f "$KEY_PATH"
+
+      - name: Note unsigned/unnotarized DMG
+        if: steps.import-cert.outputs.has_cert != 'true'
+        run: echo "::notice::APPLE_DEVELOPER_ID_CERT_P12/APPLE_DEVELOPER_ID_CERT_PASSWORD not set - DMG ships unsigned/ad-hoc. See docs/gh-release.md#release-signing."
+
+      - name: Note unnotarized DMG
+        if: steps.import-cert.outputs.has_cert == 'true' && env.HAS_APPLE_NOTARY != 'true'
+        run: echo "::notice::APPLE_NOTARY_KEY_P8/APPLE_NOTARY_KEY_ID/APPLE_NOTARY_KEY_ISSUER_ID not set - DMG is signed but not notarized/stapled. See docs/gh-release.md#release-signing."
 
       - name: Upload DMG
         uses: actions/upload-artifact@v7
@@ -1067,6 +1153,10 @@ jobs:
     needs: [plan, build-wasm]
     if: needs.plan.outputs.build_windows == 'true'
     runs-on: windows-latest
+    # `secrets` isn't allowed directly in step `if:` conditions, so surface
+    # the presence check as a job-level env var instead.
+    env:
+      HAS_WINDOWS_CERT: ${{ secrets.WINDOWS_SIGNING_CERT_BASE64 != '' && secrets.WINDOWS_SIGNING_CERT_PASSWORD != '' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -1124,6 +1214,36 @@ jobs:
         run: |
           mkdir -p dist/bin
           cp target/release/unified-hifi-control.exe dist/bin/unified-hifi-win64.exe
+
+      # Windows Authenticode signing (issue #561): deferred until Windows
+      # matters commercially. Prepared but inactive - gated on
+      # WINDOWS_SIGNING_CERT_BASE64/WINDOWS_SIGNING_CERT_PASSWORD, which do
+      # not exist yet, so this step is a no-op today. When the owner is
+      # ready (an Azure Trusted Signing subscription or an OV cert), either
+      # populate those two secrets for a traditional PFX cert, or swap this
+      # step for azure/trusted-signing-action and its AZURE_TRUSTED_SIGNING_*
+      # secrets - both are viable, pick whichever the owner buys.
+      - name: Sign Windows binary (Authenticode)
+        if: ${{ env.HAS_WINDOWS_CERT == 'true' }}
+        shell: bash
+        env:
+          CERT_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+        run: |
+          echo "$CERT_BASE64" | base64 --decode > cert.pfx
+          SIGNTOOL=$(find "/c/Program Files (x86)/Windows Kits/10/bin" -name signtool.exe -path "*x64*" | sort | tail -1)
+          if [ -z "$SIGNTOOL" ]; then
+            echo "::error::signtool.exe not found on this runner image - verify the Windows SDK path before enabling this step."
+            exit 1
+          fi
+          "$SIGNTOOL" sign /f cert.pfx /p "$CERT_PASSWORD" /tr http://timestamp.digicert.com /td sha256 /fd sha256 dist/bin/unified-hifi-win64.exe
+          "$SIGNTOOL" verify /pa dist/bin/unified-hifi-win64.exe
+          rm -f cert.pfx
+
+      - name: Note unsigned Windows binary
+        if: ${{ env.HAS_WINDOWS_CERT != 'true' }}
+        shell: bash
+        run: echo "::notice::Windows signing deferred (WINDOWS_SIGNING_CERT_BASE64/WINDOWS_SIGNING_CERT_PASSWORD not set) - binary ships unsigned. See docs/gh-release.md#release-signing."
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
@@ -1324,6 +1444,10 @@ jobs:
       needs.plan.outputs.build_qnap == 'true' &&
       needs.qnap-package-test.result == 'success'
     runs-on: ubuntu-latest
+    # `secrets` isn't allowed directly in step `if:` conditions, so surface
+    # the presence check as a job-level env var instead.
+    env:
+      HAS_QNAP_SIGNING: ${{ secrets.QNAP_SIGNING_CERT != '' && secrets.QNAP_SIGNING_KEY != '' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -1364,6 +1488,27 @@ jobs:
           mkdir -p dist/installers
           mv qnap-build/*.qpkg dist/installers/unified-hifi-control_${{ needs.plan.outputs.version }}_x86_64.qpkg
 
+      # QNAP code-signing (issue #561): waiting on the owner to join the QNAP
+      # developer program and obtain code-signing credentials. Prepared but
+      # inactive - skips cleanly until QNAP_SIGNING_CERT/QNAP_SIGNING_KEY
+      # secrets exist. Without a signature, QNAP App Center shows an
+      # "unverified publisher" warning on install (documented in README).
+      - name: Sign QPKG (QNAP developer program)
+        if: ${{ env.HAS_QNAP_SIGNING == 'true' }}
+        env:
+          QNAP_SIGNING_CERT: ${{ secrets.QNAP_SIGNING_CERT }}
+          QNAP_SIGNING_KEY: ${{ secrets.QNAP_SIGNING_KEY }}
+        run: |
+          echo "::error::QNAP_SIGNING_CERT/QNAP_SIGNING_KEY are set but the signing step is not implemented yet."
+          echo "Once the owner has QNAP developer credentials, wire QDK's qpkg signing tool"
+          echo "(codesign_pkg / QDK sign step) here, using the two secrets above, then remove"
+          echo "this placeholder failure."
+          exit 1
+
+      - name: Note unsigned QPKG
+        if: ${{ env.HAS_QNAP_SIGNING != 'true' }}
+        run: echo "::notice::QNAP_SIGNING_CERT/QNAP_SIGNING_KEY not set - QPKG ships unsigned (App Center will show a signature warning). See docs/gh-release.md#release-signing."
+
       - name: Upload QNAP package
         uses: actions/upload-artifact@v7
         with:
@@ -1380,6 +1525,10 @@ jobs:
       needs.plan.outputs.build_qnap_arm == 'true' &&
       needs.build-linux-arm.result == 'success'
     runs-on: ubuntu-latest
+    # `secrets` isn't allowed directly in step `if:` conditions, so surface
+    # the presence check as a job-level env var instead.
+    env:
+      HAS_QNAP_SIGNING: ${{ secrets.QNAP_SIGNING_CERT != '' && secrets.QNAP_SIGNING_KEY != '' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -1419,6 +1568,24 @@ jobs:
         run: |
           mkdir -p dist/installers
           mv qnap-build/*.qpkg dist/installers/unified-hifi-control_${{ needs.plan.outputs.version }}_arm_64.qpkg
+
+      # QNAP code-signing (issue #561): see the matching step in the x64 job
+      # (build-qnap-x64) for context - same secrets, same TODO.
+      - name: Sign QPKG (QNAP developer program)
+        if: ${{ env.HAS_QNAP_SIGNING == 'true' }}
+        env:
+          QNAP_SIGNING_CERT: ${{ secrets.QNAP_SIGNING_CERT }}
+          QNAP_SIGNING_KEY: ${{ secrets.QNAP_SIGNING_KEY }}
+        run: |
+          echo "::error::QNAP_SIGNING_CERT/QNAP_SIGNING_KEY are set but the signing step is not implemented yet."
+          echo "Once the owner has QNAP developer credentials, wire QDK's qpkg signing tool"
+          echo "(codesign_pkg / QDK sign step) here, using the two secrets above, then remove"
+          echo "this placeholder failure."
+          exit 1
+
+      - name: Note unsigned QPKG
+        if: ${{ env.HAS_QNAP_SIGNING != 'true' }}
+        run: echo "::notice::QNAP_SIGNING_CERT/QNAP_SIGNING_KEY not set - QPKG ships unsigned (App Center will show a signature warning). See docs/gh-release.md#release-signing."
 
       - name: Upload QNAP package
         uses: actions/upload-artifact@v7
@@ -1558,6 +1725,12 @@ jobs:
     needs: [plan, build-docker-release]
     if: needs.plan.outputs.is_release == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for cosign keyless signing: it exchanges this token for a
+      # short-lived certificate from Sigstore's public-good Fulcio CA, so no
+      # long-lived signing key or secret is needed for the Docker images.
+      id-token: write
     steps:
       - name: Download digests
         uses: actions/download-artifact@v8
@@ -1602,6 +1775,23 @@ jobs:
             docker buildx imagetools create $TAGS \
               $(printf 'muness/unified-hifi-control@sha256:%s ' *)
           fi
+
+      # Free-tier release signing (issue #561): cosign keyless (sigstore)
+      # signatures for every tag this release publishes. No secrets or
+      # enrollment needed - cosign uses the job's GitHub OIDC token to get a
+      # short-lived Fulcio certificate and records the signature in the
+      # public Rekor transparency log.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign container images (cosign keyless)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          for TAG in $(jq -cr '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON"); do
+            echo "Signing $TAG"
+            cosign sign --yes "$TAG"
+          done
 
   # Note: Web assets are embedded in the binary (ADR 002)
   build-linux-packages:
@@ -1706,6 +1896,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # `secrets` isn't allowed directly in step `if:` conditions, so surface
+    # the presence check as a job-level env var instead.
+    env:
+      HAS_GPG_KEY: ${{ secrets.GPG_PRIVATE_KEY != '' }}
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -1728,6 +1922,48 @@ jobs:
           find artifacts -name "*.qpkg" -type f -exec cp {} release/ \;
           find artifacts -name "*.dmg" -type f -exec cp {} release/ \;
           ls -la release/
+
+      # Free-tier release signing (issue #561): SHA256SUMS + detached GPG
+      # signature for every release artifact. The signing key itself is
+      # never committed - it's imported from the GPG_PRIVATE_KEY secret at
+      # sign time. Until the owner adds that secret, this step notices and
+      # skips cleanly; the release still ships (just unsigned).
+      - name: Generate SHA256SUMS
+        working-directory: release
+        run: |
+          sha256sum ./* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Import GPG signing key
+        id: gpg-import
+        if: ${{ env.HAS_GPG_KEY == 'true' }}
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "has_key=true" >> "$GITHUB_OUTPUT"
+
+      - name: GPG-sign SHA256SUMS
+        if: steps.gpg-import.outputs.has_key == 'true'
+        working-directory: release
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+            --detach-sign --armor -o SHA256SUMS.asc SHA256SUMS
+          gpg --verify SHA256SUMS.asc SHA256SUMS
+          ls -la
+
+      - name: Print exported public key (for repo)
+        if: steps.gpg-import.outputs.has_key == 'true'
+        run: |
+          echo "::notice::If docs/release-signing/gpg-public-key.asc is still the placeholder, copy the key printed below into that file and commit it so users can verify releases."
+          gpg --armor --export
+
+      - name: Note unsigned checksums
+        if: steps.gpg-import.outputs.has_key != 'true'
+        run: |
+          echo "::warning::GPG_PRIVATE_KEY secret not set - SHA256SUMS ships without a .asc signature. See docs/gh-release.md#release-signing."
 
       - name: Generate asset list
         run: |
@@ -1761,6 +1997,13 @@ jobs:
 
           ### LMS Plugin
           - `lms-unified-hifi-control-*.zip` - Install via LMS Settings > Plugins
+
+          ### Verifying downloads
+          - `SHA256SUMS` - checksums for every file in this release
+          - `SHA256SUMS.asc` - detached GPG signature over `SHA256SUMS` (present once the owner has enrolled the signing key; see below if absent)
+          - Docker images (`muness/unified-hifi-control`) are signed keylessly with [cosign](https://docs.sigstore.dev/cosign/overview/) via GitHub Actions OIDC
+
+          See [Verifying Release Artifacts](https://github.com/${{ github.repository }}/blob/v3/docs/gh-release.md#release-signing) for step-by-step verification commands.
           EOF
 
       - name: Generate beta LMS repository feed

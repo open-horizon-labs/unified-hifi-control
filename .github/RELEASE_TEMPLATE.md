@@ -59,6 +59,37 @@ does and does not control.
 
 ---
 
+## Verifying These Artifacts
+
+Every file attached to this release is listed in `SHA256SUMS`. If
+`SHA256SUMS.asc` is also attached, it's a detached GPG signature over
+`SHA256SUMS`, made with the project's release-signing key
+(`docs/release-signing/gpg-public-key.asc` in the repo).
+
+```bash
+# Checksum any downloaded file against SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+
+# Verify SHA256SUMS itself was signed by the project (one-time key import)
+gpg --import gpg-public-key.asc
+gpg --verify SHA256SUMS.asc SHA256SUMS
+```
+
+Docker images (`muness/unified-hifi-control:{{VERSION}}`) are signed
+keylessly with [cosign](https://docs.sigstore.dev/cosign/overview/) via
+GitHub Actions OIDC - no key to import:
+
+```bash
+cosign verify muness/unified-hifi-control:{{VERSION}} \
+  --certificate-identity-regexp 'https://github.com/open-horizon-labs/unified-hifi-control/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Full details, including which platforms are signed today versus pending
+owner credentials: [docs/gh-release.md#release-signing](https://github.com/open-horizon-labs/unified-hifi-control/blob/v3/docs/gh-release.md#release-signing).
+
+---
+
 ## MCP Server (Claude Integration)
 
 The bridge includes a built-in MCP server. Add to your MCP config (Claude Code, Claude Desktop, etc.):

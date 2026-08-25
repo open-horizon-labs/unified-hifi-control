@@ -59,6 +59,28 @@ Betas are less soaked than releases. Use one channel or the other, not both at o
 
 Pre-built binaries available for Linux (x64, arm64, armv7), macOS (x64, arm64), and Windows from [Releases](https://github.com/open-horizon-labs/unified-hifi-control/releases).
 
+### Verifying Release Artifacts
+
+Every release ships a `SHA256SUMS` file covering all attached binaries and
+packages, plus keyless [cosign](https://docs.sigstore.dev/cosign/overview/)
+signatures on the Docker images (no key import needed - verified against
+GitHub's OIDC issuer). Once the project's GPG signing key is enrolled (see
+`docs/release-signing/gpg-public-key.asc`), releases also carry a detached
+`SHA256SUMS.asc` signature.
+
+```bash
+# Checksum a downloaded file
+sha256sum -c SHA256SUMS --ignore-missing
+
+# Verify Docker images
+cosign verify muness/unified-hifi-control:<version> \
+  --certificate-identity-regexp 'https://github.com/open-horizon-labs/unified-hifi-control/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Full verification steps (including GPG) and current per-platform signing
+status: [docs/gh-release.md#release-signing](docs/gh-release.md#release-signing).
+
 ## Quick Start (Docker)
 
 ```yaml

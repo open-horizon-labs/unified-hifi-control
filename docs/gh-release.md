@@ -331,3 +331,121 @@ This adds ~14s but catches ABI issues, missing linkage, and startup crashes befo
 ## LMS Plugin
 
 See [lms-plugin.md](lms-plugin.md) for LMS plugin distribution modes (bootstrap vs full ZIPs) and testing instructions.
+
+## Release Signing
+
+Tracked as issue #561, worked cheapest-first. Each platform activates
+independently once its GitHub Actions secrets exist - nothing here is
+all-or-nothing.
+
+### Status
+
+| Platform | State | Secrets required |
+|----------|-------|-------------------|
+| SHA256SUMS (all binaries/packages) | **Active** | none - always generated |
+| SHA256SUMS.asc (GPG detached signature) | Gated | `GPG_PRIVATE_KEY`, `GPG_PASSPHRASE` |
+| Docker images (cosign/sigstore keyless) | **Active** | none - uses GitHub OIDC |
+| QNAP QPKG (x64 + arm64) | Prepared, not implemented | `QNAP_SIGNING_CERT`, `QNAP_SIGNING_KEY` (fails loudly if set, since the actual QDK signing call isn't wired up yet) |
+| macOS companion DMG (codesign) | Gated | `APPLE_DEVELOPER_ID_CERT_P12`, `APPLE_DEVELOPER_ID_CERT_PASSWORD`, `APPLE_DEVELOPMENT_TEAM_ID` |
+| macOS companion DMG (notarize + staple) | Gated (requires codesign above) | `APPLE_NOTARY_KEY_P8`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_KEY_ISSUER_ID` |
+| Windows binary (Authenticode/signtool) | Prepared, disabled | `WINDOWS_SIGNING_CERT_BASE64`, `WINDOWS_SIGNING_CERT_PASSWORD` (deferred until Windows matters commercially) |
+| Synology SPK | Not signable | n/a - Synology does not support self-signed packages; DSM 7 shows an "unrecognized publisher" warning by design (see README) |
+
+Every gated step is written to skip cleanly (or, for QNAP, fail with a clear
+message) when its secrets are absent, so adding platforms later never
+requires touching the workflow's control flow - only adding secrets.
+
+### Free tier (active now)
+
+**SHA256SUMS + GPG signature.** The `upload-release` job in
+`.github/workflows/build.yml` runs `sha256sum *` over every file in the
+release (binaries, packages, DMG, zips) and writes `SHA256SUMS`. If the
+`GPG_PRIVATE_KEY` secret is set, it imports that key and produces a detached,
+armored signature at `SHA256SUMS.asc`; if not, the release still ships,
+just without the `.asc` file. See
+[docs/release-signing/gpg-public-key.asc](release-signing/gpg-public-key.asc)
+for exactly how to generate and install that key - it's currently a
+placeholder because generating a long-lived signing key isn't something CI
+(or an automated change) should do on the owner's behalf.
+
+**cosign (sigstore keyless) for Docker images.** The `docker-manifest` job
+signs every tag it publishes (`muness/unified-hifi-control` and the legacy
+`muness/roon-extension-knob` alias) with `cosign sign --yes <tag>`. This uses
+GitHub Actions' OIDC identity token to get a short-lived certificate from
+Sigstore's public-good Fulcio CA and records the signature in the public
+Rekor transparency log - no secret, no enrollment, no long-lived key. It's
+already active on every tagged release.
+
+### Verifying a release
+
+Given a downloaded release asset (say `unified-hifi-linux-x64`) and the
+`SHA256SUMS`/`SHA256SUMS.asc` files from the same release:
+
+```sh
+# 1. Checksum: does the file match what CI produced?
+sha256sum -c SHA256SUMS --ignore-missing
+
+# 2. Signature: was SHA256SUMS itself signed by the project's key?
+#    (one-time) import the project's public key:
+gpg --import gpg-public-key.asc   # from docs/release-signing/gpg-public-key.asc
+gpg --verify SHA256SUMS.asc SHA256SUMS
+```
+
+For Docker images:
+
+```sh
+cosign verify muness/unified-hifi-control:<version> \
+  --certificate-identity-regexp 'https://github.com/open-horizon-labs/unified-hifi-control/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+If `SHA256SUMS.asc` is missing from a release, GPG signing wasn't active yet
+for that build - the checksum file itself is still valid, just unsigned.
+
+### Gated platforms (prepared, waiting on owner-supplied secrets)
+
+**QNAP QPKG.** `build-qnap-x64` and `build-qnap-arm` each have a signing step
+gated on `QNAP_SIGNING_CERT`/`QNAP_SIGNING_KEY`. Unlike the other gated
+steps, this one is intentionally not a silent no-op if the secrets exist:
+QNAP's actual QDK signing call (`codesign_pkg` or equivalent) isn't
+implemented yet, so the step fails loudly rather than claim a package is
+signed when it isn't. Wire up the real signing call before setting these
+secrets in CI.
+
+**macOS companion DMG.** `build-applemusic-companion-dmg` imports a
+"Developer ID Application" certificate from `APPLE_DEVELOPER_ID_CERT_P12` /
+`APPLE_DEVELOPER_ID_CERT_PASSWORD` into a temporary keychain, builds with
+that identity (`APPLE_DEVELOPMENT_TEAM_ID`), and - if the three
+`APPLE_NOTARY_KEY_*` secrets (an App Store Connect API key) are also set -
+submits the DMG to `notarytool` and staples the ticket. Any subset missing
+falls back to today's unsigned/ad-hoc build; once all six secrets exist, the
+`companion/apple_music/README.md` "unsigned app" workaround and the matching
+note in `.github/RELEASE_TEMPLATE.md`/README should be removed.
+
+**Windows Authenticode.** `build-windows` has a `signtool` step gated on
+`WINDOWS_SIGNING_CERT_BASE64`/`WINDOWS_SIGNING_CERT_PASSWORD` (a base64 PFX +
+password). Deferred by design until Windows matters commercially per issue
+#561. When ready, either populate those two secrets, or replace the step
+with `azure/trusted-signing-action` and its `AZURE_TRUSTED_SIGNING_*` secrets
+if using Azure Trusted Signing instead of a traditional OV certificate -
+both are supported paths, pick whichever the owner buys.
+
+### Secret names, all in one place
+
+| Secret | Used by | Purpose |
+|--------|---------|---------|
+| `GPG_PRIVATE_KEY` | `upload-release` | ASCII-armored private key, imported at sign time |
+| `GPG_PASSPHRASE` | `upload-release` | Passphrase for the key above (may be empty-string key, see placeholder doc) |
+| `QNAP_SIGNING_CERT` | `build-qnap-x64`, `build-qnap-arm` | QNAP developer program signing certificate |
+| `QNAP_SIGNING_KEY` | `build-qnap-x64`, `build-qnap-arm` | QNAP developer program signing key |
+| `APPLE_DEVELOPER_ID_CERT_P12` | `build-applemusic-companion-dmg` | base64 "Developer ID Application" .p12 export |
+| `APPLE_DEVELOPER_ID_CERT_PASSWORD` | `build-applemusic-companion-dmg` | Password for the .p12 above |
+| `APPLE_DEVELOPMENT_TEAM_ID` | `build-applemusic-companion-dmg` | 10-character Apple Developer Team ID |
+| `APPLE_NOTARY_KEY_P8` | `build-applemusic-companion-dmg` | base64 App Store Connect API key (.p8) |
+| `APPLE_NOTARY_KEY_ID` | `build-applemusic-companion-dmg` | Key ID for the API key above |
+| `APPLE_NOTARY_KEY_ISSUER_ID` | `build-applemusic-companion-dmg` | Issuer ID for the API key above |
+| `WINDOWS_SIGNING_CERT_BASE64` | `build-windows` | base64 PFX code-signing certificate (deferred) |
+| `WINDOWS_SIGNING_CERT_PASSWORD` | `build-windows` | Password for the PFX above (deferred) |
+
+None of these are committed anywhere; the workflow only ever imports them
+from GitHub Actions secrets at build time.
