@@ -54,7 +54,9 @@ fn runner_builds_matching_assets_before_it_starts_the_server() {
         .find("make css")
         .expect("the runner must build the stylesheet");
     let wasm = WEB_RUNNER
-        .find("dx build --release --platform web --features web")
+        // The runner resolves the dx binary into $DX first (and strips any
+        // sccache wrapper), so match the invocation from `build` onward.
+        .find("build --release --platform web --features web")
         .expect("the runner must build the Dioxus WASM client and server together");
     let server = WEB_RUNNER
         .find("target/dx/unified-hifi-control/release/web/server")
