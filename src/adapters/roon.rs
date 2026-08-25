@@ -3044,6 +3044,12 @@ impl LibraryAdapter for RoonAdapter {
                         "item_key": item.item_key,
                         "navigable": navigable,
                         "playable": playable,
+                        // #549: Roon's own image_key, resolved through the
+                        // same `RoonAdapter::get_image` now-playing art
+                        // already uses -- `hifi_collections` mints an
+                        // opaque ref over this rather than handing it to a
+                        // client directly.
+                        "image_key": item.image_key,
                     }));
                 }
                 let next_offset = (total > offset + limit).then_some((offset + limit) as u64);

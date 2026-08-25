@@ -292,6 +292,12 @@ pub struct AppState {
     /// constructor parameter -- like `sse_connections` above -- so every
     /// existing `AppState::new` call site is untouched by this addition.
     pub mcp_refs: crate::mcp::refs::RefTable,
+    /// Opaque image refs (#549): what a `hifi_collections`/`/api/collections`
+    /// item's `image` field resolves through, so a collection browse row can
+    /// carry a per-item artwork reference without ever handing a client the
+    /// provider-native image handle behind it. Deliberately a separate table
+    /// from `mcp_refs` -- see `crate::mcp::refs::ImageRef`'s docs for why.
+    pub image_refs: crate::mcp::refs::ImageRefTable,
     /// UHC-owned requested listening sequences, separate from provider queue
     /// observations (#483).
     pub listening_plans: crate::mcp::listening_plan::ListeningPlanStore,
@@ -358,6 +364,7 @@ impl AppState {
             shutdown,
             sse_connections: Arc::new(AtomicUsize::new(0)),
             mcp_refs: crate::mcp::refs::RefTable::new(),
+            image_refs: crate::mcp::refs::ImageRefTable::new(),
             listening_plans: crate::mcp::listening_plan::ListeningPlanStore::from_config(),
             apple_feedback: crate::mcp::feedback::FeedbackStore::from_config(),
             reliable_commands: None,
@@ -425,6 +432,8 @@ impl AppState {
             ImageData { content_type, data }
         } else if zone_id.starts_with("applemusic:") {
             fetch_apple_music_artwork(image_key).await?
+        } else if zone_id.starts_with("musicassistant:") {
+            fetch_musicassistant_artwork(image_key).await?
         } else if let Some(instance) = zone_id.strip_prefix("hqplayer:") {
             self.hqp_images.get_current_cover(instance).await?
         } else if zone_id.starts_with("roon:") || !zone_id.contains(':') {
@@ -466,6 +475,28 @@ impl AppState {
 async fn fetch_apple_music_artwork(image_key: &str) -> anyhow::Result<crate::bus::ImageData> {
     let url = validate_apple_music_artwork_url(image_key)?;
     fetch_remote_artwork_url(url).await
+}
+
+/// Music Assistant's `image_url` (#549) is already an absolute URL the MA
+/// server hands out for both now-playing and library items -- there is no
+/// separate provider-side id/proxy to resolve the way Roon's `image_key` or
+/// LMS's coverid are. Unlike Apple Music's CDN allowlist (MA art can come
+/// from any of MA's own providers, not one known host), the only guard
+/// worth enforcing here is "this is actually an http(s) URL", so a
+/// malformed or unexpected scheme fails closed rather than being handed to
+/// `reqwest` uninspected.
+async fn fetch_musicassistant_artwork(image_key: &str) -> anyhow::Result<crate::bus::ImageData> {
+    let url = validate_musicassistant_artwork_url(image_key)?;
+    fetch_remote_artwork_url(url).await
+}
+
+fn validate_musicassistant_artwork_url(image_key: &str) -> anyhow::Result<reqwest::Url> {
+    let url = reqwest::Url::parse(image_key)
+        .map_err(|_| anyhow::anyhow!("Music Assistant artwork URL is invalid"))?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        anyhow::bail!("Music Assistant artwork URL must be http or https");
+    }
+    Ok(url)
 }
 
 fn validate_apple_music_artwork_url(image_key: &str) -> anyhow::Result<reqwest::Url> {
@@ -970,6 +1001,77 @@ pub async fn roon_image_handler(
         }
         Err(e) => {
             tracing::warn!("Image fetch failed: {}", e);
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Query params for the collections image proxy (#549).
+#[derive(Deserialize)]
+pub struct CollectionImageQuery {
+    /// Opaque token minted by `hifi_collections`/`/api/collections` on a
+    /// browse row's `image` field. Never a provider-native image key.
+    pub r#ref: String,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+/// GET /api/collections/image -- fetch a `hifi_collections` item's artwork.
+///
+/// Resolves the opaque `ref` through `state.image_refs` to a
+/// `(zone_id, image_key)` pair and re-enters `AppState::get_image`'s
+/// existing per-provider dispatch, exactly like `/now_playing/image` and
+/// `/roon/image` already do for now-playing art -- the only difference is
+/// the image handle came from a browse row's ref, not the zone's live state.
+/// An unknown, expired, or evicted ref reads as a plain 404, the same shape
+/// as any other image fetch failure; nothing about a stale-vs-invalid ref is
+/// distinguishable from here, deliberately (see `crate::mcp::refs`' module
+/// docs on why that collapse is the point).
+pub async fn collections_image_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<CollectionImageQuery>,
+) -> impl IntoResponse {
+    let Some(target) = state.image_refs.resolve(&params.r#ref).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "image ref is unknown or expired".to_string(),
+            }),
+        )
+            .into_response();
+    };
+    match state
+        .get_image(
+            &target.zone_id,
+            &target.image_key,
+            params.width,
+            params.height,
+            params.format.as_deref(),
+        )
+        .await
+    {
+        Ok(image_data) => {
+            let headers = [(
+                axum::http::header::CONTENT_TYPE,
+                image_data
+                    .content_type
+                    .parse()
+                    .unwrap_or(axum::http::HeaderValue::from_static("image/jpeg")),
+            )];
+            (StatusCode::OK, headers, image_data.data).into_response()
+        }
+        Err(e) => {
+            tracing::warn!("Collection image fetch failed: {}", e);
             (
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse {

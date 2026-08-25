@@ -338,6 +338,127 @@ fn generate_token() -> String {
     format!("{TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes))
 }
 
+/// What an image ref resolves to (#549): the zone whose provider serves the
+/// artwork, and the provider-native image handle to fetch through that
+/// provider's `AppState::get_image` dispatch -- the same handle a Roon
+/// `image_key`, an LMS coverid/URL, or a Music Assistant `image_url` already
+/// is, just minted here instead of handed to a client.
+///
+/// A deliberately separate table from [`RefTable`], not a new [`RefTarget`]
+/// variant: an image ref is resolved only by the collections image-proxy
+/// route (`src/api/mod.rs::collections_image_handler`), never by
+/// `hifi_play_ref`. Folding it into `RefTarget` would drag it through every
+/// `(LibraryRoute, RefTarget)` pairing in
+/// `src/mcp/tools/library.rs::handle_play_ref`'s exhaustive dispatch for a
+/// variant that dispatch can never validly reach -- a lot of churn for a
+/// combination that should simply never arise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageRef {
+    pub zone_id: String,
+    pub image_key: String,
+}
+
+struct ImageRecord {
+    target: ImageRef,
+    minted_at: Instant,
+}
+
+struct ImageInner {
+    entries: HashMap<String, ImageRecord>,
+    order: VecDeque<String>,
+    capacity: usize,
+    ttl: Duration,
+}
+
+impl ImageInner {
+    /// Same eviction policy as [`Inner::evict_to_capacity`]: insertion-order,
+    /// draining already-expired fronts opportunistically. See that method's
+    /// docs for why the loop checks both `entries` and `order`.
+    fn evict_to_capacity(&mut self) {
+        while self.entries.len() >= self.capacity || self.order.len() >= self.capacity {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.entries.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+/// The server-side table an `hifi_collections`/`/api/collections` item's
+/// `image` field resolves through. Same opaque-token, bounded-size,
+/// uniform-TTL design as [`RefTable`] -- see its module docs -- kept as its
+/// own type rather than a case of that one (see [`ImageRef`]'s docs).
+#[derive(Clone)]
+pub struct ImageRefTable {
+    inner: Arc<Mutex<ImageInner>>,
+}
+
+impl Default for ImageRefTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ImageRefTable {
+    /// A table with [`DEFAULT_CAPACITY`] and [`DEFAULT_TTL`].
+    pub fn new() -> Self {
+        Self::with_capacity_and_ttl(DEFAULT_CAPACITY, DEFAULT_TTL)
+    }
+
+    /// A table with an explicit capacity and TTL, for tests that need to
+    /// force eviction or expiry without waiting on the production defaults.
+    pub fn with_capacity_and_ttl(capacity: usize, ttl: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ImageInner {
+                entries: HashMap::new(),
+                order: VecDeque::new(),
+                capacity,
+                ttl,
+            })),
+        }
+    }
+
+    /// Mint an opaque token for `target`, evicting the oldest entry first if
+    /// the table is already at capacity.
+    pub async fn mint(&self, target: ImageRef) -> String {
+        let token = generate_token();
+        let mut inner = self.inner.lock().await;
+        inner.evict_to_capacity();
+        inner.order.push_back(token.clone());
+        inner.entries.insert(
+            token.clone(),
+            ImageRecord {
+                target,
+                minted_at: Instant::now(),
+            },
+        );
+        token
+    }
+
+    /// Resolve a token to its target, or `None` if it is unknown, mangled,
+    /// expired, or evicted -- all four collapse to the same answer, exactly
+    /// as [`RefTable::resolve`] does.
+    pub async fn resolve(&self, token: &str) -> Option<ImageRef> {
+        let mut inner = self.inner.lock().await;
+        let expired = match inner.entries.get(token) {
+            Some(record) => record.minted_at.elapsed() > inner.ttl,
+            None => return None,
+        };
+        if expired {
+            inner.entries.remove(token);
+            return None;
+        }
+        inner.entries.get(token).map(|r| r.target.clone())
+    }
+
+    #[cfg(test)]
+    async fn len(&self) -> usize {
+        self.inner.lock().await.entries.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,5 +805,83 @@ mod tests {
             target,
             RefTarget::AppleMusic { companion_id, .. } if companion_id == "iphone"
         ));
+    }
+
+    // =========================================================================
+    // ImageRefTable (#549): opaque, same as RefTable, but a separate table
+    // so hifi_play_ref's dispatch never has to consider an image ref.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn image_ref_mints_and_resolves_to_its_zone_and_key() {
+        let table = ImageRefTable::new();
+        let token = table
+            .mint(ImageRef {
+                zone_id: "roon:zone1".to_string(),
+                image_key: "abc123".to_string(),
+            })
+            .await;
+        assert!(token.starts_with(TOKEN_PREFIX));
+        let resolved = table.resolve(&token).await.unwrap();
+        assert_eq!(resolved.zone_id, "roon:zone1");
+        assert_eq!(resolved.image_key, "abc123");
+    }
+
+    #[tokio::test]
+    async fn image_ref_token_carries_no_verbatim_image_key() {
+        let table = ImageRefTable::new();
+        let token = table
+            .mint(ImageRef {
+                zone_id: "lms:player1".to_string(),
+                image_key: "a-very-long-and-distinctive-coverid-value-123456".to_string(),
+            })
+            .await;
+        assert!(!token.contains("a-very-long-and-distinctive-coverid-value-123456"));
+    }
+
+    #[tokio::test]
+    async fn unknown_image_token_resolves_to_none() {
+        let table = ImageRefTable::new();
+        assert!(table.resolve("ref_does-not-exist").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn image_ref_expires_after_its_ttl() {
+        let table =
+            ImageRefTable::with_capacity_and_ttl(DEFAULT_CAPACITY, Duration::from_millis(20));
+        let token = table
+            .mint(ImageRef {
+                zone_id: "musicassistant:zone1".to_string(),
+                image_key: "https://example.invalid/art.jpg".to_string(),
+            })
+            .await;
+        assert!(table.resolve(&token).await.is_some());
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(table.resolve(&token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn image_ref_table_stays_bounded_by_evicting_the_oldest() {
+        let table = ImageRefTable::with_capacity_and_ttl(2, DEFAULT_TTL);
+        let first = table
+            .mint(ImageRef {
+                zone_id: "roon:z".to_string(),
+                image_key: "one".to_string(),
+            })
+            .await;
+        table
+            .mint(ImageRef {
+                zone_id: "roon:z".to_string(),
+                image_key: "two".to_string(),
+            })
+            .await;
+        table
+            .mint(ImageRef {
+                zone_id: "roon:z".to_string(),
+                image_key: "three".to_string(),
+            })
+            .await;
+        assert!(table.resolve(&first).await.is_none(), "oldest is evicted");
+        assert_eq!(table.len().await, 2);
     }
 }

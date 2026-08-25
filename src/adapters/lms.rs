@@ -160,6 +160,29 @@ fn loop_entity_id(row: &Value, entity: &str) -> Option<i64> {
     lms_i64(row.get(format!("{}_id", entity)).or_else(|| row.get("id"))).filter(|id| *id > 0)
 }
 
+/// This row's artwork handle, for `hifi_collections`' image ref (#549), or
+/// `None` when LMS has none for it (an artist row, or a track/album LMS
+/// never assigned art to) -- absent honestly, not a placeholder.
+///
+/// `coverid` first, `artwork_track_id` second: the same preference
+/// `get_player_status` already applies for now-playing art (`artwork_id`,
+/// this file's docs on #407), here read from `tags:cJ` requested on the
+/// `albums`/`titles`/`playlists tracks` queries this helper serves. Both
+/// tags resolve to a plain id `AppState::get_image`'s LMS branch already
+/// knows how to turn into `/music/<id>/cover.jpg` through
+/// `LmsAdapter::get_artwork` -- no different from a coverid read off
+/// `status`.
+fn row_image_key(row: &Value) -> Option<String> {
+    let read = |key: &str| -> Option<String> {
+        row.get(key).and_then(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
+        })
+    };
+    read("coverid").or_else(|| read("artwork_track_id"))
+}
+
 /// The next page's offset for a `hifi_collections` page, or `None` at the
 /// end.
 ///
@@ -1634,9 +1657,16 @@ impl LmsAdapter {
         let password = state.password.clone();
         drop(state);
 
-        // If image_key is a URL, fetch directly
+        // If image_key is a URL, fetch directly. #549: a favorite's `icon`
+        // can also be server-relative (a local plugin's own icon path,
+        // unlike the coverid/artwork_track_id ids the collections queries
+        // otherwise hand back) -- same relative-to-absolute rule
+        // docs/lyrion.md already documents for `artwork_url`.
         let url = if image_key.starts_with("http://") || image_key.starts_with("https://") {
             image_key.to_string()
+        } else if let Some(path) = image_key.strip_prefix('/') {
+            let base_url = self.rpc.base_url().await?;
+            format!("{base_url}/{path}")
         } else {
             // Otherwise treat as coverid
             self.get_artwork_url(image_key, width, height).await?
@@ -2136,7 +2166,15 @@ impl LmsAdapter {
         limit: usize,
         artist_id: Option<i64>,
     ) -> Result<Value> {
-        let mut params = vec![json!("albums"), json!(offset), json!(limit)];
+        // #549: `tags:cJ` requests coverid and artwork_track_id (docs/lyrion.md)
+        // so `row_image_key` has something to read; neither tag changes any
+        // field this method already used.
+        let mut params = vec![
+            json!("albums"),
+            json!(offset),
+            json!(limit),
+            json!("tags:cJ"),
+        ];
         if let Some(id) = artist_id {
             params.push(json!(format!("artist_id:{id}")));
         }
@@ -2154,6 +2192,7 @@ impl LmsAdapter {
                     "title": title,
                     "subtitle": artist.map(|a| format!("Album by {a}")),
                     "path": format!("album:{id}"),
+                    "image_key": row_image_key(row),
                 }))
             })
             .collect();
@@ -2200,6 +2239,8 @@ impl LmsAdapter {
                     json!(offset),
                     json!(limit),
                     json!(format!("{filter_key}:{filter_id}")),
+                    // #549: see `row_image_key`'s docs.
+                    json!("tags:cJ"),
                 ],
             )
             .await?;
@@ -2217,6 +2258,7 @@ impl LmsAdapter {
                     "subtitle": artist,
                     "kind": "track",
                     "id": id,
+                    "image_key": row_image_key(row),
                 }))
             })
             .collect();
@@ -2265,6 +2307,8 @@ impl LmsAdapter {
                     json!(offset),
                     json!(limit),
                     json!(format!("playlist_id:{playlist_id}")),
+                    // #549: see `row_image_key`'s docs.
+                    json!("tags:cJ"),
                 ],
             )
             .await?;
@@ -2286,6 +2330,7 @@ impl LmsAdapter {
                     "subtitle": artist,
                     "kind": "track",
                     "id": id,
+                    "image_key": row_image_key(row),
                 }))
             })
             .collect();
@@ -2323,7 +2368,11 @@ impl LmsAdapter {
                     .and_then(Value::as_str)?
                     .to_string();
                 let url = row.get("url").and_then(Value::as_str)?.to_string();
-                Some(json!({"title": title, "url": url}))
+                // #549: `favorites items` hands back `icon` (usually an
+                // absolute URL) on its own, unlike albums/titles/playlists
+                // tracks -- no `tags:` request needed for it.
+                let image_key = row.get("icon").and_then(Value::as_str).map(str::to_string);
+                Some(json!({"title": title, "url": url, "image_key": image_key}))
             })
             .collect();
         let next_offset = next_offset(&raw, offset, limit, items.len());

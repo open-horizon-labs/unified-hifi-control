@@ -93,6 +93,16 @@ class UnifiedHifiControlApiClient:
         """Build the direct URL for a zone's now-playing artwork."""
         return f"{self._base_url}{PATH_NOW_PLAYING_IMAGE}?zone_id={zone_id}"
 
+    def resolve_url(self, path: str) -> str:
+        """Turn a server-relative path (e.g. a hifi_collections item's
+        ``image`` field, ``/api/collections/image?ref=...``) into an
+        absolute URL against this server. Mirrors what :meth:`image_url`
+        already does for now-playing artwork -- the collections image proxy
+        (#549) hands back the same kind of same-origin path, just minted
+        per-item instead of built from a fixed zone_id template.
+        """
+        return f"{self._base_url}{path}"
+
     async def async_zone_group(
         self,
         action: str,

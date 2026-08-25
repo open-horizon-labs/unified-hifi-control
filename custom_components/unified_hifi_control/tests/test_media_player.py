@@ -1,7 +1,7 @@
 """Tests for capability mapping in media_player.py."""
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from homeassistant.components.media_player import (
@@ -157,6 +157,46 @@ async def test_browse_media_top_level_walks_into_collections_browse():
     ]
     assert result.children[0].can_expand and not result.children[0].can_play
     assert result.children[1].can_play and not result.children[1].can_expand
+
+
+@pytest.mark.asyncio
+async def test_browse_media_thumbnail_resolves_an_items_image_field():
+    """#549: an item's `image` (a same-origin `/api/collections/image?ref=...`
+    path) becomes `BrowseMedia.thumbnail`, resolved against this server the
+    same way `UnifiedHifiControlApiClient.image_url` already resolves
+    now-playing artwork -- a row with no `image` field gets no thumbnail,
+    honestly, rather than a guessed-at one.
+    """
+    zone = ZoneState(
+        zone_id="lms:aa", zone_name="Bedroom", source="lms", browse_supported=True
+    )
+    player = _player(zone)
+    player.coordinator.client.async_browse_collections = AsyncMock(
+        return_value=_ok_envelope(
+            {
+                "items": [
+                    {
+                        "title": "Kind of Blue",
+                        "path": "browse-token-albums",
+                        "image": "/api/collections/image?ref=abc123",
+                    },
+                    {"title": "No Art Track", "ref": "play-token-1"},
+                ]
+            }
+        )
+    )
+    player.coordinator.client.resolve_url = MagicMock(
+        side_effect=lambda path: f"http://uhc.test.invalid{path}"
+    )
+    result = await player.async_browse_media(media_content_id="top:browse")
+    player.coordinator.client.resolve_url.assert_called_once_with(
+        "/api/collections/image?ref=abc123"
+    )
+    assert (
+        result.children[0].thumbnail
+        == "http://uhc.test.invalid/api/collections/image?ref=abc123"
+    )
+    assert result.children[1].thumbnail is None
 
 
 @pytest.mark.asyncio

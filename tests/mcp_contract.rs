@@ -1796,14 +1796,16 @@ async fn musicassistant_mcp_handler(
             }]
         }),
         Some("music/browse") => json!([
+            // #549: no image_url -- a folder-shaped row honestly has no art.
             {"name": "Jazz", "path": "library://jazz"},
-            {"name": "So What", "uri": "library://track/42", "artists": [{"name": "Miles Davis"}]}
+            {"name": "So What", "uri": "library://track/42", "artists": [{"name": "Miles Davis"}], "image_url": "https://example.invalid/so-what.jpg"}
         ]),
         Some("music/playlists/library_items") => json!([
+            // #549: no image_url -- exercises the absent-honestly path for playlists too.
             {"name": "Sunday Morning", "uri": "library://playlist/7"}
         ]),
         Some("music/tracks/library_items") => json!([
-            {"name": "My Favorite Track", "uri": "library://track/99", "artists": [{"name": "Nina Simone"}]}
+            {"name": "My Favorite Track", "uri": "library://track/99", "artists": [{"name": "Nina Simone"}], "image_url": "https://example.invalid/favorite-track.jpg"}
         ]),
         Some("music/radio/library_items") => json!([
             {"name": "My Favorite Station", "uri": "library://radio/13"}
@@ -2335,6 +2337,64 @@ async fn roon_zone_group_routes_join_status_and_leave_through_the_registry() {
     core.stop().await;
 }
 
+/// #549: `hifi_collections`' Roon rows carry an `image` field, minted as an
+/// opaque `/api/collections/image?ref=...` path over `RoonAdapter::content`'s
+/// `image_key` (see `RoonAdapter::content`'s `collections_browse` mapping in
+/// `src/adapters/roon.rs`), for a row that has Roon art -- and omit it
+/// entirely, honestly, for one that does not.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn roon_collections_browse_mints_an_image_ref_when_roon_has_art() {
+    use mock_servers::roon_core::{album, FakeItem, FakeLibrary, FakeRoonCore};
+
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![
+        album("Kind of Blue", "Miles Davis", &["So What"]).with_image_key("roon-album-art-key"),
+        FakeItem::list("Jazz"),
+    ];
+    let core = FakeRoonCore::start_with(library).await;
+    let app = roon_mcp_app(&core).await;
+
+    let root = app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": "roon:zone_1", "action": "browse"}),
+        )
+        .await;
+    assert_eq!(root["structuredContent"]["outcome"], "ok");
+    let root_page: Value = serde_json::from_str(&result_text(&root)).expect("root page JSON");
+    let with_art = root_page["items"]
+        .as_array()
+        .expect("root items")
+        .iter()
+        .find(|item| item["title"] == "Kind of Blue")
+        .expect("album row must be present");
+    let image = with_art["image"]
+        .as_str()
+        .expect("a row with a Roon image_key must carry an image field");
+    assert!(
+        image.starts_with("/api/collections/image?ref="),
+        "image must be a same-origin proxy path, not a raw Roon image_key: {image}"
+    );
+    assert!(
+        !image.contains("roon-album-art-key"),
+        "the raw Roon image_key must stay server-side: {image}"
+    );
+
+    let without_art = root_page["items"]
+        .as_array()
+        .expect("root items")
+        .iter()
+        .find(|item| item["title"] == "Jazz")
+        .expect("no-art row must be present");
+    assert!(
+        without_art.get("image").is_none(),
+        "a row with no Roon image_key must omit `image`: {without_art}"
+    );
+
+    core.stop().await;
+}
+
 /// Collections must have one provider-neutral wire shape: no MA URI escapes,
 /// pages are explicit, paths continue browse, and playable rows use the same
 /// opaque refs as search.
@@ -2360,6 +2420,12 @@ async fn musicassistant_collections_are_paged_and_mint_opaque_playable_refs() {
         .expect("browse folder must return an opaque continuation path");
     assert!(path.starts_with("ref_"));
     assert_ne!(path, "library://jazz", "MA path must stay server-side");
+    // #549: the folder-shaped root row has no MA image_url, so it must carry
+    // no image field at all -- absent honestly, not a placeholder.
+    assert!(
+        root_page["items"][0].get("image").is_none(),
+        "a row with no provider artwork must omit `image`: {root_page}"
+    );
 
     let cross_provider = app
         .call_tool(
@@ -2390,6 +2456,20 @@ async fn musicassistant_collections_are_paged_and_mint_opaque_playable_refs() {
         browse_page["items"][0].get("uri").is_none(),
         "provider URI must stay server-side"
     );
+    // #549: "So What" carries a real MA image_url in the mock fixture --
+    // hifi_collections must mint an opaque, same-origin image ref over it,
+    // never the raw MA URL.
+    let image = browse_page["items"][0]["image"]
+        .as_str()
+        .expect("a row with provider artwork must carry an image field");
+    assert!(
+        image.starts_with("/api/collections/image?ref="),
+        "image must be a same-origin proxy path, not a raw provider URL: {image}"
+    );
+    assert!(
+        !image.contains("example.invalid"),
+        "the raw MA artwork URL must stay server-side: {image}"
+    );
     let next = app
         .call_tool(
             "hifi_play_ref",
@@ -2402,17 +2482,23 @@ async fn musicassistant_collections_are_paged_and_mint_opaque_playable_refs() {
         .await;
     assert_eq!(next["structuredContent"]["outcome"], "accepted");
 
-    for (action, extra, expected_title) in [
-        ("playlists", json!({}), "Sunday Morning"),
+    for (action, extra, expected_title, expect_image) in [
+        // #549: "Sunday Morning" carries no image_url in the mock fixture --
+        // absent honestly.
+        ("playlists", json!({}), "Sunday Morning", false),
+        // "My Favorite Track" does carry one.
         (
             "favorites",
             json!({"media_type": "tracks"}),
             "My Favorite Track",
+            true,
         ),
+        // "My Favorite Station" does not.
         (
             "favorites",
             json!({"media_type": "radio"}),
             "My Favorite Station",
+            false,
         ),
     ] {
         let mut args = json!({"zone_id": zone_id, "action": action, "limit": 20, "offset": 0});
@@ -2425,6 +2511,11 @@ async fn musicassistant_collections_are_paged_and_mint_opaque_playable_refs() {
             serde_json::from_str(&result_text(&result)).expect("collection page JSON");
         assert_eq!(page["items"][0]["title"], expected_title);
         assert!(page["items"][0]["ref"].as_str().is_some());
+        assert_eq!(
+            page["items"][0].get("image").is_some(),
+            expect_image,
+            "{expected_title}: image presence must match provider artwork: {page}"
+        );
     }
 
     let requests = mock.requests.lock().expect("requests").clone();
@@ -2471,6 +2562,10 @@ async fn lms_collections_browse_walks_albums_into_tracks() {
     h.mock
         .set_album_tracks(7, vec![(42, "So What", Some("Miles Davis"))])
         .await;
+    // #549: the album has a coverid; the track underneath it deliberately
+    // does not, so this one test exercises both the presence and the
+    // absence path.
+    h.mock.set_artwork(7, "cover-kind-of-blue").await;
 
     let root = h
         .app
@@ -2501,6 +2596,17 @@ async fn lms_collections_browse_walks_albums_into_tracks() {
     let albums_page: Value = serde_json::from_str(&result_text(&albums)).expect("albums page JSON");
     assert_eq!(albums_page["items"][0]["title"], "Kind of Blue");
     assert_eq!(albums_page["items"][0]["subtitle"], "Album by Miles Davis");
+    let album_image = albums_page["items"][0]["image"]
+        .as_str()
+        .expect("an album with a seeded coverid must carry an image field");
+    assert!(
+        album_image.starts_with("/api/collections/image?ref="),
+        "image must be a same-origin proxy path: {album_image}"
+    );
+    assert!(
+        !album_image.contains("cover-kind-of-blue"),
+        "the raw coverid must stay server-side"
+    );
     let album_path = albums_page["items"][0]["path"]
         .as_str()
         .expect("an album is itself browsable, into its tracks");
@@ -2519,6 +2625,11 @@ async fn lms_collections_browse_walks_albums_into_tracks() {
         .as_str()
         .expect("a track is playable, not a browsable path");
     assert!(tracks_page["items"][0].get("path").is_none());
+    // #549: this track's coverid was never seeded -- absent honestly.
+    assert!(
+        tracks_page["items"][0].get("image").is_none(),
+        "a track with no seeded artwork must omit `image`: {tracks_page}"
+    );
 
     // The minted ref plays via hifi_play_ref exactly like a search hit's.
     let play = h
@@ -2547,8 +2658,18 @@ async fn lms_collections_playlists_and_favorites() {
     h.mock
         .set_playlist_tracks(3, vec![(9, "Blue in Green", Some("Miles Davis"))])
         .await;
+    // #549: this playlist track has a seeded coverid.
+    h.mock.set_artwork(9, "cover-blue-in-green").await;
     h.mock
         .set_favorites(vec![("Jazz FM", "http://example.com/jazzfm")])
+        .await;
+    // #549: a second favorite, this one with LMS's own `icon` field.
+    h.mock
+        .set_favorite_with_icon(
+            "Classical FM",
+            "http://example.com/classicalfm",
+            "http://example.com/classicalfm-icon.png",
+        )
         .await;
 
     let playlists = h
@@ -2576,6 +2697,10 @@ async fn lms_collections_playlists_and_favorites() {
     assert_eq!(tracks["structuredContent"]["outcome"], "ok");
     let tracks_page: Value = serde_json::from_str(&result_text(&tracks)).expect("tracks page JSON");
     assert_eq!(tracks_page["items"][0]["title"], "Blue in Green");
+    let track_image = tracks_page["items"][0]["image"]
+        .as_str()
+        .expect("a playlist track with seeded artwork must carry an image field");
+    assert!(track_image.starts_with("/api/collections/image?ref="));
 
     let favorites = h
         .app
@@ -2594,6 +2719,25 @@ async fn lms_collections_playlists_and_favorites() {
     assert!(
         !favorite_ref.contains("jazzfm"),
         "the favorite's url must stay server-side"
+    );
+    // #549: "Jazz FM" was seeded with no icon -- absent honestly.
+    assert!(
+        favorites_page["items"][0].get("image").is_none(),
+        "a favorite with no icon must omit `image`: {favorites_page}"
+    );
+    let with_icon = favorites_page["items"]
+        .as_array()
+        .expect("favorites items")
+        .iter()
+        .find(|item| item["title"] == "Classical FM")
+        .expect("Classical FM favorite must be listed");
+    let favorite_image = with_icon["image"]
+        .as_str()
+        .expect("a favorite with an icon must carry an image field");
+    assert!(favorite_image.starts_with("/api/collections/image?ref="));
+    assert!(
+        !favorite_image.contains("classicalfm-icon"),
+        "the raw icon URL must stay server-side"
     );
 
     h.stop().await;
