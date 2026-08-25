@@ -2693,7 +2693,7 @@ impl LmsHarness {
         let upnp = Arc::new(UPnPAdapter::new(bus.clone()));
         let startable_adapters: Vec<Arc<dyn Startable>> = vec![lms.clone()];
         let state = AppState::new(
-            roon,
+            roon.clone(),
             hqplayer,
             hqp_instances,
             hqp_zone_links,
@@ -2709,6 +2709,18 @@ impl LmsHarness {
             CancellationToken::new(),
         )
         .with_reliable_commands(runtime.commands.clone());
+        // Mirror main.rs's unconditional content-library registration
+        // (#513/#515): `hifi_zone_group` (#517) dispatches
+        // multiroom_status/set_members/ungroup, and `hifi_collections` (#531)
+        // dispatches collections_browse/collections_playlists, to Roon and LMS
+        // through `AdapterRegistry::library_content` exactly like Music
+        // Assistant, so the test harness must expose the same registry entries
+        // production wiring does (see `tests/adapter_boundary_lint.rs`).
+        state.adapter_registry.register_library("roon", roon).await;
+        state
+            .adapter_registry
+            .register_library("lms", lms.clone())
+            .await;
 
         // Match production ordering: both consumers are alive before the adapter can publish.
         let aggregator_task = tokio::spawn(async move { aggregator.run().await });
