@@ -13,8 +13,11 @@ use crate::adapters::{
     Startable,
 };
 use crate::aggregator::{HqpSnapshotPresence, ZoneAggregator};
-use crate::bus::runtime::{CommandGateway, HqpRuntimeCommand};
-use crate::bus::{HqpImageSource, ProviderAccount, SharedBus};
+use crate::bus::runtime::{
+    CommandDeadlines, CommandGateway, CommandLane, CommandRequest, CommandStatus,
+    HqpRuntimeCommand, RuntimeCommand,
+};
+use crate::bus::{Command, HqpImageSource, PrefixedZoneId, ProviderAccount, SharedBus};
 use crate::coordinator::AdapterCoordinator;
 use crate::knobs::KnobStore;
 use axum::{
@@ -40,15 +43,10 @@ pub mod apple_bridge;
 pub mod browse;
 pub mod controller_auth;
 pub mod credentials;
+pub mod mqtt_settings;
 pub mod provider_auth;
 
 const MAX_REMOTE_ARTWORK_BYTES: usize = 10 * 1024 * 1024;
-
-/// Preserve the legacy flash-page bookmark while sending users to the secure
-/// Web Serial flasher origin.
-pub async fn knob_flasher_redirect_handler() -> Redirect {
-    Redirect::permanent(crate::app::KNOB_FLASHER_URL)
-}
 
 /// Registry for provider adapters whose transport is not represented by a
 /// dedicated field on `AppState` (for example cloud and bridge-backed sources).
@@ -299,8 +297,13 @@ pub struct AppState {
     pub listening_plans: crate::mcp::listening_plan::ListeningPlanStore,
     /// Explicit Apple Music feedback and bounded adaptation context (#485).
     pub apple_feedback: crate::mcp::feedback::FeedbackStore,
-    /// Private reliable command ingress for provider paths with correlated readback.
+    /// Private reliable command ingress.  Surfaces retain their existing request/response shapes
+    /// and use this only for provider paths that have migrated to a correlated readback.
     pub reliable_commands: Option<CommandGateway>,
+    /// Optional MQTT publisher exposing every zone to Home Assistant (#508).
+    /// Fully inert until both configured and enabled; see
+    /// `crate::mqtt::MqttPublisher`.
+    pub mqtt: Arc<crate::mqtt::MqttPublisher>,
 }
 
 impl AppState {
@@ -322,6 +325,12 @@ impl AppState {
         shutdown: CancellationToken,
     ) -> Self {
         let hqp_images: Arc<dyn HqpImageSource> = hqp_instances.clone();
+        let adapter_registry = Arc::new(AdapterRegistry::default());
+        let mqtt = Arc::new(crate::mqtt::MqttPublisher::new(
+            bus.clone(),
+            aggregator.clone(),
+            adapter_registry.clone(),
+        ));
         Self {
             roon,
             hqplayer,
@@ -332,7 +341,7 @@ impl AppState {
             openhome,
             upnp,
             musicassistant: Arc::new(ReconfigurableMusicAssistant::new(bus.clone())),
-            adapter_registry: Arc::new(AdapterRegistry::default()),
+            adapter_registry,
             provider_auth: Arc::new(provider_auth::ProviderAuthState::default()),
             controller_auth: controller_auth::ControllerAuthState::new(),
             apple_bridges: apple_bridge::AppleBridgeRegistry::from_env().unwrap_or_else(|error| {
@@ -351,10 +360,15 @@ impl AppState {
             listening_plans: crate::mcp::listening_plan::ListeningPlanStore::from_config(),
             apple_feedback: crate::mcp::feedback::FeedbackStore::from_config(),
             reliable_commands: None,
+            mqtt,
         }
     }
 
     pub fn with_reliable_commands(mut self, commands: CommandGateway) -> Self {
+        // The MQTT publisher (#508) resolves inbound HA commands for legacy zones through this
+        // same gateway (#529); it cannot receive one in its own constructor because `Arc<AppState>`
+        // itself is not assembled yet at that point (see `MqttPublisher::set_reliable_commands`).
+        self.mqtt.set_reliable_commands(commands.clone());
         self.reliable_commands = Some(commands);
         self
     }
@@ -500,6 +514,264 @@ async fn fetch_remote_artwork_url(url: reqwest::Url) -> anyhow::Result<crate::bu
     })
 }
 
+/// Send legacy/bookmarked flash-page requests straight to the secure Web Serial origin.
+pub async fn knob_flasher_redirect_handler() -> Redirect {
+    Redirect::permanent(crate::app::KNOB_FLASHER_URL)
+}
+
+/// Route an LMS transport/volume action through the private reliable runtime without altering any
+/// public HTTP or MCP payload.  The command becomes successful only after the LMS endpoint has
+/// committed its exact-player readback to the aggregator.
+pub(crate) async fn dispatch_lms_runtime_command(
+    state: &AppState,
+    zone_id: &str,
+    command: Command,
+) -> anyhow::Result<()> {
+    dispatch_lms_runtime_command_via(state.reliable_commands.as_ref(), zone_id, command).await
+}
+
+/// Same routing and readback wait as [`dispatch_lms_runtime_command`], parameterized directly over
+/// the reliable command gateway so callers without a full `AppState` - MQTT's inbound command
+/// router (#529) - reuse the identical dispatch path HTTP/knob/MCP use.
+pub(crate) async fn dispatch_lms_runtime_command_via(
+    gateway: Option<&CommandGateway>,
+    zone_id: &str,
+    command: Command,
+) -> anyhow::Result<()> {
+    let target = PrefixedZoneId::lms(zone_id.strip_prefix("lms:").unwrap_or(zone_id));
+    let Some(gateway) = gateway else {
+        // Compatibility-only construction used by older embedders and contract fixtures. There is
+        // no direct adapter fallback: preserve the established actionable error while refusing
+        // native I/O outside the reliable runtime.
+        return Err(anyhow::anyhow!("LMS host not configured"));
+    };
+    if !gateway.has_endpoint(&target) {
+        return Err(anyhow::anyhow!("LMS command endpoint is not available"));
+    }
+    let now = tokio::time::Instant::now();
+    let mut ticket = gateway
+        .submit(CommandRequest {
+            target,
+            command: RuntimeCommand::Control(command),
+            correlation_id: None,
+            lane: CommandLane::Interactive,
+            deadlines: CommandDeadlines {
+                dispatch_by: now + Duration::from_secs(3),
+                confirm_by: now + Duration::from_secs(15),
+            },
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("LMS command admission failed: {error:?}"))?;
+    match ticket.wait_for_observable_result().await {
+        CommandStatus::Confirmed { .. } => Ok(()),
+        CommandStatus::Failed { detail } | CommandStatus::NotDispatched { detail } => {
+            Err(anyhow::anyhow!(detail))
+        }
+        CommandStatus::Indeterminate => Err(anyhow::anyhow!(
+            "LMS accepted the command but did not publish a verified readback in time"
+        )),
+        CommandStatus::Queued | CommandStatus::Dispatched | CommandStatus::AwaitingProjection => {
+            Err(anyhow::anyhow!(
+                "LMS command stopped without a terminal result"
+            ))
+        }
+    }
+}
+
+/// Route an OpenHome transport/volume action through the reliable endpoint.
+/// Public request and response shapes stay frozen; the command is successful
+/// only after the endpoint commits an exact-device Zone readback.
+pub(crate) async fn dispatch_openhome_runtime_command(
+    state: &AppState,
+    zone_id: &str,
+    command: Command,
+) -> anyhow::Result<()> {
+    dispatch_openhome_runtime_command_via(state.reliable_commands.as_ref(), zone_id, command).await
+}
+
+/// Same routing as [`dispatch_openhome_runtime_command`], parameterized directly over the reliable
+/// command gateway so callers without a full `AppState` - MQTT's inbound command router (#529) -
+/// reuse the identical dispatch path HTTP/knob/MCP use.
+pub(crate) async fn dispatch_openhome_runtime_command_via(
+    gateway: Option<&CommandGateway>,
+    zone_id: &str,
+    command: Command,
+) -> anyhow::Result<()> {
+    if gateway.is_none() {
+        let raw_id = zone_id.strip_prefix("openhome:").unwrap_or(zone_id);
+        return Err(anyhow::anyhow!("Device not found: {raw_id}"));
+    }
+    dispatch_provider_runtime_command(
+        gateway,
+        PrefixedZoneId::openhome(zone_id.strip_prefix("openhome:").unwrap_or(zone_id)),
+        command,
+        "OpenHome",
+    )
+    .await
+}
+
+/// Route a UPnP transport/volume action through the reliable endpoint. Public
+/// HTTP and MCP payloads stay unchanged; success means an exact SOAP readback
+/// has committed into the aggregator, never merely that a SOAP write returned.
+pub(crate) async fn dispatch_upnp_runtime_command(
+    state: &AppState,
+    zone_id: &str,
+    command: Command,
+) -> anyhow::Result<()> {
+    dispatch_upnp_runtime_command_via(state.reliable_commands.as_ref(), zone_id, command).await
+}
+
+/// Same routing as [`dispatch_upnp_runtime_command`], parameterized directly over the reliable
+/// command gateway so callers without a full `AppState` - MQTT's inbound command router (#529) -
+/// reuse the identical dispatch path HTTP/knob/MCP use.
+pub(crate) async fn dispatch_upnp_runtime_command_via(
+    gateway: Option<&CommandGateway>,
+    zone_id: &str,
+    command: Command,
+) -> anyhow::Result<()> {
+    // Standalone API/MCP fixtures intentionally compose no runtime. Preserve
+    // the frozen adapter-shaped refusal without doing native I/O outside the
+    // composed server's reliable endpoint.
+    if gateway.is_none() {
+        let raw_id = zone_id.strip_prefix("upnp:").unwrap_or(zone_id);
+        return Err(anyhow::anyhow!("Renderer not found: {raw_id}"));
+    }
+    dispatch_provider_runtime_command(
+        gateway,
+        PrefixedZoneId::upnp(zone_id.strip_prefix("upnp:").unwrap_or(zone_id)),
+        command,
+        "UPnP",
+    )
+    .await
+}
+
+/// Route a Roon transport/volume action through the reliable endpoint. Roon confirms through its
+/// authoritative Core callback rather than a synthetic synchronous readback.
+pub(crate) async fn dispatch_roon_runtime_command(
+    state: &AppState,
+    zone_id: &str,
+    command: Command,
+) -> anyhow::Result<()> {
+    dispatch_roon_runtime_command_via(state.reliable_commands.as_ref(), zone_id, command).await
+}
+
+/// Same routing as [`dispatch_roon_runtime_command`], parameterized directly over the reliable
+/// command gateway so callers without a full `AppState` - MQTT's inbound command router (#529) -
+/// reuse the identical dispatch path HTTP/knob/MCP use.
+pub(crate) async fn dispatch_roon_runtime_command_via(
+    gateway: Option<&CommandGateway>,
+    zone_id: &str,
+    command: Command,
+) -> anyhow::Result<()> {
+    if gateway.is_none() {
+        return Err(anyhow::anyhow!("Not connected to Roon"));
+    }
+    dispatch_provider_runtime_command(
+        gateway,
+        PrefixedZoneId::roon(zone_id.strip_prefix("roon:").unwrap_or(zone_id)),
+        command,
+        "Roon",
+    )
+    .await
+}
+
+async fn dispatch_provider_runtime_command(
+    gateway: Option<&CommandGateway>,
+    target: PrefixedZoneId,
+    command: Command,
+    provider: &str,
+) -> anyhow::Result<()> {
+    let Some(gateway) = gateway else {
+        return Err(anyhow::anyhow!(
+            "{provider} reliable command runtime is unavailable"
+        ));
+    };
+    if !gateway.has_endpoint(&target) {
+        return Err(anyhow::anyhow!(
+            "{provider} command endpoint is not available"
+        ));
+    }
+    let now = tokio::time::Instant::now();
+    let mut ticket = gateway
+        .submit(CommandRequest {
+            target,
+            command: RuntimeCommand::Control(command),
+            correlation_id: None,
+            lane: CommandLane::Interactive,
+            deadlines: CommandDeadlines {
+                dispatch_by: now + Duration::from_secs(3),
+                confirm_by: now + Duration::from_secs(15),
+            },
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("{provider} command admission failed: {error:?}"))?;
+    match ticket.wait_for_observable_result().await {
+        CommandStatus::Confirmed { .. } => Ok(()),
+        CommandStatus::Failed { detail } | CommandStatus::NotDispatched { detail } => {
+            Err(anyhow::anyhow!(detail))
+        }
+        CommandStatus::Indeterminate => Err(anyhow::anyhow!(
+            "{provider} accepted the command but did not publish a verified readback in time"
+        )),
+        CommandStatus::Queued | CommandStatus::Dispatched | CommandStatus::AwaitingProjection => {
+            Err(anyhow::anyhow!(
+                "{provider} command stopped without a terminal result"
+            ))
+        }
+    }
+}
+
+/// Normalize OpenHome/UPnP's shared transport and integer volume vocabulary at
+/// the surface boundary.  Provider-specific refusals still happen inside their
+/// endpoint; this prevents a raw adapter action string crossing the bus seam.
+pub(crate) fn renderer_runtime_command_from_action(
+    action: &str,
+    value: Option<i32>,
+) -> anyhow::Result<Command> {
+    match action {
+        "play" => Ok(Command::Play),
+        "pause" => Ok(Command::Pause),
+        "play_pause" | "playpause" => Ok(Command::PlayPause),
+        "stop" => Ok(Command::Stop),
+        "next" => Ok(Command::Next),
+        "previous" | "prev" => Ok(Command::Previous),
+        "volume" | "vol_abs" => Ok(Command::VolumeAbsolute {
+            value: value.unwrap_or(50) as f32,
+            output_id: None,
+        }),
+        "vol_rel" => Ok(Command::VolumeRelative {
+            delta: value.unwrap_or(0) as f32,
+            output_id: None,
+        }),
+        _ => Err(anyhow::anyhow!("Unknown command: {action}")),
+    }
+}
+
+/// Normalize the stable legacy LMS action vocabulary before it crosses the private runtime seam.
+/// Kept here so HTTP, knob, and MCP surfaces cannot drift into subtly different native commands.
+pub(crate) fn lms_runtime_command_from_action(
+    action: &str,
+    value: Option<f32>,
+) -> anyhow::Result<Command> {
+    match action {
+        "play" => Ok(Command::Play),
+        "pause" => Ok(Command::Pause),
+        "play_pause" | "playpause" => Ok(Command::PlayPause),
+        "stop" => Ok(Command::Stop),
+        "next" => Ok(Command::Next),
+        "previous" | "prev" => Ok(Command::Previous),
+        "volume" | "vol_abs" => Ok(Command::VolumeAbsolute {
+            value: value.unwrap_or(50.0),
+            output_id: None,
+        }),
+        "vol_rel" => Ok(Command::VolumeRelative {
+            delta: value.unwrap_or(0.0),
+            output_id: None,
+        }),
+        _ => Err(anyhow::anyhow!("Unknown command: {action}")),
+    }
+}
+
 /// Error response
 #[derive(Serialize)]
 struct ErrorResponse {
@@ -610,7 +882,11 @@ pub async fn roon_control_handler(
     State(state): State<AppState>,
     Json(req): Json<ControlRequest>,
 ) -> impl IntoResponse {
-    match state.roon.control(&req.zone_id, &req.action).await {
+    let result = match renderer_runtime_command_from_action(&req.action, None) {
+        Ok(command) => dispatch_roon_runtime_command(&state, &req.zone_id, command).await,
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -638,11 +914,18 @@ pub async fn roon_volume_handler(
     State(state): State<AppState>,
     Json(req): Json<VolumeRequest>,
 ) -> impl IntoResponse {
-    match state
-        .roon
-        .change_volume(&req.zone_id, req.value, req.relative)
-        .await
-    {
+    let command = if req.relative {
+        Command::VolumeRelative {
+            delta: req.value,
+            output_id: None,
+        }
+    } else {
+        Command::VolumeAbsolute {
+            value: req.value,
+            output_id: None,
+        }
+    };
+    match dispatch_roon_runtime_command(&state, &req.zone_id, command).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -1167,29 +1450,27 @@ async fn hqp_default_pipeline_from_aggregator(
 pub async fn hqp_status_handler(
     State(state): State<AppState>,
 ) -> Json<crate::adapters::hqplayer::HqpConnectionStatus> {
-    Json(state.hqplayer.get_status().await)
+    if let Some(snapshot) = state.aggregator.get_hqplayer_snapshot("default").await {
+        let mut connection = snapshot.observation.connection;
+        connection.connected = snapshot.presence == HqpSnapshotPresence::Live;
+        Json(connection)
+    } else {
+        // Configuration exists before the first native observation and remains useful while the
+        // endpoint is unavailable; this fallback contains configuration, not playback state.
+        Json(state.hqplayer.get_status().await)
+    }
 }
 
 /// GET /hqplayer/pipeline - HQPlayer pipeline status
 pub async fn hqp_pipeline_handler(State(state): State<AppState>) -> impl IntoResponse {
-    // Quick check - if not connected, return error immediately (don't block on timeout)
-    let status = state.hqplayer.get_status().await;
-    if !status.connected {
-        return (
+    match state.aggregator.get_hqplayer_snapshot("default").await {
+        Some(snapshot) if snapshot.presence == HqpSnapshotPresence::Live => {
+            (StatusCode::OK, Json(snapshot.observation.pipeline)).into_response()
+        }
+        _ => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
                 error: "HQPlayer not connected".to_string(),
-            }),
-        )
-            .into_response();
-    }
-
-    match state.hqplayer.get_pipeline_status().await {
-        Ok(pipeline) => (StatusCode::OK, Json(pipeline)).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
             }),
         )
             .into_response(),
@@ -1207,12 +1488,20 @@ pub async fn hqp_control_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpControlRequest>,
 ) -> impl IntoResponse {
-    match state.hqplayer.control(&req.action).await {
+    match crate::knobs::routes::dispatch_hqplayer_action(
+        &state,
+        "hqplayer:default",
+        "default",
+        &req.action,
+        None,
+    )
+    .await
+    {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: e.to_string(),
+                error: e.message().to_string(),
             }),
         )
             .into_response(),
@@ -1230,12 +1519,20 @@ pub async fn hqp_volume_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpVolumeRequest>,
 ) -> impl IntoResponse {
-    match state.hqplayer.set_volume(req.value).await {
+    match crate::knobs::routes::dispatch_hqplayer_action(
+        &state,
+        "hqplayer:default",
+        "default",
+        "volume",
+        Some(f64::from(req.value)),
+    )
+    .await
+    {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: e.to_string(),
+                error: e.message().to_string(),
             }),
         )
             .into_response(),
@@ -1249,9 +1546,11 @@ pub struct HqpSettingRequest {
     pub value: u32,
 }
 
-/// Resolve and dispatch the legacy numeric HQPlayer setting contract.  Numbers are
-/// list positions for enumerated controls (and Hz for samplerate); the runtime
-/// gateway performs the live enumeration before sending the semantic command.
+/// Apply one legacy numeric setting, resolving the number to a name at this boundary.
+///
+/// Shared by `POST /hqplayer/setting` and the numeric arm of `POST /hqp/pipeline` so there is exactly
+/// one place a list position is interpreted, and it is a place with the daemon's current enumeration
+/// in hand. `samplerate` is the exception by contract: its number is **Hz**, not a position.
 async fn hqp_apply_legacy_setting(
     state: &AppState,
     setting: &str,
@@ -1269,7 +1568,7 @@ async fn hqp_apply_legacy_setting(
     .map_err(|error| anyhow::anyhow!(error.message().to_string()))
 }
 
-/// Apply a semantic HQPlayer setting through the runtime gateway.
+/// Apply one setting given as a semantic name, which is the modern contract.
 async fn hqp_apply_named_setting(
     state: &AppState,
     setting: &str,
@@ -1282,13 +1581,13 @@ async fn hqp_apply_named_setting(
         "matrix_profile" => value.to_string(),
         "convolution" | "adaptive_volume" | "random" => parse_hqp_bool(value)?.to_string(),
         "repeat" => parse_hqp_repeat(value)?.to_string(),
-        "samplerate" | "rate" => value
-            .parse::<u32>()
-            .map_err(|_| {
+        "samplerate" | "rate" => {
+            let hz: u32 = value.parse().map_err(|_| {
                 anyhow::anyhow!("Invalid rate value (expected Hz like 48000, 96000): {value}")
-            })?
-            .to_string(),
-        other => return Err(anyhow::anyhow!("Unknown setting: {other}")),
+            })?;
+            hz.to_string()
+        }
+        other => return Err(anyhow::anyhow!("Unknown setting: {}", other)),
     };
     crate::knobs::routes::dispatch_hqplayer_reconfiguration(
         state,
@@ -1324,10 +1623,19 @@ fn parse_hqp_repeat(value: &str) -> anyhow::Result<u8> {
 }
 
 /// POST /hqplayer/setting - Change HQPlayer pipeline setting (legacy endpoint)
+///
+/// The request contract carries `value: u32` and is frozen, so this is the **compatibility boundary**:
+/// the number is resolved into the semantic name the daemon's current enumeration gives that position,
+/// and the name is what goes inward. Nothing downstream ever sees the number, and a position the
+/// current list does not have is an error here rather than an index forwarded to the wire.
 pub async fn hqp_setting_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpSettingRequest>,
 ) -> impl IntoResponse {
+    // This endpoint's accepted names, exactly as it has always accepted them. The numeric applier
+    // below is shared with `POST /hqp/pipeline`, which additionally accepts `dither` — sharing the
+    // applier must not quietly widen *this* route, so the gate is here and the error text is the one
+    // it already answered with.
     const ACCEPTED: [&str; 8] = [
         "mode",
         "filter",
@@ -1347,7 +1655,10 @@ pub async fn hqp_setting_handler(
         )
             .into_response();
     }
-    match hqp_apply_legacy_setting(&state, &req.name, req.value).await {
+
+    let result = hqp_apply_legacy_setting(&state, &req.name, req.value).await;
+
+    match result {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -1395,6 +1706,12 @@ pub async fn hqp_pipeline_update_handler(
             .into_response();
     }
 
+    // The request contract accepts a string or a number, and the two mean different things. A string
+    // is a semantic name and travels inward unchanged. A **number** is a list position for every
+    // family except `samplerate`, whose number is Hz — so it is resolved to a name here, at the
+    // boundary, against the enumeration the daemon is serving now. Stringifying the number and
+    // letting a resolver parse it back out was the fallback HQP-C-063 records: it made a stale or
+    // guessed position select whatever now sits there.
     let result = match &req.value {
         serde_json::Value::Number(n) => match n.as_u64() {
             Some(v) if v <= u64::from(u32::MAX) => {
@@ -1405,10 +1722,16 @@ pub async fn hqp_pipeline_update_handler(
                 req.setting
             )),
         },
-        serde_json::Value::String(value) => {
-            hqp_apply_named_setting(&state, &req.setting, value).await
+        serde_json::Value::String(s) => hqp_apply_named_setting(&state, &req.setting, s).await,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Invalid value type".to_string(),
+                }),
+            )
+                .into_response()
         }
-        _ => Err(anyhow::anyhow!("Invalid value type")),
     };
 
     match result {
@@ -1434,7 +1757,7 @@ pub async fn hqp_pipeline_update_handler(
 
 /// GET /hqplayer/profiles - Get available profiles
 pub async fn hqp_profiles_handler(State(state): State<AppState>) -> impl IntoResponse {
-    match state.hqplayer.fetch_profiles().await {
+    match refresh_hqp_profiles_aggregate(&state, "default").await {
         Ok(profiles) => (StatusCode::OK, Json(profiles)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1457,12 +1780,20 @@ pub async fn hqp_load_profile_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpProfileRequest>,
 ) -> impl IntoResponse {
-    match state.hqplayer.load_profile(&req.profile).await {
+    match crate::knobs::routes::dispatch_hqplayer_reconfiguration(
+        &state,
+        "default",
+        HqpRuntimeCommand::LoadProfile {
+            profile: req.profile,
+        },
+    )
+    .await
+    {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: e.to_string(),
+                error: e.message().to_string(),
             }),
         )
             .into_response(),
@@ -1471,20 +1802,19 @@ pub async fn hqp_load_profile_handler(
 
 /// GET /hqplayer/matrix/profiles - Get matrix profiles and current selection
 pub async fn hqp_matrix_profiles_handler(State(state): State<AppState>) -> impl IntoResponse {
-    // Quick check - if not connected, return empty immediately (don't block on timeout)
-    let status = state.hqplayer.get_status().await;
-    if !status.connected {
+    if state
+        .aggregator
+        .get_hqplayer_snapshot("default")
+        .await
+        .is_none()
+    {
         return (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "profiles": [],
-                "current": null
-            })),
+            Json(serde_json::json!({"profiles": [], "current": null})),
         )
             .into_response();
     }
-
-    match state.hqplayer.get_advanced_options_snapshot().await {
+    match refresh_hqp_advanced_aggregate(&state, "default").await {
         Ok(snapshot) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -1521,21 +1851,41 @@ pub async fn hqp_set_matrix_profile_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpMatrixProfileRequest>,
 ) -> impl IntoResponse {
-    match state.hqplayer.set_matrix_profile(req.profile).await {
-        Ok(outcome) => match outcome.into_applied_result() {
-            Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-            Err(e) => (
+    let profile = match refresh_hqp_advanced_aggregate(&state, "default")
+        .await
+        .and_then(|snapshot| {
+            snapshot
+                .matrix_profiles
+                .into_iter()
+                .find(|profile| profile.index == req.profile)
+                .ok_or_else(|| anyhow::anyhow!("Unknown matrix profile index: {}", req.profile))
+        }) {
+        Ok(profile) => profile,
+        Err(e) => {
+            return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
                     error: e.to_string(),
                 }),
             )
-                .into_response(),
+                .into_response();
+        }
+    };
+    match crate::knobs::routes::dispatch_hqplayer_reconfiguration(
+        &state,
+        "default",
+        HqpRuntimeCommand::Pipeline {
+            setting: "matrix_profile".to_string(),
+            value: profile.name,
         },
+    )
+    .await
+    {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: e.to_string(),
+                error: e.message().to_string(),
             }),
         )
             .into_response(),
@@ -1593,11 +1943,12 @@ pub async fn lms_control_handler(
     State(state): State<AppState>,
     Json(req): Json<LmsControlRequest>,
 ) -> impl IntoResponse {
-    match state
-        .lms
-        .control(&req.player_id, &req.action, req.value)
-        .await
-    {
+    let result =
+        match lms_runtime_command_from_action(&req.action, req.value.map(|value| value as f32)) {
+            Ok(command) => dispatch_lms_runtime_command(&state, &req.player_id, command).await,
+            Err(error) => Err(error),
+        };
+    match result {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -1623,11 +1974,18 @@ pub async fn lms_volume_handler(
     State(state): State<AppState>,
     Json(req): Json<LmsVolumeRequest>,
 ) -> impl IntoResponse {
-    match state
-        .lms
-        .change_volume(&req.player_id, req.value, req.relative)
-        .await
-    {
+    let command = if req.relative {
+        Command::VolumeRelative {
+            delta: req.value,
+            output_id: None,
+        }
+    } else {
+        Command::VolumeAbsolute {
+            value: req.value,
+            output_id: None,
+        }
+    };
+    match dispatch_lms_runtime_command(&state, &req.player_id, command).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -1778,11 +2136,11 @@ pub async fn openhome_control_handler(
     State(state): State<AppState>,
     Json(req): Json<OpenHomeControlRequest>,
 ) -> impl IntoResponse {
-    match state
-        .openhome
-        .control(&req.zone_id, &req.action, req.value)
-        .await
-    {
+    let result = match renderer_runtime_command_from_action(&req.action, req.value) {
+        Ok(command) => dispatch_openhome_runtime_command(&state, &req.zone_id, command).await,
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -1845,11 +2203,11 @@ pub async fn upnp_control_handler(
     State(state): State<AppState>,
     Json(req): Json<UPnPControlRequest>,
 ) -> impl IntoResponse {
-    match state
-        .upnp
-        .control(&req.zone_id, &req.action, req.value)
-        .await
-    {
+    let result = match renderer_runtime_command_from_action(&req.action, req.value) {
+        Ok(command) => dispatch_upnp_runtime_command(&state, &req.zone_id, command).await,
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -1880,9 +2238,9 @@ pub async fn lms_configure_handler(
     State(state): State<AppState>,
     Json(req): Json<LmsConfigRequest>,
 ) -> impl IntoResponse {
-    // LMS polling and the CLI subscription share one `lms:` projection. Stop
-    // both observers before changing credentials so the old server cannot
-    // republish a stale snapshot during reconfiguration.
+    // LMS has two concurrent observers of the same `lms:` projection.  Stop
+    // both before retirement/reconfiguration so an old CLI callback cannot
+    // republish zones from the former server after the projection is flushed.
     state
         .coordinator
         .stop_adapter_and_companions_then_flush(state.lms.as_ref(), "lms", "LMS reconfiguration")
@@ -1894,8 +2252,8 @@ pub async fn lms_configure_handler(
         .configure(req.host.clone(), req.port, req.username, req.password)
         .await;
 
-    // Restart the adapter and its registered CLI companion through the same
-    // coordinator lifecycle path used at process startup.
+    // Start both observers together; the CLI companion is not an optional
+    // feature of a manually configured LMS connection.
     match state
         .coordinator
         .start_adapter_and_companions(state.lms.as_ref())
@@ -1951,6 +2309,20 @@ pub async fn hqp_configure_handler(
 
     // Save to instance manager for persistence
     state.hqp_instances.save_to_config().await;
+
+    // An enabled fresh installation may have skipped the HQPlayer lifecycle at process startup
+    // because no endpoint existed yet. Start the idempotent manager after configuration rather than
+    // requiring a process restart, while still honoring the adapter's explicit enabled setting.
+    if state.coordinator.is_enabled("hqplayer").await {
+        match state.hqp_instances.start().await {
+            Ok(()) => state.coordinator.set_running("hqplayer", true).await,
+            Err(error) => {
+                tracing::warn!(
+                    "HQPlayer managed lifecycle could not start after configuration: {error}"
+                )
+            }
+        }
+    }
 
     // Test connection by attempting to get pipeline status (this establishes connection)
     let connected = match state.hqplayer.get_pipeline_status().await {
@@ -2163,6 +2535,15 @@ pub async fn hqp_add_instance_handler(
         )
         .await;
 
+    if state.coordinator.is_enabled("hqplayer").await {
+        match state.hqp_instances.start().await {
+            Ok(()) => state.coordinator.set_running("hqplayer", true).await,
+            Err(error) => tracing::warn!(
+                "HQPlayer managed lifecycle could not start after adding an instance: {error}"
+            ),
+        }
+    }
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -2205,20 +2586,17 @@ pub async fn hqp_instance_profiles_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let adapter = match state.hqp_instances.get(&name).await {
-        Some(a) => a,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("Instance not found: {}", name),
-                }),
-            )
-                .into_response()
-        }
-    };
+    if state.hqp_instances.get(&name).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Instance not found: {}", name),
+            }),
+        )
+            .into_response();
+    }
 
-    match adapter.fetch_profiles().await {
+    match refresh_hqp_profiles_aggregate(&state, &name).await {
         Ok(profiles) => (StatusCode::OK, Json(profiles)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2236,29 +2614,25 @@ pub async fn hqp_instance_load_profile_handler(
     Path(name): Path<String>,
     Json(req): Json<HqpProfileRequest>,
 ) -> impl IntoResponse {
-    let adapter = match state.hqp_instances.get(&name).await {
-        Some(a) => a,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("Instance not found: {}", name),
-                }),
-            )
-                .into_response()
-        }
-    };
-
-    match adapter.load_profile(&req.profile).await {
+    let profile = req.profile;
+    match crate::knobs::routes::dispatch_hqplayer_reconfiguration(
+        &state,
+        &name,
+        HqpRuntimeCommand::LoadProfile {
+            profile: profile.clone(),
+        },
+    )
+    .await
+    {
         Ok(()) => (
             StatusCode::OK,
-            Json(serde_json::json!({"ok": true, "instance": name, "profile": req.profile})),
+            Json(serde_json::json!({"ok": true, "instance": name, "profile": profile})),
         )
             .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: e.to_string(),
+                error: e.message().to_string(),
             }),
         )
             .into_response(),
@@ -2270,33 +2644,27 @@ pub async fn hqp_instance_matrix_profiles_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let adapter = match state.hqp_instances.get(&name).await {
-        Some(a) => a,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("Instance not found: {}", name),
-                }),
-            )
-                .into_response()
-        }
-    };
+    if state.hqp_instances.get(&name).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Instance not found: {}", name),
+            }),
+        )
+            .into_response();
+    }
 
-    let profiles = adapter.get_matrix_profiles().await;
-    let current = adapter.get_matrix_profile().await;
-
-    match (profiles, current) {
-        (Ok(profiles), Ok(current)) => (
+    match refresh_hqp_advanced_aggregate(&state, &name).await {
+        Ok(snapshot) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "instance": name,
-                "profiles": profiles,
-                "current": current
+                "profiles": snapshot.matrix_profiles,
+                "current": snapshot.current_matrix_profile
             })),
         )
             .into_response(),
-        (Err(e), _) | (_, Err(e)) => (
+        Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: e.to_string(),
@@ -2318,38 +2686,45 @@ pub async fn hqp_instance_set_matrix_profile_handler(
     Path(name): Path<String>,
     Json(req): Json<HqpInstanceMatrixProfileRequest>,
 ) -> impl IntoResponse {
-    let adapter = match state.hqp_instances.get(&name).await {
-        Some(a) => a,
-        None => {
+    let profile = match refresh_hqp_advanced_aggregate(&state, &name)
+        .await
+        .and_then(|snapshot| {
+            snapshot
+                .matrix_profiles
+                .into_iter()
+                .find(|profile| profile.index == req.value)
+                .ok_or_else(|| anyhow::anyhow!("Unknown matrix profile index: {}", req.value))
+        }) {
+        Ok(profile) => profile,
+        Err(e) => {
             return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("Instance not found: {}", name),
-                }),
-            )
-                .into_response()
-        }
-    };
-
-    match adapter.set_matrix_profile(req.value).await {
-        Ok(outcome) => match outcome.into_applied_result() {
-            Ok(()) => (
-                StatusCode::OK,
-                Json(serde_json::json!({"ok": true, "instance": name, "value": req.value})),
-            )
-                .into_response(),
-            Err(e) => (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
                     error: e.to_string(),
                 }),
             )
-                .into_response(),
+                .into_response();
+        }
+    };
+    match crate::knobs::routes::dispatch_hqplayer_reconfiguration(
+        &state,
+        &name,
+        HqpRuntimeCommand::Pipeline {
+            setting: "matrix_profile".to_string(),
+            value: profile.name,
         },
+    )
+    .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "instance": name, "value": req.value})),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: e.to_string(),
+                error: e.message().to_string(),
             }),
         )
             .into_response(),
@@ -2461,7 +2836,17 @@ pub async fn hqp_zone_pipeline_handler(
     State(state): State<AppState>,
     Path(zone_id): Path<String>,
 ) -> impl IntoResponse {
-    match state.hqp_zone_links.get_pipeline_for_zone(&zone_id).await {
+    let instance = state.hqp_zone_links.get_instance_for_zone(&zone_id).await;
+    let pipeline = match instance {
+        Some(instance) => state
+            .aggregator
+            .get_hqplayer_snapshot(&instance)
+            .await
+            .filter(|snapshot| snapshot.presence == HqpSnapshotPresence::Live)
+            .map(|snapshot| snapshot.observation.pipeline),
+        None => None,
+    };
+    match pipeline {
         Some(pipeline) => (StatusCode::OK, Json(pipeline)).into_response(),
         None => (
             StatusCode::NOT_FOUND,
@@ -2546,6 +2931,10 @@ pub struct AdapterSettings {
     /// Music Assistant is an opt-in remote playback adapter.
     #[serde(default)]
     pub musicassistant: bool,
+    /// The MQTT/Home Assistant discovery publisher (#508) is opt-in and off
+    /// by default: it needs a broker configured before it can do anything.
+    #[serde(default)]
+    pub mqtt: bool,
 }
 
 fn default_true() -> bool {
@@ -2567,6 +2956,7 @@ impl Default for AppSettings {
                 spotify: false,
                 applemusic: false,
                 musicassistant: false,
+                mqtt: false,
             },
         }
     }
@@ -2686,6 +3076,7 @@ pub async fn api_settings_post_handler(
             "musicassistant",
             old_adapters.musicassistant != new_adapters.musicassistant,
         ),
+        ("mqtt", old_adapters.mqtt != new_adapters.mqtt),
     ];
 
     let mut applied_transitions = Vec::new();
@@ -2704,6 +3095,11 @@ pub async fn api_settings_post_handler(
             "spotify" => new_adapters.spotify,
             "applemusic" => new_adapters.applemusic,
             "musicassistant" => new_adapters.musicassistant,
+            // MQTT is a bus consumer, not a `Startable` in `adapters_list` -
+            // handled separately below via `state.mqtt` (the sanctioned
+            // surface `tests/adapter_boundary_lint.rs` allows this module
+            // to reach; it is not part of the legacy coordinator registry).
+            "mqtt" => continue,
             _ => continue,
         };
 
@@ -2745,6 +3141,14 @@ pub async fn api_settings_post_handler(
         }
     }
 
+    // MQTT is a bus consumer with no zones/companions to flush, so it does
+    // not go through the coordinator's start/stop-and-flush lifecycle - it
+    // simply turns its background publisher task on or off.
+    if old_adapters.mqtt != new_adapters.mqtt {
+        state.mqtt.set_enabled(new_adapters.mqtt).await;
+        applied_transitions.push("mqtt");
+    }
+
     // Persist only after every requested runtime transition succeeded.
     if !save_app_settings(&new_settings) {
         coord
@@ -2754,6 +3158,9 @@ pub async fn api_settings_post_handler(
                 &applied_transitions,
             )
             .await;
+        if applied_transitions.contains(&"mqtt") {
+            state.mqtt.set_enabled(old_adapters.mqtt).await;
+        }
         return Json(serde_json::json!({"ok": false, "error": "Failed to save settings"}));
     }
 
@@ -2771,6 +3178,7 @@ fn adapter_enabled(settings: &AdapterSettings, name: &str) -> Option<bool> {
         "spotify" => Some(settings.spotify),
         "applemusic" => Some(settings.applemusic),
         "musicassistant" => Some(settings.musicassistant),
+        "mqtt" => Some(settings.mqtt),
         _ => None,
     }
 }
@@ -2778,8 +3186,117 @@ fn adapter_enabled(settings: &AdapterSettings, name: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::{create_bus, BusEvent, PlaybackState, Zone};
     use serial_test::serial;
     use std::env;
+    use std::time::Duration;
+
+    struct FakeAdapter(&'static str);
+
+    #[async_trait::async_trait]
+    impl Startable for FakeAdapter {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        async fn start(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn stop(&self) {}
+    }
+
+    fn fake_zone(zone_id: &str, source: &str) -> Zone {
+        Zone {
+            zone_id: zone_id.to_string(),
+            zone_name: "Test Zone".to_string(),
+            state: PlaybackState::Stopped,
+            volume_control: None,
+            now_playing: None,
+            source: source.to_string(),
+            is_controllable: true,
+            is_seekable: false,
+            last_updated: 0,
+            is_play_allowed: true,
+            is_pause_allowed: true,
+            is_next_allowed: true,
+            is_previous_allowed: true,
+        }
+    }
+
+    /// Issue #429: disabling an adapter must remove its zones, not just stop
+    /// it. This exercises the real path end to end -- a live `ZoneAggregator`
+    /// consuming from a real bus -- rather than only asserting that an event
+    /// was published, since `ZoneAggregator`'s own handling of
+    /// `AdapterStopping` had no test anywhere in the codebase either.
+    #[tokio::test]
+    async fn stopping_an_adapter_flushes_its_zones_from_the_aggregator() {
+        let bus = create_bus();
+        let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+        let agg_for_task = aggregator.clone();
+        tokio::spawn(async move { agg_for_task.run().await });
+
+        // Give the aggregator's subscription a moment to attach before the
+        // first publish -- otherwise this event can race the subscribe.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        bus.publish(BusEvent::ZoneDiscovered {
+            zone: fake_zone("lms:aa:bb:cc:dd:ee:ff", "lms"),
+        });
+        bus.publish(BusEvent::ZoneDiscovered {
+            zone: fake_zone("roon:untouched", "roon"),
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            aggregator.get_zones().await.len(),
+            2,
+            "both zones should be present before the adapter stops"
+        );
+
+        let adapter: Arc<dyn Startable> = Arc::new(FakeAdapter("lms"));
+        let coordinator = AdapterCoordinator::new(bus.clone());
+        coordinator.register("lms", true).await;
+        coordinator
+            .stop_adapter_and_flush(adapter.as_ref(), "test shutdown")
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let remaining = aggregator.get_zones().await;
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the lms zone should have been flushed, got {remaining:?}"
+        );
+        assert_eq!(remaining[0].zone_id, "roon:untouched");
+    }
+
+    async fn app_state_with_startable(startable: Arc<dyn Startable>) -> AppState {
+        let bus = create_bus();
+        let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
+        let hqp_instances = Arc::new(HqpInstanceManager::new(bus.clone()));
+        let hqplayer = hqp_instances.get_default().await;
+        let hqp_zone_links = Arc::new(HqpZoneLinkService::new(hqp_instances.clone()));
+        let lms = Arc::new(LmsAdapter::new(bus.clone()));
+        let openhome = Arc::new(OpenHomeAdapter::new(bus.clone()));
+        let upnp = Arc::new(UPnPAdapter::new(bus.clone()));
+        let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+        let coordinator = Arc::new(AdapterCoordinator::new(bus.clone()));
+
+        AppState::new(
+            roon,
+            hqplayer,
+            hqp_instances,
+            hqp_zone_links,
+            lms,
+            openhome,
+            upnp,
+            KnobStore::new(),
+            bus,
+            aggregator,
+            coordinator,
+            vec![startable],
+            Instant::now(),
+            CancellationToken::new(),
+        )
+    }
 
     #[test]
     fn apple_music_artwork_accepts_only_https_apple_cdn_urls() {
@@ -2802,6 +3319,61 @@ mod tests {
                 "accepted unsafe artwork URL: {url}"
             );
         }
+    }
+
+    /// Issue #429, proving the wiring itself: calling the real
+    /// `POST /api/settings` handler to disable an adapter must remove its
+    /// zones. Unlike `stopping_an_adapter_flushes_its_zones_from_the_aggregator`
+    /// above (which calls the coordinator lifecycle operation directly and would
+    /// stay green even if the handler stopped calling it), this goes through
+    /// `api_settings_post_handler` itself.
+    #[tokio::test]
+    #[serial]
+    async fn disabling_an_adapter_via_the_real_endpoint_flushes_its_zones() {
+        env::set_var("UHC_CONFIG_DIR", "/tmp/uhc-test-issue-429-adapter-stopping");
+
+        // Seed "old" settings with the adapter already enabled, so the
+        // handler's before/after comparison sees a disable, not a no-op.
+        let mut seed = AppSettings::default();
+        seed.adapters.lms = true;
+        assert!(save_app_settings(&seed), "failed to seed test settings");
+
+        let adapter: Arc<dyn Startable> = Arc::new(FakeAdapter("lms"));
+        let state = app_state_with_startable(adapter).await;
+        state.coordinator.register("lms", true).await;
+        state.coordinator.set_running("lms", true).await;
+        let agg_for_task = state.aggregator.clone();
+        tokio::spawn(async move { agg_for_task.run().await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        state.bus.publish(BusEvent::ZoneDiscovered {
+            zone: fake_zone("lms:aa:bb:cc:dd:ee:ff", "lms"),
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            state.aggregator.get_zones().await.len(),
+            1,
+            "zone should be present before disabling"
+        );
+
+        let mut disabled = AppSettings::default();
+        disabled.adapters.lms = false;
+        let response = api_settings_post_handler(State(state.clone()), Json(disabled)).await;
+        let _ = response; // the endpoint's own `{"ok": true}` body isn't the assertion here
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let remaining = state.aggregator.get_zones().await;
+        assert_eq!(
+            remaining.len(),
+            0,
+            "disabling lms via the real endpoint should flush its zone, got {remaining:?}"
+        );
+        assert!(
+            !state.coordinator.is_running("lms").await,
+            "disabling an adapter must also retire its coordinator running state"
+        );
+
+        env::remove_var("UHC_CONFIG_DIR");
     }
 
     #[test]
@@ -2846,6 +3418,7 @@ mod tests {
         assert!(!settings.adapters.spotify);
         assert!(!settings.adapters.applemusic);
         assert!(!settings.adapters.musicassistant);
+        assert!(!settings.adapters.mqtt);
     }
 
     #[test]
@@ -2859,6 +3432,7 @@ mod tests {
             spotify: true,
             applemusic: true,
             musicassistant: true,
+            mqtt: true,
         };
         for name in [
             "roon",
@@ -2869,6 +3443,7 @@ mod tests {
             "spotify",
             "applemusic",
             "musicassistant",
+            "mqtt",
         ] {
             assert_eq!(adapter_enabled(&settings, name), Some(true), "{name}");
         }

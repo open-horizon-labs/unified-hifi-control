@@ -50,7 +50,9 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 use unified_hifi_control::adapters::hqplayer::{HqpInstanceManager, HqpZoneLinkService};
-use unified_hifi_control::adapters::lms::LmsAdapter;
+use unified_hifi_control::adapters::lms::{
+    create_lms_adapters_with_runtime, LmsAdapter, LmsRuntimeBridge,
+};
 use unified_hifi_control::adapters::musicassistant::{MusicAssistantAdapter, MusicAssistantConfig};
 use unified_hifi_control::adapters::openhome::OpenHomeAdapter;
 use unified_hifi_control::adapters::roon::RoonAdapter;
@@ -59,6 +61,7 @@ use unified_hifi_control::adapters::Startable;
 use unified_hifi_control::aggregator::ZoneAggregator;
 use unified_hifi_control::api::AppState;
 use unified_hifi_control::bus::create_bus;
+use unified_hifi_control::bus::runtime::build_runtime;
 use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::knobs::KnobStore;
 use unified_hifi_control::mcp;
@@ -2640,6 +2643,7 @@ struct LmsHarness {
     player_id: &'static str,
     _settings: SettingsFixture,
     _aggregator: tokio::task::JoinHandle<()>,
+    _projection: tokio::task::JoinHandle<()>,
 }
 
 impl LmsHarness {
@@ -2662,7 +2666,13 @@ impl LmsHarness {
             .await;
 
         let bus = create_bus();
-        let lms = Arc::new(LmsAdapter::new(bus.clone()));
+        let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+        let runtime = build_runtime(aggregator.clone(), 16, 32);
+        let bridge = Arc::new(LmsRuntimeBridge::new(
+            runtime.projection_ingress.clone(),
+            runtime.commands.clone(),
+        ));
+        let (lms, _lms_cli) = create_lms_adapters_with_runtime(bus.clone(), Some(bridge));
         lms.configure(
             mock.addr().ip().to_string(),
             Some(mock.addr().port()),
@@ -2671,11 +2681,39 @@ impl LmsHarness {
         )
         .await;
 
-        let state = build_state_with_bus(bus, Some(lms.clone()), None).await;
+        let coordinator = Arc::new(AdapterCoordinator::new(bus.clone()));
+        let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
+        let hqp_instances = Arc::new(HqpInstanceManager::new_with_native_sink(
+            bus.clone(),
+            aggregator.clone(),
+        ));
+        let hqplayer = hqp_instances.get_default().await;
+        let hqp_zone_links = Arc::new(HqpZoneLinkService::new(hqp_instances.clone()));
+        let openhome = Arc::new(OpenHomeAdapter::new(bus.clone()));
+        let upnp = Arc::new(UPnPAdapter::new(bus.clone()));
+        let startable_adapters: Vec<Arc<dyn Startable>> = vec![lms.clone()];
+        let state = AppState::new(
+            roon,
+            hqplayer,
+            hqp_instances,
+            hqp_zone_links,
+            lms.clone(),
+            openhome,
+            upnp,
+            KnobStore::new(),
+            bus.clone(),
+            aggregator.clone(),
+            coordinator,
+            startable_adapters,
+            Instant::now(),
+            CancellationToken::new(),
+        )
+        .with_reliable_commands(runtime.commands.clone());
 
-        // The aggregator only learns about zones by consuming bus events.
-        let aggregator = state.aggregator.clone();
+        // Match production ordering: both consumers are alive before the adapter can publish.
         let aggregator_task = tokio::spawn(async move { aggregator.run().await });
+        tokio::task::yield_now().await;
+        let projection_task = tokio::spawn(runtime.projection_actor.run());
 
         lms.start().await.expect("LMS adapter must start");
 
@@ -2709,6 +2747,7 @@ impl LmsHarness {
             player_id: Self::PLAYER_ID,
             _settings: settings,
             _aggregator: aggregator_task,
+            _projection: projection_task,
         }
     }
 
@@ -2718,6 +2757,7 @@ impl LmsHarness {
     async fn stop(self) {
         self.lms.stop().await;
         self._aggregator.abort();
+        self._projection.abort();
         self.mock.stop().await;
     }
 }

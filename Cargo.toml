@@ -32,6 +32,7 @@ server = [
     "dep:mime_guess",
     "dep:http-body-util",
     "dep:rust-mcp-sdk",
+    "dep:rumqttc",
 ]
 web = ["dioxus/web"]
 
@@ -129,6 +130,9 @@ resvg = { version = "0.47.0", features = ["default"], optional = true }
 # MCP server (server only)
 rust-mcp-sdk = { version = "0.8", default-features = false, features = ["server", "macros", "hyper-server", "sse"], optional = true }
 
+# MQTT publisher for Home Assistant discovery (server only, issue #508)
+rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"], optional = true }
+
 # ============ WEB-ONLY DEPENDENCIES ============
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
@@ -166,6 +170,10 @@ tempfile = "3"
 # Pinned to the same version roon-api uses as its client, so the fake and the real
 # client library share one framing implementation and no new crate is compiled.
 tokio-tungstenite = "0.21"
+# In-process MQTT broker for tests/mqtt_integration.rs (issue #508). Pure-Rust,
+# embeddable, and wire-compatible with the `rumqttc` client used by the publisher -
+# this is the "mock/in-process broker" the issue's acceptance criteria calls for.
+rumqttd = { version = "0.19", default-features = false }
 
 [profile.release]
 lto = true
