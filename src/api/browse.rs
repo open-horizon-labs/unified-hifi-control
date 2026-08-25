@@ -24,7 +24,7 @@
 
 use crate::api::AppState;
 use crate::mcp::tools::collections::{handle_collections, HifiCollectionsTool};
-use crate::mcp::tools::library::{handle_play_ref, HifiPlayRefTool};
+use crate::mcp::tools::library::{handle_play_ref, handle_search, HifiPlayRefTool, HifiSearchTool};
 use crate::mcp::tools::queue::{handle_queue, HifiQueueTool};
 use axum::{extract::State, http::StatusCode, Json};
 use rust_mcp_sdk::schema::{schema_utils::CallToolError, CallToolResult};
@@ -83,4 +83,17 @@ pub async fn play_ref_handler(
     Json(args): Json<HifiPlayRefTool>,
 ) -> (StatusCode, Json<Value>) {
     envelope_response(handle_play_ref(&state, args).await)
+}
+
+/// `POST /api/search` -- catalog search across the zone's provider, minting
+/// the same short-lived refs `/api/collections` does. Added for #550's
+/// unified Library search field: the field filters the current browse level
+/// locally *and* fires this endpoint (debounced) for "Everywhere" results.
+/// Same verb vocabulary as the `hifi_search` MCP tool -- this is a thin HTTP
+/// mirror, not a new capability (see this module's doc comment).
+pub async fn search_handler(
+    State(state): State<AppState>,
+    Json(args): Json<HifiSearchTool>,
+) -> (StatusCode, Json<Value>) {
+    envelope_response(handle_search(&state, args).await)
 }

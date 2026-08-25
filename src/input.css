@@ -459,6 +459,372 @@
   .hqp-saved-path {
     @apply grid grid-cols-[minmax(0,1fr)_2.5rem_minmax(0,1fr)] items-center gap-3;
   }
+
+  /* ======================================================================
+   * Library page (#550): home page browse/search surface.
+   * ==================================================================== */
+
+  .library-page {
+    @apply pb-28;
+  }
+
+  .library-search-input {
+    @apply mb-4 text-base;
+  }
+
+  .library-source-tabs {
+    @apply flex flex-wrap gap-2 mb-3;
+  }
+
+  .library-tabs {
+    @apply flex flex-wrap gap-1 mb-4 border-b;
+    border-color: var(--border-subtle);
+  }
+
+  .library-tab {
+    @apply px-3 py-2 text-sm font-medium rounded-t-md -mb-px border border-transparent;
+    color: var(--text-secondary);
+  }
+  .library-tab:hover {
+    color: var(--text-primary);
+  }
+  .library-tab--active {
+    color: var(--text-primary);
+    border-color: var(--border-subtle);
+    border-bottom-color: var(--surface-base);
+    background: var(--surface-elevated);
+  }
+
+  .library-breadcrumbs {
+    @apply flex flex-wrap items-center gap-1 mb-4 text-sm;
+    color: var(--text-muted);
+  }
+  .library-breadcrumb-item {
+    @apply rounded px-1 py-0.5;
+    color: var(--text-secondary);
+  }
+  .library-breadcrumb-item:hover {
+    color: var(--text-primary);
+    background: var(--surface-hover);
+  }
+  .library-breadcrumb-item:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: 2px;
+  }
+  .library-breadcrumb-sep {
+    @apply mx-1;
+  }
+
+  .library-content {
+    @apply min-h-[200px];
+  }
+
+  .library-empty,
+  .library-provider-down {
+    @apply flex flex-col items-center gap-3 rounded-xl p-10 text-center;
+    background: var(--surface-elevated);
+    border: 1px dashed var(--border-default);
+  }
+
+  .library-search-heading {
+    @apply text-sm font-semibold mb-2 uppercase tracking-wide;
+    color: var(--text-muted);
+  }
+
+  /* Row list (folders / mixed levels) */
+  .library-list {
+    @apply flex flex-col gap-1;
+  }
+
+  .library-row {
+    @apply flex items-center justify-between gap-3 rounded-lg px-3 py-2.5;
+  }
+  .library-row:hover {
+    background: var(--surface-hover);
+  }
+
+  .library-skeleton-row {
+    @apply h-12 rounded-lg;
+    background: linear-gradient(
+      90deg,
+      var(--surface-elevated) 25%,
+      var(--surface-hover) 37%,
+      var(--surface-elevated) 63%
+    );
+    background-size: 400% 100%;
+    animation: library-skeleton 1.6s ease-in-out infinite;
+  }
+
+  .library-row-actions {
+    @apply flex items-center gap-1 flex-shrink-0;
+  }
+
+  /* Play affordance: hidden until hover/focus so the row's own chevron (or
+     plain layout, for a leaf with no folder) stays the primary target. */
+  .library-play-btn {
+    @apply inline-flex size-9 items-center justify-center rounded-full opacity-0 transition-opacity;
+    color: var(--text-secondary);
+  }
+  .library-row:hover .library-play-btn,
+  .library-row:focus-within .library-play-btn,
+  .library-tile:hover .library-tile-play,
+  .library-tile:focus-within .library-tile-play {
+    opacity: 1;
+  }
+  .library-play-btn:hover {
+    color: var(--accent-color);
+  }
+  .library-play-btn:focus-visible {
+    opacity: 1;
+    outline: 2px solid var(--accent-color);
+    outline-offset: 2px;
+  }
+
+  .library-chevron-btn {
+    @apply inline-flex size-9 items-center justify-center rounded-full;
+    color: var(--text-muted);
+  }
+  .library-chevron-btn:hover {
+    color: var(--text-primary);
+    background: var(--surface-hover);
+  }
+
+  .library-overflow {
+    @apply relative;
+  }
+  .library-overflow-trigger {
+    @apply inline-flex size-9 items-center justify-center rounded-full;
+    color: var(--text-muted);
+  }
+  .library-overflow-trigger:hover {
+    color: var(--text-primary);
+    background: var(--surface-hover);
+  }
+  .library-overflow-menu {
+    @apply absolute right-0 z-20 mt-1 flex min-w-32 flex-col rounded-md py-1 shadow-lg;
+    background: var(--surface-elevated);
+    border: 1px solid var(--border-default);
+  }
+  .library-overflow-menu button {
+    @apply px-3 py-2 text-left text-sm;
+    color: var(--text-secondary);
+  }
+  .library-overflow-menu button:hover {
+    color: var(--text-primary);
+    background: var(--surface-hover);
+  }
+
+  .library-live-tick {
+    @apply inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-bold tracking-wide;
+    background: var(--primary-error-color);
+    color: var(--secondary-error-color, #fff);
+  }
+
+  /* "Currently playing" equalizer glyph: three bars bouncing at slightly
+     different phases. */
+  .library-eq {
+    @apply inline-flex h-3.5 w-3.5 items-end gap-0.5 flex-shrink-0;
+  }
+  .library-eq span {
+    @apply w-0.5 rounded-sm;
+    background: var(--accent-color);
+    animation: library-eq-bounce 1s ease-in-out infinite;
+  }
+  .library-eq span:nth-child(1) {
+    height: 40%;
+    animation-delay: -0.4s;
+  }
+  .library-eq span:nth-child(2) {
+    height: 100%;
+    animation-delay: -0.2s;
+  }
+  .library-eq span:nth-child(3) {
+    height: 65%;
+    animation-delay: 0s;
+  }
+
+  /* Art-forward grid (album-shaped levels) */
+  .library-grid {
+    @apply grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5;
+  }
+
+  .library-tile {
+    @apply flex flex-col gap-2;
+  }
+
+  .library-tile-art {
+    @apply relative aspect-square w-full cursor-pointer overflow-hidden rounded-lg;
+    background: var(--surface-elevated);
+    border: 1px solid var(--border-default);
+  }
+
+  .library-tile-placeholder {
+    @apply flex h-full w-full items-center justify-center text-3xl;
+    color: var(--text-muted);
+  }
+
+  .library-tile-play {
+    @apply absolute bottom-2 right-2 inline-flex size-9 items-center justify-center rounded-full opacity-0 shadow-md transition-opacity;
+    background: var(--accent-color);
+    color: var(--surface-base);
+  }
+
+  .library-tile-chevron {
+    @apply absolute right-2 top-2 inline-flex size-6 items-center justify-center rounded-full;
+    background: color-mix(in srgb, var(--surface-base) 65%, transparent);
+    color: var(--text-primary);
+  }
+
+  .library-eq--tile {
+    @apply absolute left-2 top-2;
+  }
+
+  .library-live-tick--tile {
+    @apply absolute left-2 top-2;
+  }
+
+  .library-tile-meta {
+    @apply min-w-0;
+  }
+
+  /* Staggered reveal on level load. Transform/opacity only, ease-out-quint,
+     ~20ms stagger per row via a CSS custom property the component sets
+     inline (`--library-stagger-index`). */
+  .library-row--reveal,
+  .library-tile--reveal {
+    animation: library-reveal 0.36s cubic-bezier(0.22, 1, 0.36, 1) both;
+    animation-delay: calc(var(--library-stagger-index, 0) * 20ms);
+  }
+
+  /* ======================================================================
+   * Zones strip (#550): persistent bottom play-target bar.
+   * ==================================================================== */
+
+  .zones-strip {
+    @apply fixed inset-x-0 bottom-0 z-30;
+    background: var(--surface-elevated);
+    border-top: 1px solid var(--border-default);
+  }
+
+  .zones-strip-inner {
+    @apply mx-auto flex max-w-7xl items-center gap-3 px-3 py-2 sm:px-6 lg:px-8;
+  }
+
+  .zones-strip-target {
+    @apply flex min-w-0 flex-1 items-center gap-3 rounded-lg p-1.5 text-left;
+  }
+  .zones-strip-target:hover {
+    background: var(--surface-hover);
+  }
+  .zones-strip-target:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: 2px;
+  }
+
+  .zones-strip-art {
+    @apply size-10 flex-shrink-0 rounded-md object-cover sm:size-12;
+    background: var(--surface-base);
+  }
+  .zones-strip-art--empty {
+    @apply flex items-center justify-center text-lg;
+    color: var(--text-muted);
+  }
+
+  .zones-strip-meta {
+    @apply flex min-w-0 flex-1 flex-col;
+  }
+  .zones-strip-zone-name {
+    @apply truncate text-xs font-semibold uppercase tracking-wide;
+    color: var(--text-muted);
+  }
+  .zones-strip-track {
+    @apply truncate text-sm font-medium;
+  }
+  .zones-strip-track--idle {
+    color: var(--text-muted);
+    font-weight: 400;
+  }
+  .zones-strip-artist {
+    @apply truncate text-xs;
+    color: var(--text-muted);
+  }
+
+  .zones-strip-chevron {
+    @apply hidden size-4 flex-shrink-0 sm:block;
+    color: var(--text-muted);
+  }
+
+  .zones-strip-transport {
+    @apply flex flex-shrink-0 items-center gap-1;
+  }
+
+  .zones-strip-picker {
+    @apply mx-auto max-w-7xl border-t px-3 py-3 sm:px-6 lg:px-8;
+    border-color: var(--border-subtle);
+  }
+
+  .zones-strip-picker-list {
+    @apply flex flex-col gap-1;
+  }
+
+  .zones-strip-picker-item {
+    @apply flex w-full items-center justify-between gap-2 rounded-md px-3 py-2 text-left text-sm;
+  }
+  .zones-strip-picker-item:hover {
+    background: var(--surface-hover);
+  }
+
+  .zones-strip-transfer {
+    @apply mt-2 flex flex-wrap items-center gap-2 border-t pt-2;
+    border-color: var(--border-subtle);
+  }
+
+  .library-strip-spacer {
+    @apply h-24;
+  }
+}
+
+@keyframes library-skeleton {
+  0% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0 50%;
+  }
+}
+
+@keyframes library-eq-bounce {
+  0%,
+  100% {
+    transform: scaleY(0.4);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+
+@keyframes library-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .library-row--reveal,
+  .library-tile--reveal {
+    animation: none;
+  }
+  .library-skeleton-row {
+    animation: none;
+  }
+  .library-eq span {
+    animation: none;
+  }
 }
 
 @keyframes hqp-signal {

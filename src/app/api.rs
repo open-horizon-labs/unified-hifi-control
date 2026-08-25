@@ -288,6 +288,9 @@ pub fn source_label(source: &str) -> &str {
         "hqplayer" => "HQPlayer",
         "openhome" => "OpenHome",
         "upnp" => "UPnP",
+        "musicassistant" => "Music Assistant",
+        "spotify" => "Spotify",
+        "applemusic" => "Apple Music",
         other => other,
     }
 }
@@ -521,6 +524,34 @@ pub async fn post_queue_action(req: &QueueRequest) -> Result<Envelope<serde_json
 /// `POST /api/play_ref`.
 pub async fn post_play_ref(req: &PlayRefRequest) -> Result<Envelope<serde_json::Value>, String> {
     post_json("/api/play_ref", req).await
+}
+
+/// One `hifi_search` hit -- mirrors `crate::mcp::types::McpSearchResult`.
+/// `item_ref` is `Some` only when the result has a durable-enough handle to
+/// play later via `/api/play_ref`; a `None` ref is still worth showing (it
+/// carries title/subtitle) but has no Play/Queue affordance.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SearchResult {
+    pub title: String,
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    #[serde(rename = "ref", default)]
+    pub item_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SearchRequest {
+    pub query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zone_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// `POST /api/search` -- the Library page's "Everywhere" results (#550), a
+/// thin mirror of the `hifi_search` MCP tool (see `src/api/browse.rs`).
+pub async fn fetch_search(req: &SearchRequest) -> Result<Envelope<Vec<SearchResult>>, String> {
+    post_json("/api/search", req).await
 }
 
 // =============================================================================

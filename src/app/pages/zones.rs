@@ -3,10 +3,9 @@
 //! Shows all available zones using Dioxus resources.
 
 use crate::app::api::{HqpMatrixProfilesResponse, HqpProfile, NowPlaying, Zone, ZonesResponse};
-use crate::app::components::{
-    CollectionsBrowser, ErrorAlert, HqpControlsCompact, Layout, VolumeControlsCompact,
-};
+use crate::app::components::{ErrorAlert, HqpControlsCompact, Layout, VolumeControlsCompact};
 use crate::app::sse::{use_sse, SseEvent};
+use crate::app::Route;
 use dioxus::prelude::*;
 use std::collections::HashMap;
 
@@ -256,15 +255,6 @@ pub fn Zones() -> Element {
     let profiles = hqp_profiles();
     let matrix = hqp_matrix();
 
-    // Music Assistant zones support library browse and queue transfer
-    // (#507); every other adapter hides the panel entirely rather than
-    // showing a browse surface that immediately refuses every call.
-    let musicassistant_zones: Vec<(String, String)> = zones_list
-        .iter()
-        .filter(|z| z.zone_id.starts_with("musicassistant:"))
-        .map(|z| (z.zone_id.clone(), z.zone_name.clone()))
-        .collect();
-
     // Group *consecutive* same-source zones, preserving the order `/zones` delivered.
     //
     // `/zones` arrives ordered by `crate::zone_list` -- the user's explicit order, then
@@ -312,7 +302,6 @@ pub fn Zones() -> Element {
                                 on_control: control,
                                 on_load_profile: load_profile,
                                 on_set_matrix: set_matrix,
-                                musicassistant_zones: musicassistant_zones.clone(),
                             }
                         }
                     }
@@ -353,10 +342,6 @@ fn ZoneCard(
     on_control: EventHandler<(String, String)>,
     on_load_profile: EventHandler<String>,
     on_set_matrix: EventHandler<String>,
-    /// Every Music Assistant zone, `(zone_id, zone_name)`, for the browse
-    /// panel's queue-transfer target list (#507). Empty when there are none.
-    #[props(default)]
-    musicassistant_zones: Vec<(String, String)>,
 ) -> Element {
     let zone_id = zone.zone_id.clone();
     let zone_id_prev = zone_id.clone();
@@ -509,21 +494,25 @@ fn ZoneCard(
                 }
             }
 
-            // Library browse + queue transfer (#507, #531). Gated on the
+            // Library browse moved off the zone card and onto the Library
+            // home page (#550) -- one browse surface instead of one per
+            // zone. This is just a deep link that arms this zone as the
+            // Library page's play target and opens its source. Gated on the
             // server-reported `browse_supported` -- whether `/api/collections`
-            // actually implements this zone's provider -- rather than a
-            // hardcoded prefix, so LMS and Roon zones light up as their
-            // slices land without a web change. Queue transfer itself
-            // remains Music Assistant-only (`musicassistant_zones` below);
-            // that is a separate capability (#507) this gate does not cover.
+            // actually implements this zone's provider -- so LMS and Roon
+            // zones light up as their slices land without a web change.
             if zone.browse_supported {
-                CollectionsBrowser {
-                    zone_id: zone.zone_id.clone(),
-                    transfer_targets: musicassistant_zones
-                        .iter()
-                        .filter(|(id, _)| *id != zone.zone_id)
-                        .cloned()
-                        .collect::<Vec<_>>(),
+                div { class: "mt-3 border-t border-subtle pt-3",
+                    Link {
+                        class: "btn btn-ghost text-sm",
+                        to: Route::Library {
+                            source: zone.source.clone(),
+                            tab: None,
+                            path: None,
+                            zone: Some(zone.zone_id.clone()),
+                        },
+                        "Browse →"
+                    }
                 }
             }
         }
