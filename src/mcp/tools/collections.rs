@@ -478,9 +478,14 @@ async fn handle_roon(
         return env.failed("Collection error: Roon adapter returned no session_key");
     };
     // `RoonAdapter::content` already dropped grouping rows (headers,
-    // result-count rows) -- see that method's docs -- so every row here is
-    // either navigable (`List` hint) or playable, and this loop only mints
-    // the ref that matches which.
+    // result-count rows, and -- #545 -- the Action/ActionList rows Roon's
+    // play-resolution walk uses internally) -- see that method's docs.
+    // `navigable` and `playable` are independent booleans, not a single
+    // either/or choice: #545 found albums and playlists that are both (you
+    // can browse in to see tracks *and* play the whole thing directly) as
+    // well as leaf tracks that are playable only (a browse-in would land on
+    // nothing but the now-filtered action row). This loop mints whichever
+    // ref(s) apply, possibly both, for the same `item_key`.
     let mut items = Vec::new();
     for item in response
         .get("items")
@@ -502,6 +507,10 @@ async fn handle_roon(
             .get("navigable")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let playable = item
+            .get("playable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let (path, r#ref) = match item_key {
             None => (None, None),
             Some(item_key) => {
@@ -509,33 +518,33 @@ async fn handle_roon(
                     item_key: item_key.to_string(),
                     multi_session_key: session_key.to_string(),
                 };
-                if navigable {
-                    (
-                        Some(
-                            state
-                                .mcp_refs
-                                .mint(RefTarget::RoonBrowse {
-                                    target,
-                                    title: title.clone(),
-                                })
-                                .await,
-                        ),
-                        None,
+                let path = if navigable {
+                    Some(
+                        state
+                            .mcp_refs
+                            .mint(RefTarget::RoonBrowse {
+                                target: target.clone(),
+                                title: title.clone(),
+                            })
+                            .await,
                     )
                 } else {
-                    (
-                        None,
-                        Some(
-                            state
-                                .mcp_refs
-                                .mint(RefTarget::Roon {
-                                    target,
-                                    title: title.clone(),
-                                })
-                                .await,
-                        ),
+                    None
+                };
+                let r#ref = if playable {
+                    Some(
+                        state
+                            .mcp_refs
+                            .mint(RefTarget::Roon {
+                                target,
+                                title: title.clone(),
+                            })
+                            .await,
                     )
-                }
+                } else {
+                    None
+                };
+                (path, r#ref)
             }
         };
         items.push(CollectionItem {

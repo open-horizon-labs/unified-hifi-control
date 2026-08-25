@@ -248,6 +248,34 @@ pub fn album(title: &str, artist: &str, tracks: &[&str]) -> FakeItem {
         .with_children(children)
 }
 
+/// A playlist whose page puts an immediately-invokable `"Play Playlist"`
+/// action directly alongside its tracks -- the exact shape issue #545's live
+/// repro captured against a real Core (`Available: ["Play Playlist",
+/// "Laundromat (Remastered 2017)", ...]`).
+///
+/// Deliberately different from [`album`]'s shape: an album's first child is
+/// `action_list("Play Album")`, a *wrapper* that itself must be entered to
+/// reach `play_actions()` (double-nested). A playlist's `"Play Playlist"` is
+/// `action` hinted directly -- browsing its own `item_key` invokes it on the
+/// spot (see `handle_browse`'s "Invoking an action does not produce a list"
+/// case below), with no further menu to open. Getting this distinction
+/// wrong is exactly what #545's play-matcher bug was: the adapter treated
+/// every action-hinted row as a submenu wrapper and searched a level too
+/// deep for a literal `"Play Now"`.
+pub fn playlist(title: &str, tracks: &[&str]) -> FakeItem {
+    let mut children = vec![FakeItem::action("Play Playlist")];
+    for track in tracks {
+        children.push(
+            FakeItem::list(track)
+                .with_subtitle(title)
+                .with_children(vec![
+                    FakeItem::action_list("Play Track").with_children(play_actions())
+                ]),
+        );
+    }
+    FakeItem::list(title).with_children(children)
+}
+
 /// The fake Core's library: a browse root plus a flat set of searchable items.
 #[derive(Debug, Clone)]
 pub struct FakeLibrary {
