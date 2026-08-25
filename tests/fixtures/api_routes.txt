@@ -34,6 +34,7 @@ GET /control
 GET /events
 GET /firmware/download
 GET /firmware/version
+GET /fonts/{*path}
 GET /hqp/discover
 GET /hqp/instances
 GET /hqp/pipeline

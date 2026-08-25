@@ -83,6 +83,37 @@ pub async fn serve_embedded_asset(
     }
 }
 
+/// Axum handler to serve embedded font files at `/fonts/*` (#560: these
+/// 404'd on the built server -- `public/fonts/` is embedded into
+/// [`PublicAssets`] like every other file under `public/`, but nothing
+/// routed `/fonts/*` requests to it, so the SPA fallback (`serve_index_html`)
+/// answered instead and the browser's woff2 fetch failed).
+pub async fn serve_embedded_font(
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> Response<Body> {
+    let asset_path = format!("fonts/{}", path);
+
+    match PublicAssets::get(&asset_path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(&asset_path)
+                .first_or_octet_stream()
+                .to_string();
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, mime)
+                // Immutable cache: font filenames carry their own content hash upstream.
+                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                .body(Body::from(content.data.into_owned()))
+                .unwrap_or_else(|_| Response::new(Body::empty()))
+        }
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("Font not found"))
+            .unwrap_or_else(|_| Response::new(Body::from("Font not found"))),
+    }
+}
+
 /// Axum handler to serve the embedded index.html (SPA shell with WASM script tags).
 /// This is used as a fallback for client-side routing.
 pub async fn serve_index_html() -> Response<Body> {
