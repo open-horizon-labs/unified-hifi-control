@@ -1742,7 +1742,7 @@ pub fn Settings() -> Element {
                                                 span { aria_live: "polite", "{spotify_callback_copy_state().label(\"Copy URL\")}" }
                                             }
                                         }
-                                        p { class: "mt-2 text-xs text-muted", "This is the default loopback callback. If UHC runs on a NAS or another machine, edit the Redirect URI field below first (an HTTPS tunnel URL or your LAN's HTTPS address) — Spotify only accepts plain HTTP for 127.0.0.1/::1." }
+                                        p { class: "mt-2 text-xs text-muted", "This is the default loopback callback — it only works when your browser runs on the same machine as UHC. On a NAS or another machine, click \"Get an HTTPS address\" below: UHC opens a temporary secure tunnel and gives you the exact URL to register instead. (Spotify only accepts plain HTTP for 127.0.0.1/::1.)" }
                                     }
                                     li { "Copy that app's Client ID (and Client Secret, if you're not using PKCE) into the fields below." }
                                     li { "Save client settings, then click Connect Spotify and approve access on Spotify's consent page." }
