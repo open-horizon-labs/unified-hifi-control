@@ -628,7 +628,7 @@
   .library-eq span {
     @apply w-0.5 rounded-sm;
     background: var(--accent-color);
-    animation: library-eq-bounce 1s ease-in-out infinite;
+    animation: library-eq-pulse 1s ease-in-out infinite;
   }
   .library-eq span:nth-child(1) {
     height: 40%;
@@ -803,7 +803,7 @@
   }
 }
 
-@keyframes library-eq-bounce {
+@keyframes library-eq-pulse {
   0%,
   100% {
     transform: scaleY(0.4);
