@@ -116,7 +116,7 @@ pub fn Nav(props: NavProps) -> Element {
                         hidden: hide_knobs,
                         aria_hidden: hide_knobs,
                         tabindex: if hide_knobs { "-1" } else { "0" },
-                        "Knobs"
+                        "Controllers"
                     }
                     Link { class: nav_link_class("settings"), to: Route::Settings {}, "Settings" }
                 }
@@ -187,7 +187,7 @@ pub fn Nav(props: NavProps) -> Element {
                         aria_hidden: hide_knobs,
                         tabindex: if hide_knobs { "-1" } else { "0" },
                         onclick: move |_| menu_open.set(false),
-                        "Knobs"
+                        "Controllers"
                     }
                     Link { class: nav_link_class("settings"), to: Route::Settings {}, onclick: move |_| menu_open.set(false), "Settings" }
                 }
