@@ -94,7 +94,8 @@ fn multiroom_target(zone_id: &str) -> Option<ZoneTarget> {
 
 #[mcp_tool(
     name = "hifi_zone_group",
-    description = "Inspect or change multiroom zone groups for any provider that supports \
+    description = "Alpha capability: expect refinement across releases. Inspect or change \
+                    multiroom zone groups for any provider that supports \
                     synchronised playback (Roon, LMS, Music Assistant). action=status is \
                     read-only: pass zone_id to scope it to one provider, or omit zone_id to \
                     aggregate every provider's groups (a provider that cannot be reached is \

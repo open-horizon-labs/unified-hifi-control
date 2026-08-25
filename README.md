@@ -102,6 +102,45 @@ If you route audio through HQPlayer for upsampling or filtering, this bridge let
 3. Link zones to HQPlayer instances — each zone can use a different HQPlayer
 4. Zone now-playing info will include HQPlayer pipeline status
 
+## Streaming Providers (Alpha)
+
+Beyond the always-on Roon/LMS/UPnP/OpenHome/HQPlayer adapters, three
+direct/peer streaming providers are available as opt-in, **Alpha**
+adapters. Enable each from **Settings**; expect rough edges while these
+mature:
+
+- **Spotify** — controls existing Spotify Connect devices via the
+  standard OAuth authorization-code flow. UHC does not act as a Connect
+  receiver itself.
+- **Apple Music** — pairs with the native iOS/macOS companion
+  (`companion/apple_music_ios`, `companion/apple_music`) to control a
+  `SystemMusicPlayer` session from UHC.
+- **Music Assistant** — an optional peer adapter for an existing Music
+  Assistant server, using its authenticated JSON API and a long-lived
+  access token.
+
+See [docs/streaming-adapters.md](docs/streaming-adapters.md) for the
+full provider-boundary and authorization details.
+
+## Home Assistant Integration (Alpha)
+
+Two independent, **Alpha** ways to reach Home Assistant, both opt-in from
+**Settings**:
+
+- **MQTT discovery publisher** — publishes every UHC zone (and any
+  paired knob) to HA over MQTT discovery: state `sensor`, `image`,
+  volume `number`, mute `switch`, and transport `button`s per zone, with
+  inbound HA commands routed back through UHC's adapters.
+- **[HACS custom integration](docs/home_assistant_integration.md)**
+  (`custom_components/unified_hifi_control`) — a native `media_player`
+  entity per zone with HA voice control and dashboard cards, installed
+  via [HACS](https://hacs.xyz/) by adding this repository as a custom
+  repository.
+
+Both are new; see
+[docs/home_assistant_integration.md](docs/home_assistant_integration.md)
+for setup and current limitations.
+
 ## Architecture
 
 ```

@@ -1,5 +1,12 @@
 # Home Assistant integration (`custom_components/unified_hifi_control`)
 
+**Status: Alpha.** This integration and the MQTT/Home Assistant discovery
+publisher it complements (below) are new; expect rough edges and breaking
+changes between releases while the entity model and event contract settle.
+Report issues on the [tracker](https://github.com/open-horizon-labs/unified-hifi-control/issues).
+The pre-1.0 `version` in `manifest.json` reflects this: bump it to `1.0.0`
+only once the entity/service contract is considered stable.
+
 A HACS-installable custom integration that exposes every UHC zone as a
 `media_player` entity, giving Home Assistant native voice control
 ("pause the kitchen"), media-player dashboard cards, and `media_player.*`

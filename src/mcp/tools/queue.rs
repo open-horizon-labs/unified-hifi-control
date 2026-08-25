@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 #[mcp_tool(
     name = "hifi_queue",
-    description = "Read or edit a playback queue. action='read' is the default. Music Assistant supports jump, reorder, remove, clear, and transfer against its active queue; each mutation returns a fresh queue readback. transfer moves the active queue from zone_id to target_zone_id (both must be Music Assistant zones). Queue add is hifi_play action='queue'."
+    description = "Read or edit a playback queue. action='read' is the default. Music Assistant supports jump, reorder, remove, clear, and transfer against its active queue; each mutation returns a fresh queue readback. transfer (Alpha capability: expect refinement across releases) moves the active queue from zone_id to target_zone_id (both must be Music Assistant zones). Queue add is hifi_play action='queue'."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiQueueTool {

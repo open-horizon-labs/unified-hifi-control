@@ -53,7 +53,7 @@ pub fn zone_supports_hifi_collections(zone_id: &str) -> bool {
 
 #[mcp_tool(
     name = "hifi_collections",
-    description = "Browse a provider library or list saved playlists and favorites. Results are paged with limit/offset and playable entries include a short-lived opaque ref for hifi_play_ref. Use path from a browse entry to continue into that collection. Implemented for lms and roon zones; Music Assistant zones (see hifi_queue's provider notes); Spotify and Apple Music are reachable via hifi_spotify and the Apple Music tools today, not yet through this one."
+    description = "Alpha capability: expect refinement across releases. Browse a provider library or list saved playlists and favorites. Results are paged with limit/offset and playable entries include a short-lived opaque ref for hifi_play_ref. Use path from a browse entry to continue into that collection. Implemented for lms and roon zones; Music Assistant zones (see hifi_queue's provider notes); Spotify and Apple Music are reachable via hifi_spotify and the Apple Music tools today, not yet through this one."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiCollectionsTool {

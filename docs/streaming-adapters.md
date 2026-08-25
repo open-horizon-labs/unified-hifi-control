@@ -4,6 +4,13 @@ This document records the provider boundary for the direct streaming-adapter
 initiative.  It is intentionally conservative: a provider is not advertised
 as supported until its authorization and playback path is available to UHC.
 
+**Status: Alpha.** Every provider documented here that UHC currently ships —
+Spotify, Apple Music, and Music Assistant — is labeled Alpha in the Settings
+UI (`badge badge-secondary "Alpha"`). They are fully wired end to end
+(settings → enable → working zone), not feature-gated or hidden, but their
+authorization flows and capability coverage are new enough to expect rough
+edges and occasional breaking changes between releases.
+
 ## Amazon Music: access-gated discovery
 
 Amazon publishes a Web API for catalog metadata, search, user libraries, and

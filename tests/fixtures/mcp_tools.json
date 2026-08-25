@@ -114,7 +114,7 @@
     }
   },
   "hifi_collections": {
-    "description": "Browse a provider library or list saved playlists and favorites. Results are paged with limit/offset and playable entries include a short-lived opaque ref for hifi_play_ref. Use path from a browse entry to continue into that collection. Implemented for lms and roon zones; Music Assistant zones (see hifi_queue's provider notes); Spotify and Apple Music are reachable via hifi_spotify and the Apple Music tools today, not yet through this one.",
+    "description": "Alpha capability: expect refinement across releases. Browse a provider library or list saved playlists and favorites. Results are paged with limit/offset and playable entries include a short-lived opaque ref for hifi_play_ref. Use path from a browse entry to continue into that collection. Implemented for lms and roon zones; Music Assistant zones (see hifi_queue's provider notes); Spotify and Apple Music are reachable via hifi_spotify and the Apple Music tools today, not yet through this one.",
     "inputSchema": {
       "properties": {
         "action": {
@@ -335,7 +335,7 @@
     }
   },
   "hifi_queue": {
-    "description": "Read or edit a playback queue. action='read' is the default. Music Assistant supports jump, reorder, remove, clear, and transfer against its active queue; each mutation returns a fresh queue readback. transfer moves the active queue from zone_id to target_zone_id (both must be Music Assistant zones). Queue add is hifi_play action='queue'.",
+    "description": "Read or edit a playback queue. action='read' is the default. Music Assistant supports jump, reorder, remove, clear, and transfer against its active queue; each mutation returns a fresh queue readback. transfer (Alpha capability: expect refinement across releases) moves the active queue from zone_id to target_zone_id (both must be Music Assistant zones). Queue add is hifi_play action='queue'.",
     "inputSchema": {
       "properties": {
         "action": {
@@ -463,7 +463,7 @@
     }
   },
   "hifi_zone_group": {
-    "description": "Inspect or change multiroom zone groups for any provider that supports synchronised playback (Roon, LMS, Music Assistant). action=status is read-only: pass zone_id to scope it to one provider, or omit zone_id to aggregate every provider's groups (a provider that cannot be reached is reported in `errors` rather than failing the whole read). join and leave require confirm=true because grouping changes playback topology, and every zone id involved (leader plus every member) must belong to the same provider -- cross-provider groups are refused. Two provider-specific member conventions: Roon retires a grouped zone's own id and reports/accepts its members as roon:<output_id>; LMS sync groups are leaderless, so leader_zone_id there is UHC's stable-but-arbitrary pick of the first member id, not an LMS fact.",
+    "description": "Alpha capability: expect refinement across releases. Inspect or change multiroom zone groups for any provider that supports synchronised playback (Roon, LMS, Music Assistant). action=status is read-only: pass zone_id to scope it to one provider, or omit zone_id to aggregate every provider's groups (a provider that cannot be reached is reported in `errors` rather than failing the whole read). join and leave require confirm=true because grouping changes playback topology, and every zone id involved (leader plus every member) must belong to the same provider -- cross-provider groups are refused. Two provider-specific member conventions: Roon retires a grouped zone's own id and reports/accepts its members as roon:<output_id>; LMS sync groups are leaderless, so leader_zone_id there is UHC's stable-but-arbitrary pick of the first member id, not an LMS fact.",
     "inputSchema": {
       "properties": {
         "action": {
