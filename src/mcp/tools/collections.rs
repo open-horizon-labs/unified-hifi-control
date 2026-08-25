@@ -3,11 +3,25 @@
 //! The wire contract deliberately speaks only of collections, paths, pages and
 //! opaque playable refs. Provider adapters translate those concepts to their
 //! native library APIs; no provider URI or identifier is returned to a client.
+//!
+//! # #531: per-provider slices, not one blanket gate
+//!
+//! #492 wired only Music Assistant, behind a blanket "not implemented for
+//! this provider yet" refusal for every other route. That refusal did not
+//! distinguish "this provider cannot" from "UHC has not wired it" and, worse,
+//! disagreed with [`crate::mcp::capabilities`] for Spotify: `hifi_spotify`
+//! already exposes playlists/favorites/browse there, so the capability table
+//! reports `browse`/`saved_playlists`/`favorites` as `supported` for Spotify
+//! zones independent of this tool. This module now implements LMS and Roon
+//! (#531's biggest UX win -- local-library and Roon-library browsing had no
+//! neutral surface at all) and refuses Spotify and Apple Music by name,
+//! honestly: reachable through their own provider tools today, not yet wired
+//! to this one. See #531's PR body for what remains.
 
 use crate::api::AppState;
 use crate::mcp::capabilities::{support, Capability, Support};
 use crate::mcp::envelope::{Envelope, Refusal, Scope};
-use crate::mcp::refs::RefTarget;
+use crate::mcp::refs::{RefTarget, RoonRefTarget};
 use crate::mcp::routing::{LibraryRoute, ZoneTarget};
 use rust_mcp_sdk::{
     macros::{mcp_tool, JsonSchema},
@@ -18,9 +32,28 @@ use serde_json::{json, Value};
 
 const ACTIONS: &[&str] = &["browse", "playlists", "favorites"];
 
+/// Whether `hifi_collections` (and its HTTP mirror, `/api/collections`)
+/// implements this zone's provider at all.
+///
+/// **Narrower than "is any collections capability `supported`"**: Spotify's
+/// `browse`/`saved_playlists`/`favorites` cells read `supported` in
+/// [`crate::mcp::capabilities`] because `hifi_spotify` already implements
+/// them (see that module's `routed()`), not because this tool does. The web
+/// UI's `CollectionsBrowser` panel (`src/app/pages/zones.rs`) calls
+/// `/api/collections`, which is *this* tool -- so it must gate on this
+/// narrower question, not on the general capability table, or it would light
+/// up a panel that immediately refuses every call for a Spotify zone. See
+/// #531's PR body for Spotify and Apple Music's plan to close this gap.
+pub fn zone_supports_hifi_collections(zone_id: &str) -> bool {
+    matches!(
+        ZoneTarget::classify(zone_id).for_library(),
+        LibraryRoute::MusicAssistant | LibraryRoute::Lms | LibraryRoute::Roon
+    )
+}
+
 #[mcp_tool(
     name = "hifi_collections",
-    description = "Browse a provider library or list saved playlists and favorites. Results are paged with limit/offset and playable entries include a short-lived opaque ref for hifi_play_ref. Use path from a browse entry to continue into that collection."
+    description = "Browse a provider library or list saved playlists and favorites. Results are paged with limit/offset and playable entries include a short-lived opaque ref for hifi_play_ref. Use path from a browse entry to continue into that collection. Implemented for lms and roon zones; Music Assistant zones (see hifi_queue's provider notes); Spotify and Apple Music are reachable via hifi_spotify and the Apple Music tools today, not yet through this one."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiCollectionsTool {
@@ -84,51 +117,59 @@ pub async fn handle_collections(
         .param_opt("limit", args.limit)
         .param_opt("offset", args.offset)
         .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await);
-    let prefix = match target.for_library() {
-        LibraryRoute::Roon => "roon",
-        LibraryRoute::Lms => "lms",
-        LibraryRoute::Spotify => "spotify",
-        LibraryRoute::AppleMusic => "applemusic",
-        LibraryRoute::MusicAssistant => "musicassistant",
-        LibraryRoute::Refused(_) => return env.failed("This zone has no library path"),
-    };
-    // Browse paths are server-side refs, just like playable media refs. MA's
-    // native `library://…` paths contain provider implementation details and
-    // must not become MCP client input.
-    let provider_path = match args.path.as_deref() {
-        None => None,
-        Some(token) => match state.mcp_refs.resolve(token).await {
-            Some(RefTarget::MusicAssistantBrowse { path, .. })
-                if matches!(target, ZoneTarget::MusicAssistant) => Some(path),
-            Some(_) => {
-                return env.refused(
-                    "path does not name a collection for this zone.",
-                    Refusal::invalid_parameter(
-                        "path",
-                        &["a path returned by hifi_collections for this zone"],
-                        "Browse again from this zone and use that result's path.",
-                    ),
-                )
-            }
-            None => {
-                return env.refused(
-                    "path is unknown or expired. Browse again from the collection root.",
-                    Refusal::UnknownTarget {
-                        parameter: "path",
-                        discover_with: "hifi_collections",
-                        detail: "Collection paths are short-lived opaque references. Call hifi_collections without path to start again.".to_string(),
-                    },
-                )
-            }
-        },
-    };
-    // This provider-neutral surface has a route vocabulary for every library
-    // adapter, but #492 implements the first adapter slice only. Resolve an
-    // opaque path first so a path minted for MA is never sent to another
-    // provider, even when that provider does not yet implement collections.
-    if !matches!(target, ZoneTarget::MusicAssistant) {
-        return env.failed("Collections are not implemented for this provider yet.");
+    let route = target.for_library();
+    if let LibraryRoute::Refused(_) = route {
+        return env.failed("This zone has no library path");
     }
+
+    // A `path`'s provider-boundary check runs before anything else,
+    // regardless of whether this zone's provider is wired to
+    // `hifi_collections` at all: a ref minted for one provider must never be
+    // treated as valid input for a different one, even a zone whose provider
+    // this tool cannot yet browse. Each provider handler below re-resolves
+    // the token itself to extract its specific shape; this pass only rules
+    // out "wrong provider" and "unknown token" up front.
+    if let Some(token) = args.path.as_deref() {
+        match state.mcp_refs.resolve(token).await {
+            Some(resolved) if resolved.provider() != target.provider() => {
+                return refuse_foreign_path(env);
+            }
+            None => return refuse_unknown_path(env),
+            Some(_) => {}
+        }
+    }
+
+    // Spotify and Apple Music already expose (some of) this surface through
+    // their own provider-specific tools (`hifi_spotify`, the Apple Music
+    // tools), which is why `hifi_capabilities` can report `supported` for
+    // them independent of this tool. Refusing here names that honestly
+    // instead of either lying "not implemented" for a capability the
+    // provider actually has, or silently trying an adapter operation this
+    // tool never taught it (`collections_browse` and friends) and surfacing
+    // whatever generic error falls out.
+    if matches!(route, LibraryRoute::Spotify | LibraryRoute::AppleMusic) {
+        let alternative = match route {
+            LibraryRoute::Spotify => "hifi_spotify",
+            _ => "the Apple Music companion tools",
+        };
+        return env.refused(
+            format!(
+                "hifi_collections does not reach {} zones yet; use {alternative} for this \
+                 provider's collections today.",
+                target.label()
+            ),
+            Refusal::NotImplemented {
+                operation: capability.name().to_string(),
+                tracked_by: "#531",
+                alternatives: vec![alternative.to_string()],
+                detail: format!(
+                    "{alternative} already exposes this provider's content operations; #531 \
+                     tracks adapting them behind the neutral hifi_collections contract."
+                ),
+            },
+        );
+    }
+
     if !matches!(support(target, capability), Support::Supported) {
         return env.failed(format!(
             "{} is not available for {} zones",
@@ -136,13 +177,56 @@ pub async fn handle_collections(
             target.label()
         ));
     }
+
     let limit = args.limit.unwrap_or(20).clamp(1, 50);
     let offset = args.offset.unwrap_or(0);
+
+    match route {
+        LibraryRoute::MusicAssistant => {
+            handle_music_assistant(state, env, &args, limit, offset).await
+        }
+        LibraryRoute::Lms => handle_lms(state, env, &args, limit, offset).await,
+        LibraryRoute::Roon => handle_roon(state, env, &args, limit, offset).await,
+        // Handled above; exhaustive so a new route fails to compile here
+        // rather than silently falling through.
+        LibraryRoute::Spotify | LibraryRoute::AppleMusic => env.failed(
+            "internal routing error: Spotify/Apple Music reached collections dispatch after \
+             being refused above. This is a UHC bug.",
+        ),
+        LibraryRoute::Refused(_) => env.failed(
+            "internal routing error: a refused zone reached collections dispatch. This is a \
+             UHC bug.",
+        ),
+    }
+}
+
+// =============================================================================
+// Music Assistant (#492): unchanged from before #531, minus the blanket gate.
+// =============================================================================
+
+async fn handle_music_assistant(
+    state: &AppState,
+    env: Envelope,
+    args: &HifiCollectionsTool,
+    limit: u32,
+    offset: u32,
+) -> Result<CallToolResult, CallToolError> {
+    // Browse paths are server-side refs, just like playable media refs. MA's
+    // native `library://…` paths contain provider implementation details and
+    // must not become MCP client input.
+    let provider_path = match args.path.as_deref() {
+        None => None,
+        Some(token) => match state.mcp_refs.resolve(token).await {
+            Some(RefTarget::MusicAssistantBrowse { path, .. }) => Some(path),
+            Some(_) => return refuse_foreign_path(env),
+            None => return refuse_unknown_path(env),
+        },
+    };
     let operation = format!("collections_{}", args.action);
     let response = match state
         .adapter_registry
         .library_content(
-            prefix,
+            "musicassistant",
             &operation,
             &json!({
                 "zone_id": args.zone_id,
@@ -177,8 +261,8 @@ pub async fn handle_collections(
             .get("subtitle")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
-        let path = match (target, item.get("path").and_then(Value::as_str)) {
-            (ZoneTarget::MusicAssistant, Some(path)) => Some(
+        let path = match item.get("path").and_then(Value::as_str) {
+            Some(path) => Some(
                 state
                     .mcp_refs
                     .mint(RefTarget::MusicAssistantBrowse {
@@ -187,14 +271,132 @@ pub async fn handle_collections(
                     })
                     .await,
             ),
-            _ => None,
+            None => None,
         };
-        let r#ref = match (target, item.get("uri").and_then(Value::as_str)) {
-            (ZoneTarget::MusicAssistant, Some(uri)) => Some(
+        let r#ref = match item.get("uri").and_then(Value::as_str) {
+            Some(uri) => Some(
                 state
                     .mcp_refs
                     .mint(RefTarget::MusicAssistant {
                         uri: uri.to_string(),
+                        title: title.clone(),
+                    })
+                    .await,
+            ),
+            None => None,
+        };
+        items.push(CollectionItem {
+            title,
+            subtitle,
+            path,
+            r#ref,
+        });
+    }
+    Ok(env.json_result(&CollectionPage { items, next_offset }))
+}
+
+// =============================================================================
+// LMS (#531): albums/artists/playlists/favorites over the CLI/jsonrpc the
+// adapter already speaks for search and playback.
+// =============================================================================
+
+async fn handle_lms(
+    state: &AppState,
+    env: Envelope,
+    args: &HifiCollectionsTool,
+    limit: u32,
+    offset: u32,
+) -> Result<CallToolResult, CallToolError> {
+    // Same opaque-path split as Music Assistant: the plain collection path
+    // this adapter invents ("albums", "album:<id>", ...) never becomes
+    // client-visible; only the ref token is.
+    let provider_path = match args.path.as_deref() {
+        None => None,
+        Some(token) => match state.mcp_refs.resolve(token).await {
+            Some(RefTarget::LmsBrowse { path, .. }) => Some(path),
+            Some(_) => return refuse_foreign_path(env),
+            None => return refuse_unknown_path(env),
+        },
+    };
+    let operation = format!("collections_{}", args.action);
+    let response = match state
+        .adapter_registry
+        .library_content(
+            "lms",
+            &operation,
+            &json!({
+                "path": provider_path,
+                "media_type": args.media_type,
+                "limit": limit,
+                "offset": offset,
+            }),
+        )
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => return env.failed(format!("Collection error: {error}")),
+    };
+    let next_offset = response
+        .get("next_offset")
+        .and_then(Value::as_u64)
+        .map(|v| v as u32);
+    let mut items = Vec::new();
+    for item in response
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let title = item
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("Untitled")
+            .to_string();
+        let subtitle = item
+            .get("subtitle")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        // A navigable row carries `path` (another collection to browse); a
+        // playable leaf carries either `kind`+`id` (a durable LMS entity --
+        // `LmsPlayTarget::Library`) or `url` (a favorite, which LMS gives no
+        // durable id for -- `LmsPlayTarget::Url`). At most one of the three
+        // is ever present on one row.
+        let path = match item.get("path").and_then(Value::as_str) {
+            Some(path) => Some(
+                state
+                    .mcp_refs
+                    .mint(RefTarget::LmsBrowse {
+                        path: path.to_string(),
+                        title: title.clone(),
+                    })
+                    .await,
+            ),
+            None => None,
+        };
+        let r#ref = match (
+            item.get("kind").and_then(Value::as_str),
+            item.get("id").and_then(Value::as_i64),
+            item.get("url").and_then(Value::as_str),
+        ) {
+            (Some("track"), Some(id), _) => Some(
+                state
+                    .mcp_refs
+                    .mint(RefTarget::Lms {
+                        target: crate::adapters::lms::LmsPlayTarget::Library {
+                            kind: crate::adapters::lms::LmsSearchResultType::Track,
+                            id,
+                        },
+                        title: title.clone(),
+                    })
+                    .await,
+            ),
+            (_, _, Some(url)) => Some(
+                state
+                    .mcp_refs
+                    .mint(RefTarget::Lms {
+                        target: crate::adapters::lms::LmsPlayTarget::Url {
+                            url: url.to_string(),
+                        },
                         title: title.clone(),
                     })
                     .await,
@@ -209,4 +411,168 @@ pub async fn handle_collections(
         });
     }
     Ok(env.json_result(&CollectionPage { items, next_offset }))
+}
+
+// =============================================================================
+// Roon (#531): the same browse/load session machinery `hifi_search` already
+// drives (src/adapters/roon.rs), exposed as hierarchy walking.
+// =============================================================================
+
+async fn handle_roon(
+    state: &AppState,
+    env: Envelope,
+    args: &HifiCollectionsTool,
+    limit: u32,
+    offset: u32,
+) -> Result<CallToolResult, CallToolError> {
+    // Roon's continuation is a (item_key, multi_session_key) pair, not a flat
+    // string -- resuming it must re-enter that exact session (same reasoning
+    // as a playable Roon ref; see `RoonRefTarget`'s docs).
+    let resume = match args.path.as_deref() {
+        None => None,
+        Some(token) => match state.mcp_refs.resolve(token).await {
+            Some(RefTarget::RoonBrowse { target, .. }) => Some(target),
+            Some(_) => return refuse_foreign_path(env),
+            None => return refuse_unknown_path(env),
+        },
+    };
+
+    let mut params = json!({
+        "zone_id": args.zone_id,
+        "limit": limit,
+        "offset": offset,
+    });
+    if let Some(RoonRefTarget {
+        item_key,
+        multi_session_key,
+    }) = &resume
+    {
+        params["item_key"] = json!(item_key);
+        params["session_key"] = json!(multi_session_key);
+    }
+    // Roon has no separate playlists/favorites protocol feature: both arrive
+    // as named nodes in the same browse hierarchy (see the capability
+    // table's note on this). `favorites` never reaches here -- `support()`
+    // reports it `not_implemented` for Roon and the shared check above
+    // already refused it.
+    let operation = match args.action.as_str() {
+        "browse" => "collections_browse",
+        "playlists" => "collections_playlists",
+        other => {
+            return env.failed(format!(
+                "internal routing error: unexpected hifi_collections action {other:?} reached \
+                 Roon dispatch after the capability check. This is a UHC bug."
+            ))
+        }
+    };
+    let response = match state
+        .adapter_registry
+        .library_content("roon", operation, &params)
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => return env.failed(format!("Collection error: {error}")),
+    };
+
+    let Some(session_key) = response.get("session_key").and_then(Value::as_str) else {
+        return env.failed("Collection error: Roon adapter returned no session_key");
+    };
+    // `RoonAdapter::content` already dropped grouping rows (headers,
+    // result-count rows) -- see that method's docs -- so every row here is
+    // either navigable (`List` hint) or playable, and this loop only mints
+    // the ref that matches which.
+    let mut items = Vec::new();
+    for item in response
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let title = item
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("Untitled")
+            .to_string();
+        let subtitle = item
+            .get("subtitle")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let item_key = item.get("item_key").and_then(Value::as_str);
+        let navigable = item.get("navigable").and_then(Value::as_bool).unwrap_or(false);
+        let (path, r#ref) = match item_key {
+            None => (None, None),
+            Some(item_key) => {
+                let target = RoonRefTarget {
+                    item_key: item_key.to_string(),
+                    multi_session_key: session_key.to_string(),
+                };
+                if navigable {
+                    (
+                        Some(
+                            state
+                                .mcp_refs
+                                .mint(RefTarget::RoonBrowse {
+                                    target,
+                                    title: title.clone(),
+                                })
+                                .await,
+                        ),
+                        None,
+                    )
+                } else {
+                    (
+                        None,
+                        Some(
+                            state
+                                .mcp_refs
+                                .mint(RefTarget::Roon {
+                                    target,
+                                    title: title.clone(),
+                                })
+                                .await,
+                        ),
+                    )
+                }
+            }
+        };
+        items.push(CollectionItem {
+            title,
+            subtitle,
+            path,
+            r#ref,
+        });
+    }
+    let next_offset = response
+        .get("next_offset")
+        .and_then(Value::as_u64)
+        .map(|v| v as u32);
+    Ok(env.json_result(&CollectionPage { items, next_offset }))
+}
+
+// =============================================================================
+// Shared refusals
+// =============================================================================
+
+fn refuse_foreign_path(env: Envelope) -> Result<CallToolResult, CallToolError> {
+    env.refused(
+        "path does not name a collection for this zone.",
+        Refusal::invalid_parameter(
+            "path",
+            &["a path returned by hifi_collections for this zone"],
+            "Browse again from this zone and use that result's path.",
+        ),
+    )
+}
+
+fn refuse_unknown_path(env: Envelope) -> Result<CallToolResult, CallToolError> {
+    env.refused(
+        "path is unknown or expired. Browse again from the collection root.",
+        Refusal::UnknownTarget {
+            parameter: "path",
+            discover_with: "hifi_collections",
+            detail: "Collection paths are short-lived opaque references. Call hifi_collections \
+                      without path to start again."
+                .to_string(),
+        },
+    )
 }

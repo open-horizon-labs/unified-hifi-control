@@ -513,10 +513,14 @@ fn ZoneCard(
                 }
             }
 
-            // Library browse + queue transfer (#507). Music Assistant only
-            // today; other adapters hide the panel rather than exposing a
-            // browse surface that would refuse every call.
-            if zone.zone_id.starts_with("musicassistant:") {
+            // Library browse + queue transfer (#507, #531). Gated on the
+            // server-reported `browse_supported` -- whether `/api/collections`
+            // actually implements this zone's provider -- rather than a
+            // hardcoded prefix, so LMS and Roon zones light up as their
+            // slices land without a web change. Queue transfer itself
+            // remains Music Assistant-only (`musicassistant_zones` below);
+            // that is a separate capability (#507) this gate does not cover.
+            if zone.browse_supported {
                 CollectionsBrowser {
                     zone_id: zone.zone_id.clone(),
                     transfer_targets: musicassistant_zones

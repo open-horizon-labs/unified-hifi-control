@@ -374,8 +374,17 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
             target,
             ZoneTarget::MusicAssistant | ZoneTarget::Roon | ZoneTarget::Lms
         ),
-        Capability::Browse | Capability::SavedPlaylists | Capability::Favorites => {
-            matches!(target, ZoneTarget::Spotify | ZoneTarget::MusicAssistant)
+        // #531: LMS implements all three (albums/artists/playlists/favorites
+        // queries over the CLI/jsonrpc). Roon implements browse and playlists
+        // (the same browse/load session `hifi_search` already drives);
+        // favorites remains a gap -- see `GAPS` below -- because Roon exposes
+        // it as a browse hierarchy this slice does not yet walk into.
+        Capability::Browse | Capability::SavedPlaylists => matches!(
+            target,
+            ZoneTarget::Spotify | ZoneTarget::MusicAssistant | ZoneTarget::Lms | ZoneTarget::Roon
+        ),
+        Capability::Favorites => {
+            matches!(target, ZoneTarget::Spotify | ZoneTarget::MusicAssistant | ZoneTarget::Lms)
         }
     };
     supported.then_some(Support::Supported)
@@ -482,9 +491,6 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     (ZoneTarget::Roon, Capability::PlayByRef, Gap::NotWired("#396",
         "RoonAdapter::browse/load/play_item exist and are exposed over HTTP; MCP mints no \
          reference for a search hit to act on.")),
-    (ZoneTarget::Roon, Capability::Browse, Gap::NotWired("#399",
-        "RoonAdapter::browse() and load() exist and POST /roon/browse exposes them; only the \
-         MCP projection is missing.")),
     (ZoneTarget::Roon, Capability::QueueRead, Gap::NotWired("#400",
         "the pinned roon-api fork exposes subscribe_queue(zone, max_items), which nothing in \
          UHC calls.")),
@@ -505,10 +511,7 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     (ZoneTarget::Roon, Capability::ShuffleMode, Gap::NotWired("#360",
         "the Roon API's transport service takes a shuffle setting; UHC drives it from no \
          surface.")),
-    (ZoneTarget::Roon, Capability::SavedPlaylists, Gap::NotWired("#399",
-        "Roon exposes Playlists as a browse hierarchy, so this arrives with browse rather \
-         than as its own protocol feature.")),
-    (ZoneTarget::Roon, Capability::Favorites, Gap::NotWired("#399",
+    (ZoneTarget::Roon, Capability::Favorites, Gap::NotWired("#531",
         "Roon exposes My Favorites and tags as browse hierarchies, so this arrives with \
          browse.")),
 
@@ -522,10 +525,6 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
          that playlistcontrol accepts, verified live; MCP discards them and hands back a title. \
          Note the XMLBrowser paths (globalsearch, favorites) return positional breadcrumbs \
          instead, which is #396's safety problem, not a capability gap.")),
-    (ZoneTarget::Lms, Capability::Browse, Gap::NotWired("#402",
-        "browselibrary items and the native albums/artists/genres/years/playlists/mediafolder \
-         queries walk the whole hierarchy with native <start> <n> paging -- all \
-         verified live on Lyrion 9.1.2. The adapter never calls any of them.")),
     (ZoneTarget::Lms, Capability::QueueRead, Gap::NotWired("#400",
         "status <player> <start> <n> returns the whole current playlist with playlist_cur_index; \
          verified live.")),
@@ -555,15 +554,6 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     (ZoneTarget::Lms, Capability::ShuffleMode, Gap::NotWired("#403",
         "playlist shuffle <0|1|2> and playlist shuffle ? read and write it; verified live. \
          Setting it reshuffles the queue, so it is also a queue mutation.")),
-    (ZoneTarget::Lms, Capability::SavedPlaylists, Gap::NotWired("#403",
-        "playlists / playlists tracks / playlistcontrol cmd:load playlist_id / playlists new / \
-         rename / delete all exist and were verified live. playlist save additionally needs a \
-         configured playlistdir, which is unset on a stock install -- so its own answer is \
-         three-state at the server level, which is why #403 probes pref playlistdir ?.")),
-    (ZoneTarget::Lms, Capability::Favorites, Gap::NotWired("#403",
-        "favorites items / favorites playlist play / add / delete / exists all work; verified \
-         live. Note LMS favorites have no durable id -- only a url -- so a ref must be minted \
-         over the url.")),
 
     // -------------------------------------------------------------------------
     // OpenHome. Transport, skip and (since #398) volume are routed.

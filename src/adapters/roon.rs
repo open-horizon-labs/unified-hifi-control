@@ -1920,6 +1920,132 @@ impl RoonAdapter {
         Ok((session_key, vec![]))
     }
 
+    // =========================================================================
+    // hifi_collections (#531): the same browse/load machinery `hifi_search`
+    // already drives, exposed as hierarchy walking rather than a query.
+    // =========================================================================
+
+    /// One `hifi_collections browse` step: enter `item_key` within
+    /// `session_key` (a fresh session and the collection root when both are
+    /// `None`), then load one page. Returns the (possibly newly minted)
+    /// session key, the page's items, and the level's total count for
+    /// `next_offset`.
+    ///
+    /// Deliberately never combines `pop_all` with `item_key` in the same
+    /// request, and never sends `pop_all` when resuming an existing
+    /// session -- see [`Self::play_ref`]'s doc comment for the live evidence
+    /// that combination hangs a real Core.
+    pub async fn browse_collection(
+        &self,
+        zone_id: &str,
+        item_key: Option<&str>,
+        session_key: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(String, Vec<BrowseItem>, usize)> {
+        let bare_zone_id = strip_roon_prefix(zone_id);
+        let session_key = session_key.map(ToOwned::to_owned).unwrap_or_else(|| {
+            format!(
+                "collections_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            )
+        });
+
+        let mut opts = BrowseOpts {
+            multi_session_key: Some(session_key.clone()),
+            zone_or_output_id: Some(bare_zone_id.to_string()),
+            ..Default::default()
+        };
+        match item_key {
+            Some(key) => opts.item_key = Some(key.to_string()),
+            // Only reset the browse stack when there is nowhere to navigate
+            // from -- i.e. a brand new session at the collection root.
+            None => opts.pop_all = true,
+        }
+        self.browse(opts).await?;
+
+        let load = self
+            .load(LoadOpts {
+                multi_session_key: Some(session_key.clone()),
+                offset,
+                count: Some(limit),
+                ..Default::default()
+            })
+            .await?;
+
+        Ok((session_key, load.items, load.list.count))
+    }
+
+    /// Enter a named top-level browse node (`"Playlists"`, ...) in a fresh
+    /// session and load one page of its contents in a single call --
+    /// `hifi_collections playlists`'s whole job, since Roon exposes playlists
+    /// as a browse hierarchy rather than its own protocol feature (see the
+    /// capability table's note on this).
+    pub async fn browse_named_root_node(
+        &self,
+        zone_id: &str,
+        node_title: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(String, Vec<BrowseItem>, usize)> {
+        let bare_zone_id = strip_roon_prefix(zone_id);
+        let session_key = format!(
+            "collections_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+
+        self.browse(BrowseOpts {
+            multi_session_key: Some(session_key.clone()),
+            zone_or_output_id: Some(bare_zone_id.to_string()),
+            pop_all: true,
+            ..Default::default()
+        })
+        .await?;
+
+        let root_items = self
+            .load(LoadOpts {
+                multi_session_key: Some(session_key.clone()),
+                count: Some(50),
+                ..Default::default()
+            })
+            .await?;
+
+        let node = root_items
+            .items
+            .iter()
+            .find(|item| item.title.eq_ignore_ascii_case(node_title))
+            .ok_or_else(|| anyhow::anyhow!("{node_title} not found in Roon browse root"))?;
+        let node_key = node
+            .item_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("{node_title} has no item_key"))?;
+
+        self.browse(BrowseOpts {
+            multi_session_key: Some(session_key.clone()),
+            item_key: Some(node_key),
+            zone_or_output_id: Some(bare_zone_id.to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+        let items = self
+            .load(LoadOpts {
+                multi_session_key: Some(session_key.clone()),
+                offset,
+                count: Some(limit),
+                ..Default::default()
+            })
+            .await?;
+
+        Ok((session_key, items.items, items.list.count))
+    }
+
     /// Search and play the first matching result
     pub async fn search_and_play(
         &self,
@@ -2514,28 +2640,48 @@ impl RoonAdapter {
     }
 }
 
-/// Content-library surface (#509): only the multiroom grouping operations
-/// are implemented here. Roon's own search/play surfaces are reached
-/// through their dedicated paths (`RoonAdapter::search`, `RoonAdapter::play_item`,
-/// ...); this trait is what lets the provider-neutral MCP registry
-/// (`AdapterRegistry::library_content`) dispatch `multiroom_status`,
-/// `multiroom_set_members` and `multiroom_ungroup` to Roon the same way it
-/// already dispatches them to Music Assistant
-/// (`src/adapters/musicassistant.rs`).
+/// Content-library surface: the multiroom grouping operations (#509) and
+/// the `hifi_collections` browse operations (#531) are both implemented
+/// here. Roon's own search/play surfaces are reached through their
+/// dedicated paths (`RoonAdapter::search`, `RoonAdapter::play_item`, ...)
+/// rather than through this trait's `search`/`play_uri` -- a Roon playable
+/// target is an `(item_key, multi_session_key)` pair, not a portable URI
+/// (see `RoonRefTarget`'s docs) -- which is exactly why `hifi_search`/
+/// `hifi_play`/`hifi_play_ref` already call `RoonAdapter` directly
+/// (pre-existing debt, unaffected by this registration). `content` is what
+/// lets the provider-neutral MCP registry (`AdapterRegistry::library_content`)
+/// dispatch `multiroom_status`, `multiroom_set_members`,
+/// `multiroom_ungroup`, `collections_browse` and `collections_playlists` to
+/// Roon the same way it already dispatches the multiroom operations to
+/// Music Assistant (`src/adapters/musicassistant.rs`).
 #[async_trait]
 impl LibraryAdapter for RoonAdapter {
     async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<LibrarySearchResult>> {
         Err(anyhow::anyhow!(
-            "Roon search is not implemented via the generic content-library surface (see #396/#402)"
+            "Roon search is not reachable through the generic library registry; hifi_search \
+             calls RoonAdapter directly because a Roon item_key is scoped to the \
+             multi_session_key that minted it, not a flat URI"
         ))
     }
 
     async fn play_uri(&self, _zone_id: &str, _uri: &str) -> Result<String> {
         Err(anyhow::anyhow!(
-            "Roon play-by-uri is not implemented via the generic content-library surface (see #396)"
+            "Roon playback is not reachable through the generic library registry; \
+             hifi_play/hifi_play_ref call RoonAdapter directly for the same reason as search"
         ))
     }
 
+    /// `operation` is one of `multiroom_status`, `multiroom_set_members`,
+    /// `multiroom_ungroup`, `collections_browse` or `collections_playlists`
+    /// (never `collections_favorites` -- Roon's favorites capability is not
+    /// wired, see `crate::mcp::capabilities`). The collections response is
+    /// this adapter's own shape, not `hifi_collections`' wire shape:
+    /// `{session_key, items: [{title, subtitle, item_key, navigable}],
+    /// next_offset}`. `crate::mcp::tools::collections::handle_roon` mints
+    /// the opaque ref (a path for `navigable`, a playable ref otherwise)
+    /// pairing `item_key` with `session_key` -- this method's job ends at
+    /// handing back an already session-scoped, already grouping-filtered
+    /// page, not at deciding what a client may address.
     async fn content(&self, operation: &str, params: &Value) -> Result<Value> {
         match operation {
             "multiroom_status" => self.multiroom_status().await,
@@ -2576,6 +2722,46 @@ impl LibraryAdapter for RoonAdapter {
                     .map(ToOwned::to_owned)
                     .collect::<Vec<_>>();
                 self.ungroup_members(&members).await
+            }
+            "collections_browse" | "collections_playlists" => {
+                let zone_id = params
+                    .get("zone_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("zone_id is required"))?;
+                let limit = params
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(20)
+                    .clamp(1, 50) as usize;
+                let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let (session_key, items, total) = if operation == "collections_browse" {
+                    let item_key = params.get("item_key").and_then(Value::as_str);
+                    let session_key = params.get("session_key").and_then(Value::as_str);
+                    self.browse_collection(zone_id, item_key, session_key, offset, limit)
+                        .await?
+                } else {
+                    self.browse_named_root_node(zone_id, "Playlists", offset, limit)
+                        .await?
+                };
+                let mapped: Vec<Value> = items
+                    .into_iter()
+                    .filter(|item| !is_ungrounded_grouping(item))
+                    .map(|item| {
+                        let navigable = matches!(item.hint, Some(ItemHint::List));
+                        serde_json::json!({
+                            "title": item.title,
+                            "subtitle": item.subtitle,
+                            "item_key": item.item_key,
+                            "navigable": navigable,
+                        })
+                    })
+                    .collect();
+                let next_offset = (total > offset + limit).then_some((offset + limit) as u64);
+                Ok(serde_json::json!({
+                    "session_key": session_key,
+                    "items": mapped,
+                    "next_offset": next_offset,
+                }))
             }
             _ => Err(anyhow::anyhow!(
                 "Roon content operation `{operation}` is not supported"

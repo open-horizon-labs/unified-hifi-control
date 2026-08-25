@@ -160,6 +160,22 @@ fn loop_entity_id(row: &Value, entity: &str) -> Option<i64> {
     lms_i64(row.get(format!("{}_id", entity)).or_else(|| row.get("id"))).filter(|id| *id > 0)
 }
 
+/// The next page's offset for a `hifi_collections` page, or `None` at the
+/// end.
+///
+/// LMS's own `count` field is the total across the whole query (not just
+/// this page), so it is the source of truth when present. A response
+/// missing it (the mock's catch-all shape, or an unmodeled LMS reply) falls
+/// back to "this page was full" as the continue signal -- the same
+/// length-based heuristic Music Assistant's `collections_content` uses for
+/// its `library_items` paging.
+fn next_offset(raw: &Value, offset: usize, limit: usize, page_len: usize) -> Option<u64> {
+    match raw.get("count").and_then(Value::as_u64) {
+        Some(total) => (total > (offset + limit) as u64).then_some((offset + limit) as u64),
+        None => (page_len == limit).then_some((offset + limit) as u64),
+    }
+}
+
 /// What LMS actually does when a request fails, spelled out once.
 ///
 /// `Slim::Web::JSONRPC::requestMethod` calls `closeHTTPSocket()` on any
@@ -2020,6 +2036,287 @@ impl LmsAdapter {
         Ok(results)
     }
 
+    // =========================================================================
+    // hifi_collections (#531): provider-neutral browse/playlists/favorites
+    // =========================================================================
+
+    /// Dispatch one `hifi_collections` operation to the matching taggedlist
+    /// query. `params.path` is a plain server-side collection path (never a
+    /// client-visible token -- `hifi_collections` mints/resolves the opaque
+    /// ref around it); `None`/`"root"` means the collection root.
+    ///
+    /// The wire shape returned here is LMS-specific, not the provider-neutral
+    /// `{title, subtitle, path}` shape `hifi_collections` sends to the client:
+    /// a navigable row carries `path` (a collection path for another
+    /// `collections_browse` call); a playable leaf carries `kind`+`id` (an
+    /// [`LmsPlayTarget::Library`]) or `url` (an [`LmsPlayTarget::Url`]) for
+    /// `crate::mcp::tools::collections` to mint a ref over -- mirroring the
+    /// split `LmsPlayTarget` already makes for `hifi_search`.
+    pub async fn collections_content(&self, operation: &str, params: &Value) -> Result<Value> {
+        let limit = params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 50) as usize;
+        let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+        match operation {
+            "collections_browse" => {
+                let path = params
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("root");
+                self.browse_collections(path, offset, limit).await
+            }
+            "collections_playlists" => self.list_playlists(offset, limit).await,
+            "collections_favorites" => self.list_favorites(offset, limit).await,
+            _ => Err(anyhow!("unsupported LMS collection operation {operation}")),
+        }
+    }
+
+    /// Walk one level of the LMS collection hierarchy: the synthetic root
+    /// (Albums/Artists/Playlists), an album's or artist's contents, or a
+    /// playlist's tracks. Every navigable path is a plain string this adapter
+    /// invented (`"albums"`, `"album:<id>"`, ...) -- never a raw LMS id handed
+    /// back to a client uninterpreted.
+    async fn browse_collections(&self, path: &str, offset: usize, limit: usize) -> Result<Value> {
+        if path == "root" {
+            // The root menu is invented by this adapter, not read from LMS --
+            // but a caller with no LMS host configured (or one that is
+            // unreachable) must still get that failure here rather than a
+            // synthetic success that never touched the server. `serverstatus`
+            // with a zero-item request is the cheapest real round trip.
+            self.rpc
+                .execute(None, vec![json!("serverstatus"), json!(0), json!(0)])
+                .await?;
+            let categories = [("Albums", "albums"), ("Artists", "artists"), ("Playlists", "playlists")];
+            let items: Vec<Value> = categories
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .map(|(title, path)| json!({"title": title, "path": path}))
+                .collect();
+            let next_offset =
+                (categories.len() > offset + limit).then_some((offset + limit) as u64);
+            return Ok(json!({"items": items, "next_offset": next_offset}));
+        }
+        if path == "albums" {
+            return self.query_albums(offset, limit, None).await;
+        }
+        if path == "artists" {
+            return self.query_artists(offset, limit).await;
+        }
+        if path == "playlists" {
+            return self.list_playlists(offset, limit).await;
+        }
+        if let Some(id) = path.strip_prefix("album:").and_then(|s| s.parse::<i64>().ok()) {
+            return self.query_tracks(offset, limit, "album_id", id).await;
+        }
+        if let Some(id) = path.strip_prefix("artist:").and_then(|s| s.parse::<i64>().ok()) {
+            return self.query_albums(offset, limit, Some(id)).await;
+        }
+        if let Some(id) = path.strip_prefix("playlist:").and_then(|s| s.parse::<i64>().ok()) {
+            return self.query_playlist_tracks(offset, limit, id).await;
+        }
+        Err(anyhow!("unknown LMS collection path {path:?}"))
+    }
+
+    /// `albums <start> <count> [artist_id:<id>]` -- the whole album library,
+    /// or one artist's albums when `artist_id` is given.
+    async fn query_albums(
+        &self,
+        offset: usize,
+        limit: usize,
+        artist_id: Option<i64>,
+    ) -> Result<Value> {
+        let mut params = vec![json!("albums"), json!(offset), json!(limit)];
+        if let Some(id) = artist_id {
+            params.push(json!(format!("artist_id:{id}")));
+        }
+        let raw = self.rpc.execute(None, params).await?;
+        let items: Vec<Value> = raw
+            .get("albums_loop")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|row| {
+                let id = loop_entity_id(row, "album")?;
+                let title = row.get("album").and_then(Value::as_str)?.to_string();
+                let artist = row.get("artist").and_then(Value::as_str).map(String::from);
+                Some(json!({
+                    "title": title,
+                    "subtitle": artist.map(|a| format!("Album by {a}")),
+                    "path": format!("album:{id}"),
+                }))
+            })
+            .collect();
+        let next_offset = next_offset(&raw, offset, limit, items.len());
+        Ok(json!({"items": items, "next_offset": next_offset}))
+    }
+
+    /// `artists <start> <count>` -- the whole artist library.
+    async fn query_artists(&self, offset: usize, limit: usize) -> Result<Value> {
+        let raw = self
+            .rpc
+            .execute(None, vec![json!("artists"), json!(offset), json!(limit)])
+            .await?;
+        let items: Vec<Value> = raw
+            .get("artists_loop")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|row| {
+                let id = loop_entity_id(row, "artist")?;
+                let title = row.get("artist").and_then(Value::as_str)?.to_string();
+                Some(json!({"title": title, "path": format!("artist:{id}")}))
+            })
+            .collect();
+        let next_offset = next_offset(&raw, offset, limit, items.len());
+        Ok(json!({"items": items, "next_offset": next_offset}))
+    }
+
+    /// `titles <start> <count> <filter_key>:<id>` -- tracks under one album
+    /// (or, in principle, another filterable field; only album is used today).
+    async fn query_tracks(
+        &self,
+        offset: usize,
+        limit: usize,
+        filter_key: &str,
+        filter_id: i64,
+    ) -> Result<Value> {
+        let raw = self
+            .rpc
+            .execute(
+                None,
+                vec![
+                    json!("titles"),
+                    json!(offset),
+                    json!(limit),
+                    json!(format!("{filter_key}:{filter_id}")),
+                ],
+            )
+            .await?;
+        let items: Vec<Value> = raw
+            .get("titles_loop")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|row| {
+                let id = loop_entity_id(row, "track")?;
+                let title = row.get("title").and_then(Value::as_str)?.to_string();
+                let artist = row.get("artist").and_then(Value::as_str).map(String::from);
+                Some(json!({
+                    "title": title,
+                    "subtitle": artist,
+                    "kind": "track",
+                    "id": id,
+                }))
+            })
+            .collect();
+        let next_offset = next_offset(&raw, offset, limit, items.len());
+        Ok(json!({"items": items, "next_offset": next_offset}))
+    }
+
+    /// `playlists <start> <count>` -- every saved playlist. Both
+    /// `collections_playlists` and browsing into the synthetic `"playlists"`
+    /// node use this, since LMS has exactly one playlist listing.
+    async fn list_playlists(&self, offset: usize, limit: usize) -> Result<Value> {
+        let raw = self
+            .rpc
+            .execute(None, vec![json!("playlists"), json!(offset), json!(limit)])
+            .await?;
+        let items: Vec<Value> = raw
+            .get("playlists_loop")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|row| {
+                let id = loop_entity_id(row, "playlist")?;
+                let title = row.get("playlist").and_then(Value::as_str)?.to_string();
+                Some(json!({"title": title, "path": format!("playlist:{id}")}))
+            })
+            .collect();
+        let next_offset = next_offset(&raw, offset, limit, items.len());
+        Ok(json!({"items": items, "next_offset": next_offset}))
+    }
+
+    /// `playlists tracks <start> <count> playlist_id:<id>` -- one playlist's
+    /// contents.
+    async fn query_playlist_tracks(
+        &self,
+        offset: usize,
+        limit: usize,
+        playlist_id: i64,
+    ) -> Result<Value> {
+        let raw = self
+            .rpc
+            .execute(
+                None,
+                vec![
+                    json!("playlists"),
+                    json!("tracks"),
+                    json!(offset),
+                    json!(limit),
+                    json!(format!("playlist_id:{playlist_id}")),
+                ],
+            )
+            .await?;
+        let items: Vec<Value> = raw
+            .get("playlisttracks_loop")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|row| {
+                let id = loop_entity_id(row, "track")?;
+                let title = row
+                    .get("title")
+                    .or_else(|| row.get("track"))
+                    .and_then(Value::as_str)?
+                    .to_string();
+                let artist = row.get("artist").and_then(Value::as_str).map(String::from);
+                Some(json!({
+                    "title": title,
+                    "subtitle": artist,
+                    "kind": "track",
+                    "id": id,
+                }))
+            })
+            .collect();
+        let next_offset = next_offset(&raw, offset, limit, items.len());
+        Ok(json!({"items": items, "next_offset": next_offset}))
+    }
+
+    /// `favorites items <start> <count>` -- the flat favourites list. LMS
+    /// favorites carry no durable entity id, only a `url` (verified live,
+    /// #403's gap-table note); a folder-shaped favorite (`hasitems`) is
+    /// listed but not itself browsable in this slice -- narrower than a full
+    /// walk, called out in #531's PR body rather than silently dropped.
+    async fn list_favorites(&self, offset: usize, limit: usize) -> Result<Value> {
+        let raw = self
+            .rpc
+            .execute(
+                None,
+                vec![json!("favorites"), json!("items"), json!(offset), json!(limit)],
+            )
+            .await?;
+        let items: Vec<Value> = raw
+            .get("loop_loop")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|row| {
+                let title = row
+                    .get("name")
+                    .or_else(|| row.get("title"))
+                    .and_then(Value::as_str)?
+                    .to_string();
+                let url = row.get("url").and_then(Value::as_str)?.to_string();
+                Some(json!({"title": title, "url": url}))
+            })
+            .collect();
+        let next_offset = next_offset(&raw, offset, limit, items.len());
+        Ok(json!({"items": items, "next_offset": next_offset}))
+    }
+
     /// Search and play the first matching result
     ///
     /// Searches using globalsearch (includes streaming services), finds the first
@@ -2278,6 +2575,37 @@ impl LmsAdapter {
             );
         }
         Ok(())
+    }
+}
+
+/// #531: routes `hifi_collections` through `AdapterRegistry::library_content`
+/// rather than a new direct `state.lms` field access from `src/mcp/tools/`
+/// (the architecture boundary #436 is closing -- see
+/// `tests/adapter_boundary_lint.rs`). `search`/`play_uri` are not
+/// meaningfully implementable through this trait's flat-URI contract --
+/// LMS's playable targets are typed (`LmsPlayTarget::{Library,Url,
+/// GlobalSearchItem}`), which is exactly why `hifi_search`/`hifi_play`
+/// already call `LmsAdapter` directly (pre-existing debt, unaffected by this
+/// registration) rather than through this trait. Only `content` is real.
+#[async_trait]
+impl LibraryAdapter for LmsAdapter {
+    async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<LibrarySearchResult>> {
+        Err(anyhow!(
+            "LMS search is not reachable through the generic library registry; \
+             hifi_search calls LmsAdapter directly because LMS's playable targets are typed, \
+             not a flat URI"
+        ))
+    }
+
+    async fn play_uri(&self, _zone_id: &str, _uri: &str) -> Result<String> {
+        Err(anyhow!(
+            "LMS playback is not reachable through the generic library registry; \
+             hifi_play/hifi_play_ref call LmsAdapter directly for the same reason as search"
+        ))
+    }
+
+    async fn content(&self, operation: &str, params: &Value) -> Result<Value> {
+        self.collections_content(operation, params).await
     }
 }
 

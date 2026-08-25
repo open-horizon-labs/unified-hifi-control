@@ -104,6 +104,11 @@ pub struct ZoneInfo {
     pub volume_control: Option<VolumeControl>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dsp: Option<DspInfo>,
+    /// Whether `hifi_collections`/`/api/collections` implements this zone's
+    /// provider at all (#531). The web UI's `CollectionsBrowser` panel gates
+    /// on this instead of a hardcoded `musicassistant:` prefix check, so LMS
+    /// and Roon zones light up as their slices land, without a web change.
+    pub browse_supported: bool,
 }
 
 /// GET /knob/zones response
@@ -175,6 +180,9 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
         })
         .map(|z| ZoneInfo {
             dsp: get_dsp(&z.zone_id),
+            browse_supported: crate::mcp::tools::collections::zone_supports_hifi_collections(
+                &z.zone_id,
+            ),
             zone_id: z.zone_id,
             zone_name: z.zone_name,
             source: z.source,
@@ -1580,6 +1588,7 @@ mod tests {
             state: "stopped".to_string(),
             volume_control: None,
             dsp: None,
+            browse_supported: false,
         }
     }
 

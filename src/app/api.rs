@@ -208,6 +208,12 @@ pub struct Zone {
     #[serde(default)]
     pub state: Option<String>,
     pub dsp: Option<ZoneDsp>,
+    /// Whether `/api/collections` implements this zone's provider (#531).
+    /// `default`s to `false` so an older cached response (or a field this
+    /// build predates) hides the browse panel rather than showing one that
+    /// will refuse every call.
+    #[serde(default)]
+    pub browse_supported: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
