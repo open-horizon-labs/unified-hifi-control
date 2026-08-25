@@ -376,6 +376,18 @@ class UnifiedHifiControlMediaPlayer(
             item_title = item.get("title") or "Untitled"
             item_path = item.get("path")
             item_ref = item.get("ref")
+            # #549: an item's `image` is a same-origin proxy path
+            # (`/api/collections/image?ref=...`), never a raw provider URL
+            # or id -- resolve it against this server the same way
+            # `UnifiedHifiControlApiClient.image_url` already does for
+            # now-playing artwork. Absent when the provider has no art for
+            # this row (PR #537's "no artwork" deviation, closed by #549).
+            item_image = item.get("image")
+            thumbnail = (
+                self.coordinator.client.resolve_url(item_image)
+                if item_image
+                else None
+            )
             if item_path:
                 children.append(
                     BrowseMedia(
@@ -385,6 +397,7 @@ class UnifiedHifiControlMediaPlayer(
                         title=item_title,
                         can_play=False,
                         can_expand=True,
+                        thumbnail=thumbnail,
                     )
                 )
             elif item_ref:
@@ -396,6 +409,7 @@ class UnifiedHifiControlMediaPlayer(
                         title=item_title,
                         can_play=True,
                         can_expand=False,
+                        thumbnail=thumbnail,
                     )
                 )
             # A row with neither path nor ref (e.g. #396's known LMS

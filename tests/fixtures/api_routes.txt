@@ -19,6 +19,7 @@ GET /admin
 GET /api/bridges/applemusic/commands
 GET /api/bridges/applemusic/content
 GET /api/bridges/applemusic/status
+GET /api/collections/image
 GET /api/controller/status
 GET /api/mqtt/status
 GET /api/providers/musicassistant/status

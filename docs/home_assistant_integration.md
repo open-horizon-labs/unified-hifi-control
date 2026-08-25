@@ -116,11 +116,15 @@ subdirectory. Rationale:
     forwards it to `/api/play_ref`; an `enqueue` value HA passes maps to
     `hifi_play_ref`'s `queue`/`next`/`play` actions where a distinct verb
     exists, and to `queue` otherwise (UHC has no separate "replace the
-    queue" verb). **Artwork caveat**: `hifi_collections` items carry no
-    per-item artwork field today (only now-playing state does, via
-    `/knob/now_playing/image`), so browsed folders and tracks render
-    without thumbnails — `BrowseMedia.thumbnail` is left unset rather
-    than guessing at one.
+    queue" verb). **Artwork** (#549): an item that has provider art
+    carries an `image` field, a same-origin
+    `/api/collections/image?ref=...` path over an opaque token UHC mints
+    server-side — never a raw provider image key/URL. `async_browse_media`
+    resolves it against the server (`UnifiedHifiControlApiClient
+    .resolve_url`, the same pattern `image_url` already uses for
+    now-playing artwork) and sets it as `BrowseMedia.thumbnail`; a row
+    with no provider art simply carries no `image` field, and
+    `thumbnail` is left unset rather than guessing at one.
 - **Mute caveat**: UHC's `/knob/now_playing` response does not include
   mute state, and not every provider has confirmed `mute`/`unmute`
   wiring through `/knob/control` end-to-end (only HQPlayer's handler was
@@ -199,10 +203,6 @@ becomes active once this lands on `v3`.
   plain-REST equivalent for grouping (mirroring `src/api/browse.rs`'s
   pattern) would let this integration drop its one remaining MCP
   JSON-RPC call.
-- `hifi_collections` items carry no per-item artwork, so browsed
-  folders/tracks show no thumbnail in the HA browse UI (see the
-  Architecture section's browsing note). Adding artwork to the
-  provider-neutral collections contract is tracked separately.
 - Queue management (`hifi_queue`: read/reorder/remove/transfer) is not
   exposed through this integration yet — only browse-and-play. A future
   version could surface it via `async_get_media_source`/a

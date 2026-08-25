@@ -84,6 +84,31 @@ struct CollectionItem {
     path: Option<String>,
     #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
     r#ref: Option<String>,
+    /// Artwork URL (#549), present only when the provider has art for this
+    /// row. Always a same-origin `/api/collections/image?ref=...` path over
+    /// an opaque token minted by `state.image_refs` -- never a provider
+    /// image key or a raw remote URL, following the same opaque-ref
+    /// discipline as `path`/`ref` above. Absent (not `null`-valued) when the
+    /// provider has no art for this row, so a client can tell "no artwork"
+    /// from "artwork omitted" the same way `subtitle` already does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
+}
+
+/// Mint an image ref for a browse row and return the path a client resolves
+/// it through, or `None` if this row's adapter response carried no image
+/// key at all. Shared by all three provider handlers below so the URL shape
+/// (`/api/collections/image?ref=...`) is defined in exactly one place.
+async fn mint_image(state: &AppState, zone_id: &str, image_key: Option<&str>) -> Option<String> {
+    let image_key = image_key?;
+    let token = state
+        .image_refs
+        .mint(crate::mcp::refs::ImageRef {
+            zone_id: zone_id.to_string(),
+            image_key: image_key.to_string(),
+        })
+        .await;
+    Some(format!("/api/collections/image?ref={token}"))
 }
 
 #[derive(Debug, Serialize)]
@@ -285,11 +310,18 @@ async fn handle_music_assistant(
             ),
             None => None,
         };
+        let image = mint_image(
+            state,
+            &args.zone_id,
+            item.get("image_key").and_then(Value::as_str),
+        )
+        .await;
         items.push(CollectionItem {
             title,
             subtitle,
             path,
             r#ref,
+            image,
         });
     }
     Ok(env.json_result(&CollectionPage { items, next_offset }))
@@ -403,11 +435,18 @@ async fn handle_lms(
             ),
             _ => None,
         };
+        let image = mint_image(
+            state,
+            &args.zone_id,
+            item.get("image_key").and_then(Value::as_str),
+        )
+        .await;
         items.push(CollectionItem {
             title,
             subtitle,
             path,
             r#ref,
+            image,
         });
     }
     Ok(env.json_result(&CollectionPage { items, next_offset }))
@@ -547,11 +586,18 @@ async fn handle_roon(
                 (path, r#ref)
             }
         };
+        let image = mint_image(
+            state,
+            &args.zone_id,
+            item.get("image_key").and_then(Value::as_str),
+        )
+        .await;
         items.push(CollectionItem {
             title,
             subtitle,
             path,
             r#ref,
+            image,
         });
     }
     let next_offset = response

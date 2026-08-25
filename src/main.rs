@@ -818,6 +818,10 @@ mod server {
             // verb vocabulary as the hifi_collections/hifi_queue/hifi_play_ref
             // MCP tools -- see src/api/browse.rs.
             .route("/api/collections", post(api::browse::collections_handler))
+            // Per-item artwork for hifi_collections rows (#549); mirrors
+            // /roon/image and /now_playing/image but resolves an opaque ref
+            // minted by hifi_collections instead of a live zone's own state.
+            .route("/api/collections/image", get(api::collections_image_handler))
             .route("/api/queue", post(api::browse::queue_handler))
             .route("/api/play_ref", post(api::browse::play_ref_handler))
             // Kept on one line each: the API-contract extractor (tests/api_contract.rs) only sees

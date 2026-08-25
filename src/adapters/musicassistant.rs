@@ -1558,6 +1558,15 @@ impl MusicAssistantAdapter {
             if let Some(path) = item.get("path").and_then(Value::as_str) {
                 mapped.insert("path".to_string(), Value::String(path.to_string()));
             }
+            // #549: same field set `parse_now_playing` already reads MA
+            // artwork from (`image_url`/`artwork_url`/`image`) -- MA hands
+            // out an absolute URL directly rather than a separate opaque
+            // provider id, resolved through `AppState::get_image`'s
+            // musicassistant branch once `hifi_collections` mints a ref
+            // over it.
+            if let Some(image_key) = value_string(item, &["image_url", "artwork_url", "image"]) {
+                mapped.insert("image_key".to_string(), Value::String(image_key));
+            }
             items.push(Value::Object(mapped));
         }
         let next_offset = if operation == "collections_browse" {

@@ -101,6 +101,10 @@ pub struct MockTrack {
 pub struct MockFavorite {
     pub name: String,
     pub url: String,
+    /// #549: the `icon` field real LMS hands back for favorites that have
+    /// one, unrelated to the `tags:cJ` coverid/artwork_track_id path
+    /// albums/titles/playlist-tracks use.
+    pub icon: Option<String>,
 }
 
 /// Mock LMS server state
@@ -134,6 +138,12 @@ struct MockLmsState {
     playlist_tracks: HashMap<i64, Vec<MockTrack>>,
     /// The flat favourites list for `favorites items <start> <count>` (#531).
     favorites: Vec<MockFavorite>,
+    /// `entity_id` -> coverid, for #549's `hifi_collections` artwork slice.
+    /// One map shared across albums and tracks: real LMS ids don't collide
+    /// across kinds either, and the fixtures this mock serves keep them
+    /// distinct by construction (see `set_library_albums`/`set_album_tracks`
+    /// call sites).
+    artwork: HashMap<i64, String>,
 }
 
 /// Mock LMS Server
@@ -154,6 +164,7 @@ impl MockLmsServer {
             album_tracks: HashMap::new(),
             playlist_tracks: HashMap::new(),
             favorites: Vec::new(),
+            artwork: HashMap::new(),
         }));
 
         let app = Router::new()
@@ -327,9 +338,35 @@ impl MockLmsServer {
             .map(|(name, url)| MockFavorite {
                 name: name.to_string(),
                 url: url.to_string(),
+                icon: None,
             })
             .collect();
         self.state.write().await.favorites = items;
+    }
+
+    /// Seed a coverid for one album or track id (#549), so
+    /// `hifi_collections`' albums/titles/playlist-tracks rows carry an
+    /// `image_key` the way a real LMS response with `tags:cJ` would. Not
+    /// seeding an id at all is the "no artwork" case -- covered by every
+    /// other `set_library_*`/`set_*_tracks` call in these tests that never
+    /// calls this.
+    pub async fn set_artwork(&self, entity_id: i64, coverid: &str) {
+        self.state
+            .write()
+            .await
+            .artwork
+            .insert(entity_id, coverid.to_string());
+    }
+
+    /// Seed one favourite with an `icon`, real LMS's own artwork field for
+    /// `favorites items` (#549) -- distinct from [`Self::set_favorites`],
+    /// which leaves every favourite's `icon` absent.
+    pub async fn set_favorite_with_icon(&self, name: &str, url: &str, icon: &str) {
+        self.state.write().await.favorites.push(MockFavorite {
+            name: name.to_string(),
+            url: url.to_string(),
+            icon: Some(icon.to_string()),
+        });
     }
 
     /// Commands received for `player_id`, excluding the read-only polling
@@ -776,9 +813,16 @@ async fn handle_jsonrpc(
                 .iter()
                 .skip(offset)
                 .take(count)
-                .map(
-                    |item| json!({"album_id": item.id, "album": item.title, "artist": item.artist}),
-                )
+                .map(|item| {
+                    json!({
+                        "album_id": item.id,
+                        "album": item.title,
+                        "artist": item.artist,
+                        // #549: mirrors real LMS's `tags:cJ` coverid field,
+                        // present only for ids seeded via `set_artwork`.
+                        "coverid": state.artwork.get(&item.id),
+                    })
+                })
                 .collect();
             json!({ "count": all.len(), "albums_loop": page })
         }
@@ -808,7 +852,14 @@ async fn handle_jsonrpc(
                 .iter()
                 .skip(offset)
                 .take(count)
-                .map(|t| json!({"track_id": t.id, "title": t.title, "artist": t.artist}))
+                .map(|t| {
+                    json!({
+                        "track_id": t.id,
+                        "title": t.title,
+                        "artist": t.artist,
+                        "coverid": state.artwork.get(&t.id),
+                    })
+                })
                 .collect();
             json!({ "count": tracks.len(), "titles_loop": page })
         }
@@ -827,7 +878,14 @@ async fn handle_jsonrpc(
                 .iter()
                 .skip(offset)
                 .take(count)
-                .map(|t| json!({"id": t.id, "title": t.title, "artist": t.artist}))
+                .map(|t| {
+                    json!({
+                        "id": t.id,
+                        "title": t.title,
+                        "artist": t.artist,
+                        "coverid": state.artwork.get(&t.id),
+                    })
+                })
                 .collect();
             json!({ "count": tracks.len(), "playlisttracks_loop": page })
         }
@@ -855,7 +913,7 @@ async fn handle_jsonrpc(
                 .iter()
                 .skip(offset)
                 .take(count)
-                .map(|f| json!({"name": f.name, "url": f.url}))
+                .map(|f| json!({"name": f.name, "url": f.url, "icon": f.icon}))
                 .collect();
             json!({ "count": state.favorites.len(), "loop_loop": page })
         }
