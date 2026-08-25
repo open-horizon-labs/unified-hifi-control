@@ -37,6 +37,7 @@ use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 pub mod apple_bridge;
+pub mod browse;
 pub mod controller_auth;
 pub mod credentials;
 pub mod provider_auth;

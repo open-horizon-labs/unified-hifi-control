@@ -553,6 +553,26 @@ impl MusicAssistantAdapter {
             .ok_or_else(|| anyhow!("Music Assistant active queue had no queue_id"))
     }
 
+    /// Move `zone_id`'s active queue onto `target_zone_id`'s queue, via MA's
+    /// `player_queues/transfer` (#507). Both queue ids are read fresh
+    /// immediately before the call, matching the stale-item guard the other
+    /// queue mutations use, and the readback afterward is the target's --
+    /// that is where the transferred queue now lives.
+    async fn queue_transfer(&self, zone_id: &str, target_zone_id: &str) -> Result<Value> {
+        let source_queue_id = self.queue_id_for_zone(zone_id).await?;
+        let target_queue_id = self.queue_id_for_zone(target_zone_id).await?;
+        let _: Value = self
+            .command(
+                "player_queues/transfer",
+                Some(json!({
+                    "source_queue_id": source_queue_id,
+                    "target_queue_id": target_queue_id,
+                })),
+            )
+            .await?;
+        self.read_active_queue(target_zone_id).await
+    }
+
     async fn search_catalog(&self, query: &str, limit: usize) -> Result<Vec<LibrarySearchResult>> {
         let response: Value = self
             .command(
@@ -1131,6 +1151,21 @@ impl LibraryAdapter for MusicAssistantAdapter {
     async fn content(&self, operation: &str, params: &Value) -> Result<Value> {
         if operation.starts_with("collections_") {
             return self.collections_content(operation, params).await;
+        }
+        if operation == "queue_transfer" {
+            let zone_id = params
+                .get("zone_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("Music Assistant queue transfer requires zone_id"))?;
+            let target_zone_id = params
+                .get("target_zone_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    anyhow!("Music Assistant queue transfer requires target_zone_id")
+                })?;
+            return self.queue_transfer(zone_id, target_zone_id).await;
         }
         match operation {
             "multiroom_status" => return self.multiroom_status().await,
@@ -2084,6 +2119,52 @@ mod tests {
             expected["queue_id"] = json!("group-living-room");
             assert_eq!(mutation.body["args"], expected);
         }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn queue_transfer_moves_the_active_queue_and_returns_the_targets_readback() {
+        let (config, state, server) = mock_musicassistant_server().await;
+        let adapter =
+            MusicAssistantAdapter::new(crate::bus::create_bus(), config).expect("adapter");
+        let result = adapter
+            .content(
+                "queue_transfer",
+                &json!({
+                    "zone_id": "musicassistant:sonos-kitchen",
+                    "target_zone_id": "musicassistant:sonos-office",
+                }),
+            )
+            .await
+            .expect("transfer");
+        // The readback is the target's fresh active queue.
+        assert_eq!(result["queue"]["queue_id"], "group-living-room");
+
+        let requests = state.requests.lock().expect("requests").clone();
+        let transfer = requests
+            .iter()
+            .find(|request| request.body["command"] == "player_queues/transfer")
+            .expect("transfer command sent");
+        assert_eq!(
+            transfer.body["args"],
+            json!({"source_queue_id": "group-living-room", "target_queue_id": "group-living-room"})
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn queue_transfer_requires_both_zone_ids() {
+        let (config, _state, server) = mock_musicassistant_server().await;
+        let adapter =
+            MusicAssistantAdapter::new(crate::bus::create_bus(), config).expect("adapter");
+        let error = adapter
+            .content(
+                "queue_transfer",
+                &json!({"zone_id": "musicassistant:sonos-kitchen"}),
+            )
+            .await
+            .expect_err("missing target_zone_id");
+        assert!(error.to_string().contains("target_zone_id"));
         server.abort();
     }
 

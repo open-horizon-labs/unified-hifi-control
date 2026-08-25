@@ -3,7 +3,9 @@
 //! Shows all available zones using Dioxus resources.
 
 use crate::app::api::{HqpMatrixProfilesResponse, HqpProfile, NowPlaying, Zone, ZonesResponse};
-use crate::app::components::{ErrorAlert, HqpControlsCompact, Layout, VolumeControlsCompact};
+use crate::app::components::{
+    CollectionsBrowser, ErrorAlert, HqpControlsCompact, Layout, VolumeControlsCompact,
+};
 use crate::app::sse::{use_sse, SseEvent};
 use dioxus::prelude::*;
 use std::collections::HashMap;
@@ -254,6 +256,15 @@ pub fn Zones() -> Element {
     let profiles = hqp_profiles();
     let matrix = hqp_matrix();
 
+    // Music Assistant zones support library browse and queue transfer
+    // (#507); every other adapter hides the panel entirely rather than
+    // showing a browse surface that immediately refuses every call.
+    let musicassistant_zones: Vec<(String, String)> = zones_list
+        .iter()
+        .filter(|z| z.zone_id.starts_with("musicassistant:"))
+        .map(|z| (z.zone_id.clone(), z.zone_name.clone()))
+        .collect();
+
     // Group zones by source protocol
     let grouped_zones: Vec<(String, Vec<Zone>)> = {
         let mut groups: std::collections::HashMap<String, Vec<Zone>> =
@@ -305,6 +316,7 @@ pub fn Zones() -> Element {
                                 on_control: control,
                                 on_load_profile: load_profile,
                                 on_set_matrix: set_matrix,
+                                musicassistant_zones: musicassistant_zones.clone(),
                             }
                         }
                     }
@@ -345,6 +357,10 @@ fn ZoneCard(
     on_control: EventHandler<(String, String)>,
     on_load_profile: EventHandler<String>,
     on_set_matrix: EventHandler<String>,
+    /// Every Music Assistant zone, `(zone_id, zone_name)`, for the browse
+    /// panel's queue-transfer target list (#507). Empty when there are none.
+    #[props(default)]
+    musicassistant_zones: Vec<(String, String)>,
 ) -> Element {
     let zone_id = zone.zone_id.clone();
     let zone_id_prev = zone_id.clone();
@@ -494,6 +510,20 @@ fn ZoneCard(
                     volume_step: volume_step,
                     on_vol_down: move |_| on_control.call((zone_id_vol_down.clone(), "vol_down".to_string())),
                     on_vol_up: move |_| on_control.call((zone_id_vol_up.clone(), "vol_up".to_string())),
+                }
+            }
+
+            // Library browse + queue transfer (#507). Music Assistant only
+            // today; other adapters hide the panel rather than exposing a
+            // browse surface that would refuse every call.
+            if zone.zone_id.starts_with("musicassistant:") {
+                CollectionsBrowser {
+                    zone_id: zone.zone_id.clone(),
+                    transfer_targets: musicassistant_zones
+                        .iter()
+                        .filter(|(id, _)| *id != zone.zone_id)
+                        .cloned()
+                        .collect::<Vec<_>>(),
                 }
             }
         }

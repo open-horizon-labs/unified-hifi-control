@@ -800,6 +800,7 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
             ("action", true),
             ("item_id", false),
             ("position", false),
+            ("target_zone_id", false),
         ],
     ),
     (
@@ -1805,7 +1806,8 @@ async fn musicassistant_mcp_handler(
         | Some("player_queues/play_index")
         | Some("player_queues/move_item")
         | Some("player_queues/delete_item")
-        | Some("player_queues/clear") => json!({"ok": true}),
+        | Some("player_queues/clear")
+        | Some("player_queues/transfer") => json!({"ok": true}),
         Some("players/cmd/set_members") | Some("players/cmd/ungroup_many") => json!({"ok": true}),
         command => panic!("unexpected Music Assistant command: {command:?}"),
     };
@@ -2021,6 +2023,7 @@ async fn musicassistant_queue_mutations_use_documented_wire_commands() {
         json!({"zone_id": zone_id, "action": "reorder", "item_id": "q2", "position": 0}),
         json!({"zone_id": zone_id, "action": "remove", "item_id": "q2"}),
         json!({"zone_id": zone_id, "action": "clear"}),
+        json!({"zone_id": zone_id, "action": "transfer", "target_zone_id": "musicassistant:group-child-2"}),
     ] {
         assert_eq!(
             app.call_tool("hifi_queue", args).await["structuredContent"]["outcome"],
@@ -2034,7 +2037,8 @@ async fn musicassistant_queue_mutations_use_documented_wire_commands() {
             "player_queues/play_index"
             | "player_queues/move_item"
             | "player_queues/delete_item"
-            | "player_queues/clear" => Some((
+            | "player_queues/clear"
+            | "player_queues/transfer" => Some((
                 request["command"].as_str().unwrap(),
                 request["args"].clone(),
             )),
@@ -2059,6 +2063,10 @@ async fn musicassistant_queue_mutations_use_documented_wire_commands() {
             (
                 "player_queues/clear",
                 json!({"queue_id":"living-room-group"})
+            ),
+            (
+                "player_queues/transfer",
+                json!({"source_queue_id":"living-room-group", "target_queue_id":"living-room-group"})
             ),
         ]
     );
@@ -4831,6 +4839,7 @@ const EXPECTED_CAPABILITIES: &[&str] = &[
     "queue_reorder",
     "queue_remove",
     "queue_clear",
+    "queue_transfer",
     "play_next",
     "repeat_mode",
     "shuffle_mode",
@@ -5227,6 +5236,14 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
                 "hifi_queue",
                 json!({ "zone_id": zone_id, "action": "clear" }),
             )),
+            "queue_transfer" => Some((
+                "hifi_queue",
+                json!({
+                    "zone_id": zone_id,
+                    "action": "transfer",
+                    "target_zone_id": format!("{provider}:xyz"),
+                }),
+            )),
             "repeat_mode" => Some((
                 "hifi_control",
                 json!({ "zone_id": zone_id, "action": "repeat_off" }),
@@ -5279,15 +5296,16 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
     }
     // The routed Spotify content and mode cells plus Music Assistant's queue
     // mutations, mode, collections, and zone-group cells add twenty-three probes to the
-    // original provider transport set.
+    // original provider transport set, plus one more for Music Assistant's
+    // queue_transfer (#507).
     // Apple Music's transport/skip/volume
     // cells remain gated until signed physical companion validation (#465).
     // Asserted exactly, not as a floor: a floor would pass while a cell silently
     // stopped being reported as supported, which is the direction that hides a
     // capability rather than inventing one.
     assert_eq!(
-        proved, 45,
-        "{proved} supported cells were proved end to end, expected 45. If a capability was deliberately wired or unwired, change this number in the same commit."
+        proved, 46,
+        "{proved} supported cells were proved end to end, expected 46. If a capability was deliberately wired or unwired, change this number in the same commit."
     );
 }
 

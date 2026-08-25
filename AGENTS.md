@@ -219,6 +219,7 @@ Two things this table does **not** claim:
 | `queue_reorder` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | 🚧 #462 | ✅ |
 | `queue_remove` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | 🚧 #462 | ✅ |
 | `queue_clear` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | 🚧 #462 | ✅ |
+| `queue_transfer` | ⛔ | 🚧 #400 | ⛔ | ⛔ | 🚧 #209 | 🚧 #462 | 🚧 #462 | ✅ |
 | `play_next` | 🚧 #399 | 🚧 #403 | 🚧 #392 | 🚧 #396 | 🚧 #209 | 🚧 #483 | 🚧 #462 | ✅ |
 | `repeat_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | ✅ | 🚧 #462 | ✅ | ✅ |
 | `shuffle_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | ✅ | 🚧 #462 | ✅ | ✅ |
@@ -288,6 +289,13 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - 🚧 **hqplayer / `queue_clear`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `queue_clear`** (#483) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
 - 🚧 **spotify / `queue_clear`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
+- ⛔ **roon / `queue_transfer`** — The Roon API's transport service exposes a queue subscription and play_from_here and no mutation at all -- no move, remove or clear. The pinned roon-api fork (ohc/main) exposes subscribe_queue and play_from_here and nothing further.
+- 🚧 **lms / `queue_transfer`** (#400) — sync <playerid> was verified live (#403) to merge a player into another's sync group by adopting the leader's queue, which destroys the source's queue rather than transferring it; the CLI reference names no dedicated queue-to-queue transfer command. A composite emulation -- read the source's playlist, replay it against the target with playlistcontrol, then playlist clear the source -- is buildable from primitives #400 already verified live, but is not wired.
+- ⛔ **openhome / `queue_transfer`** — OpenHome's Playlist:1 (Read/Insert/DeleteId/DeleteAll) is scoped to one room's renderer; the service set defines no action that moves one room's playlist into another's. Songcast (Sender:1/Receiver:1) relays audio to a group, it does not merge queue state. Verified from the OpenHome service definitions, not from a device.
+- ⛔ **upnp / `queue_transfer`** — AVTransport:1 holds a single current transport URI plus one SetNextAVTransportURI; it has no playlist to enumerate or mutate. Verified from the UPnP AV service definitions, not from a device.
+- 🚧 **hqplayer / `queue_transfer`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
+- 🚧 **applemusic / `queue_transfer`** (#462) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
+- 🚧 **spotify / `queue_transfer`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **roon / `play_next`** (#399) — Roon's browse item actions include Play Next alongside Play Now and Queue; UHC's PlayAction models only Play, Queue and Radio, so this arrives with browse rather than with the queue.
 - 🚧 **lms / `play_next`** (#403) — playlistcontrol cmd:insert places an item immediately after the current one, verified live -- and LmsPlayAction::Insert is already modelled in the adapter and simply unreachable from MCP.
 - 🚧 **openhome / `play_next`** (#392) — OpenHome's Playlist:1 service provides Read/ReadList/IdArray, Insert, DeleteId, DeleteAll, SeekId/SeekIndex and SetRepeat/SetShuffle. UHC discovers only Product/Transport/Volume and drives none of it, so this is a UHC gap. Verified from the OpenHome service definitions, not from a device.

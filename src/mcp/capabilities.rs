@@ -116,6 +116,8 @@ pub enum Capability {
     QueueRemove,
     /// Empty the queue.
     QueueClear,
+    /// Move an active queue from one zone to another (#507).
+    QueueTransfer,
     /// Insert immediately after the current item.
     PlayNext,
     /// Read and set repeat mode.
@@ -148,6 +150,7 @@ impl Capability {
         Self::QueueReorder,
         Self::QueueRemove,
         Self::QueueClear,
+        Self::QueueTransfer,
         Self::PlayNext,
         Self::RepeatMode,
         Self::ShuffleMode,
@@ -172,6 +175,7 @@ impl Capability {
             Self::QueueReorder => "queue_reorder",
             Self::QueueRemove => "queue_remove",
             Self::QueueClear => "queue_clear",
+            Self::QueueTransfer => "queue_transfer",
             Self::PlayNext => "play_next",
             Self::RepeatMode => "repeat_mode",
             Self::ShuffleMode => "shuffle_mode",
@@ -358,7 +362,8 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
         Capability::QueueJump
         | Capability::QueueReorder
         | Capability::QueueRemove
-        | Capability::QueueClear => target == ZoneTarget::MusicAssistant,
+        | Capability::QueueClear
+        | Capability::QueueTransfer => target == ZoneTarget::MusicAssistant,
         Capability::PlayNext => target == ZoneTarget::MusicAssistant,
         Capability::MultiroomSync => target == ZoneTarget::MusicAssistant,
         Capability::Browse | Capability::SavedPlaylists | Capability::Favorites => {
@@ -411,6 +416,14 @@ const ROON_QUEUE_IS_READ_PLUS_JUMP: &str = "The Roon API's transport service exp
     subscription and play_from_here and no mutation at all -- no move, remove or clear. The \
     pinned roon-api fork (ohc/main) exposes subscribe_queue and play_from_here and nothing \
     further.";
+
+/// OpenHome's per-room `Playlist:1` has no cross-room action, and Songcast
+/// relays audio rather than queue state.
+const OPENHOME_HAS_NO_QUEUE_TRANSFER: &str = "OpenHome's Playlist:1 (Read/Insert/DeleteId/\
+    DeleteAll) is scoped to one room's renderer; the service set defines no action that moves \
+    one room's playlist into another's. Songcast (Sender:1/Receiver:1) relays audio to a group, \
+    it does not merge queue state. Verified from the OpenHome service definitions, not from a \
+    device.";
 
 /// Playing a *named* item is a different question from *finding* one, and the ship
 /// gate's dissent caught this module conflating them.
@@ -472,6 +485,7 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     (ZoneTarget::Roon, Capability::QueueReorder, Gap::ProviderCannot(ROON_QUEUE_IS_READ_PLUS_JUMP)),
     (ZoneTarget::Roon, Capability::QueueRemove, Gap::ProviderCannot(ROON_QUEUE_IS_READ_PLUS_JUMP)),
     (ZoneTarget::Roon, Capability::QueueClear, Gap::ProviderCannot(ROON_QUEUE_IS_READ_PLUS_JUMP)),
+    (ZoneTarget::Roon, Capability::QueueTransfer, Gap::ProviderCannot(ROON_QUEUE_IS_READ_PLUS_JUMP)),
     (ZoneTarget::Roon, Capability::PlayNext, Gap::NotWired("#399",
         "Roon's browse item actions include Play Next alongside Play Now and Queue; UHC's \
          PlayAction models only Play, Queue and Radio, so this arrives with browse rather \
@@ -518,6 +532,13 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
         "playlist delete <index> removes one queued item; verified live.")),
     (ZoneTarget::Lms, Capability::QueueClear, Gap::NotWired("#400",
         "playlist clear empties the queue; verified live.")),
+    (ZoneTarget::Lms, Capability::QueueTransfer, Gap::NotWired("#400",
+        "sync <playerid> was verified live (#403) to merge a player into another's sync group by \
+         adopting the leader's queue, which destroys the source's queue rather than transferring \
+         it; the CLI reference names no dedicated queue-to-queue transfer command. A composite \
+         emulation -- read the source's playlist, replay it against the target with \
+         playlistcontrol, then playlist clear the source -- is buildable from primitives #400 \
+         already verified live, but is not wired.")),
     (ZoneTarget::Lms, Capability::PlayNext, Gap::NotWired("#403",
         "playlistcontrol cmd:insert places an item immediately after the current one, verified \
          live -- and LmsPlayAction::Insert is already modelled in the adapter and simply \
@@ -557,6 +578,7 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
          OpenHome service definitions, not from a device.")),
     (ZoneTarget::OpenHome, Capability::QueueRemove, Gap::NotWired("#392", OPENHOME_PLAYLIST_SERVICE_UNUSED)),
     (ZoneTarget::OpenHome, Capability::QueueClear, Gap::NotWired("#392", OPENHOME_PLAYLIST_SERVICE_UNUSED)),
+    (ZoneTarget::OpenHome, Capability::QueueTransfer, Gap::ProviderCannot(OPENHOME_HAS_NO_QUEUE_TRANSFER)),
     (ZoneTarget::OpenHome, Capability::PlayNext, Gap::NotWired("#392", OPENHOME_PLAYLIST_SERVICE_UNUSED)),
     (ZoneTarget::OpenHome, Capability::RepeatMode, Gap::NotWired("#392", OPENHOME_PLAYLIST_SERVICE_UNUSED)),
     (ZoneTarget::OpenHome, Capability::ShuffleMode, Gap::NotWired("#392", OPENHOME_PLAYLIST_SERVICE_UNUSED)),
@@ -592,6 +614,7 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     (ZoneTarget::Upnp, Capability::QueueReorder, Gap::ProviderCannot(UPNP_HAS_NO_QUEUE)),
     (ZoneTarget::Upnp, Capability::QueueRemove, Gap::ProviderCannot(UPNP_HAS_NO_QUEUE)),
     (ZoneTarget::Upnp, Capability::QueueClear, Gap::ProviderCannot(UPNP_HAS_NO_QUEUE)),
+    (ZoneTarget::Upnp, Capability::QueueTransfer, Gap::ProviderCannot(UPNP_HAS_NO_QUEUE)),
     (ZoneTarget::Upnp, Capability::PlayNext, Gap::NotWired("#396", PLAY_A_NAMED_URI_EXISTS)),
     (ZoneTarget::Upnp, Capability::RepeatMode, Gap::NotWired("#392",
         "AVTransport:1's SetPlayMode takes REPEAT_ONE and REPEAT_ALL, so repeat is a protocol \
@@ -633,6 +656,7 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     (ZoneTarget::HqPlayer, Capability::QueueReorder, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::QueueRemove, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::QueueClear, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
+    (ZoneTarget::HqPlayer, Capability::QueueTransfer, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::PlayNext, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::SavedPlaylists, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::Favorites, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
@@ -822,6 +846,7 @@ mod tests {
                                 | Capability::QueueReorder
                                 | Capability::QueueRemove
                                 | Capability::QueueClear
+                                | Capability::QueueTransfer
                                 | Capability::PlayNext
                                 | Capability::SavedPlaylists
                                 | Capability::Favorites
@@ -1027,7 +1052,7 @@ mod tests {
                 capability.name()
             );
         }
-        assert_eq!(seen.len(), 18, "the vocabulary changed size: {seen:?}");
+        assert_eq!(seen.len(), 19, "the vocabulary changed size: {seen:?}");
     }
 
     /// A refusal built from a capability state must carry the same

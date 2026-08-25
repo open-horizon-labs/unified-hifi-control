@@ -740,6 +740,12 @@ mod server {
             // App settings API
             .route("/api/settings", get(api::api_settings_get_handler))
             .route("/api/settings", post(api::api_settings_post_handler))
+            // Library browse, queue and play-ref for the web UI (#507). Same
+            // verb vocabulary as the hifi_collections/hifi_queue/hifi_play_ref
+            // MCP tools -- see src/api/browse.rs.
+            .route("/api/collections", post(api::browse::collections_handler))
+            .route("/api/queue", post(api::browse::queue_handler))
+            .route("/api/play_ref", post(api::browse::play_ref_handler))
             // Event stream (SSE)
             .route("/events", get(api::events_handler))
             // Knob hardware API routes
