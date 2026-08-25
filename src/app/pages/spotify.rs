@@ -78,11 +78,16 @@ pub fn Spotify() -> Element {
             Some(SseEvent::ZoneUpdated { .. } | SseEvent::NowPlayingChanged { .. }) => {
                 if let Some(zone_id) = event.as_ref().and_then(SseEvent::zone_id) {
                     let zone_id = zone_id.to_string();
-                    if pending_zone() == Some(zone_id.clone()) {
+                    // `.peek()`, not the tracked call: this effect is driven by
+                    // sse.event_count/sse.last_event above, not by pending_zone or
+                    // pending_track_change (which it also writes below). A tracked
+                    // read here would subscribe the effect to its own write and
+                    // cause an extra self-triggered run (reactive-loop-lint).
+                    if *pending_zone.peek() == Some(zone_id.clone()) {
                         if matches!(event, Some(SseEvent::NowPlayingChanged { .. })) {
                             pending_zone.set(None);
                             pending_track_change.set(false);
-                        } else if !pending_track_change() {
+                        } else if !*pending_track_change.peek() {
                             // Play/pause and stop are reported as a normal
                             // zone update; only track-changing commands need
                             // the longer metadata retry window below.
@@ -102,7 +107,9 @@ pub fn Spotify() -> Element {
                 if payload.output_id.starts_with("spotify:") =>
             {
                 let zone_id = payload.output_id.clone();
-                if pending_zone() == Some(zone_id.clone()) {
+                // `.peek()`, not the tracked call: see the comment above -- this
+                // effect must not subscribe to its own pending_zone write.
+                if *pending_zone.peek() == Some(zone_id.clone()) {
                     pending_zone.set(None);
                     pending_track_change.set(false);
                 }
