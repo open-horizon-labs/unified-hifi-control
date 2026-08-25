@@ -20,6 +20,12 @@ PATH_NOW_PLAYING_IMAGE = "/knob/now_playing/image"
 PATH_CONTROL = "/knob/control"
 PATH_EVENTS = "/events"
 PATH_MCP = "/mcp"
+# Plain-REST mirrors of the hifi_collections/hifi_play_ref MCP tools
+# (src/api/browse.rs, PR #516/#531). Unlike grouping, these forward the same
+# envelope shape a client would get from /mcp without paying for the
+# JSON-RPC transport.
+PATH_COLLECTIONS = "/api/collections"
+PATH_PLAY_REF = "/api/play_ref"
 
 # Poll interval used as a safety-net fallback in case the SSE stream to
 # /events silently drops without the underlying connection erroring out.
@@ -30,11 +36,23 @@ FALLBACK_POLL_INTERVAL = timedelta(seconds=60)
 # validation and coordinator refreshes.
 REQUEST_TIMEOUT = 10
 
-# Providers known to implement the multiroom join/leave verbs today.
-# Roon and LMS grouping work landed on a sibling branch (issue #517 /
-# PR #521) that had not merged into this integration's base branch at
-# the time this was written -- see docs/home_assistant_integration.md.
-GROUPING_CAPABLE_PROVIDERS: set[str] = {"musicassistant"}
+# Providers that implement the multiroom join/leave verbs (issue #517 /
+# PR #521, plus Music Assistant's original wiring): `hifi_zone_group`
+# routes join/leave/status to whichever of the three owns the zone prefix.
+# Roon reports grouped members as roon:<output_id> (its own zone ids churn
+# on merge); LMS sync groups are leaderless. Both conventions are tolerated
+# verbatim in group_members rather than normalized -- see
+# src/mcp/tools/groups.rs's module docs.
+GROUPING_CAPABLE_PROVIDERS: set[str] = {"musicassistant", "roon", "lms"}
+
+# Top-level hifi_collections/`/api/collections` entry points, in menu order.
+# (content_id, title) pairs surfaced at the root of async_browse_media.
+BROWSE_ROOT_ID = "root"
+BROWSE_TOP_LEVEL: tuple[tuple[str, str], ...] = (
+    ("top:browse", "Browse Library"),
+    ("top:playlists", "Playlists"),
+    ("top:favorites", "Favorites"),
+)
 
 # Providers whose adapters explicitly refuse next/previous (see
 # src/adapters/upnp.rs::REFUSED_TRANSPORT_ACTIONS).

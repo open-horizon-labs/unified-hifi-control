@@ -19,11 +19,13 @@ from typing import Any
 import aiohttp
 
 from .const import (
+    PATH_COLLECTIONS,
     PATH_CONTROL,
     PATH_EVENTS,
     PATH_MCP,
     PATH_NOW_PLAYING,
     PATH_NOW_PLAYING_IMAGE,
+    PATH_PLAY_REF,
     PATH_ZONES,
     REQUEST_TIMEOUT,
 )
@@ -124,6 +126,93 @@ class UnifiedHifiControlApiClient:
             raise UnifiedHifiControlApiError(
                 f"hifi_zone_group failed: {result['error']!r}"
             )
+
+    async def async_browse_collections(
+        self,
+        zone_id: str,
+        action: str,
+        *,
+        path: str | None = None,
+        media_type: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> dict[str, Any]:
+        """POST /api/collections; browse/playlists/favorites for one zone.
+
+        Mirrors the ``hifi_collections`` MCP tool's verb and paging
+        semantics (see ``src/mcp/tools/collections.rs``). Returns the tool's
+        own envelope verbatim (``outcome``/``data``/``refusal``, ...) rather
+        than raising on a refusal: a provider or action UHC has not wired
+        yet (e.g. Roon favorites) answers with an ``unsupported``/``invalid``
+        outcome, which is a normal read result for this contract, not a
+        transport failure. Callers must check ``outcome`` themselves.
+        """
+        body: dict[str, Any] = {"zone_id": zone_id, "action": action}
+        if path is not None:
+            body["path"] = path
+        if media_type is not None:
+            body["media_type"] = media_type
+        if limit is not None:
+            body["limit"] = limit
+        if offset is not None:
+            body["offset"] = offset
+        return await self._request("POST", PATH_COLLECTIONS, json=body)
+
+    async def async_play_ref(
+        self, ref: str, zone_id: str, action: str | None = None
+    ) -> dict[str, Any]:
+        """POST /api/play_ref; play or queue a ref minted by /api/collections.
+
+        Same verb vocabulary as ``hifi_play_ref`` (``play``, ``queue``,
+        ``radio`` on Roon, ``next`` on LMS). Returns the tool's own envelope
+        verbatim, like :meth:`async_browse_collections`.
+        """
+        body: dict[str, Any] = {"ref": ref, "zone_id": zone_id}
+        if action is not None:
+            body["action"] = action
+        return await self._request("POST", PATH_PLAY_REF, json=body)
+
+    async def async_zone_group_status(
+        self, zone_id: str | None = None
+    ) -> dict[str, Any]:
+        """Call ``hifi_zone_group`` action=status and return its ``data``.
+
+        Scoped to one provider when ``zone_id`` is given (``{"groups": [...]}``),
+        or aggregated across every grouping-capable provider when omitted
+        (``{"groups": [...], "errors": [...]}`` -- a provider that cannot be
+        reached is reported in ``errors`` rather than failing the whole
+        call). Each group entry carries ``leader_zone_id`` and
+        ``member_zone_ids``; Roon's members are ``roon:<output_id>`` and
+        LMS's groups are leaderless, per ``src/mcp/tools/groups.rs``.
+        """
+        arguments: dict[str, Any] = {"action": "status"}
+        if zone_id is not None:
+            arguments["zone_id"] = zone_id
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "hifi_zone_group", "arguments": arguments},
+        }
+        response = await self._request("POST", PATH_MCP, json=payload)
+        if isinstance(response, dict) and response.get("error"):
+            raise UnifiedHifiControlApiError(
+                f"hifi_zone_group status failed: {response['error']!r}"
+            )
+        result = response.get("result") if isinstance(response, dict) else None
+        structured = (
+            result.get("structuredContent") if isinstance(result, dict) else None
+        )
+        if not isinstance(structured, dict):
+            raise UnifiedHifiControlApiError(
+                f"hifi_zone_group status returned no structuredContent: {response!r}"
+            )
+        if structured.get("refusal"):
+            raise UnifiedHifiControlApiError(
+                f"hifi_zone_group status refused: {structured['refusal']!r}"
+            )
+        data = structured.get("data")
+        return data if isinstance(data, dict) else {}
 
     async def async_ping(self) -> None:
         """Raise if the server is unreachable. Used by the config flow."""

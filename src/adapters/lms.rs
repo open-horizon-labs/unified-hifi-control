@@ -2578,37 +2578,6 @@ impl LmsAdapter {
     }
 }
 
-/// #531: routes `hifi_collections` through `AdapterRegistry::library_content`
-/// rather than a new direct `state.lms` field access from `src/mcp/tools/`
-/// (the architecture boundary #436 is closing -- see
-/// `tests/adapter_boundary_lint.rs`). `search`/`play_uri` are not
-/// meaningfully implementable through this trait's flat-URI contract --
-/// LMS's playable targets are typed (`LmsPlayTarget::{Library,Url,
-/// GlobalSearchItem}`), which is exactly why `hifi_search`/`hifi_play`
-/// already call `LmsAdapter` directly (pre-existing debt, unaffected by this
-/// registration) rather than through this trait. Only `content` is real.
-#[async_trait]
-impl LibraryAdapter for LmsAdapter {
-    async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<LibrarySearchResult>> {
-        Err(anyhow!(
-            "LMS search is not reachable through the generic library registry; \
-             hifi_search calls LmsAdapter directly because LMS's playable targets are typed, \
-             not a flat URI"
-        ))
-    }
-
-    async fn play_uri(&self, _zone_id: &str, _uri: &str) -> Result<String> {
-        Err(anyhow!(
-            "LMS playback is not reachable through the generic library registry; \
-             hifi_play/hifi_play_ref call LmsAdapter directly for the same reason as search"
-        ))
-    }
-
-    async fn content(&self, operation: &str, params: &Value) -> Result<Value> {
-        self.collections_content(operation, params).await
-    }
-}
-
 /// Convert an LMS player to a unified Zone representation
 fn lms_player_to_zone(player: &LmsPlayer) -> Zone {
     let zone_id = PrefixedZoneId::lms(&player.playerid).to_string();
@@ -3584,25 +3553,34 @@ async fn run_lms_command_endpoint(
     }
 }
 
-/// Content-library surface (#510): only the multiroom sync-group operations
-/// are implemented here. LMS's own search/play surfaces are reached through
-/// their dedicated paths (`LmsAdapter::search`, `LmsAdapter::control`, ...);
-/// this trait is what lets the provider-neutral MCP registry
+/// Content-library surface: the multiroom sync-group operations (#510) and
+/// the `hifi_collections` browse operations (#531) are both implemented
+/// here. LMS's own search/play surfaces are reached through their
+/// dedicated paths (`LmsAdapter::search`, `LmsAdapter::control`, ...)
+/// rather than through this trait's `search`/`play_uri` -- LMS's playable
+/// targets are typed (`LmsPlayTarget::{Library,Url,GlobalSearchItem}`),
+/// which is exactly why `hifi_search`/`hifi_play` already call `LmsAdapter`
+/// directly (pre-existing debt, unaffected by this registration). `content`
+/// is what lets the provider-neutral MCP registry
 /// (`AdapterRegistry::library_content`) dispatch `multiroom_status`,
-/// `multiroom_set_members` and `multiroom_ungroup` to LMS the same way it
-/// already dispatches them to Music Assistant
+/// `multiroom_set_members`, `multiroom_ungroup`, `collections_browse`,
+/// `collections_playlists` and `collections_favorites` to LMS the same way
+/// it already dispatches the multiroom operations to Music Assistant
 /// (`src/adapters/musicassistant.rs`).
 #[async_trait]
 impl LibraryAdapter for LmsAdapter {
     async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<LibrarySearchResult>> {
         Err(anyhow!(
-            "LMS search is not implemented via the generic content-library surface (see #396/#402)"
+            "LMS search is not reachable through the generic library registry; \
+             hifi_search calls LmsAdapter directly because LMS's playable targets are typed, \
+             not a flat URI"
         ))
     }
 
     async fn play_uri(&self, _zone_id: &str, _uri: &str) -> Result<String> {
         Err(anyhow!(
-            "LMS play-by-uri is not implemented via the generic content-library surface (see #396)"
+            "LMS playback is not reachable through the generic library registry; \
+             hifi_play/hifi_play_ref call LmsAdapter directly for the same reason as search"
         ))
     }
 
@@ -3646,6 +3624,9 @@ impl LibraryAdapter for LmsAdapter {
                     .map(ToOwned::to_owned)
                     .collect::<Vec<_>>();
                 self.ungroup_members(&members).await
+            }
+            "collections_browse" | "collections_playlists" | "collections_favorites" => {
+                self.collections_content(operation, params).await
             }
             _ => Err(anyhow!("LMS content operation `{operation}` is not supported")),
         }

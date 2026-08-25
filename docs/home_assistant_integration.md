@@ -69,17 +69,51 @@ subdirectory. Rationale:
   - Next/previous: all providers except UPnP, whose adapter explicitly
     refuses skip actions (`src/adapters/upnp.rs::REFUSED_TRANSPORT_ACTIONS`).
   - Grouping (`MediaPlayerEntityFeature.GROUPING`, wired to
-    `async_join_players`/`async_unjoin_player`): **Music Assistant
-    only** on this branch, matching `Capability::MultiroomSync` in
-    `src/mcp/capabilities.rs` (the only provider marked `Supported`
-    there). Roon/LMS grouping work exists on branch `issue/517`
-    (feeding PR #521) but had not merged into this integration's base
-    branch as of this PR — calling join/unjoin on any other provider
-    raises a `HomeAssistantError` naming the tracking issues instead of
-    silently failing.
+    `async_join_players`/`async_unjoin_player`): **Music Assistant,
+    Roon and LMS**, matching `Capability::MultiroomSync` in
+    `src/mcp/capabilities.rs` (issue #517 / PR #521). Calling join/unjoin
+    on any other provider's zone raises a `HomeAssistantError`, as does
+    passing `group_members` whose zone ids belong to a different
+    provider than the target zone — UHC has no protocol that groups
+    zones across providers, so cross-provider joins are refused
+    client-side before any adapter call. `group_members` is populated
+    from a periodic aggregate `hifi_zone_group` status poll
+    (`UnifiedHifiControlCoordinator._refresh_group_members`), run
+    alongside the fallback poll; a provider that cannot be reached for
+    that poll is simply skipped rather than failing the whole refresh.
+    Two provider-specific conventions are tolerated verbatim in
+    `group_members`, per `src/mcp/tools/groups.rs`: Roon reports grouped
+    members as `roon:<output_id>` (its own zone ids churn when outputs
+    are grouped/ungrouped in Roon itself), and LMS sync groups are
+    leaderless (the reported "leader" is UHC's stable-but-arbitrary pick
+    of the first member, not an LMS fact).
   - Grouping itself is implemented over the `/mcp` JSON-RPC endpoint
     (`hifi_zone_group` tool) because grouping has no plain-REST route
-    yet; everything else in this integration is plain REST.
+    yet; browsing (`/api/collections`, `/api/play_ref`) and everything
+    else in this integration is plain REST.
+  - Browsing (`MediaPlayerEntityFeature.BROWSE_MEDIA` /
+    `PLAY_MEDIA` / `MEDIA_ENQUEUE`, wired to `async_browse_media`/
+    `async_play_media`): gated per-zone on the server-reported
+    `browse_supported` flag (`/knob/zones`, PR #533's
+    `zone_supports_hifi_collections`) rather than a hardcoded provider
+    set, so it tracks whichever providers `hifi_collections` implements
+    (Music Assistant, Roon, LMS as of #531) without a client-side
+    update. `async_browse_media` presents three root entries mirroring
+    `hifi_collections`' actions (Browse Library, Playlists, Favorites);
+    navigating into a subfolder always re-enters with `action=browse`
+    and the previous page's opaque `path` token, since a browse
+    continuation is provider-generic regardless of which entry point
+    minted it (see `src/mcp/tools/collections.rs`'s path-resolution
+    comments). `async_play_media` only accepts a `media_id` that
+    `async_browse_media` itself returned (an opaque `ref:` token) and
+    forwards it to `/api/play_ref`; an `enqueue` value HA passes maps to
+    `hifi_play_ref`'s `queue`/`next`/`play` actions where a distinct verb
+    exists, and to `queue` otherwise (UHC has no separate "replace the
+    queue" verb). **Artwork caveat**: `hifi_collections` items carry no
+    per-item artwork field today (only now-playing state does, via
+    `/knob/now_playing/image`), so browsed folders and tracks render
+    without thumbnails — `BrowseMedia.thumbnail` is left unset rather
+    than guessing at one.
 - **Mute caveat**: UHC's `/knob/now_playing` response does not include
   mute state, and not every provider has confirmed `mute`/`unmute`
   wiring through `/knob/control` end-to-end (only HQPlayer's handler was
@@ -152,11 +186,17 @@ becomes active once this lands on `v3`.
 
 ## Known follow-ups
 
-- No plain-REST route exists for zone grouping, collections, queue, or
-  play-by-ref — they're MCP-only today. This integration only uses MCP
-  for grouping; a UHC-side push endpoint or plain-REST equivalents for
-  the rest would let a future version add queue/collections support
-  without embedding an MCP client for everything.
-- Extending grouping support to Roon/LMS once `issue/517`'s work lands
-  on this integration's base branch is a follow-up, not blocking this
-  PR (the code already refuses cleanly for those providers today).
+- No plain-REST route exists for zone grouping itself (`hifi_zone_group`)
+  — it's MCP-only today, unlike `/api/collections`/`/api/play_ref`
+  (PR #516/#531), which already got plain-REST mirrors. A UHC-side
+  plain-REST equivalent for grouping (mirroring `src/api/browse.rs`'s
+  pattern) would let this integration drop its one remaining MCP
+  JSON-RPC call.
+- `hifi_collections` items carry no per-item artwork, so browsed
+  folders/tracks show no thumbnail in the HA browse UI (see the
+  Architecture section's browsing note). Adding artwork to the
+  provider-neutral collections contract is tracked separately.
+- Queue management (`hifi_queue`: read/reorder/remove/transfer) is not
+  exposed through this integration yet — only browse-and-play. A future
+  version could surface it via `async_get_media_source`/a
+  queue-specific service, once there's a concrete HA UX for it.

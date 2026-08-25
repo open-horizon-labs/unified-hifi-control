@@ -5,9 +5,14 @@ import logging
 from typing import Any
 
 from homeassistant.components.media_player import (
+    BrowseError,
+    BrowseMedia,
+    MediaClass,
+    MediaPlayerEnqueue,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
+    MediaType,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -18,6 +23,8 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .api import UnifiedHifiControlApiError
 from .const import (
+    BROWSE_ROOT_ID,
+    BROWSE_TOP_LEVEL,
     DOMAIN,
     GROUPING_CAPABLE_PROVIDERS,
     MANUFACTURER,
@@ -28,6 +35,18 @@ from .const import (
 from .coordinator import UnifiedHifiControlCoordinator, ZoneState
 
 _LOGGER = logging.getLogger(__name__)
+
+# media_content_id prefixes used by async_browse_media/async_play_media.
+# "top:<action>" is one of hifi_collections' three entry points (browse,
+# playlists, favorites); "path:<token>" is an opaque browse-continuation ref
+# minted by a previous /api/collections call (always re-entered with
+# action=browse -- see src/mcp/tools/collections.rs's path-resolution
+# comments); "ref:<token>" is an opaque playable ref for /api/play_ref.
+_TOP_PREFIX = "top:"
+_PATH_PREFIX = "path:"
+_REF_PREFIX = "ref:"
+
+_TOP_LEVEL_TITLES = dict(BROWSE_TOP_LEVEL)
 
 
 async def async_setup_entry(
@@ -74,6 +93,12 @@ def _supported_features(zone: ZoneState) -> MediaPlayerEntityFeature:
     if zone.source in GROUPING_CAPABLE_PROVIDERS:
         features |= (
             MediaPlayerEntityFeature.GROUPING
+        )
+    if zone.browse_supported:
+        features |= (
+            MediaPlayerEntityFeature.BROWSE_MEDIA
+            | MediaPlayerEntityFeature.PLAY_MEDIA
+            | MediaPlayerEntityFeature.MEDIA_ENQUEUE
         )
     return features
 
@@ -186,6 +211,14 @@ class UnifiedHifiControlMediaPlayer(
         # is_muted has been observed for this zone.
         return zone.is_muted if zone else None
 
+    @property
+    def group_members(self) -> list[str]:
+        # UHC zone ids double as this integration's unique_id, so the group
+        # is expressed the same way async_join_players/async_unjoin_player
+        # already accept it (see those methods below), not as HA entity_ids.
+        zone = self._zone
+        return zone.group_members if zone else []
+
     async def async_media_play(self) -> None:
         await self._async_control("play")
 
@@ -240,8 +273,18 @@ class UnifiedHifiControlMediaPlayer(
         if zone is None or zone.source not in GROUPING_CAPABLE_PROVIDERS:
             source = zone.source if zone else "unknown"
             raise HomeAssistantError(
-                f"Grouping is not supported for provider '{source}' yet "
-                "(tracked in unified-hifi-control issue #517/#521)."
+                f"Grouping is not supported for provider '{source}'."
+            )
+        foreign = [
+            member_id
+            for member_id in group_members
+            if not member_id.startswith(f"{zone.source}:")
+        ]
+        if foreign:
+            raise HomeAssistantError(
+                f"Cannot group zone {self._zone_id} ({zone.source}) with "
+                f"{foreign}: UHC has no protocol that groups zones across "
+                "providers. Join zones from the same provider only."
             )
         try:
             await self.coordinator.client.async_zone_group(
@@ -256,8 +299,7 @@ class UnifiedHifiControlMediaPlayer(
         if zone is None or zone.source not in GROUPING_CAPABLE_PROVIDERS:
             source = zone.source if zone else "unknown"
             raise HomeAssistantError(
-                f"Grouping is not supported for provider '{source}' yet "
-                "(tracked in unified-hifi-control issue #517/#521)."
+                f"Grouping is not supported for provider '{source}'."
             )
         try:
             await self.coordinator.client.async_zone_group(
@@ -265,4 +307,144 @@ class UnifiedHifiControlMediaPlayer(
             )
         except UnifiedHifiControlApiError as err:
             raise HomeAssistantError(f"Failed to unjoin player: {err}") from err
+        await self.coordinator.async_request_refresh()
+
+    async def async_browse_media(
+        self,
+        media_content_type: str | None = None,
+        media_content_id: str | None = None,
+    ) -> BrowseMedia:
+        zone = self._zone
+        if zone is None or not zone.browse_supported:
+            raise BrowseError(
+                f"Zone {self._zone_id} does not support browsing its library."
+            )
+
+        if media_content_id in (None, "", BROWSE_ROOT_ID):
+            return BrowseMedia(
+                media_class=MediaClass.DIRECTORY,
+                media_content_id=BROWSE_ROOT_ID,
+                media_content_type=MediaType.MUSIC,
+                title=zone.zone_name,
+                can_play=False,
+                can_expand=True,
+                children_media_class=MediaClass.DIRECTORY,
+                children=[
+                    BrowseMedia(
+                        media_class=MediaClass.DIRECTORY,
+                        media_content_id=content_id,
+                        media_content_type=MediaType.MUSIC,
+                        title=title,
+                        can_play=False,
+                        can_expand=True,
+                    )
+                    for content_id, title in BROWSE_TOP_LEVEL
+                ],
+            )
+
+        if media_content_id.startswith(_TOP_PREFIX):
+            action = media_content_id[len(_TOP_PREFIX) :]
+            path = None
+            title = _TOP_LEVEL_TITLES.get(media_content_id, action.title())
+        elif media_content_id.startswith(_PATH_PREFIX):
+            # A browse continuation always re-enters as action=browse,
+            # regardless of which top-level entry point minted the path
+            # token -- see the module-level comment on _PATH_PREFIX.
+            action = "browse"
+            path = media_content_id[len(_PATH_PREFIX) :]
+            title = "Library"
+        else:
+            raise BrowseError(f"Cannot browse media_content_id {media_content_id!r}")
+
+        try:
+            envelope = await self.coordinator.client.async_browse_collections(
+                self._zone_id, action, path=path
+            )
+        except UnifiedHifiControlApiError as err:
+            raise BrowseError(f"Failed to browse zone {self._zone_id}: {err}") from err
+
+        if envelope.get("outcome") != "ok":
+            refusal = envelope.get("refusal") or {}
+            detail = refusal.get("message") or envelope.get("outcome", "unknown error")
+            raise BrowseError(
+                f"{action} is not available for zone {self._zone_id}: {detail}"
+            )
+
+        data = envelope.get("data") or {}
+        children: list[BrowseMedia] = []
+        for item in data.get("items") or []:
+            item_title = item.get("title") or "Untitled"
+            item_path = item.get("path")
+            item_ref = item.get("ref")
+            if item_path:
+                children.append(
+                    BrowseMedia(
+                        media_class=MediaClass.DIRECTORY,
+                        media_content_id=f"{_PATH_PREFIX}{item_path}",
+                        media_content_type=MediaType.MUSIC,
+                        title=item_title,
+                        can_play=False,
+                        can_expand=True,
+                    )
+                )
+            elif item_ref:
+                children.append(
+                    BrowseMedia(
+                        media_class=MediaClass.TRACK,
+                        media_content_id=f"{_REF_PREFIX}{item_ref}",
+                        media_content_type=MediaType.MUSIC,
+                        title=item_title,
+                        can_play=True,
+                        can_expand=False,
+                    )
+                )
+            # A row with neither path nor ref (e.g. #396's known LMS
+            # XMLBrowser gap) carries nothing this integration can act on;
+            # it is silently omitted rather than shown as dead-end.
+
+        return BrowseMedia(
+            media_class=MediaClass.DIRECTORY,
+            media_content_id=media_content_id,
+            media_content_type=MediaType.MUSIC,
+            title=title,
+            can_play=False,
+            can_expand=True,
+            children_media_class=MediaClass.DIRECTORY,
+            children=children,
+        )
+
+    async def async_play_media(
+        self, media_type: str, media_id: str, **kwargs: Any
+    ) -> None:
+        zone = self._zone
+        if zone is None or not zone.browse_supported:
+            raise HomeAssistantError(
+                f"Zone {self._zone_id} does not support playing browsed media."
+            )
+        if not media_id.startswith(_REF_PREFIX):
+            raise HomeAssistantError(
+                f"Cannot play media_id {media_id!r}: only items returned by "
+                "browsing this zone's library can be played."
+            )
+        ref = media_id[len(_REF_PREFIX) :]
+        enqueue = kwargs.get("enqueue")
+        if enqueue in (None, MediaPlayerEnqueue.PLAY):
+            action = "play"
+        elif enqueue == MediaPlayerEnqueue.NEXT:
+            action = "next"
+        else:
+            # ADD / REPLACE: UHC's hifi_play_ref has no distinct "replace the
+            # queue" verb, so both fall back to appending -- see
+            # docs/home_assistant_integration.md.
+            action = "queue"
+        try:
+            envelope = await self.coordinator.client.async_play_ref(
+                ref, self._zone_id, action=action
+            )
+        except UnifiedHifiControlApiError as err:
+            raise HomeAssistantError(f"Failed to play media: {err}") from err
+        if envelope.get("outcome") not in ("ok", "accepted"):
+            refusal = envelope.get("refusal") or {}
+            detail = refusal.get("message") or envelope.get("outcome", "unknown error")
+            raise HomeAssistantError(f"Failed to play media: {detail}")
         await self.coordinator.async_request_refresh()

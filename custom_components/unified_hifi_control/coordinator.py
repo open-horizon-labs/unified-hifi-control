@@ -24,7 +24,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import UnifiedHifiControlApiClient, UnifiedHifiControlApiError
-from .const import DOMAIN, FALLBACK_POLL_INTERVAL
+from .const import DOMAIN, FALLBACK_POLL_INTERVAL, GROUPING_CAPABLE_PROVIDERS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -56,6 +56,14 @@ class ZoneState:
     is_pause_allowed: bool = True
     is_next_allowed: bool = True
     is_previous_allowed: bool = True
+    # Server-reported: whether /api/collections (hifi_collections) implements
+    # this zone's provider at all (see src/mcp/tools/collections.rs's
+    # zone_supports_hifi_collections, surfaced on /knob/zones since #533).
+    browse_supported: bool = False
+    # This zone's multiroom group membership (this zone included), from the
+    # most recent hifi_zone_group status poll. Empty when ungrouped or when
+    # this zone's provider does not support grouping.
+    group_members: list[str] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -134,8 +142,36 @@ class UnifiedHifiControlCoordinator(DataUpdateCoordinator[dict[str, ZoneState]])
                     zs.volume_min = now_playing.get("volume_min", zs.volume_min)
                     zs.volume_max = now_playing.get("volume_max", zs.volume_max)
                     zs.volume_step = now_playing.get("volume_step", zs.volume_step)
+            zs.browse_supported = zone.get("browse_supported", False)
             result[zone_id] = zs
+        await self._refresh_group_members(result)
         return result
+
+    async def _refresh_group_members(self, zones: dict[str, ZoneState]) -> None:
+        """Populate ``group_members`` for every grouping-capable zone.
+
+        One aggregate ``hifi_zone_group`` status call covers every provider;
+        a provider that cannot be reached is reported in the aggregate's
+        ``errors`` rather than raising, so its zones are simply left
+        ungrouped for this poll rather than failing the whole refresh.
+        """
+        if not any(zs.source in GROUPING_CAPABLE_PROVIDERS for zs in zones.values()):
+            return
+        try:
+            status = await self.client.async_zone_group_status()
+        except UnifiedHifiControlApiError as err:
+            _LOGGER.debug("hifi_zone_group status failed, leaving groups as-is: %s", err)
+            return
+        for group in status.get("groups") or []:
+            leader = group.get("leader_zone_id")
+            members = group.get("member_zone_ids") or []
+            if not isinstance(leader, str):
+                continue
+            all_ids = [leader, *[m for m in members if isinstance(m, str)]]
+            for zone_id in all_ids:
+                zs = zones.get(zone_id)
+                if zs is not None:
+                    zs.group_members = all_ids
 
     def start_event_listener(self) -> None:
         """Start the background SSE listener task."""
@@ -247,6 +283,7 @@ def _h_zone_discovered(data: dict[str, ZoneState], payload: dict[str, Any]) -> b
         zone_name=zone.get("zone_name", zone_id),
         source=zone.get("source", "unknown"),
         state=zone.get("state", "unknown"),
+        browse_supported=zone.get("browse_supported", False),
     )
     return True
 

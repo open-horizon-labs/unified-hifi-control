@@ -1,7 +1,13 @@
 """Tests for coordinator event handling."""
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
+import pytest
+
+from custom_components.unified_hifi_control.api import UnifiedHifiControlApiError
 from custom_components.unified_hifi_control.coordinator import (
+    UnifiedHifiControlCoordinator,
     ZoneState,
     _h_now_playing_changed,
     _h_seek_changed,
@@ -93,3 +99,77 @@ def test_zone_discovered_existing_zone_is_noop():
     )
     assert not changed
     assert data["roon:1"].zone_name == "Kitchen"
+
+
+def test_zone_discovered_carries_browse_supported():
+    data: dict[str, ZoneState] = {}
+    _h_zone_discovered(
+        data,
+        {
+            "zone": {
+                "zone_id": "lms:aa",
+                "zone_name": "Bedroom",
+                "source": "lms",
+                "browse_supported": True,
+            }
+        },
+    )
+    assert data["lms:aa"].browse_supported is True
+
+
+def _coordinator_with_client(client) -> UnifiedHifiControlCoordinator:
+    """A coordinator instance with only `.client` set.
+
+    `_refresh_group_members` only touches `self.client`, so this avoids
+    wiring up the full `DataUpdateCoordinator`/hass machinery just to test
+    it.
+    """
+    coordinator = object.__new__(UnifiedHifiControlCoordinator)
+    coordinator.client = client
+    return coordinator
+
+
+@pytest.mark.asyncio
+async def test_refresh_group_members_populates_leader_and_members():
+    client = AsyncMock()
+    client.async_zone_group_status = AsyncMock(
+        return_value={
+            "groups": [
+                {"leader_zone_id": "roon:1", "member_zone_ids": ["roon:2", "roon:3"]}
+            ]
+        }
+    )
+    coordinator = _coordinator_with_client(client)
+    zones = {
+        "roon:1": _zone(zone_id="roon:1"),
+        "roon:2": _zone(zone_id="roon:2"),
+        "roon:3": _zone(zone_id="roon:3"),
+    }
+    await coordinator._refresh_group_members(zones)
+    assert zones["roon:1"].group_members == ["roon:1", "roon:2", "roon:3"]
+    assert zones["roon:2"].group_members == ["roon:1", "roon:2", "roon:3"]
+    assert zones["roon:3"].group_members == ["roon:1", "roon:2", "roon:3"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_group_members_skips_when_no_grouping_capable_zone():
+    client = AsyncMock()
+    client.async_zone_group_status = AsyncMock()
+    coordinator = _coordinator_with_client(client)
+    zones = {"upnp:1": _zone(zone_id="upnp:1")}
+    zones["upnp:1"].source = "upnp"
+    await coordinator._refresh_group_members(zones)
+    client.async_zone_group_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_refresh_group_members_tolerates_status_failure():
+    client = AsyncMock()
+    client.async_zone_group_status = AsyncMock(
+        side_effect=UnifiedHifiControlApiError("unreachable")
+    )
+    coordinator = _coordinator_with_client(client)
+    zones = {"roon:1": _zone(zone_id="roon:1")}
+    # Must not raise.
+    await coordinator._refresh_group_members(zones)
+    assert zones["roon:1"].group_members == []
