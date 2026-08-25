@@ -4354,4 +4354,206 @@ mod tests {
             "a save failure must surface as an HTTP error the client can detect"
         );
     }
+
+    /// Issue #548: a tester upgraded a v3 release install (config dir preserved) to the
+    /// integration/streaming-ha-alpha build and found `hidden_zones` emptied while `zone_order`
+    /// stayed intact -- with no explicit edit in between. This seeds a v3-shaped `app-settings.json`
+    /// verbatim (the exact bytes a v3 release writes, not a value round-tripped through this build's
+    /// own `AppSettings`, so a struct-shape or attribute mismatch would actually show up) and drives
+    /// every early write path a freshly-upgraded server hits, asserting all three zone lists survive
+    /// each one:
+    ///
+    /// - the load itself (`load_app_settings`)
+    /// - `POST /api/settings` with the settings page's real partial body (adapter toggle, no zone
+    ///   fields -- see `posting_settings_without_hidden_zones_preserves_the_hide_list`)
+    /// - `POST /api/zones/visibility` (hiding a *different* zone)
+    /// - `POST /api/zones/order` (moving a zone)
+    /// - `POST /api/zones/name` (renaming a zone)
+    ///
+    /// This is a *regression* test: as of this commit it passes, because `mutate_app_settings` reads
+    /// and merges every field through the same `Option<Vec<_>>` / `Option<BTreeMap<_, _>>` shape on
+    /// both sides of the merge, and every handler that is not `POST /api/settings` only ever mutates
+    /// the one field it owns. It exists to catch a *future* regression -- e.g. a merge that
+    /// re-introduces a non-`Option` zone field, drops a `#[serde(default)]`, or adds a write path
+    /// that reconstructs `AppSettings` from scratch instead of mutating the loaded value.
+    #[tokio::test]
+    #[serial]
+    async fn upgrading_a_v3_settings_file_survives_every_early_write_path() {
+        env::set_var("UHC_CONFIG_DIR", "/tmp/uhc-test-issue-548-upgrade-simulation");
+
+        // The exact shape a v3 release build persists: snake_case keys, no unknown fields, three
+        // populated zone lists. Written as raw bytes -- not through this build's own `AppSettings` --
+        // so a field-shape mismatch introduced here would actually be exercised by deserialization.
+        let v3_settings_json = serde_json::json!({
+            "hide_knobs_page": false,
+            "hide_hqp_page": false,
+            "hide_lms_page": false,
+            "adapters": {
+                "roon": true,
+                "upnp": false,
+                "openhome": false,
+                "lms": false,
+                "hqplayer": false
+            },
+            "hidden_zones": ["roon:phone"],
+            "zone_order": ["roon:kitchen", "roon:phone", "roon:office"],
+            "zone_names": {"roon:phone": "Upstairs Phone"}
+        });
+        let settings_file = settings_path();
+        std::fs::create_dir_all(settings_file.parent().unwrap())
+            .expect("create config subdirectory");
+        std::fs::write(
+            &settings_file,
+            serde_json::to_string_pretty(&v3_settings_json).unwrap(),
+        )
+        .expect("seed v3-shaped settings.json");
+
+        let assert_zone_lists_intact = |settings: &AppSettings, step: &str| {
+            assert_eq!(
+                settings.hidden_zone_ids(),
+                ["roon:phone".to_string()],
+                "hidden_zones lost after {step}"
+            );
+            assert_eq!(
+                settings.zone_order_ids(),
+                [
+                    "roon:kitchen".to_string(),
+                    "roon:phone".to_string(),
+                    "roon:office".to_string()
+                ],
+                "zone_order lost after {step}"
+            );
+            assert_eq!(
+                settings.custom_zone_name("roon:phone"),
+                Some("Upstairs Phone"),
+                "zone_names lost after {step}"
+            );
+        };
+
+        // Step 1: the load itself, exactly as `load_app_settings()` does at every request and at
+        // startup (`main.rs` calls it to build the adapter coordinator's initial registry).
+        let loaded = load_app_settings();
+        assert_zone_lists_intact(&loaded, "load_app_settings()");
+
+        // Step 2: `POST /api/settings` with the real settings-page body -- an adapter toggle, no
+        // zone fields at all (the client's own `AppSettings` type, in `src/app/api.rs`, does not
+        // declare them). This is the write every "flip a switch" interaction sends.
+        let bus = create_bus();
+        let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+        let agg_for_task = aggregator.clone();
+        tokio::spawn(async move { agg_for_task.run().await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Publish the zones referenced above so `manageable_zones` (used by the order/name steps
+        // below) has something to reorder and rename.
+        for (id, source) in [
+            ("roon:kitchen", "roon"),
+            ("roon:phone", "roon"),
+            ("roon:office", "roon"),
+        ] {
+            bus.publish(BusEvent::ZoneDiscovered {
+                zone: fake_zone(id, source),
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let state = app_state_with_startable(Arc::new(FakeAdapter("lms"))).await;
+        // Reuse the live aggregator with the published zones instead of the empty one
+        // `app_state_with_startable` constructs.
+        let state = AppState {
+            aggregator: aggregator.clone(),
+            ..state
+        };
+
+        let toggle_body: AppSettings = serde_json::from_value(serde_json::json!({
+            "hide_knobs_page": false,
+            "hide_hqp_page": false,
+            "hide_lms_page": false,
+            "adapters": { "roon": true, "upnp": false, "openhome": false, "lms": true, "hqplayer": false }
+        }))
+        .expect("the settings page's own partial body must deserialise");
+        let _ = api_settings_post_handler(State(state.clone()), Json(toggle_body)).await;
+        assert_zone_lists_intact(&load_app_settings(), "POST /api/settings (adapter toggle)");
+
+        // Step 3: `POST /api/zones/visibility`, hiding a zone *other* than the one already hidden.
+        let visibility_response = zone_visibility_post(Json(ZoneVisibilityRequest {
+            zone_id: "roon:office".to_string(),
+            hidden: true,
+        }))
+        .await
+        .into_response();
+        assert_eq!(visibility_response.status(), StatusCode::OK);
+        let after_hide = load_app_settings();
+        // `zone_visibility_post` sorts the hide list before persisting, for a stable on-disk shape.
+        assert_eq!(
+            after_hide.hidden_zone_ids(),
+            ["roon:office".to_string(), "roon:phone".to_string()],
+            "hiding a new zone must add to, not replace, the carried-forward hide list"
+        );
+        assert_eq!(
+            after_hide.zone_order_ids(),
+            [
+                "roon:kitchen".to_string(),
+                "roon:phone".to_string(),
+                "roon:office".to_string()
+            ],
+            "zone_order lost after POST /api/zones/visibility"
+        );
+        assert_eq!(
+            after_hide.custom_zone_name("roon:phone"),
+            Some("Upstairs Phone"),
+            "zone_names lost after POST /api/zones/visibility"
+        );
+
+        // Step 4: `POST /api/zones/order`, moving a zone via the real handler (exercises
+        // `manageable_zones` and the write-lock merge together).
+        let order_response = zone_order_post(
+            State(state.clone()),
+            Json(ZoneOrderRequest {
+                zone_id: "roon:kitchen".to_string(),
+                direction: Some(crate::app::api::MoveDirection::Down),
+                target_zone_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(order_response.status(), StatusCode::OK);
+        let after_order = load_app_settings();
+        assert_eq!(
+            after_order.hidden_zone_ids(),
+            ["roon:office".to_string(), "roon:phone".to_string()],
+            "hidden_zones lost after POST /api/zones/order"
+        );
+        assert_eq!(
+            after_order.custom_zone_name("roon:phone"),
+            Some("Upstairs Phone"),
+            "zone_names lost after POST /api/zones/order"
+        );
+
+        // Step 5: `POST /api/zones/name`, renaming a different zone.
+        let name_response = zone_name_post(Json(ZoneNameRequest {
+            zone_id: "roon:kitchen".to_string(),
+            name: Some("Kitchen Speaker".to_string()),
+        }))
+        .await
+        .into_response();
+        assert_eq!(name_response.status(), StatusCode::OK);
+        let final_settings = load_app_settings();
+        env::remove_var("UHC_CONFIG_DIR");
+
+        assert_eq!(
+            final_settings.hidden_zone_ids(),
+            ["roon:office".to_string(), "roon:phone".to_string()],
+            "hidden_zones lost after POST /api/zones/name"
+        );
+        assert_eq!(
+            final_settings.custom_zone_name("roon:phone"),
+            Some("Upstairs Phone"),
+            "the original v3-set zone name must survive every step"
+        );
+        assert_eq!(
+            final_settings.custom_zone_name("roon:kitchen"),
+            Some("Kitchen Speaker"),
+            "the new rename made during this simulation must also land"
+        );
+    }
 }
