@@ -29,7 +29,9 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.12", "3.13"]
+        # Home Assistant's current minimum is Python 3.13; 3.12 also trips a
+        # pycares thread-leak false positive in the test framework's teardown.
+        python-version: ["3.13"]
     steps:
       - uses: actions/checkout@v4
 
