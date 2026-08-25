@@ -867,7 +867,15 @@ mod server {
             .route("/control", get(control_redirect))
             .route("/admin", get(settings_redirect))
             // Embedded WASM/JS assets (ADR 002: serve from memory, no disk extraction)
-            .route("/assets/{*path}", get(embedded::serve_embedded_asset));
+            .route("/assets/{*path}", get(embedded::serve_embedded_asset))
+            // #560: fonts 404'd on the built server -- public/fonts/ is
+            // embedded like every other public/ file, but (unlike
+            // /assets/*) nothing routed requests there, so the SPA
+            // fallback answered instead. Registered unconditionally
+            // (not gated on `feature = "web"` like the block below) because
+            // it serves the same embedded PublicAssets data regardless of
+            // that feature.
+            .route("/fonts/{*path}", get(embedded::serve_embedded_font));
 
         // Static file routes: only needed for non-web builds (cargo run).
         // In web/fullstack mode, Dioxus automatically serves public/ directory.

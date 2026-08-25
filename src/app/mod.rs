@@ -134,7 +134,12 @@ pub enum Route {
         path: Option<String>,
         zone: Option<String>,
     },
-    #[route("/zones")]
+    // #560: was `/zones`, which collides with the JSON protocol route
+    // `GET /zones` (knobs::knob_zones_handler, registered in main.rs) --
+    // that API route wins the axum route table, so the SPA page was
+    // unreachable (the URL just served raw JSON). Moved to a path the API
+    // doesn't own; the API route itself is untouched.
+    #[route("/ui/zones")]
     Zones {},
     #[route("/hqplayer")]
     HqPlayer {},

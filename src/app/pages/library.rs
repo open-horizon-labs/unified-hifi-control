@@ -671,7 +671,18 @@ pub fn Library(
             let query = search_query();
             let generation = {
                 let mut g = search_generation;
-                let next = g() + 1;
+                // `peek()`, not `()`: reading `search_generation` the tracked
+                // way here would subscribe THIS effect to its own signal, and
+                // the `.set()` two lines down would then re-trigger this same
+                // effect on every run -- a synchronous self-referential loop
+                // that pegs the wasm main thread at mount (#560) before any
+                // network request even completes (`query` is empty on the
+                // first run, so this isn't data-driven). `peek()` reads the
+                // current value without creating that subscription; the
+                // async block below still re-reads `search_generation()` the
+                // tracked way to detect supersession, which is fine since
+                // that read happens off the render/effect call stack.
+                let next = *g.peek() + 1;
                 g.set(next);
                 next
             };
