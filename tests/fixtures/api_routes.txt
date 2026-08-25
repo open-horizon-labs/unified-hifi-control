@@ -26,6 +26,7 @@ GET /api/providers/spotify/account
 GET /api/providers/{provider}/oauth/callback
 GET /api/providers/{provider}/oauth/start
 GET /api/settings
+GET /api/zones/visibility
 GET /assets/{*path}
 GET /config/{knob_id}
 GET /control
@@ -86,6 +87,9 @@ POST /api/providers/{provider}/configure
 POST /api/providers/{provider}/oauth/revoke
 POST /api/queue
 POST /api/settings
+POST /api/zones/name
+POST /api/zones/order
+POST /api/zones/visibility
 POST /control
 POST /hqp/detect
 POST /hqp/instances

@@ -820,6 +820,12 @@ mod server {
             .route("/api/collections", post(api::browse::collections_handler))
             .route("/api/queue", post(api::browse::queue_handler))
             .route("/api/play_ref", post(api::browse::play_ref_handler))
+            // Kept on one line each: the API-contract extractor (tests/api_contract.rs) only sees
+            // single-line `.route(...)` calls, so a multi-line form would slip past the guard.
+            .route("/api/zones/visibility", get(api::zone_visibility_get))
+            .route("/api/zones/visibility", post(api::zone_visibility_post))
+            .route("/api/zones/order", post(api::zone_order_post))
+            .route("/api/zones/name", post(api::zone_name_post))
             // Event stream (SSE)
             .route("/events", get(api::events_handler))
             // Knob hardware API routes

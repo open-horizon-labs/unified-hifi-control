@@ -66,3 +66,6 @@ pub mod mqtt;
 // Server-only: it necessarily touches both `crate::bus` and `crate::adaptive`.
 #[cfg(feature = "server")]
 pub mod producers;
+// The single decision point for zone-list membership and order (see module docs).
+#[cfg(feature = "server")]
+pub mod zone_list;

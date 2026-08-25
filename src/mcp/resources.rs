@@ -212,7 +212,9 @@ pub async fn list_resources(state: &AppState, hqplayer_enabled: bool) -> Vec<Res
         },
     ];
 
-    for zone in state.aggregator.get_zones().await {
+    // Same visibility policy as `hifi_zones` -- a hidden zone must not reappear as a resource.
+    // Reading `state.aggregator.get_zones()` here would leak exactly what the user hid.
+    for zone in crate::zone_list::visible_zones(state).await {
         resources.push(zone_resource(&zone.zone_id, &zone.zone_name));
     }
 

@@ -102,9 +102,10 @@ async fn one_zone(
 /// client can plan for a zone type before it appears — and so the AGENTS.md matrix
 /// is exactly this payload rather than a subset of it.
 async fn every_zone(state: &AppState, env: Envelope) -> CallToolResult {
-    let zones: Vec<McpCapabilityZone> = state
-        .aggregator
-        .get_zones()
+    // Same visibility policy as `hifi_zones`. This report is how a client discovers what it can do
+    // with each zone, so listing a hidden zone here would put it back in front of the assistant
+    // that `hifi_zones` just withheld it from.
+    let zones: Vec<McpCapabilityZone> = crate::zone_list::visible_zones(state)
         .await
         .into_iter()
         .map(|zone| McpCapabilityZone {
