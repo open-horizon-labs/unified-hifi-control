@@ -206,15 +206,16 @@ struct TestApp {
 }
 
 async fn build_state(lms: Option<Arc<LmsAdapter>>) -> AppState {
-    build_state_with_bus(create_bus(), lms).await
+    build_state_with_bus(create_bus(), lms, None).await
 }
 
 async fn build_state_with_bus(
     bus: unified_hifi_control::bus::SharedBus,
     lms: Option<Arc<LmsAdapter>>,
+    roon: Option<Arc<RoonAdapter>>,
 ) -> AppState {
     let coordinator = Arc::new(AdapterCoordinator::new(bus.clone()));
-    let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
+    let roon = roon.unwrap_or_else(|| Arc::new(RoonAdapter::new_disconnected(bus.clone())));
     let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
     let hqp_instances = Arc::new(HqpInstanceManager::new_with_native_sink(
         bus.clone(),
@@ -228,12 +229,12 @@ async fn build_state_with_bus(
     let startable_adapters: Vec<Arc<dyn Startable>> =
         vec![roon.clone(), lms.clone(), openhome.clone(), upnp.clone()];
 
-    AppState::new(
-        roon,
+    let state = AppState::new(
+        roon.clone(),
         hqplayer,
         hqp_instances,
         hqp_zone_links,
-        lms,
+        lms.clone(),
         openhome,
         upnp,
         KnobStore::new(),
@@ -243,7 +244,15 @@ async fn build_state_with_bus(
         startable_adapters,
         Instant::now(),
         CancellationToken::new(),
-    )
+    );
+    // Mirror main.rs's unconditional content-library registration (#513/#515):
+    // `hifi_zone_group` (#517) dispatches multiroom_status/set_members/ungroup
+    // to Roon and LMS through `AdapterRegistry::library_content` exactly like
+    // Music Assistant, so the test harness must expose the same registry
+    // entries production wiring does.
+    state.adapter_registry.register_library("roon", roon).await;
+    state.adapter_registry.register_library("lms", lms).await;
+    state
 }
 
 impl TestApp {
@@ -854,6 +863,7 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
         "hifi_zone_group",
         &[
             ("action", true),
+            ("zone_id", false),
             ("leader_zone_id", false),
             ("member_zone_ids", false),
             ("confirm", false),
@@ -1838,7 +1848,7 @@ async fn musicassistant_mcp_app() -> (TestApp, MusicAssistantMcpMock, tokio::tas
     });
 
     let bus = create_bus();
-    let state = build_state_with_bus(bus.clone(), None).await;
+    let state = build_state_with_bus(bus.clone(), None, None).await;
     let adapter = Arc::new(
         MusicAssistantAdapter::new(
             bus,
@@ -2129,6 +2139,187 @@ async fn musicassistant_zone_group_refuses_invalid_inputs_before_ma_calls() {
     server.abort();
 }
 
+/// Cross-provider grouping is refused for every pairing among the three
+/// multiroom-capable providers (#517's acceptance criterion), not just the
+/// musicassistant/roon pair the original single-provider tests happened to
+/// cover. Nothing here needs a live backend: every case is refused by zone-id
+/// classification before any adapter is called.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn zone_group_refuses_every_cross_provider_pairing() {
+    let app = TestApp::new().await;
+    for args in [
+        // join: leader and member disagree, for every ordered pairing.
+        json!({"action":"join", "leader_zone_id":"roon:a", "member_zone_ids":["lms:b"], "confirm":true}),
+        json!({"action":"join", "leader_zone_id":"lms:a", "member_zone_ids":["roon:b"], "confirm":true}),
+        json!({"action":"join", "leader_zone_id":"roon:a", "member_zone_ids":["musicassistant:b"], "confirm":true}),
+        json!({"action":"join", "leader_zone_id":"musicassistant:a", "member_zone_ids":["lms:b"], "confirm":true}),
+        // join: a mix of matching and mismatching members must still refuse.
+        json!({"action":"join", "leader_zone_id":"roon:a", "member_zone_ids":["roon:b", "lms:c"], "confirm":true}),
+        // join: a leader from a provider that does not implement grouping at all.
+        json!({"action":"join", "leader_zone_id":"openhome:a", "member_zone_ids":["openhome:b"], "confirm":true}),
+        // leave: members from two different multiroom providers.
+        json!({"action":"leave", "member_zone_ids":["roon:a", "lms:b"], "confirm":true}),
+        json!({"action":"leave", "member_zone_ids":["lms:a", "musicassistant:b"], "confirm":true}),
+        // leave: a provider that does not implement grouping at all.
+        json!({"action":"leave", "member_zone_ids":["upnp:a"], "confirm":true}),
+        // status: a zone_id from a provider that does not implement grouping.
+        json!({"action":"status", "zone_id":"upnp:a"}),
+    ] {
+        let result = app.call_tool("hifi_zone_group", args.clone()).await;
+        assert_eq!(
+            result["structuredContent"]["outcome"], "invalid",
+            "{args} must be refused as invalid: {result}"
+        );
+        assert_eq!(
+            result["structuredContent"]["refusal"]["reason"], "invalid_parameter",
+            "{args}: {result}"
+        );
+    }
+}
+
+/// A `TestApp` wired to a real `RoonAdapter` driven against
+/// `tests/mock_servers/roon_core.rs`'s `FakeRoonCore` -- the same harness
+/// `tests/roon_protocol.rs` uses for Roon's own multiroom tests
+/// (`roon_set_group_members_merges_outputs_into_one_zone` and friends), but
+/// wrapped in the real `/mcp` route so `hifi_zone_group`'s routing (#517) is
+/// proved end to end rather than only at the adapter layer.
+async fn roon_mcp_app(core: &mock_servers::roon_core::FakeRoonCore) -> TestApp {
+    let bus = create_bus();
+    let roon = std::sync::Arc::new(RoonAdapter::new_configured(
+        bus.clone(),
+        "http://test.invalid:8088".to_string(),
+        KnobStore::new(),
+    ));
+    let runner = roon.clone();
+    let ip = core.ip();
+    let port = core.port();
+    tokio::spawn(async move {
+        let _ = runner
+            .run_event_loop_against_core_for_tests(ip, &port)
+            .await;
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if roon.is_browse_connected().await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        roon.is_browse_connected().await,
+        "RoonAdapter never connected to the fake core"
+    );
+
+    let state = build_state_with_bus(bus, None, Some(roon)).await;
+    TestApp::with_state(state)
+}
+
+/// `hifi_zone_group` routing generalized to Roon (issue #517), proved against
+/// the same `FakeRoonCore` fixture `tests/roon_protocol.rs` uses at the
+/// adapter layer -- join merges two single-output zones' outputs via
+/// `group_outputs`, status reports the merge, and leave splits them back via
+/// `ungroup_outputs`, all addressed by `roon:` zone ids with no Music
+/// Assistant or LMS involved.
+///
+/// Roon confirms grouping asynchronously through its ordinary zone
+/// subscription rather than a synchronous RPC reply (documented on
+/// `RoonAdapter::set_group_members`), so this polls `hifi_zone_group`
+/// status rather than trusting the immediate `join`/`leave` response to
+/// reflect the merge -- the same caveat #517 documents on the tool itself.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn roon_zone_group_routes_join_status_and_leave_through_the_registry() {
+    use mock_servers::roon_core::{zone_with_grouping, FakeRoonCore};
+
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let core = FakeRoonCore::start().await;
+    core.set_zones(vec![
+        zone_with_grouping("zone_a", "Living Room", "output_a", &["output_b"]),
+        zone_with_grouping("zone_b", "Kitchen", "output_b", &["output_a"]),
+    ])
+    .await;
+    let app = roon_mcp_app(&core).await;
+
+    // Poll status until the aggregate view either shows the expected group
+    // count or a bound is hit, so a slow merge shows what actually arrived
+    // instead of just "assertion failed".
+    async fn wait_for_group_count(app: &TestApp, expected: usize) -> Value {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let status = app
+                .call_tool(
+                    "hifi_zone_group",
+                    json!({"action": "status", "zone_id": "roon:zone_a"}),
+                )
+                .await;
+            let payload: Value =
+                serde_json::from_str(&result_text(&status)).expect("status payload JSON");
+            let count = payload["groups"].as_array().map(Vec::len).unwrap_or(0);
+            if count == expected || std::time::Instant::now() >= deadline {
+                return payload;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    let before = wait_for_group_count(&app, 0).await;
+    assert_eq!(before["groups"].as_array().unwrap().len(), 0, "{before}");
+
+    let joined = app
+        .call_tool(
+            "hifi_zone_group",
+            json!({
+                "action": "join",
+                "leader_zone_id": "roon:zone_a",
+                "member_zone_ids": ["roon:zone_b"],
+                "confirm": true,
+            }),
+        )
+        .await;
+    assert_eq!(joined["structuredContent"]["outcome"], "accepted");
+
+    let after = wait_for_group_count(&app, 1).await;
+    let groups = after["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1, "{after}");
+    assert_eq!(groups[0]["leader_zone_id"], json!("roon:zone_a"));
+    assert_eq!(
+        groups[0]["member_zone_ids"],
+        json!(["roon:output_b"]),
+        "zone_b was retired by the merge, so the surviving member is named by output id: {after}"
+    );
+    let group_requests = core
+        .requests_named("com.roonlabs.transport:2/group_outputs")
+        .await;
+    assert_eq!(group_requests.len(), 1, "exactly one group_outputs call");
+
+    let left = app
+        .call_tool(
+            "hifi_zone_group",
+            json!({
+                "action": "leave",
+                "member_zone_ids": ["roon:output_b"],
+                "confirm": true,
+            }),
+        )
+        .await;
+    assert_eq!(left["structuredContent"]["outcome"], "accepted");
+
+    let split = wait_for_group_count(&app, 0).await;
+    assert_eq!(split["groups"].as_array().unwrap().len(), 0, "{split}");
+    let ungroup_requests = core
+        .requests_named("com.roonlabs.transport:2/ungroup_outputs")
+        .await;
+    assert_eq!(
+        ungroup_requests.len(),
+        1,
+        "exactly one ungroup_outputs call"
+    );
+
+    core.stop().await;
+}
+
 /// Collections must have one provider-neutral wire shape: no MA URI escapes,
 /// pages are explicit, paths continue browse, and playable rows use the same
 /// opaque refs as search.
@@ -2290,7 +2481,7 @@ impl LmsHarness {
         )
         .await;
 
-        let state = build_state_with_bus(bus, Some(lms.clone())).await;
+        let state = build_state_with_bus(bus, Some(lms.clone()), None).await;
 
         // The aggregator only learns about zones by consuming bus events.
         let aggregator = state.aggregator.clone();
@@ -2417,6 +2608,88 @@ async fn lms_round_trip_pins_the_action_map_and_the_volume_sign() {
              mock received {commands:?}"
         );
     }
+
+    h.stop().await;
+}
+
+/// `hifi_zone_group` routing generalized to LMS (issue #517): a real mock
+/// server, a real adapter registered as an `AdapterRegistry` library (exactly
+/// the wiring `main.rs` does for #513), and the MCP tool driven over the real
+/// `/mcp` route -- join syncs the mock's second player into the first's
+/// group, status reports it, and leave unsyncs it, all addressed by `lms:`
+/// zone ids with no Music Assistant involved.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn lms_zone_group_routes_join_status_and_leave_through_the_registry() {
+    let h = LmsHarness::start().await;
+    const MEMBER_ID: &str = "11:22:33:44:55:66";
+    h.mock.add_player(MEMBER_ID, "Kitchen").await;
+
+    let leader_zone = h.zone_id();
+    let member_zone = format!("lms:{MEMBER_ID}");
+
+    let before = h
+        .app
+        .call_tool(
+            "hifi_zone_group",
+            json!({"action": "status", "zone_id": leader_zone}),
+        )
+        .await;
+    assert_eq!(before["structuredContent"]["outcome"], "ok");
+    assert_eq!(
+        before["structuredContent"]["scope"]["provider"],
+        json!("lms"),
+        "a zone_id-scoped status must identify lms, not aggregate: {before}"
+    );
+    let before_payload: Value =
+        serde_json::from_str(&result_text(&before)).expect("status payload JSON");
+    assert_eq!(
+        before_payload["groups"].as_array().map(Vec::len),
+        Some(0),
+        "no sync group exists yet: {before_payload}"
+    );
+
+    let joined = h
+        .app
+        .call_tool(
+            "hifi_zone_group",
+            json!({
+                "action": "join",
+                "leader_zone_id": leader_zone,
+                "member_zone_ids": [member_zone.clone()],
+                "confirm": true,
+            }),
+        )
+        .await;
+    assert_eq!(joined["structuredContent"]["outcome"], "accepted");
+    let joined_payload: Value =
+        serde_json::from_str(&result_text(&joined)).expect("join payload JSON");
+    let groups = joined_payload["groups"].as_array().expect("groups array");
+    assert_eq!(groups.len(), 1, "{joined_payload}");
+    assert_eq!(groups[0]["leader_zone_id"], json!(leader_zone));
+    assert_eq!(groups[0]["member_zone_ids"], json!([member_zone.clone()]));
+    assert_eq!(
+        h.mock.sync_groups().await,
+        vec![vec![h.player_id.to_string(), MEMBER_ID.to_string()]],
+        "the wire command must address the leader with `sync <member>`, per #403"
+    );
+
+    let left = h
+        .app
+        .call_tool(
+            "hifi_zone_group",
+            json!({
+                "action": "leave",
+                "member_zone_ids": [member_zone],
+                "confirm": true,
+            }),
+        )
+        .await;
+    assert_eq!(left["structuredContent"]["outcome"], "accepted");
+    assert!(
+        h.mock.sync_groups().await.is_empty(),
+        "leave must unsync the member"
+    );
 
     h.stop().await;
 }
@@ -5038,7 +5311,9 @@ async fn lms_never_reports_a_uhc_gap_as_a_provider_limitation() {
         "shuffle_mode",
         "saved_playlists",
         "favorites",
-        "multiroom_sync",
+        // multiroom_sync is deliberately absent here: #517 wired LMS sync
+        // groups (#513) to `hifi_zone_group`, so it is `supported` and is
+        // asserted as such below rather than as not-yet-implemented.
     ] {
         let entry = caps
             .get(capability)
@@ -5049,6 +5324,13 @@ async fn lms_never_reports_a_uhc_gap_as_a_provider_limitation() {
             "lms/{capability} must read as not-yet-implemented until its issue lands"
         );
     }
+
+    assert_eq!(
+        support_of(&caps["multiroom_sync"]),
+        "supported",
+        "lms/multiroom_sync must be supported: #513 wired native sync groups and #517 routes \
+         hifi_zone_group to them"
+    );
 }
 
 /// OpenHome and UPnP volume was ❌ in AGENTS.md and `not_implemented` in #395.
@@ -5252,7 +5534,29 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
                 "hifi_control",
                 json!({ "zone_id": zone_id, "action": "shuffle_off" }),
             )),
-            "multiroom_sync" => Some(("hifi_zone_group", json!({ "action": "status" }))),
+            // musicassistant's "multiroom" library is never registered in this
+            // generic TestApp, so a scoped status call reaches the registry's
+            // own "not configured" wording -- the same fingerprint every other
+            // musicassistant probe above proves against.
+            "multiroom_sync" if provider == "musicassistant" => Some((
+                "hifi_zone_group",
+                json!({ "action": "status", "zone_id": zone_id }),
+            )),
+            // Roon and LMS libraries *are* registered (`build_state_with_bus`),
+            // so status would reach a live, empty adapter and succeed instead of
+            // naming it. `join` reaches deep enough into each adapter's own
+            // group-membership resolution to name the provider even while
+            // disconnected/unconfigured -- see the bespoke `expected` strings
+            // below for why status is not used here.
+            "multiroom_sync" => Some((
+                "hifi_zone_group",
+                json!({
+                    "action": "join",
+                    "leader_zone_id": zone_id,
+                    "member_zone_ids": [format!("{provider}:def")],
+                    "confirm": true,
+                }),
+            )),
             _ => None,
         }
     }
@@ -5282,6 +5586,13 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
                 && capability == "play_by_ref"
             {
                 "unknown or expired"
+            } else if *provider == "roon" && capability == "multiroom_sync" {
+                // The disconnected fake never populates a zone, so
+                // `resolve_roon_output` fails before `set_group_members` ever
+                // reaches its own "Not connected to Roon" transport check --
+                // this is still RoonAdapter's own wording, just from a step
+                // earlier in the same call.
+                "Roon group leader was not found"
             } else {
                 fingerprint(provider)
             };
@@ -5297,15 +5608,16 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
     // The routed Spotify content and mode cells plus Music Assistant's queue
     // mutations, mode, collections, and zone-group cells add twenty-three probes to the
     // original provider transport set, plus one more for Music Assistant's
-    // queue_transfer (#507).
+    // queue_transfer (#507), plus two more for Roon and LMS multiroom_sync,
+    // generalized from the Music Assistant-only original (#517).
     // Apple Music's transport/skip/volume
     // cells remain gated until signed physical companion validation (#465).
     // Asserted exactly, not as a floor: a floor would pass while a cell silently
     // stopped being reported as supported, which is the direction that hides a
     // capability rather than inventing one.
     assert_eq!(
-        proved, 46,
-        "{proved} supported cells were proved end to end, expected 46. If a capability was deliberately wired or unwired, change this number in the same commit."
+        proved, 48,
+        "{proved} supported cells were proved end to end, expected 48. If a capability was deliberately wired or unwired, change this number in the same commit."
     );
 }
 
@@ -5859,7 +6171,7 @@ async fn now_playing_resource_agrees_with_hifi_now_playing_tool_for_a_live_zone(
 async fn a_newly_discovered_zone_is_addressable_without_a_restart() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let bus = create_bus();
-    let state = build_state_with_bus(bus.clone(), None).await;
+    let state = build_state_with_bus(bus.clone(), None, None).await;
 
     let aggregator = state.aggregator.clone();
     let aggregator_task = tokio::spawn(async move { aggregator.run().await });

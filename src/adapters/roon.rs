@@ -14,6 +14,7 @@ use roon_api::{
     CoreEvent, Info, Parsed, RoonApi, RoonApiError, Services, Svc,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -25,7 +26,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::adapters::handle::{AdapterHandle, RetryConfig};
 use crate::adapters::traits::{
-    AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
+    AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic, LibraryAdapter,
+    LibrarySearchResult,
 };
 use crate::bus::{
     runtime::{
@@ -172,6 +174,35 @@ pub(crate) fn is_ungrounded_grouping(item: &BrowseItem) -> bool {
 /// MCP and aggregator use prefixed IDs (e.g., "roon:zone_123"), but Roon API expects bare IDs.
 fn strip_roon_prefix(id: &str) -> &str {
     id.strip_prefix("roon:").unwrap_or(id)
+}
+
+/// Require a properly-prefixed Roon zone id and return its bare id.
+///
+/// Unlike [`strip_roon_prefix`] (used by the pre-existing transport paths,
+/// which tolerate a bare id for backward compatibility), the multiroom
+/// grouping surface (#509) is new and follows the stricter validation the
+/// Music Assistant and LMS adapters already apply to their own multiroom
+/// parameters (`musicassistant_player_id`, `lms_player_id`).
+fn roon_zone_id(zone_id: &str, parameter: &str) -> Result<String> {
+    zone_id
+        .strip_prefix("roon:")
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("{parameter} must be a Roon zone id"))
+}
+
+/// [`roon_zone_id`] over a list, rejecting duplicates the same way the
+/// Music Assistant and LMS multiroom contracts do.
+fn roon_zone_ids(zone_ids: &[String], parameter: &str) -> Result<Vec<String>> {
+    let mut ids = Vec::with_capacity(zone_ids.len());
+    for zone_id in zone_ids {
+        let id = roon_zone_id(zone_id, parameter)?;
+        if ids.contains(&id) {
+            return Err(anyhow::anyhow!("{parameter} must not contain duplicate zones"));
+        }
+        ids.push(id);
+    }
+    Ok(ids)
 }
 
 /// Pending image request - stores the oneshot sender to deliver the result
@@ -630,6 +661,14 @@ pub struct Output {
     pub output_id: String,
     pub display_name: String,
     pub volume: Option<VolumeInfo>,
+    /// Output ids this output can be grouped with, straight from the Core
+    /// (`transport::Output::can_group_with_output_ids`). Roon only groups
+    /// outputs that share a streaming protocol (RAAT with RAAT, AirPlay with
+    /// AirPlay, etc); this is the Core's own compatibility list, so grouping
+    /// (#509) refuses upfront against it instead of guessing at protocol
+    /// names the wire format never exposes.
+    #[serde(default)]
+    pub can_group_with_output_ids: Vec<String>,
 }
 
 /// Volume information
@@ -1372,6 +1411,213 @@ impl RoonAdapter {
         };
         transport.mute(&output_id, &how).await;
         Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Multiroom grouping (#509): `Transport::group_outputs` / `ungroup_outputs`
+    // wired to the `multiroom_status` / `multiroom_set_members` /
+    // `multiroom_ungroup` contract the Music Assistant adapter already
+    // implements (`src/adapters/musicassistant.rs`).
+    //
+    // Roon groups *outputs*, not zones. Grouping merges every named zone's
+    // outputs into a single zone; the Core keeps the leader's zone_id and
+    // retires the other zones (their outputs move under the leader's
+    // zone_id in the next zone update). This adapter resolves each zone
+    // argument to one representative output -- the same first-output
+    // resolution `change_volume` (above) already uses for multi-output
+    // zones -- and lets the ordinary zone-event pipeline in `run()`
+    // (`Parsed::Zones` / `Parsed::ZonesRemoved`, already unconditional for
+    // every zone change) publish the resulting `ZoneUpdated` /
+    // `ZoneRemoved` bus events. No special-case bus code is needed for
+    // grouping: from the bus's perspective a merge is just an ordinary zone
+    // update plus zone removal.
+    //
+    // Because member zone ids do not survive a merge, this adapter reports
+    // (and accepts back) *outputs* as members once a group exists: for a
+    // zone with more than one output, `multiroom_status` treats the first
+    // output as the "leader" and the rest as members, addressed as
+    // `roon:<output_id>` rather than a zone id. That is a stable-but-
+    // arbitrary UHC display convention (mirroring the same call LMS's
+    // adapter documents for its own leaderless sync groups), not a Roon
+    // fact: `resolve_roon_output` accepts either a live zone id or a bare
+    // output id, so a caller can always name a group member whether or not
+    // it currently has its own zone.
+
+    /// Resolve `id` (bare, no "roon:" prefix) to one Roon output: either the
+    /// first output of a zone with this id, or -- for a member of an
+    /// existing group, whose original zone id was retired by the merge --
+    /// the output with this id directly.
+    async fn resolve_roon_output(&self, id: &str) -> Result<Output> {
+        let state = self.state.read().await;
+        if let Some(zone) = state.zones.get(id) {
+            return zone
+                .outputs
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Zone has no outputs: {id}"));
+        }
+        state
+            .zones
+            .values()
+            .find_map(|zone| zone.outputs.iter().find(|o| o.output_id == id).cloned())
+            .ok_or_else(|| anyhow::anyhow!("Roon zone or output was not found: {id}"))
+    }
+
+    /// Report every Roon zone with more than one output as a group.
+    ///
+    /// `can_set_members` is always `true`: every Roon output accepts
+    /// `group_outputs`/`ungroup_outputs` unconditionally, so there is no
+    /// per-group capability to check (unlike Music Assistant's per-leader
+    /// `SET_MEMBERS` feature flag).
+    pub async fn multiroom_status(&self) -> Result<Value> {
+        let state = self.state.read().await;
+        let groups: Vec<Value> = state
+            .zones
+            .values()
+            .filter(|zone| zone.outputs.len() > 1)
+            .filter_map(|zone| {
+                let (_leader_output, member_outputs) = zone.outputs.split_first()?;
+                Some(json!({
+                    "leader_zone_id": PrefixedZoneId::roon(&zone.zone_id).to_string(),
+                    "member_zone_ids": member_outputs
+                        .iter()
+                        .map(|o| PrefixedZoneId::roon(&o.output_id).to_string())
+                        .collect::<Vec<_>>(),
+                    "can_set_members": true,
+                }))
+            })
+            .collect();
+        Ok(json!({ "groups": groups }))
+    }
+
+    /// Group `add_zone_ids` (and any current members of `leader_zone_id`'s
+    /// group) together via `group_outputs`, and ungroup `remove_zone_ids` via
+    /// `ungroup_outputs`, then return the current `multiroom_status`.
+    ///
+    /// Roon confirms grouping asynchronously through the ordinary zone
+    /// subscription rather than a synchronous RPC reply (the same is true of
+    /// `change_volume`/`mute`/`control` above), so -- unlike the Music
+    /// Assistant and LMS adapters, whose underlying protocols are
+    /// request/response -- the status returned here is a snapshot of
+    /// current knowledge, not a guaranteed post-condition. Callers that need
+    /// the authoritative outcome should watch the zone bus, exactly as they
+    /// already must for every other Roon transport command.
+    pub async fn set_group_members(
+        &self,
+        leader_zone_id: &str,
+        add_zone_ids: &[String],
+        remove_zone_ids: &[String],
+    ) -> Result<Value> {
+        if add_zone_ids.is_empty() && remove_zone_ids.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Roon group membership needs at least one member"
+            ));
+        }
+        let leader_id = roon_zone_id(leader_zone_id, "leader_zone_id")?;
+        let add_ids = roon_zone_ids(add_zone_ids, "member_zone_ids_to_add")?;
+        let remove_ids = roon_zone_ids(remove_zone_ids, "member_zone_ids_to_remove")?;
+        for id in add_ids.iter().chain(remove_ids.iter()) {
+            if id == &leader_id {
+                return Err(anyhow::anyhow!(
+                    "Roon group leader cannot be its own member input"
+                ));
+            }
+        }
+
+        let leader_output = self
+            .resolve_roon_output(&leader_id)
+            .await
+            .map_err(|_| anyhow::anyhow!("Roon group leader was not found"))?;
+        let mut add_outputs = Vec::with_capacity(add_ids.len());
+        for id in &add_ids {
+            add_outputs.push(
+                self.resolve_roon_output(id)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Roon group member was not found"))?,
+            );
+        }
+        let mut remove_outputs = Vec::with_capacity(remove_ids.len());
+        for id in &remove_ids {
+            remove_outputs.push(
+                self.resolve_roon_output(id)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Roon group member was not found"))?,
+            );
+        }
+
+        // Roon only groups outputs that share a streaming protocol. The Core
+        // does not expose a queryable protocol name, but `can_group_with_output_ids`
+        // *is* the Core's own compatibility list for the leader's output, so a
+        // mismatch here is refused cleanly instead of being sent to the Core
+        // to fail (or be silently ignored) in some undocumented way.
+        for output in &add_outputs {
+            if !leader_output
+                .can_group_with_output_ids
+                .iter()
+                .any(|id| id == &output.output_id)
+            {
+                return Err(anyhow::anyhow!(
+                    "Cannot group '{}' with '{}': they do not share a compatible streaming protocol",
+                    output.display_name,
+                    leader_output.display_name
+                ));
+            }
+        }
+
+        let transport = {
+            let state = self.state.read().await;
+            state
+                .transport
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Not connected to Roon"))?
+        };
+
+        if !add_outputs.is_empty() {
+            let mut output_ids: Vec<&str> = vec![leader_output.output_id.as_str()];
+            output_ids.extend(add_outputs.iter().map(|o| o.output_id.as_str()));
+            transport.group_outputs(output_ids).await;
+        }
+        for output in &remove_outputs {
+            transport
+                .ungroup_outputs(vec![output.output_id.as_str()])
+                .await;
+        }
+
+        self.multiroom_status().await
+    }
+
+    /// Ungroup each of `member_zone_ids` via `ungroup_outputs`, then return
+    /// the current `multiroom_status`. See [`Self::set_group_members`] for
+    /// why the returned status is a snapshot rather than a guaranteed
+    /// post-condition.
+    pub async fn ungroup_members(&self, member_zone_ids: &[String]) -> Result<Value> {
+        let member_ids = roon_zone_ids(member_zone_ids, "member_zone_ids")?;
+        if member_ids.is_empty() {
+            return Err(anyhow::anyhow!("Roon ungroup needs at least one member"));
+        }
+        let mut outputs = Vec::with_capacity(member_ids.len());
+        for id in &member_ids {
+            outputs.push(
+                self.resolve_roon_output(id)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Roon group member was not found"))?,
+            );
+        }
+
+        let transport = {
+            let state = self.state.read().await;
+            state
+                .transport
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Not connected to Roon"))?
+        };
+        for output in &outputs {
+            transport
+                .ungroup_outputs(vec![output.output_id.as_str()])
+                .await;
+        }
+
+        self.multiroom_status().await
     }
 
     /// Get album art image
@@ -2268,6 +2514,76 @@ impl RoonAdapter {
     }
 }
 
+/// Content-library surface (#509): only the multiroom grouping operations
+/// are implemented here. Roon's own search/play surfaces are reached
+/// through their dedicated paths (`RoonAdapter::search`, `RoonAdapter::play_item`,
+/// ...); this trait is what lets the provider-neutral MCP registry
+/// (`AdapterRegistry::library_content`) dispatch `multiroom_status`,
+/// `multiroom_set_members` and `multiroom_ungroup` to Roon the same way it
+/// already dispatches them to Music Assistant
+/// (`src/adapters/musicassistant.rs`).
+#[async_trait]
+impl LibraryAdapter for RoonAdapter {
+    async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<LibrarySearchResult>> {
+        Err(anyhow::anyhow!(
+            "Roon search is not implemented via the generic content-library surface (see #396/#402)"
+        ))
+    }
+
+    async fn play_uri(&self, _zone_id: &str, _uri: &str) -> Result<String> {
+        Err(anyhow::anyhow!(
+            "Roon play-by-uri is not implemented via the generic content-library surface (see #396)"
+        ))
+    }
+
+    async fn content(&self, operation: &str, params: &Value) -> Result<Value> {
+        match operation {
+            "multiroom_status" => self.multiroom_status().await,
+            "multiroom_set_members" => {
+                let leader = params
+                    .get("leader_zone_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("Roon group operation requires leader_zone_id"))?;
+                let add = params
+                    .get("member_zone_ids_to_add")
+                    .or_else(|| params.get("member_zone_ids"))
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow::anyhow!("Roon group operation requires member_zone_ids"))?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                let remove = params
+                    .get("member_zone_ids_to_remove")
+                    .and_then(Value::as_array)
+                    .map(|members| {
+                        members
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                self.set_group_members(leader, &add, &remove).await
+            }
+            "multiroom_ungroup" => {
+                let members = params
+                    .get("member_zone_ids")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow::anyhow!("Roon ungroup requires member_zone_ids"))?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                self.ungroup_members(&members).await
+            }
+            _ => Err(anyhow::anyhow!(
+                "Roon content operation `{operation}` is not supported"
+            )),
+        }
+    }
+}
+
 #[async_trait]
 impl AdapterLogic for RoonAdapter {
     fn prefix(&self) -> &'static str {
@@ -2604,6 +2920,7 @@ fn convert_zone(roon_zone: &RoonZone) -> Zone {
                 is_muted: v.is_muted,
                 step: v.step,
             }),
+            can_group_with_output_ids: o.can_group_with_output_ids.clone(),
         })
         .collect();
 
@@ -3383,6 +3700,7 @@ mod tests {
                     is_muted: None,
                     step: None,
                 }),
+                can_group_with_output_ids: Vec::new(),
             }],
         }
     }
@@ -3448,6 +3766,7 @@ mod tests {
                 output_id: "output-no-vol".to_string(),
                 display_name: "No Volume Output".to_string(),
                 volume: None,
+                can_group_with_output_ids: Vec::new(),
             }],
         };
         let bus_zone = roon_zone_to_bus_zone(&zone);

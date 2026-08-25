@@ -502,6 +502,22 @@ mod server {
             .adapter_registry
             .register_library("spotify", spotify.clone())
             .await;
+        // LMS's transport commands keep going through the dedicated `state.lms`
+        // field/routes; this registration only exposes the provider-neutral
+        // content-library surface (#510's multiroom sync-group operations) via
+        // `AdapterRegistry::library_content("lms", ...)`.
+        state
+            .adapter_registry
+            .register_library("lms", state.lms.clone())
+            .await;
+        // Roon's transport commands keep going through the dedicated
+        // `state.roon` field/routes; this registration only exposes the
+        // provider-neutral content-library surface (#509's multiroom
+        // grouping operations) via `AdapterRegistry::library_content("roon", ...)`.
+        state
+            .adapter_registry
+            .register_library("roon", state.roon.clone())
+            .await;
         state.provider_auth.attach_spotify(spotify.clone()).await;
         state
             .provider_auth

@@ -58,7 +58,8 @@ use tracing::{debug, info, warn};
 use crate::adapters::handle::{AdapterHandle, RetryConfig};
 use crate::adapters::lms_discovery::discover_lms_servers;
 use crate::adapters::traits::{
-    AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
+    AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic, LibraryAdapter,
+    LibrarySearchResult,
 };
 use crate::adapters::Startable;
 use crate::bus::runtime::{
@@ -85,6 +86,33 @@ const LMS_MUTE_PREF: &str = "mute";
 /// MCP and aggregator use prefixed IDs (e.g., "lms:00:11:22:33:44:55"), but LMS API expects bare IDs.
 fn strip_lms_prefix(id: &str) -> &str {
     id.strip_prefix("lms:").unwrap_or(id)
+}
+
+/// Require a properly-prefixed LMS zone id and return its bare player id.
+///
+/// Unlike Music Assistant's ids, LMS player ids are MAC addresses and
+/// legitimately contain colons, so (unlike `musicassistant_player_id`) this
+/// does not reject a remainder containing `:`.
+fn lms_player_id(zone_id: &str, parameter: &str) -> Result<String> {
+    zone_id
+        .strip_prefix("lms:")
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow!("{parameter} must be an LMS zone id"))
+}
+
+/// [`lms_player_id`] over a list, rejecting duplicates the same way the
+/// Music Assistant multiroom contract does.
+fn lms_player_ids(zone_ids: &[String], parameter: &str) -> Result<Vec<String>> {
+    let mut ids = Vec::with_capacity(zone_ids.len());
+    for zone_id in zone_ids {
+        let id = lms_player_id(zone_id, parameter)?;
+        if ids.contains(&id) {
+            return Err(anyhow!("{parameter} must not contain duplicate zones"));
+        }
+        ids.push(id);
+    }
+    Ok(ids)
 }
 
 /// Read an integer that LMS may emit as either a JSON number or a JSON string.
@@ -1243,6 +1271,148 @@ impl LmsAdapter {
     pub async fn get_player_status(&self, player_id: &str) -> Result<LmsPlayer> {
         let player_id = strip_lms_prefix(player_id);
         self.rpc.get_player_status(player_id).await
+    }
+
+    // -------------------------------------------------------------------------
+    // Sync groups (#510): LMS's native Squeezebox multi-room, wired to the
+    // multiroom_status / multiroom_set_members / multiroom_ungroup contract
+    // the Music Assistant adapter already implements
+    // (`src/adapters/musicassistant.rs`).
+    //
+    // LMS sync is peer-based -- a group is just a set of players playing the
+    // same stream in lockstep, with no server-side concept of a leader. The
+    // contract, however, is leader/member shaped. This adapter resolves that
+    // mismatch by treating "join the leader's group" literally: every add
+    // is sent as `<leader> sync <member>`. Verified live against Lyrion 9.1.2
+    // (issue #403's investigation): the **addressed** player in a `sync`
+    // command becomes/stays the sync master, and the **argument** player
+    // adopts the addressed player's queue, repeat and shuffle -- destroying
+    // its own. Addressing the leader therefore keeps the leader's queue
+    // intact and makes the member fall in behind it, exactly the semantics
+    // `multiroom_set_members`'s `leader_zone_id` implies. Removal is
+    // leader-independent: `<member> sync -` unsyncs that one player from
+    // whatever group it is currently in.
+    //
+    // Because there is no server-side leader, `multiroom_status` cannot
+    // recover *which* player was originally addressed -- only current group
+    // membership via `syncgroups ?`. This adapter picks the first id LMS
+    // reports for each group as that group's leader for display purposes.
+    // That is a stable-but-arbitrary UHC convention, not an LMS fact.
+
+    /// Read every active LMS sync group from `syncgroups ?` as a raw member
+    /// list (no leader/member split yet). Groups of fewer than two players
+    /// are not sync groups and are dropped.
+    async fn read_sync_groups(&self) -> Result<Vec<Vec<String>>> {
+        let result = self
+            .rpc
+            .execute(None, vec![json!("syncgroups"), json!("?")])
+            .await?;
+        let groups_loop = result
+            .get("syncgroups_loop")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(groups_loop
+            .iter()
+            .filter_map(|group| group.get("sync_members").and_then(Value::as_str))
+            .map(|members| {
+                members
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|members| members.len() >= 2)
+            .collect())
+    }
+
+    /// Report every active LMS sync group in the multiroom contract's shape.
+    ///
+    /// `can_set_members` is always `true`: unlike Music Assistant's per-leader
+    /// `SET_MEMBERS` feature flag, every LMS player accepts `sync`
+    /// unconditionally, so there is no per-group capability to check.
+    pub async fn multiroom_status(&self) -> Result<Value> {
+        let groups = self.read_sync_groups().await?;
+        let groups = groups
+            .into_iter()
+            .filter_map(|members| {
+                let (leader, rest) = members.split_first()?;
+                Some(json!({
+                    "leader_zone_id": PrefixedZoneId::lms(leader).to_string(),
+                    "member_zone_ids": rest
+                        .iter()
+                        .map(|id| PrefixedZoneId::lms(id).to_string())
+                        .collect::<Vec<_>>(),
+                    "can_set_members": true,
+                }))
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({ "groups": groups }))
+    }
+
+    /// Sync `add_zone_ids` into `leader_zone_id`'s group and unsync
+    /// `remove_zone_ids`, then return the refreshed `multiroom_status`.
+    pub async fn set_group_members(
+        &self,
+        leader_zone_id: &str,
+        add_zone_ids: &[String],
+        remove_zone_ids: &[String],
+    ) -> Result<Value> {
+        if add_zone_ids.is_empty() && remove_zone_ids.is_empty() {
+            return Err(anyhow!("LMS group membership needs at least one member"));
+        }
+        let leader_id = lms_player_id(leader_zone_id, "leader_zone_id")?;
+        let add_ids = lms_player_ids(add_zone_ids, "member_zone_ids_to_add")?;
+        let remove_ids = lms_player_ids(remove_zone_ids, "member_zone_ids_to_remove")?;
+        let players = self.rpc.get_players().await?;
+        let player_exists = |id: &str| players.iter().any(|player| player.playerid == id);
+        if !player_exists(&leader_id) {
+            return Err(anyhow!("LMS group leader was not found"));
+        }
+        for player_id in add_ids.iter().chain(remove_ids.iter()) {
+            if player_id == &leader_id {
+                return Err(anyhow!(
+                    "LMS group leader cannot be its own member input"
+                ));
+            }
+            if !player_exists(player_id) {
+                return Err(anyhow!("LMS group member was not found"));
+            }
+        }
+        for member_id in &add_ids {
+            self.rpc
+                .execute(Some(&leader_id), vec![json!("sync"), json!(member_id)])
+                .await?;
+        }
+        for member_id in &remove_ids {
+            self.rpc
+                .execute(Some(member_id), vec![json!("sync"), json!("-")])
+                .await?;
+        }
+        self.multiroom_status().await
+    }
+
+    /// Unsync each of `member_zone_ids` via its own `sync -`, independent of
+    /// which group (if any) it currently belongs to, then return the
+    /// refreshed `multiroom_status`.
+    pub async fn ungroup_members(&self, member_zone_ids: &[String]) -> Result<Value> {
+        let member_ids = lms_player_ids(member_zone_ids, "member_zone_ids")?;
+        if member_ids.is_empty() {
+            return Err(anyhow!("LMS ungroup needs at least one member"));
+        }
+        let players = self.rpc.get_players().await?;
+        for member_id in &member_ids {
+            if !players.iter().any(|player| player.playerid == *member_id) {
+                return Err(anyhow!("LMS group member was not found"));
+            }
+        }
+        for member_id in &member_ids {
+            self.rpc
+                .execute(Some(member_id), vec![json!("sync"), json!("-")])
+                .await?;
+        }
+        self.multiroom_status().await
     }
 
     /// Start polling for player updates (internal - use Startable trait)
@@ -3082,6 +3252,74 @@ async fn run_lms_command_endpoint(
                 // deadline; the command may have applied even though LMS did not serve readback.
                 tracing::warn!(%error, command_id = command_id.get(), "LMS native write accepted but coherent player readback failed");
             }
+        }
+    }
+}
+
+/// Content-library surface (#510): only the multiroom sync-group operations
+/// are implemented here. LMS's own search/play surfaces are reached through
+/// their dedicated paths (`LmsAdapter::search`, `LmsAdapter::control`, ...);
+/// this trait is what lets the provider-neutral MCP registry
+/// (`AdapterRegistry::library_content`) dispatch `multiroom_status`,
+/// `multiroom_set_members` and `multiroom_ungroup` to LMS the same way it
+/// already dispatches them to Music Assistant
+/// (`src/adapters/musicassistant.rs`).
+#[async_trait]
+impl LibraryAdapter for LmsAdapter {
+    async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<LibrarySearchResult>> {
+        Err(anyhow!(
+            "LMS search is not implemented via the generic content-library surface (see #396/#402)"
+        ))
+    }
+
+    async fn play_uri(&self, _zone_id: &str, _uri: &str) -> Result<String> {
+        Err(anyhow!(
+            "LMS play-by-uri is not implemented via the generic content-library surface (see #396)"
+        ))
+    }
+
+    async fn content(&self, operation: &str, params: &Value) -> Result<Value> {
+        match operation {
+            "multiroom_status" => self.multiroom_status().await,
+            "multiroom_set_members" => {
+                let leader = params
+                    .get("leader_zone_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("LMS group operation requires leader_zone_id"))?;
+                let add = params
+                    .get("member_zone_ids_to_add")
+                    .or_else(|| params.get("member_zone_ids"))
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow!("LMS group operation requires member_zone_ids"))?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                let remove = params
+                    .get("member_zone_ids_to_remove")
+                    .and_then(Value::as_array)
+                    .map(|members| {
+                        members
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                self.set_group_members(leader, &add, &remove).await
+            }
+            "multiroom_ungroup" => {
+                let members = params
+                    .get("member_zone_ids")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow!("LMS ungroup requires member_zone_ids"))?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                self.ungroup_members(&members).await
+            }
+            _ => Err(anyhow!("LMS content operation `{operation}` is not supported")),
         }
     }
 }
