@@ -5,9 +5,10 @@
 use dioxus::prelude::*;
 
 use crate::app::api::{
-    AppSettings, AppleBridgeStatus, HqpStatus, LmsConfig, MusicAssistantConfigureRequest,
-    MusicAssistantStatusResponse, ProviderAuthResponse, ProviderOAuthStart, RoonStatus,
-    SpotifyAccountResponse, SpotifyConfigureRequest, SpotifyConfigureResponse, ZonesResponse,
+    AppSettings, AppleBridgeStatus, HqpStatus, LmsConfig, MqttConfigureRequest,
+    MqttStatusResponse, MusicAssistantConfigureRequest, MusicAssistantStatusResponse,
+    ProviderAuthResponse, ProviderOAuthStart, RoonStatus, SpotifyAccountResponse,
+    SpotifyConfigureRequest, SpotifyConfigureResponse, ZonesResponse,
 };
 use crate::app::components::Layout;
 use crate::app::settings_context::{initial_app_settings, use_settings};
@@ -130,6 +131,7 @@ enum AdapterToggle {
     Spotify,
     AppleMusic,
     MusicAssistant,
+    Mqtt,
 }
 
 fn settings_with_toggle(mut settings: AppSettings, toggle: SettingsToggle) -> AppSettings {
@@ -153,6 +155,7 @@ fn settings_with_toggle(mut settings: AppSettings, toggle: SettingsToggle) -> Ap
         SettingsToggle::Adapter(AdapterToggle::MusicAssistant, enabled) => {
             settings.adapters.musicassistant = enabled
         }
+        SettingsToggle::Adapter(AdapterToggle::Mqtt, enabled) => settings.adapters.mqtt = enabled,
         SettingsToggle::HideKnobs(enabled) => settings.hide_knobs_page = !enabled,
     }
     settings
@@ -216,6 +219,7 @@ fn FeatureToggle(label: &'static str, enabled: bool, onclick: EventHandler<Mouse
                 "Enable HQPlayer" => "adapters.hqplayer",
                 "Enable Spotify" => "adapters.spotify",
                 "Enable Apple Music" => "adapters.applemusic",
+                "Enable MQTT/Home Assistant" => "adapters.mqtt",
                 "Show Knobs page" => "hide_knobs_page",
                 _ => "",
             },
@@ -517,6 +521,7 @@ pub fn Settings() -> Element {
     let mut spotify_enabled = use_signal(|| initial_settings.adapters.spotify);
     let mut applemusic_enabled = use_signal(|| initial_settings.adapters.applemusic);
     let mut musicassistant_enabled = use_signal(|| initial_settings.adapters.musicassistant);
+    let mut mqtt_enabled = use_signal(|| initial_settings.adapters.mqtt);
 
     // Streaming-provider onboarding state. Provider credentials are never
     // rendered or stored in the browser; the backend owns OAuth tokens.
@@ -535,6 +540,15 @@ pub fn Settings() -> Element {
     let mut musicassistant_token = use_signal(String::new);
     let mut musicassistant_tls = use_signal(|| true);
     let mut musicassistant_insecure_http = use_signal(|| false);
+    let mut mqtt_action = use_signal(ProviderActionState::default);
+    let mut mqtt_error = use_signal(|| None::<String>);
+    let mut mqtt_host = use_signal(String::new);
+    let mut mqtt_port = use_signal(String::new);
+    let mut mqtt_username = use_signal(String::new);
+    let mut mqtt_password = use_signal(String::new);
+    let mut mqtt_base_topic = use_signal(|| "unified-hifi".to_string());
+    let mut mqtt_discovery_prefix = use_signal(|| "homeassistant".to_string());
+    let mut mqtt_tls = use_signal(|| false);
     let mut confirmed_settings = use_signal(|| None::<AppSettings>);
 
     // Hide knobs signal (LMS/HQPlayer visibility follows adapter enabled state)
@@ -558,6 +572,7 @@ pub fn Settings() -> Element {
             spotify_enabled.set(s.adapters.spotify);
             applemusic_enabled.set(s.adapters.applemusic);
             musicassistant_enabled.set(s.adapters.musicassistant);
+            mqtt_enabled.set(s.adapters.mqtt);
             hide_knobs.set(s.hide_knobs_page);
             confirmed_settings.set(Some(s.clone()));
             // Sync to shared context for Nav reactivity (page visibility follows adapter state)
@@ -617,6 +632,11 @@ pub fn Settings() -> Element {
     let mut apple_bridge_status = use_resource(|| async {
         crate::app::api::fetch_json::<AppleBridgeStatus>("/api/bridges/applemusic/status").await
     });
+    let mut mqtt_status = use_resource(|| async {
+        crate::app::api::fetch_json::<MqttStatusResponse>("/api/mqtt/status")
+            .await
+            .ok()
+    });
 
     use_effect(move || {
         if let Some(Some(status)) = musicassistant_status.read().as_ref() {
@@ -625,6 +645,26 @@ pub fn Settings() -> Element {
                 musicassistant_port.set(endpoint.port.to_string());
                 musicassistant_tls.set(endpoint.tls);
                 musicassistant_insecure_http.set(endpoint.allow_insecure_http);
+            }
+        }
+    });
+
+    use_effect(move || {
+        if let Some(Some(status)) = mqtt_status.read().as_ref() {
+            if let Some(host) = status.host.as_ref() {
+                mqtt_host.set(host.clone());
+            }
+            if let Some(port) = status.port {
+                mqtt_port.set(port.to_string());
+            }
+            if let Some(tls) = status.tls {
+                mqtt_tls.set(tls);
+            }
+            if let Some(base_topic) = status.base_topic.as_ref() {
+                mqtt_base_topic.set(base_topic.clone());
+            }
+            if let Some(discovery_prefix) = status.discovery_prefix.as_ref() {
+                mqtt_discovery_prefix.set(discovery_prefix.clone());
             }
         }
     });
@@ -643,6 +683,7 @@ pub fn Settings() -> Element {
             spotify_account.restart();
             musicassistant_status.restart();
             apple_bridge_status.restart();
+            mqtt_status.restart();
         }
     });
 
@@ -803,6 +844,50 @@ pub fn Settings() -> Element {
                 Err(error) => {
                     musicassistant_action.set(ProviderActionState::Failed);
                     musicassistant_error.set(Some(error));
+                }
+            }
+        });
+    };
+
+    let save_mqtt = move |_| {
+        let host = mqtt_host().trim().to_string();
+        if host.is_empty() {
+            mqtt_action.set(ProviderActionState::Failed);
+            mqtt_error.set(Some("Enter an MQTT broker host.".to_string()));
+            return;
+        }
+        let port = mqtt_port().trim().parse::<u16>().ok();
+        let username = mqtt_username().trim().to_string();
+        let password = mqtt_password().trim().to_string();
+        let base_topic = mqtt_base_topic().trim().to_string();
+        let discovery_prefix = mqtt_discovery_prefix().trim().to_string();
+        let tls = mqtt_tls();
+        mqtt_action.set(ProviderActionState::Loading);
+        mqtt_error.set(None);
+        spawn(async move {
+            let request = MqttConfigureRequest {
+                host,
+                port,
+                tls,
+                username: (!username.is_empty()).then_some(username),
+                password: (!password.is_empty()).then_some(password),
+                base_topic: (!base_topic.is_empty()).then_some(base_topic),
+                discovery_prefix: (!discovery_prefix.is_empty()).then_some(discovery_prefix),
+            };
+            match crate::app::api::post_json::<MqttConfigureRequest, serde_json::Value>(
+                "/api/mqtt/configure",
+                &request,
+            )
+            .await
+            {
+                Ok(_) => {
+                    mqtt_action.set(ProviderActionState::Success);
+                    mqtt_password.set(String::new());
+                    mqtt_status.restart();
+                }
+                Err(error) => {
+                    mqtt_action.set(ProviderActionState::Failed);
+                    mqtt_error.set(Some(error));
                 }
             }
         });
@@ -1150,6 +1235,37 @@ pub fn Settings() -> Element {
                                     } else {
                                         span { class: "text-muted", "-" }
                                     }
+                                }
+                            }
+                            // MQTT/Home Assistant discovery publisher (bus consumer, not a zone adapter)
+                            tr { class: "border-b border-default",
+                                td { class: "py-2 px-3",
+                                    FeatureToggle {
+                                        label: "Enable MQTT/Home Assistant",
+                                        enabled: mqtt_enabled(),
+                                        onclick: move |_| {
+                                            toggle_setting(SettingsToggle::Adapter(AdapterToggle::Mqtt, !mqtt_enabled()));
+                                        }
+                                    }
+                                }
+                                td { class: "py-2 px-3",
+                                    div { class: "flex items-center gap-2",
+                                        "MQTT/Home Assistant"
+                                        span { class: "badge badge-secondary", "Alpha" }
+                                    }
+                                }
+                                td { class: "py-2 px-3",
+                                    if mqtt_enabled() {
+                                        if let Some(status) = mqtt_status.read().clone().flatten() {
+                                            if status.running {
+                                                span { class: "status-ok", "✓ Connected" }
+                                            } else if status.configured {
+                                                span { class: "text-yellow-500", "Configured · waiting" }
+                                            } else {
+                                                span { class: "text-muted", "Setup required" }
+                                            }
+                                        } else { "..." }
+                                    } else { span { class: "text-muted", "-" } }
                                 }
                             }
                             // Knobs (page only, no adapter)
@@ -1690,6 +1806,75 @@ pub fn Settings() -> Element {
                 }
             }
 
+            div { id: "mqtt-anchor",
+                section {
+                    class: "mb-8",
+                    hidden: !mqtt_enabled(),
+                    aria_labelledby: "mqtt-heading",
+                    div { class: "mb-4",
+                        h2 { id: "mqtt-heading", class: "text-xl font-semibold flex items-center gap-2",
+                            "MQTT / Home Assistant"
+                            span { class: "badge badge-secondary", "Alpha" }
+                        }
+                        p { class: "text-muted text-sm", "Publish every UHC zone to Home Assistant over MQTT discovery. Broker credentials are encrypted and never returned to this page." }
+                    }
+                    div { class: "card p-5 sm:p-6",
+                        if let Some(status) = mqtt_status.read().clone().flatten() {
+                            div { class: "text-sm",
+                                if status.running {
+                                    p { class: "status-ok", "Connected to broker" }
+                                } else if status.configured {
+                                    p { class: "text-yellow-500", "Configured, not currently connected" }
+                                } else {
+                                    p { class: "text-muted", "Setup required" }
+                                }
+                                if let Some(host) = status.host.as_ref() {
+                                    p { class: "mt-1 text-secondary",
+                                        "Current broker: "
+                                        if status.tls.unwrap_or(false) { "mqtts://" } else { "mqtt://" }
+                                        "{host}:{status.port.unwrap_or_default()}"
+                                    }
+                                }
+                            }
+                        }
+                        div { class: "mt-4 grid gap-4 sm:grid-cols-2",
+                            div {
+                                label { class: "block text-sm font-medium", r#for: "mqtt-host", "Broker host" }
+                                input { id: "mqtt-host", class: "input mt-1 min-h-11 w-full", value: mqtt_host(), autocomplete: "url", placeholder: "homeassistant.local", oninput: move |event| mqtt_host.set(event.value()) }
+                            }
+                            div {
+                                label { class: "block text-sm font-medium", r#for: "mqtt-port", "Port" }
+                                input { id: "mqtt-port", class: "input mt-1 min-h-11 w-full", r#type: "number", value: mqtt_port(), placeholder: "1883", oninput: move |event| mqtt_port.set(event.value()) }
+                            }
+                            div {
+                                label { class: "block text-sm font-medium", r#for: "mqtt-username", "Username (optional)" }
+                                input { id: "mqtt-username", class: "input mt-1 min-h-11 w-full", value: mqtt_username(), autocomplete: "username", oninput: move |event| mqtt_username.set(event.value()) }
+                            }
+                            div {
+                                label { class: "block text-sm font-medium", r#for: "mqtt-password", "Password (optional)" }
+                                input { id: "mqtt-password", class: "input mt-1 min-h-11 w-full", r#type: "password", value: mqtt_password(), autocomplete: "new-password", placeholder: "Leave blank to keep the saved password", oninput: move |event| mqtt_password.set(event.value()) }
+                            }
+                            div {
+                                label { class: "block text-sm font-medium", r#for: "mqtt-base-topic", "Base topic" }
+                                input { id: "mqtt-base-topic", class: "input mt-1 min-h-11 w-full", value: mqtt_base_topic(), oninput: move |event| mqtt_base_topic.set(event.value()) }
+                            }
+                            div {
+                                label { class: "block text-sm font-medium", r#for: "mqtt-discovery-prefix", "Discovery prefix" }
+                                input { id: "mqtt-discovery-prefix", class: "input mt-1 min-h-11 w-full", value: mqtt_discovery_prefix(), oninput: move |event| mqtt_discovery_prefix.set(event.value()) }
+                            }
+                        }
+                        label { class: "mt-4 flex items-center gap-2 text-sm",
+                            input { r#type: "checkbox", checked: mqtt_tls(), onchange: move |event| mqtt_tls.set(event.checked()) }
+                            "Use TLS"
+                        }
+                        button { id: "mqtt-save-settings", r#type: "button", class: "btn btn-primary mt-5 min-h-11", disabled: mqtt_action() == ProviderActionState::Loading, aria_busy: mqtt_action() == ProviderActionState::Loading, onclick: save_mqtt,
+                            if mqtt_action() == ProviderActionState::Loading { "Saving…" } else { "Save and connect" }
+                        }
+                        p { class: "mt-2 text-sm status-err", hidden: mqtt_error().is_none(), role: "alert", "{mqtt_error().unwrap_or_default()}" }
+                    }
+                }
+            }
+
             // MCP discovery and agent onboarding
             section { class: "mb-8", aria_labelledby: "mcp-server-heading",
                 div { class: "card overflow-hidden",
@@ -1842,6 +2027,7 @@ mod tests {
                 spotify: false,
                 applemusic: true,
                 musicassistant: false,
+                mqtt: false,
             },
             hide_knobs_page: false,
             hide_hqp_page: true,

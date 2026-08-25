@@ -57,6 +57,8 @@ pub struct AdapterSettings {
     pub applemusic: bool,
     #[serde(default)]
     pub musicassistant: bool,
+    #[serde(default)]
+    pub mqtt: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -137,6 +139,37 @@ pub struct MusicAssistantStatusResponse {
     pub endpoint: Option<MusicAssistantEndpoint>,
     pub has_token: bool,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct MqttConfigureRequest {
+    pub host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub tls: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_topic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_prefix: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct MqttStatusResponse {
+    pub configured: bool,
+    pub enabled: bool,
+    pub running: bool,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub tls: Option<bool>,
+    pub base_topic: Option<String>,
+    pub discovery_prefix: Option<String>,
+    pub has_username: bool,
+    pub has_password: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
