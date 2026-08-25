@@ -480,17 +480,28 @@ pub fn Library(
     let current_tab = Tab::parse(&route_tab);
     let breadcrumbs = use_signal(|| decode_path(route_path.as_deref()));
 
-    // Re-sync local breadcrumb signal when navigation (back/forward, or a
-    // deep link) changes the route's `path` out from under us.
+    // Re-sync local breadcrumb signal when navigation (a row click's
+    // `navigator.push`, back/forward, or a deep link) changes the route's
+    // `path` out from under us.
+    //
+    // #566 (live probe): `use_reactive!` is load-bearing. `path` is a plain
+    // route prop, not a signal -- an effect that merely *captures* it has no
+    // tracked dependency and runs exactly once, at mount. In-app navigation
+    // keeps this component mounted, so every breadcrumb-changing click
+    // (browse rows and the new search-result chevrons alike) updated the URL
+    // while the visible level never changed -- the click read as a no-op.
+    // Deep links appeared to work only because a fresh mount seeds the
+    // signal's initial value. `use_reactive!` diffs the prop across renders
+    // and re-runs this effect when it actually changes.
     {
         let mut breadcrumbs = breadcrumbs;
         let route_path_for_effect = path.clone();
-        use_effect(move || {
+        use_effect(use_reactive!(|route_path_for_effect| {
             let decoded = decode_path(route_path_for_effect.as_deref());
             if *breadcrumbs.peek() != decoded {
                 breadcrumbs.set(decoded);
             }
-        });
+        }));
     }
 
     let items = use_signal(Vec::<CollectionItem>::new);
@@ -549,8 +560,26 @@ pub fn Library(
         });
     };
 
+    // The search box's text. Declared before `open_folder` (its consumers --
+    // the input binding and the search effect -- live in the "Unified search"
+    // block below) because opening a folder must clear it.
+    let mut search_query = use_signal(String::new);
+
     let open_folder = {
         move |(title, folder_path): (String, String)| {
+            // #566 (live probe): a non-empty query keeps the search-results
+            // view mounted, so opening a search hit navigated the route (URL
+            // and breadcrumbs updated) while the visible page stayed on the
+            // results list -- the click read as a no-op, the exact dead end
+            // this issue exists to remove. Opening a folder is a statement
+            // that the search is done: clear the query so the browse level
+            // the navigation lands on is actually shown. A no-op for browse
+            // rows opened outside a search (the query is already empty).
+            // (Signals are Copy: the shadow keeps this closure `Fn` -- setting
+            // the captured copy directly would make it `FnMut`, which the row
+            // components' handler props don't accept.)
+            let mut search_query = search_query;
+            search_query.set(String::new());
             let mut stack = breadcrumbs();
             stack.push(BreadcrumbEntry {
                 title,
@@ -657,7 +686,8 @@ pub fn Library(
     });
 
     // ---- Unified search (#550): local filter + debounced global search ----
-    let mut search_query = use_signal(String::new);
+    // (Declared above `open_folder` so opening a folder can clear it -- see
+    // there. Kept in this block so the search wiring reads as one unit.)
     let search_generation = use_signal(|| 0u64);
     let global_results = use_signal(Vec::<SearchResult>::new);
     let global_searching = use_signal(|| false);
