@@ -333,7 +333,10 @@ impl MqttStatusResponse {
         } else {
             "mqtt"
         };
-        Some(format!("{scheme}://{host}:{}", self.port.unwrap_or_default()))
+        Some(format!(
+            "{scheme}://{host}:{}",
+            self.port.unwrap_or_default()
+        ))
     }
 
     /// One plain sentence explaining `last_error`, or `None` when there is
@@ -354,7 +357,18 @@ impl MqttStatusResponse {
         }
         let error = self.last_error.as_ref()?;
         let lowered = error.to_lowercase();
-        let explanation = if lowered.contains("lookup address")
+        // Credentials are tested FIRST and deliberately: `rumqttc` renders a
+        // rejected CONNACK as "Connection refused, return code
+        // `NotAuthorized`", which also matches the dead-port branch below.
+        // Matching that one first would tell a user with a wrong password to
+        // go and check their port number.
+        let explanation = if lowered.contains("not authorized")
+            || lowered.contains("notauthorized")
+            || lowered.contains("bad user name")
+            || lowered.contains("badusername")
+        {
+            "The broker turned us away. Check the username and password."
+        } else if lowered.contains("lookup address")
             || lowered.contains("nodename nor servname")
             || lowered.contains("name or service not known")
             || lowered.contains("no such host")
@@ -362,12 +376,6 @@ impl MqttStatusResponse {
             "That address could not be found. Check the broker's name for a typo."
         } else if lowered.contains("connection refused") {
             "Nothing answered there. Check the port, and that the broker is switched on."
-        } else if lowered.contains("not authorized")
-            || lowered.contains("notauthorized")
-            || lowered.contains("bad user name")
-            || lowered.contains("badusername")
-        {
-            "The broker turned us away. Check the username and password."
         } else if lowered.contains("no route to host") || lowered.contains("network unreachable") {
             "That address could not be reached from here. Check they are on the same network."
         } else if lowered.contains("timed out") || lowered.contains("timeout") {
