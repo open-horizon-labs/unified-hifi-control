@@ -163,6 +163,30 @@ fn prefix_attr(html: &str, attr: &str, base: &str) -> String {
     out
 }
 
+/// Prefix rooted asset URLs that appear as quoted string literals in the
+/// client JS bundle.
+///
+/// The wasm-bindgen glue loads the wasm module from a hard-coded
+/// root-absolute path (`module_or_path:"/./assets/..._bg.wasm"`). That fetch
+/// happens *before* hydration, so it cannot consult the base-path meta tag
+/// the way `crate::app::base_path` does for every later request — under
+/// ingress it resolves against the HA frontend origin, 404s, and the WASM
+/// compile fails with "HTTP status code is not ok", leaving a dead SSR shell.
+///
+/// Deliberately narrow: only `"/assets/...` and `"/./assets/...` literals are
+/// touched (either quote style). That is the shape `dx` emits, and it cannot
+/// match a rooted path the app builds at runtime — those already go through
+/// `base_path`.
+fn prefix_js_asset_paths(js: &str, base: &str) -> String {
+    let mut out = js.to_string();
+    for needle in ["\"/./assets/", "\"/assets/", "'/./assets/", "'/assets/"] {
+        let quote = &needle[..1];
+        let path = &needle[1..];
+        out = out.replace(needle, &format!("{quote}{base}{path}"));
+    }
+    out
+}
+
 /// Rewrite one HTML document for serving under `base`: prefix rooted
 /// `href`/`src` attributes and inject the base-path meta tag.
 fn rewrite_html(html: &str, base: &str) -> String {
@@ -221,13 +245,18 @@ where
             let res = inner.call(req).await?;
             let Some(base) = base else { return Ok(res) };
 
-            let is_html = res
+            let content_type = res
                 .headers()
                 .get(header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
-                .map(|ct| ct.starts_with("text/html"))
-                .unwrap_or(false);
-            if !is_html {
+                .unwrap_or("")
+                .to_string();
+            let is_html = content_type.starts_with("text/html");
+            // The client bundle needs rewriting too: its wasm loader path is
+            // baked in at build time and runs before hydration.
+            let is_js = content_type.starts_with("application/javascript")
+                || content_type.starts_with("text/javascript");
+            if !is_html && !is_js {
                 return Ok(res);
             }
 
@@ -236,8 +265,12 @@ where
                 Ok(collected) => collected.to_bytes(),
                 Err(_) => return Ok(Response::from_parts(parts, Body::empty())),
             };
-            let html = String::from_utf8_lossy(&body_bytes).to_string();
-            let rewritten = rewrite_html(&html, &base);
+            let text = String::from_utf8_lossy(&body_bytes).to_string();
+            let rewritten = if is_html {
+                rewrite_html(&text, &base)
+            } else {
+                prefix_js_asset_paths(&text, &base)
+            };
 
             let mut new_res = Response::from_parts(parts, Body::from(rewritten));
             new_res.headers_mut().remove(header::CONTENT_LENGTH);
@@ -278,6 +311,23 @@ mod tests {
             .contains(r#"<head><meta name="uhc-base-path" content="/api/hassio_ingress/tok3n">"#));
         let twice = rewrite_html(&once, BASE);
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn js_wasm_loader_path_is_prefixed() {
+        // The exact shape `dx` emits in the client bundle.
+        let js =
+            r#"ht({module_or_path:"/./assets/unified-hifi-control_bg-dxh98.wasm"}).then(s=>{})"#;
+        let out = prefix_js_asset_paths(js, BASE);
+        assert!(out.contains(
+            r#"module_or_path:"/api/hassio_ingress/tok3n/./assets/unified-hifi-control_bg-dxh98.wasm""#
+        ));
+    }
+
+    #[test]
+    fn js_rewrite_leaves_unrelated_paths_alone() {
+        let js = r#"fetch("/roon/zones");u("//cdn/x/assets/a.js");v("assets/rel.wasm");w("https://e.com/assets/x")"#;
+        assert_eq!(prefix_js_asset_paths(js, BASE), js);
     }
 
     #[test]
