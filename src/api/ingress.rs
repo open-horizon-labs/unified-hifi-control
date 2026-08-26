@@ -237,13 +237,37 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
+    fn call(&mut self, mut req: Request<Body>) -> Self::Future {
         let mut inner = self.inner.clone();
         let base = request_ingress_base(&req);
+
+        // This layer is the OUTERMOST one, so it sees responses after the
+        // inner `CompressionLayer` has already encoded them -- and a gzip
+        // body is not text we can rewrite. Drop `accept-encoding` on trusted
+        // ingress requests so the inner layer leaves the body alone and the
+        // rewrite below operates on the real bytes. The cost is an
+        // uncompressed hop between the Supervisor's proxy and this process
+        // on the local docker network; correctness is worth far more than
+        // that. Direct-mode requests keep compression untouched.
+        if base.is_some() {
+            req.headers_mut().remove(header::ACCEPT_ENCODING);
+        }
 
         Box::pin(async move {
             let res = inner.call(req).await?;
             let Some(base) = base else { return Ok(res) };
+
+            // Belt and braces: if something encoded the body anyway, pass it
+            // through untouched. Rewriting encoded bytes would corrupt them
+            // (`from_utf8_lossy` mangles non-UTF-8 into U+FFFD), which is far
+            // worse than leaving the path unprefixed.
+            if res.headers().contains_key(header::CONTENT_ENCODING) {
+                tracing::warn!(
+                    "ingress: response is content-encoded; skipping URL rewrite \
+                     (the embedded panel may fail to load its wasm bundle)"
+                );
+                return Ok(res);
+            }
 
             let content_type = res
                 .headers()
