@@ -921,6 +921,17 @@ mod server {
                         embedded::serve_static_file(axum::extract::Path("tailwind.css".to_string()))
                     }),
                 )
+                // WebMCP bridge (#579): plain static JS, not part of the
+                // wasm bundle. Loaded on every page by `document::Script` in
+                // src/app/components/layout.rs.
+                .route(
+                    "/webmcp-bridge.js",
+                    get(|| {
+                        embedded::serve_static_file(axum::extract::Path(
+                            "webmcp-bridge.js".to_string(),
+                        ))
+                    }),
+                )
                 .route(
                     "/dx-components-theme.css",
                     get(|| {
