@@ -1327,6 +1327,31 @@ async fn handle_request(
         }
         RequestKind::Browse => handle_browse(req_id, &body, &core, &writer, &root_title).await,
         RequestKind::Load => handle_load(req_id, &body, &core, &writer).await,
+        RequestKind::ImageGet => {
+            // A minimal but real 1x1 PNG, framed the way `moo.rs::parse`
+            // reads binary bodies (`Content-Type: image/png` -> the fork's
+            // `ContentType::Png(body)`), so `RoonAdapter::get_image` -- and
+            // through it `/api/collections/image` (#549/#573) -- can be
+            // exercised end to end against this fake.
+            const PNG_1X1: &[u8] = &[
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+                0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9C, 0x63, 0xFC, 0xCF, 0xC0, 0x50, 0x0F, 0x00, 0x04, 0x85, 0x01, 0x80, 0x84, 0xA9,
+                0x8C, 0x21, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+            ];
+            core.write()
+                .await
+                .sent
+                .push((req_id, "Success".to_string()));
+            let mut frame = format!(
+                "MOO/1 COMPLETE Success\nRequest-Id: {req_id}\nContent-Length: {}\nContent-Type: image/png\n\n",
+                PNG_1X1.len()
+            )
+            .into_bytes();
+            frame.extend_from_slice(PNG_1X1);
+            let _ = writer.lock().await.send(Message::Binary(frame)).await;
+        }
         RequestKind::GroupOutputs => handle_group_outputs(req_id, &body, &core, &writer).await,
         RequestKind::UngroupOutputs => handle_ungroup_outputs(req_id, &body, &core, &writer).await,
         RequestKind::Unknown => {
@@ -1360,6 +1385,7 @@ enum RequestKind {
     Ping,
     GroupOutputs,
     UngroupOutputs,
+    ImageGet,
     Unknown,
 }
 
@@ -1376,6 +1402,8 @@ impl RequestKind {
             // FROM FORK: transport.rs:334,343 -- both send only `output_ids`.
             "com.roonlabs.transport:2/group_outputs" => Self::GroupOutputs,
             "com.roonlabs.transport:2/ungroup_outputs" => Self::UngroupOutputs,
+            // FROM FORK: image.rs SVCNAME + get_image.
+            "com.roonlabs.image:1/get_image" => Self::ImageGet,
             _ => Self::Unknown,
         }
     }

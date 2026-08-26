@@ -590,9 +590,22 @@ pub fn Library(
         let Some(zone_id) = browse_zone_id() else {
             return;
         };
-        let action = current_tab.action().to_string();
-        let media_type = current_tab.media_type().map(ToOwned::to_owned);
         let path = breadcrumbs.read().last().and_then(|e| e.path.clone());
+        // #573 (visual pass V2b root cause): a tab's action ("playlists",
+        // "favorites") lists that tab's ROOT and ignores `path` -- so once
+        // the user opened a playlist, every reload re-listed the parent
+        // under an advanced breadcrumb (an empty playlist looked like the
+        // playlists list itself). Any level below a tab's root is reached
+        // by its opaque `path`, and the documented way to continue into a
+        // path is the `browse` action, whatever tab it started from.
+        let (action, media_type) = if path.is_some() {
+            ("browse".to_string(), None)
+        } else {
+            (
+                current_tab.action().to_string(),
+                current_tab.media_type().map(ToOwned::to_owned),
+            )
+        };
         let request_offset = if append { offset() } else { 0 };
         spawn(load_page(
             zone_id,
