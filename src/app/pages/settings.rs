@@ -969,7 +969,16 @@ pub fn Settings() -> Element {
             {
                 spotify_redirect_uri.set(tunnel_callback);
                 spotify_local_setup_saved.set(false);
-                spotify_resave_needed.set(true);
+                // Deliberately NOT `spotify_resave_needed.set(true)` here:
+                // this branch also runs when Settings reloads while a tunnel
+                // whose address was already saved is still live (the field
+                // rehydrates to the loopback default and re-aligns to the
+                // tunnel), and forcing the stepper back to Save there would
+                // reopen step 3 on every mid-setup reload (#597). The one
+                // real stale case -- configured under the loopback default,
+                // then a tunnel started without re-saving -- is refused
+                // server-side by oauth/start's tunnel_redirect_mismatch
+                // guard, which renders inside the Connect step.
             }
         }
     });
