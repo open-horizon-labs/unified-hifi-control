@@ -3421,6 +3421,14 @@ const FIELD_ROLES: &[(&str, FieldRole)] = &[
          own docs.",
         ),
     ),
+    (
+        "image",
+        DisplayOnly(
+            "artwork URL (#549 for hifi_collections rows, #573 for hifi_search hits): a \
+         same-origin `/api/collections/image?ref=...` path over an opaque minted token, \
+         fetched by a web client as an <img src>; no MCP tool takes an image as input.",
+        ),
+    ),
     // hifi_status / hifi_hqplayer_status readouts.
     (
         "connected",
@@ -3809,6 +3817,9 @@ async fn no_tool_returns_an_unclassified_field() {
             // #566: same reasoning as `ref` above -- `Some` so `path` is
             // collected and must be classified below too.
             path: Some(String::new()),
+            // #573 defect 10: same again -- `Some` so `image` is collected
+            // and must be classified below.
+            image: Some(String::new()),
         })
         .expect("McpSearchResult must serialize"),
         &mut returned,

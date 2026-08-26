@@ -354,6 +354,14 @@ pub struct Zone {
     /// will refuse every call.
     #[serde(default)]
     pub browse_supported: bool,
+    /// Which Library-page tabs this zone's provider serves (#573 defect 6):
+    /// a subset of `["browse", "playlists", "favorites", "radio"]`, derived
+    /// server-side from the capability matrix. `default`s to empty, which
+    /// the Library page treats as "no information -- show every tab" so a
+    /// response from a build predating this field degrades to the old
+    /// behavior rather than hiding everything.
+    #[serde(default)]
+    pub library_tabs: Vec<String>,
 }
 
 // =============================================================================
@@ -533,7 +541,11 @@ pub struct CollectionItem {
     pub path: Option<String>,
     #[serde(rename = "ref", default)]
     pub item_ref: Option<String>,
-    /// Opaque artwork ref, resolved via `GET /api/collections/image?ref=...`.
+    /// Artwork URL, used verbatim as an `<img src>`. The server sends the
+    /// complete same-origin path (`/api/collections/image?ref=...`) --
+    /// #573 defect 2: the UI must never prepend anything to it (an earlier
+    /// draft documented this as a bare ref and the UI double-prefixed it,
+    /// 404ing every image).
     #[serde(default)]
     pub image: Option<String>,
 }
@@ -652,6 +664,11 @@ pub struct SearchResult {
     /// same way (open into browse, push a breadcrumb).
     #[serde(default)]
     pub path: Option<String>,
+    /// Artwork URL (#573 defect 10) -- same contract as
+    /// `CollectionItem::image`: a complete same-origin path, used verbatim
+    /// as an `<img src>`.
+    #[serde(default)]
+    pub image: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

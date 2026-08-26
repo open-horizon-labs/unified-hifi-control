@@ -51,6 +51,39 @@ pub fn zone_supports_hifi_collections(zone_id: &str) -> bool {
     )
 }
 
+/// Which Library-page tabs this zone's provider can actually serve, in the
+/// page's own tab vocabulary (`browse`, `playlists`, `favorites`, `radio`).
+///
+/// #573 defect 6: the web Library page rendered a static four-tab strip for
+/// every provider, so Roon zones showed Favorites and Radio tabs whose every
+/// call was refused. This derives the visible set from the same capability
+/// facts the matrix reports (`crate::mcp::capabilities::support`), through
+/// the same [`zone_supports_hifi_collections`] gate this tool routes on --
+/// the tabs and the refusals can never disagree. `favorites` and `radio` are
+/// one capability cell: both map to the `favorites` action (`media_type` is
+/// what tells them apart).
+pub fn collections_tabs_for_zone(zone_id: &str) -> Vec<&'static str> {
+    if !zone_supports_hifi_collections(zone_id) {
+        return Vec::new();
+    }
+    let target = ZoneTarget::classify(zone_id);
+    let mut tabs = Vec::new();
+    if matches!(support(target, Capability::Browse), Support::Supported) {
+        tabs.push("browse");
+    }
+    if matches!(
+        support(target, Capability::SavedPlaylists),
+        Support::Supported
+    ) {
+        tabs.push("playlists");
+    }
+    if matches!(support(target, Capability::Favorites), Support::Supported) {
+        tabs.push("favorites");
+        tabs.push("radio");
+    }
+    tabs
+}
+
 #[mcp_tool(
     name = "hifi_collections",
     description = "Alpha capability: expect refinement across releases. Browse a provider library or list saved playlists and favorites. Results are paged with limit/offset and playable entries include a short-lived opaque ref for hifi_play_ref. Use path from a browse entry to continue into that collection. Implemented for lms and roon zones; Music Assistant zones (see hifi_queue's provider notes); Spotify and Apple Music are reachable via hifi_spotify and the Apple Music tools today, not yet through this one."
@@ -99,7 +132,13 @@ struct CollectionItem {
 /// it through, or `None` if this row's adapter response carried no image
 /// key at all. Shared by all three provider handlers below so the URL shape
 /// (`/api/collections/image?ref=...`) is defined in exactly one place.
-async fn mint_image(state: &AppState, zone_id: &str, image_key: Option<&str>) -> Option<String> {
+/// Also used by `hifi_search`'s Roon mapping (#573 defect 10), so search
+/// results and browse rows resolve artwork through one identical URL shape.
+pub(crate) async fn mint_image(
+    state: &AppState,
+    zone_id: &str,
+    image_key: Option<&str>,
+) -> Option<String> {
     let image_key = image_key?;
     let token = state
         .image_refs
@@ -195,12 +234,46 @@ pub async fn handle_collections(
         );
     }
 
-    if !matches!(support(target, capability), Support::Supported) {
-        return env.failed(format!(
-            "{} is not available for {} zones",
-            capability.name(),
-            target.label()
-        ));
+    // #573 defect 6 (sub-issue): a capability gap is not a backend failure.
+    // This used to be `env.failed(...)`, which serializes as
+    // `reason: backend_error` -- telling a client "retrying may work" about
+    // Roon's unwired favorites. Report the capability table's own state
+    // (`not_implemented`/`provider_limitation`) so the refusal and
+    // `hifi_capabilities` cannot disagree.
+    match support(target, capability) {
+        Support::Supported => {}
+        Support::NotImplemented {
+            tracked_by,
+            evidence,
+        } => {
+            return env.refused(
+                format!(
+                    "{} is not available for {} zones yet.",
+                    capability.name(),
+                    target.label()
+                ),
+                Refusal::NotImplemented {
+                    operation: capability.name().to_string(),
+                    tracked_by,
+                    alternatives: Vec::new(),
+                    detail: evidence.to_string(),
+                },
+            );
+        }
+        Support::Unsupported { evidence } => {
+            return env.refused(
+                format!(
+                    "{} is not available for {} zones.",
+                    capability.name(),
+                    target.label()
+                ),
+                Refusal::ProviderLimitation {
+                    operation: capability.name().to_string(),
+                    alternatives: Vec::new(),
+                    detail: evidence.to_string(),
+                },
+            );
+        }
     }
 
     let limit = args.limit.unwrap_or(20).clamp(1, 50);
@@ -620,6 +693,40 @@ fn refuse_foreign_path(env: Envelope) -> Result<CallToolResult, CallToolError> {
             "Browse again from this zone and use that result's path.",
         ),
     )
+}
+
+#[cfg(test)]
+mod tab_gating_tests {
+    use super::*;
+
+    /// #573 defect 6: Roon serves Browse and Playlists only -- Favorites
+    /// and Radio (both the `favorites` capability) are not wired, so the
+    /// Library page must not render those tabs for Roon zones.
+    #[test]
+    fn roon_zones_serve_browse_and_playlists_only() {
+        assert_eq!(
+            collections_tabs_for_zone("roon:zone_1"),
+            vec!["browse", "playlists"]
+        );
+    }
+
+    /// The tab list is exactly the capability table's view: a provider this
+    /// tool does not reach at all serves no tabs.
+    #[test]
+    fn unreached_providers_serve_no_tabs() {
+        assert!(collections_tabs_for_zone("spotify:acct").is_empty());
+        assert!(collections_tabs_for_zone("hqplayer:main").is_empty());
+    }
+
+    /// Music Assistant keeps all four tabs (favorites supported implies the
+    /// Radio tab, which is the same capability under `media_type: radio`).
+    #[test]
+    fn music_assistant_serves_all_tabs() {
+        assert_eq!(
+            collections_tabs_for_zone("musicassistant:player_1"),
+            vec!["browse", "playlists", "favorites", "radio"]
+        );
+    }
 }
 
 fn refuse_unknown_path(env: Envelope) -> Result<CallToolResult, CallToolError> {

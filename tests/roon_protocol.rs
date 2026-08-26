@@ -31,7 +31,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mock_servers::roon_core::{
-    album, playlist, zone_with_grouping, FakeItem, FakeLibrary, FakeRoonCore, Hint, ItemKeyScope,
+    album, album_live, playlist, playlist_live, zone_with_grouping, FakeItem, FakeLibrary,
+    FakeRoonCore, Hint, ItemKeyScope,
 };
 use roon_api::browse::{BrowseOpts, LoadOpts};
 use unified_hifi_control::adapters::roon::{PlayAction, RoonAdapter, SearchSource};
@@ -1532,30 +1533,17 @@ async fn roon_collections_content_classifies_playlist_and_tracks_correctly() {
     let core = FakeRoonCore::start_with(library).await;
     let adapter = connected(&core).await;
 
-    // Browse to "Playlists", then into the playlist itself.
-    let root = adapter
+    // List playlists (the root's "Playlists" node is hidden from
+    // `collections_browse` since #573 defect 4 -- the dedicated
+    // `collections_playlists` operation is the way in), then browse into
+    // the playlist itself.
+    let playlists_level = adapter
         .content(
-            "collections_browse",
+            "collections_playlists",
             &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
         )
         .await
-        .expect("root browse");
-    let session_key = root["session_key"].as_str().unwrap().to_string();
-    let playlists_key = root["items"][0]["item_key"].as_str().unwrap().to_string();
-
-    let playlists_level = adapter
-        .content(
-            "collections_browse",
-            &json!({
-                "zone_id": "roon:zone_1",
-                "item_key": playlists_key,
-                "session_key": session_key,
-                "limit": 20,
-                "offset": 0,
-            }),
-        )
-        .await
-        .expect("Playlists node browse");
+        .expect("Playlists listing");
     let playlist_item = &playlists_level["items"][0];
     assert_eq!(playlist_item["title"], "An Introduction to Qobuz");
     // Missing-Play-button bug (#545): a playlist is both a container (has
@@ -1788,9 +1776,486 @@ async fn roon_collections_browse_root_excludes_settings() {
         .collect();
     assert_eq!(
         titles,
-        vec!["Library", "TIDAL", "Qobuz"],
-        "the root's own utility node (Settings) must not appear as an inert row"
+        vec!["Local Library", "TIDAL", "Qobuz"],
+        "the root's own utility node (Settings) must not appear as an inert row, and \
+         (#573 defect 4) the Library node is renamed so the page's breadcrumb doesn't \
+         read Library / Library"
     );
+
+    core.stop().await;
+}
+
+// =============================================================================
+// #573: Library UI defect audit -- adapter-level fixes, pinned against the
+// live-shaped fixtures (`album_live`/`playlist_live`: track rows are
+// `hint: action_list`, exactly what the live crawl captured).
+// =============================================================================
+
+/// #573 defect 1 (blocker): an album level lists its tracks -- playable,
+/// with no leaked action rows. The #545 filter dropped every
+/// Action/ActionList row, and since a live Core marks *track rows*
+/// `action_list` too, every album and playlist came back `items: []`.
+#[tokio::test]
+async fn roon_collections_live_album_level_lists_tracks_with_play_refs() {
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![FakeItem::list("Qobuz").with_children(vec![album_live(
+        "Kind of Blue",
+        "Miles Davis",
+        &["So What", "Blue in Green", "Flamenco Sketches"],
+    )])];
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let root = adapter
+        .content(
+            "collections_browse",
+            &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
+        )
+        .await
+        .expect("root browse");
+    let session_key = root["session_key"].as_str().unwrap().to_string();
+    let qobuz_key = root["items"][0]["item_key"].as_str().unwrap().to_string();
+
+    // Folder level: the Qobuz node lists its child (the album), navigable.
+    let qobuz_level = adapter
+        .content(
+            "collections_browse",
+            &json!({
+                "zone_id": "roon:zone_1",
+                "item_key": qobuz_key,
+                "session_key": session_key,
+                "limit": 20,
+                "offset": 0,
+            }),
+        )
+        .await
+        .expect("Qobuz node browse");
+    let album_item = &qobuz_level["items"][0];
+    assert_eq!(album_item["title"], "Kind of Blue");
+    assert_eq!(
+        album_item["navigable"], true,
+        "an album is navigable: {album_item:?}"
+    );
+    assert_eq!(
+        album_item["playable"], true,
+        "an album is also directly playable: {album_item:?}"
+    );
+
+    // Leaf level: the album's tracks, playable, no action rows leaked.
+    let session_key = qobuz_level["session_key"].as_str().unwrap().to_string();
+    let album_key = album_item["item_key"].as_str().unwrap().to_string();
+    let tracks_level = adapter
+        .content(
+            "collections_browse",
+            &json!({
+                "zone_id": "roon:zone_1",
+                "item_key": album_key,
+                "session_key": session_key,
+                "limit": 20,
+                "offset": 0,
+            }),
+        )
+        .await
+        .expect("album browse");
+    let items = tracks_level["items"].as_array().unwrap();
+    let titles: Vec<&str> = items.iter().map(|i| i["title"].as_str().unwrap()).collect();
+    assert_eq!(
+        titles,
+        vec!["So What", "Blue in Green", "Flamenco Sketches"],
+        "the album level must list its tracks (the #573 blocker was items: [])"
+    );
+    for track in items {
+        assert_eq!(
+            track["playable"], true,
+            "every action_list-hinted track row is a playable leaf: {track:?}"
+        );
+        assert_eq!(
+            track["navigable"], false,
+            "a track leaf must not claim navigability: {track:?}"
+        );
+        assert!(
+            track["item_key"].as_str().is_some(),
+            "a playable track needs an item_key for its play ref: {track:?}"
+        );
+    }
+    assert!(
+        !titles.contains(&"Play Album"),
+        "the Play Album verb row must not leak into the listing"
+    );
+    assert!(
+        tracks_level["next_offset"].is_null(),
+        "3 tracks in a 20-row page: no further page exists (#573 defect 8)"
+    );
+
+    core.stop().await;
+}
+
+/// #573 defect 1 (blocker), playlist half: `collections_playlists` +
+/// browse into a playlist lists its tracks, with the immediately-invokable
+/// "Play Playlist" verb filtered out.
+#[tokio::test]
+async fn roon_collections_live_playlist_level_lists_tracks() {
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![
+        FakeItem::list("Library"),
+        FakeItem::list("Playlists").with_children(vec![playlist_live(
+            "An Introduction to Qobuz",
+            &[
+                ("Laundromat (Remastered 2017)", "Queen"),
+                ("So What", "Miles Davis"),
+            ],
+        )]),
+    ];
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let playlists = adapter
+        .content(
+            "collections_playlists",
+            &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
+        )
+        .await
+        .expect("playlists listing");
+    let playlist_item = &playlists["items"][0];
+    assert_eq!(playlist_item["title"], "An Introduction to Qobuz");
+    assert_eq!(playlist_item["navigable"], true);
+    assert_eq!(playlist_item["playable"], true);
+
+    let session_key = playlists["session_key"].as_str().unwrap().to_string();
+    let playlist_key = playlist_item["item_key"].as_str().unwrap().to_string();
+    let tracks_level = adapter
+        .content(
+            "collections_browse",
+            &json!({
+                "zone_id": "roon:zone_1",
+                "item_key": playlist_key,
+                "session_key": session_key,
+                "limit": 20,
+                "offset": 0,
+            }),
+        )
+        .await
+        .expect("playlist browse");
+    let items = tracks_level["items"].as_array().unwrap();
+    let titles: Vec<&str> = items.iter().map(|i| i["title"].as_str().unwrap()).collect();
+    assert_eq!(
+        titles,
+        vec!["Laundromat (Remastered 2017)", "So What"],
+        "the playlist level must list its tracks"
+    );
+    assert!(
+        items.iter().all(|i| i["playable"] == true),
+        "playlist tracks are playable leaves: {items:?}"
+    );
+
+    core.stop().await;
+}
+
+/// #573 defect 3: the Library node's real children (Artists, Albums,
+/// Tracks, Genres, ...) share their exact titles with `CATEGORY_NAMES`, so
+/// the search-result grouping filter swallowed the whole level down to
+/// "Search". Browse levels now rely on the "<N> Results" subtitle signal
+/// alone (which those real children never carry).
+#[tokio::test]
+async fn roon_collections_library_node_lists_its_real_children() {
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![FakeItem::list("Library").with_children(vec![
+        FakeItem::list("Search").searchable("Search"),
+        FakeItem::list("Artists").with_children(vec![FakeItem::list("Miles Davis")]),
+        FakeItem::list("Albums").with_children(vec![FakeItem::list("Kind of Blue")]),
+        FakeItem::list("Tracks").with_children(vec![FakeItem::list("So What")]),
+        FakeItem::list("Genres").with_children(vec![FakeItem::list("Jazz")]),
+    ])];
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let root = adapter
+        .content(
+            "collections_browse",
+            &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
+        )
+        .await
+        .unwrap();
+    let session_key = root["session_key"].as_str().unwrap().to_string();
+    let library_key = root["items"][0]["item_key"].as_str().unwrap().to_string();
+
+    let level = adapter
+        .content(
+            "collections_browse",
+            &json!({
+                "zone_id": "roon:zone_1",
+                "item_key": library_key,
+                "session_key": session_key,
+                "limit": 20,
+                "offset": 0,
+            }),
+        )
+        .await
+        .unwrap();
+    let titles: Vec<&str> = level["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["Search", "Artists", "Albums", "Tracks", "Genres"],
+        "the Library node's real children must not be swallowed by the category filter"
+    );
+
+    core.stop().await;
+}
+
+/// #573 defect 4: the collection root hides the "Playlists" node (the
+/// dedicated tab lists the same node) -- `collections_playlists` still
+/// reaches it by name.
+#[tokio::test]
+async fn roon_collections_root_hides_the_playlists_node_but_the_tab_still_works() {
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![
+        FakeItem::list("Library"),
+        FakeItem::list("Playlists")
+            .with_children(vec![playlist_live("Focus", &[("Deep Work", "Eno")])]),
+        FakeItem::list("My Live Radio"),
+    ];
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let root = adapter
+        .content(
+            "collections_browse",
+            &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
+        )
+        .await
+        .unwrap();
+    let titles: Vec<&str> = root["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["Local Library", "My Live Radio"],
+        "the root must hide Playlists (dedicated tab) and rename Library"
+    );
+
+    let playlists = adapter
+        .content(
+            "collections_playlists",
+            &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
+        )
+        .await
+        .expect("the Playlists tab still reaches the node by name");
+    assert_eq!(playlists["items"][0]["title"], "Focus");
+
+    core.stop().await;
+}
+
+/// #573 defect 7: Roon's "No Results" placeholder row (an empty node's only
+/// child, which still carries an item_key) must not be minted as playable
+/// content.
+#[tokio::test]
+async fn roon_collections_no_results_placeholder_is_not_listed() {
+    let mut library = FakeLibrary::standard();
+    library.root_items =
+        vec![FakeItem::list("My Live Radio").with_children(vec![FakeItem::new("No Results")])];
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let root = adapter
+        .content(
+            "collections_browse",
+            &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
+        )
+        .await
+        .unwrap();
+    let session_key = root["session_key"].as_str().unwrap().to_string();
+    let radio_key = root["items"][0]["item_key"].as_str().unwrap().to_string();
+
+    let level = adapter
+        .content(
+            "collections_browse",
+            &json!({
+                "zone_id": "roon:zone_1",
+                "item_key": radio_key,
+                "session_key": session_key,
+                "limit": 20,
+                "offset": 0,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        level["items"].as_array().unwrap().is_empty(),
+        "the placeholder must not become a playable row: {level:?}"
+    );
+    assert!(
+        level["next_offset"].is_null(),
+        "an empty level must not advertise Load more (#573 defect 8): {level:?}"
+    );
+
+    core.stop().await;
+}
+
+/// #573 defect 8: paging is computed against post-filter reality. A raw
+/// page that filters to nothing (limit 1, first raw row is the "Play
+/// Playlist" verb) fetches ahead and still delivers content, and
+/// `next_offset` advertises a further page only when raw rows genuinely
+/// remain.
+#[tokio::test]
+async fn roon_collections_paging_fetches_ahead_past_filtered_rows() {
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![
+        FakeItem::list("Playlists").with_children(vec![playlist_live(
+            "Mix",
+            &[("Track One", "A"), ("Track Two", "B"), ("Track Three", "C")],
+        )]),
+    ];
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let level = adapter
+        .content(
+            "collections_playlists",
+            &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
+        )
+        .await
+        .unwrap();
+    let session_key = level["session_key"].as_str().unwrap().to_string();
+    let playlist_key = level["items"][0]["item_key"].as_str().unwrap().to_string();
+
+    // limit 1: the first raw row is the "Play Playlist" verb, which filters
+    // to nothing. Pre-#573 this returned items: [] with next_offset: 1
+    // forever ("Load more" over nothing).
+    let page = adapter
+        .content(
+            "collections_browse",
+            &json!({
+                "zone_id": "roon:zone_1",
+                "item_key": playlist_key,
+                "session_key": session_key,
+                "limit": 1,
+                "offset": 0,
+            }),
+        )
+        .await
+        .unwrap();
+    let items = page["items"].as_array().unwrap();
+    assert!(
+        !items.is_empty(),
+        "a page whose raw rows filter away must fetch ahead, not return empty: {page:?}"
+    );
+    assert_eq!(items[0]["title"], "Track One");
+    let next = page["next_offset"].as_u64().expect("more raw rows remain");
+    assert!(next >= 2, "next_offset must sit past the consumed raw rows");
+
+    core.stop().await;
+}
+
+/// #573 defect 11: a search-derived album continuation whose level is a
+/// single self-referential row (the album again, same title as the level)
+/// auto-descends to the real level -- one click opens the tracks, not a
+/// pointless second copy of the album.
+#[tokio::test]
+async fn roon_collections_single_self_row_level_descends_to_tracks() {
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![
+        FakeItem::list("Kind of Blue").with_children(vec![album_live(
+            "Kind of Blue",
+            "Miles Davis",
+            &["So What", "Blue in Green"],
+        )]),
+    ];
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let root = adapter
+        .content(
+            "collections_browse",
+            &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
+        )
+        .await
+        .unwrap();
+    let session_key = root["session_key"].as_str().unwrap().to_string();
+    let outer_key = root["items"][0]["item_key"].as_str().unwrap().to_string();
+
+    let level = adapter
+        .content(
+            "collections_browse",
+            &json!({
+                "zone_id": "roon:zone_1",
+                "item_key": outer_key,
+                "session_key": session_key,
+                "limit": 20,
+                "offset": 0,
+            }),
+        )
+        .await
+        .unwrap();
+    let titles: Vec<&str> = level["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["So What", "Blue in Green"],
+        "the self-referential single-row level must descend to the tracks"
+    );
+
+    core.stop().await;
+}
+
+/// #573 defect 5: `[[id|Name]]` link markup is stripped to plain names at
+/// the adapter mapping, including compound credits.
+#[tokio::test]
+async fn roon_collections_subtitles_are_stripped_of_link_markup() {
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![FakeItem::list("Ideal Discography").with_children(vec![
+        FakeItem::list("Thriller").with_subtitle("[[55418|Michael Jackson]]"),
+        FakeItem::list("Siembra")
+            .with_subtitle("[[8827258|Willie Colón]] & [[1981050|Rubén Blades]]"),
+    ])];
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let root = adapter
+        .content(
+            "collections_browse",
+            &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
+        )
+        .await
+        .unwrap();
+    let session_key = root["session_key"].as_str().unwrap().to_string();
+    let node_key = root["items"][0]["item_key"].as_str().unwrap().to_string();
+
+    let level = adapter
+        .content(
+            "collections_browse",
+            &json!({
+                "zone_id": "roon:zone_1",
+                "item_key": node_key,
+                "session_key": session_key,
+                "limit": 20,
+                "offset": 0,
+            }),
+        )
+        .await
+        .unwrap();
+    let items = level["items"].as_array().unwrap();
+    assert_eq!(items[0]["subtitle"], "Michael Jackson");
+    assert_eq!(items[1]["subtitle"], "Willie Colón & Rubén Blades");
 
     core.stop().await;
 }
