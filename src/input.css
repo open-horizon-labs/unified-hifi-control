@@ -723,13 +723,10 @@
     border-top: 1px solid var(--border-default);
   }
 
-  /* #594: no `flex-nowrap` fallback below `sm` -- transport (~164px) and
-     volume (~152px) are fixed-width siblings that leave almost no room for
-     the art+meta target on a 375-430px screen, so the row overflowed and the
-     art thumbnail read as "clipped". Letting the target take its own full
-     row on narrow screens (see `.zones-strip-target`'s `basis-full`) and
-     wrapping the rest below fixes that without shrinking any control below
-     its 44px hit target. Reverts to the original single row at `sm`+. */
+  /* Wraps below `sm` (#594): the fixed-width control rail leaves almost no
+     room for the art+meta target on a phone, so the target takes its own
+     full row (`basis-full`) and the rail wraps beneath it -- no control
+     ever shrinks below its 44px hit target. Single row returns at `sm`+. */
   .zones-strip-inner {
     @apply mx-auto flex max-w-7xl flex-wrap items-center gap-3 px-3 py-2 sm:flex-nowrap sm:px-6 lg:px-8;
   }
@@ -745,9 +742,14 @@
     outline-offset: 2px;
   }
 
+  /* #596: the armed header is the picker-row grammar *elevated* -- larger
+     art at every width (48px vs the rows' 32px) with an accent-token ring,
+     so "which zone am I driving" reads instantly without a divergent
+     layout. */
   .zones-strip-art {
-    @apply size-10 flex-shrink-0 rounded-md object-cover sm:size-12;
+    @apply size-12 flex-shrink-0 rounded-md object-cover;
     background: var(--surface-base);
+    box-shadow: 0 0 0 2px var(--accent-color);
   }
   /* #594: a themed border so the "no artwork" tile keeps a visible edge on
      OLED, where `--surface-base` is near-black against an equally dark
@@ -762,14 +764,35 @@
   .zones-strip-meta {
     @apply flex min-w-0 flex-1 flex-col;
   }
-  .zones-strip-zone-name {
-    @apply truncate text-xs font-semibold uppercase tracking-wide;
-    color: var(--text-muted);
+  /* #596: one name+badge row grammar shared by the armed header and every
+     picker row (art | name+badge+track | rail). The badge truncates along
+     with the name instead of holding its full width, so a long name and a
+     long source label share the squeeze at mid widths rather than the
+     badge crushing the name to a few characters. */
+  .zones-strip-name-row {
+    @apply flex min-w-0 items-center gap-2;
   }
+  .zones-strip-source-badge {
+    @apply min-w-0 truncate;
+  }
+  /* #596: one zone-name treatment strip-wide -- xs semibold uppercase, in
+     the default text color so the name leads its row ("which room" is the
+     picker's primary question). The armed header's `--armed` modifier
+     swaps in the accent token as its elevation mark. */
+  .zones-strip-zone-name {
+    @apply min-w-0 truncate text-xs font-semibold uppercase tracking-wide;
+  }
+  .zones-strip-zone-name--armed {
+    color: var(--accent-color);
+  }
+  /* #596: one track treatment strip-wide: sm/medium where it is the star
+     (armed header now playing), `--muted` where it supports the zone name
+     (picker rows), `--idle` for the header's empty state. */
   .zones-strip-track {
     @apply truncate text-sm font-medium;
   }
-  .zones-strip-track--idle {
+  .zones-strip-track--idle,
+  .zones-strip-track--muted {
     color: var(--text-muted);
     font-weight: 400;
   }
@@ -795,8 +818,81 @@
     transform: rotate(180deg);
   }
 
-  .zones-strip-transport {
-    @apply flex flex-shrink-0 items-center gap-1;
+  /* ---- #596: the vertical control rail ------------------------------
+     One right-aligned rail with fixed, token-derived column widths, shared
+     by the armed header and every mini-controller picker row, so
+     play / - / volume value / + sit on the same vertical axes strip-wide
+     regardless of name/track length. Right to left, with --rail-gap
+     between every neighbor:
+
+       header:  [prev][play][next] [volume slot]
+       row:           [play][spacer] [volume slot]
+
+     The spacer stands in for the header's next-track column, so the play
+     buttons share an axis. Below `sm` the rail takes its own full-width
+     line (PR #595's wrap pattern) but stays right-anchored, so the axes
+     hold at every viewport; `flex-wrap` inside the rail is the safety
+     valve for very narrow screens (~<=340px), where the volume slot drops
+     to a second right-anchored line instead of clipping the + button off
+     a fixed-position bar -- axes still hold because every column is
+     anchored to the same right edge. */
+  .zones-strip-rail {
+    --rail-col: 2.75rem;
+    --rail-gap: 0.25rem;
+    --rail-value: 5rem;
+    @apply flex w-full flex-shrink-0 flex-wrap items-center justify-end border-t py-1 sm:ml-auto sm:w-auto sm:flex-nowrap sm:border-t-0 sm:py-0;
+    gap: var(--rail-gap);
+    border-color: var(--border-subtle);
+  }
+  /* Fixed 44px columns: `.btn` alone has no min-width and px-4 padding, so
+     icon buttons would differ in width from the picker's btn-sm ones. A
+     hard --rail-col square keeps every rail column identical while
+     preserving the 44px hit target (`min-h-11` still applies from `.btn`). */
+  .zones-strip-rail .btn {
+    @apply px-0;
+    width: var(--rail-col);
+  }
+  .zones-strip-rail-spacer {
+    @apply flex-shrink-0;
+    width: var(--rail-col);
+  }
+  /* Fixed-width volume slot, derived from the rail tokens: reserved even
+     when a zone reports fixed volume (VolumeControlsCompact renders
+     nothing) so the play column never drifts between rows with and
+     without volume control. The inner component div stretches across it;
+     `justify-between` pins - and + to the slot's edges, which also keeps
+     them on-axis for incremental zones that render no value span. */
+  .zones-strip-volume {
+    @apply flex flex-shrink-0 items-center;
+    width: calc(2 * var(--rail-col) + var(--rail-value) + 2 * var(--rail-gap));
+  }
+  .zones-strip-volume > div {
+    @apply w-full justify-between;
+  }
+  /* <=359px: even the wrapped rail line can't fit transport + volume slot,
+     and letting flex-wrap decide per-rail would wrap the header's rail but
+     not the picker rows' (whose rail is narrower), splitting the shared
+     play axis. Forcing the volume slot onto its own rail line in EVERY
+     rail keeps the wrap deterministic: play/next columns align on line
+     one, - / value / + stay a fixed right-anchored block on line two. */
+  @media (max-width: 359px) {
+    .zones-strip-volume {
+      flex-basis: 100%;
+      justify-content: flex-end;
+    }
+    .zones-strip-volume > div {
+      width: calc(2 * var(--rail-col) + var(--rail-value) + 2 * var(--rail-gap));
+      flex-grow: 0;
+    }
+  }
+  /* #596 (owner: "39 vs 40.0 jiggles"): tabular numerals in a fixed
+     --rail-value box so - / + never shift as digits change. 5rem +
+     nowrap fits the widest real value format_volume produces
+     ("-120.0 dB" device floors included) on a single line. */
+  .zones-strip-volume span {
+    @apply flex-shrink-0 whitespace-nowrap text-center;
+    width: var(--rail-value);
+    font-variant-numeric: tabular-nums;
   }
 
   .zones-strip-picker {
@@ -849,41 +945,45 @@
   .zones-strip-picker-meta {
     @apply flex min-w-0 flex-1 flex-col gap-0.5;
   }
-  /* #594: needs its own `min-w-0` -- without it, the untruncated zone-name
-     span below could push this row (and the whole picker item) wider than
-     its flex-1 parent, overflowing into `.zones-strip-picker-controls`
-     instead of truncating. Same reasoning `.zones-strip-picker-np` already
-     applied to its own track span. */
-  .zones-strip-picker-name-row {
-    @apply flex min-w-0 items-center gap-2;
-  }
-  /* #594: the zone name itself had no truncation class, so a long name
-     could overflow the row uncontained -- the one piece of text in this
-     component that didn't already truncate like its header counterpart
-     (`.zones-strip-zone-name`), which read as "uneven alignment" between
-     the armed header and the picker rows. */
-  .zones-strip-picker-name {
-    @apply min-w-0 truncate;
-  }
+  /* Picker rows reuse `.zones-strip-name-row` / `.zones-strip-zone-name` /
+     `.zones-strip-track` (#596) -- one grammar, no `-picker-` twins. */
   .zones-strip-picker-np {
     @apply flex min-w-0 items-center gap-1.5;
-  }
-  .zones-strip-picker-track {
-    @apply truncate text-xs;
-    color: var(--text-muted);
   }
 
   /* Divider (not a background) keeps the boundary between the row's
      select-target and its own controls legible without implying the
      controls are a second clickable "row" (owner feedback on #585).
-     #594: when `.zones-strip-picker-row` wraps below `sm`, this becomes
-     its own full-width line under the select-target -- a left border reads
-     as a stray vertical tick there, so the divider moves to the top and the
-     buttons right-align, then reverts to the original left-divider,
-     left-aligned layout once the row stops wrapping. */
+     #596: layout and border-color come from the shared `.zones-strip-rail`
+     on the same element; this class only adds the row's `sm`+ left divider
+     (below `sm` the rail's own wrapped top divider takes over -- a lone
+     left border reads as a stray tick on its own line, per #594). Left
+     padding never moves the right-anchored columns. */
   .zones-strip-picker-controls {
-    @apply flex w-full flex-shrink-0 items-center justify-end gap-1 border-t py-1 pl-0 pr-1 sm:w-auto sm:justify-start sm:border-t-0 sm:border-l sm:pl-2;
-    border-color: var(--border-subtle);
+    @apply sm:border-l sm:pl-2;
+  }
+
+  /* ---- #596: restrained motion ---------------------------------------
+     Arming feedback, transform/opacity only, ease-out, no bounce; disabled
+     under prefers-reduced-motion alongside the other reveal animations at
+     the bottom of this file. Arming is acknowledged where the gesture
+     happens: the pressed row settles (below), and the picker's open/close
+     reveal reuses the library's keyframes. The header itself deliberately
+     does NOT animate -- remounting it per arm change refetches the art and
+     hides the header behind opacity:0 exactly when feedback is wanted, and
+     a mount-only animation would fire only on page load. */
+  .zones-strip-picker {
+    animation: library-reveal 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .zones-strip-picker-item {
+    transition:
+      background-color 0.15s ease-out,
+      transform 0.15s ease-out,
+      opacity 0.15s ease-out;
+  }
+  .zones-strip-picker-item:active {
+    transform: translateY(1px);
+    opacity: 0.85;
   }
 
   .zones-strip-transfer {
@@ -891,8 +991,18 @@
     border-color: var(--border-subtle);
   }
 
+  /* #596: sized to the strip it reserves room for -- the wrapped
+     target+rail header measures ~150px below `sm` (~200px under 360px
+     where the volume slot takes its own rail line) vs the single ~76px
+     row at `sm`+. Undersizing this hides the tail of the library list
+     behind the fixed strip. */
   .library-strip-spacer {
-    @apply h-24;
+    @apply h-40 sm:h-24;
+  }
+  @media (max-width: 359px) {
+    .library-strip-spacer {
+      height: 13rem;
+    }
   }
 }
 
@@ -936,6 +1046,18 @@
   }
   .library-eq span {
     animation: none;
+  }
+  /* #596: zones strip picker reveal / press-settle motion off with the
+     rest. */
+  .zones-strip-picker {
+    animation: none;
+  }
+  .zones-strip-picker-item {
+    transition: background-color 0.15s ease-out;
+  }
+  .zones-strip-picker-item:active {
+    transform: none;
+    opacity: 1;
   }
 }
 
