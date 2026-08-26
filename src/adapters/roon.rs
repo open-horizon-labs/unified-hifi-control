@@ -314,6 +314,29 @@ fn is_play_verb_title(title: &str) -> bool {
     })
 }
 
+/// Error marker: a playability peek descended into an item but the
+/// `pop_levels: 1` browse restoring the caller's position failed, so the
+/// session now sits at an unknown level (#593 review follow-up).
+///
+/// This is categorically different from an ordinary peek failure: a refused
+/// peek leaves the caller's position intact and classification can degrade
+/// gracefully, but after a failed restoration every further `load` in that
+/// session would silently map the wrong list (an album's tracks as its
+/// parent's rows). Carried in an [`anyhow::Error`]'s context chain; callers
+/// test for it with `error.is::<BrowsePositionLost>()` and stop paging.
+#[derive(Debug)]
+pub(crate) struct BrowsePositionLost;
+
+impl std::fmt::Display for BrowsePositionLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "browse position lost: could not step back out of a playability \
+             peek; abandoning this listing rather than paging an unknown level"
+        )
+    }
+}
+
 /// Whether a row is Roon's "No Results" placeholder rather than content.
 ///
 /// #573 defect 7: an empty node (the live crawl's "My Live Radio") comes back
@@ -2284,45 +2307,97 @@ impl RoonAdapter {
     /// #545: Roon puts play actions one level *below* the browsable item
     /// itself (see `resolve_item_key`'s docs on `enter_item`) -- there is no
     /// hint on the item's own row that says "you can also play this without
-    /// navigating in". The only way to know is to look: browse `item_key` in
-    /// a disposable session (so this never disturbs the caller's own browse
-    /// position -- `browse_collection`'s session may still be paging through
-    /// the level this item came from) and check the first few rows of what
-    /// comes back.
+    /// navigating in". The only way to know is to look: browse `item_key`,
+    /// check the first few rows of what comes back, and step back out.
+    ///
+    /// # The peek MUST happen inside the caller's own session (#593)
+    ///
+    /// This method's first version peeked in a disposable `peek_<nanos>`
+    /// session instead, assuming `item_key`s resolve across sessions. A real
+    /// Core scopes them per session, and its failure mode is *silent*:
+    /// browsing a foreign key inside a fresh session answers `action: list`
+    /// with the **root** ("Explore", level 0) list -- no error at all.
+    /// Probed read-only against the operator's production Core (Roon 2.x,
+    /// 2026-08, issue #593): a key minted in one `/roon/browse` session,
+    /// browsed inside a fresh one, returned the root every time. So every
+    /// peek judged the root's rows (never a play verb among them), no
+    /// list-hinted container ever classified as playable, and albums under
+    /// Artists rendered with no Play at all -- while the whole suite stayed
+    /// green, because `FakeRoonCore`'s default `ItemKeyScope::Global` modeled
+    /// exactly the assumption that was wrong (`PerSessionSilentRootReset` now
+    /// models the observed behavior).
+    ///
+    /// Peeking in the caller's session pushes the peeked level onto that
+    /// session's stack, so this browses `pop_levels: 1` afterwards to
+    /// restore the caller's position -- `content()`'s fetch-ahead loop pages
+    /// the *current* level by bare `load`s and would otherwise page the
+    /// peeked child instead (same probe: keys of a level still on the stack
+    /// stay valid after descending elsewhere and popping back).
     ///
     /// Bounded to a small peek (`PEEK_COUNT`) rather than the whole level:
     /// every fixture and the live #545 repro both put the action row(s)
     /// first, so a short prefix answers both questions at a fraction of the
     /// cost of loading the full page, and `list.count` (not the prefix
     /// length) is what `has_other_content` is actually judged against.
-    async fn peek_playability(&self, zone_id: &str, item_key: &str) -> Result<(bool, bool)> {
+    ///
+    /// # Errors
+    ///
+    /// An ordinary failure (the peek's own browse or load refused) is safe
+    /// to degrade from -- the caller's position is intact. A failure of the
+    /// restoring `pop_levels` browse is not: the error then carries
+    /// [`BrowsePositionLost`] in its chain, and the caller must stop paging
+    /// this session (see [`Self::classify_navigability`]).
+    async fn peek_playability(
+        &self,
+        zone_id: &str,
+        session_key: &str,
+        item_key: &str,
+    ) -> Result<(bool, bool)> {
         const PEEK_COUNT: usize = 5;
-        let peek_session = format!(
-            "peek_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
         let browse_result = self
             .browse(BrowseOpts {
-                multi_session_key: Some(peek_session.clone()),
+                multi_session_key: Some(session_key.to_string()),
                 item_key: Some(item_key.to_string()),
                 zone_or_output_id: Some(zone_id.to_string()),
                 ..Default::default()
             })
             .await?;
         if !matches!(browse_result.action, BrowseAction::List) {
-            // Not expected for a `hint: list` item -- nothing to peek into.
+            // Not expected for a `hint: list` item -- nothing was pushed
+            // onto the session's stack (an invoked action produces no list),
+            // so there is nothing to pop either.
             return Ok((false, false));
         }
         let loaded = self
             .load(LoadOpts {
-                multi_session_key: Some(peek_session),
+                multi_session_key: Some(session_key.to_string()),
                 count: Some(PEEK_COUNT),
                 ..Default::default()
             })
-            .await?;
+            .await;
+        // The browse above pushed the peeked level -- restore the caller's
+        // position before propagating any load failure, or the session would
+        // be left one level deep and every subsequent `load` of the caller's
+        // page would silently read the wrong level.
+        let popped = self
+            .browse(BrowseOpts {
+                multi_session_key: Some(session_key.to_string()),
+                pop_levels: Some(1),
+                zone_or_output_id: Some(zone_id.to_string()),
+                ..Default::default()
+            })
+            .await;
+        // A failed restoration outranks a failed load: the session now sits
+        // at an unknown level, and any further `load` against it (the
+        // fetch-ahead loop, the caller's next page) would silently map the
+        // wrong list -- an album's tracks as the parent's rows. Surface it
+        // as the typed [`BrowsePositionLost`] so classification stops the
+        // page instead of degrading to "not playable" the way an ordinary
+        // peek failure does.
+        if let Err(error) = popped {
+            return Err(error.context(BrowsePositionLost));
+        }
+        let loaded = loaded?;
         // #573 defect 1: `action_list`-hinted track rows are content, not
         // action rows (see `is_immediate_action_row`) -- only the verb rows
         // that get filtered out of listings count against "other content"
@@ -2360,18 +2435,32 @@ impl RoonAdapter {
     /// navigable+playable treatment PR #547 established for
     /// `hifi_collections`, rather than maintaining a second copy that could
     /// silently drift from this one.
+    ///
+    /// `session_key` must be the session `item` was listed in: a real Core
+    /// scopes `item_key`s per session, and peeking anywhere else silently
+    /// judges the wrong level (#593 -- see [`Self::peek_playability`]).
+    ///
+    /// # Errors
+    ///
+    /// `Err` only when the peek lost the session's browse position
+    /// ([`BrowsePositionLost`]): the caller must stop paging this session,
+    /// because every further `load` against it would map an unknown level's
+    /// rows. Any *other* peek failure leaves the position intact and
+    /// degrades gracefully to "navigable, not playable", exactly as before.
     pub(crate) async fn classify_navigability(
         &self,
         zone_id: &str,
+        session_key: &str,
         item: &BrowseItem,
-    ) -> (bool, bool) {
+    ) -> Result<(bool, bool)> {
         let list_hinted = matches!(item.hint, Some(ItemHint::List));
         let (playable, has_other_content) = if list_hinted {
             match item.item_key.as_deref() {
-                Some(key) => self
-                    .peek_playability(zone_id, key)
-                    .await
-                    .unwrap_or((false, true)),
+                Some(key) => match self.peek_playability(zone_id, session_key, key).await {
+                    Ok(peeked) => peeked,
+                    Err(error) if error.is::<BrowsePositionLost>() => return Err(error),
+                    Err(_) => (false, true),
+                },
                 None => (false, true),
             }
         } else {
@@ -2384,20 +2473,24 @@ impl RoonAdapter {
         // empty level. A container that offers both real content *and* a
         // play action (an album, a playlist) stays navigable too.
         let navigable = list_hinted && (!playable || has_other_content);
-        (navigable, playable)
+        Ok((navigable, playable))
     }
 
     /// Filter and map one raw browse page into `hifi_collections`' item
     /// shape, appending to `mapped`. Shared by `content()`'s first-page
     /// mapping and its #573 fetch-ahead loop so the two can never disagree
     /// about what a listing row is.
+    /// `Err` only on [`BrowsePositionLost`] (see
+    /// [`Self::classify_navigability`]) -- the page must not be served, and
+    /// the caller must not keep loading this session.
     async fn map_collection_page(
         &self,
         zone_id: &str,
+        session_key: &str,
         items: Vec<BrowseItem>,
         at_collection_root: bool,
         mapped: &mut Vec<Value>,
-    ) {
+    ) -> Result<()> {
         for item in items {
             // #573 defect 3: the exact-title category filter
             // (`is_category`) was verified for *search result* levels only,
@@ -2446,7 +2539,9 @@ impl RoonAdapter {
             if is_no_results_placeholder(&item) {
                 continue;
             }
-            let (navigable, playable) = self.classify_navigability(zone_id, &item).await;
+            let (navigable, playable) = self
+                .classify_navigability(zone_id, session_key, &item)
+                .await?;
             // #573 defect 4: at the collection root, "Library" repeats the
             // page's own name (the UI breadcrumb read "Library / Library").
             // "Local Library" names the same node distinguishably.
@@ -2469,6 +2564,7 @@ impl RoonAdapter {
                 "image_key": item.image_key,
             }));
         }
+        Ok(())
     }
 
     /// Enter a named top-level browse node (`"Playlists"`, ...) in a fresh
@@ -3347,8 +3443,14 @@ impl LibraryAdapter for RoonAdapter {
                         .await?
                 };
                 let mut mapped: Vec<Value> = Vec::new();
-                self.map_collection_page(zone_id, items, at_collection_root, &mut mapped)
-                    .await;
+                self.map_collection_page(
+                    zone_id,
+                    &session_key,
+                    items,
+                    at_collection_root,
+                    &mut mapped,
+                )
+                .await?;
                 // #573 defect 8: `next_offset` used to be computed against
                 // Roon's raw `list.count`, *before* the grouping/action-row
                 // filters above dropped items -- so a fully-filtered page
@@ -3374,8 +3476,14 @@ impl LibraryAdapter for RoonAdapter {
                         break;
                     }
                     consumed = (consumed + chunk.items.len()).min(total);
-                    self.map_collection_page(zone_id, chunk.items, at_collection_root, &mut mapped)
-                        .await;
+                    self.map_collection_page(
+                        zone_id,
+                        &session_key,
+                        chunk.items,
+                        at_collection_root,
+                        &mut mapped,
+                    )
+                    .await?;
                     rounds += 1;
                 }
                 let next_offset = (consumed < total).then_some(consumed as u64);
