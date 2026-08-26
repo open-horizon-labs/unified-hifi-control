@@ -904,9 +904,7 @@ mod server {
                 .route(
                     "/favicon.ico",
                     get(|| {
-                        embedded::serve_static_file(axum::extract::Path(
-                            "favicon.ico".to_string(),
-                        ))
+                        embedded::serve_static_file(axum::extract::Path("favicon.ico".to_string()))
                     }),
                 )
                 .route(
