@@ -31,8 +31,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mock_servers::roon_core::{
-    album, album_live, playlist, playlist_live, radio_station, zone_with_grouping, FakeItem,
-    FakeLibrary, FakeRoonCore, Hint, ItemKeyScope,
+    album, album_live, artist_live, playlist, playlist_live, radio_station, zone_with_grouping,
+    FakeItem, FakeLibrary, FakeRoonCore, Hint, ItemKeyScope,
 };
 use roon_api::browse::{BrowseOpts, LoadOpts};
 use unified_hifi_control::adapters::roon::{PlayAction, RoonAdapter, SearchSource};
@@ -906,6 +906,67 @@ async fn a_foreign_item_key_is_rejected_when_keys_are_session_scoped() {
     assert!(
         errors[0].2.starts_with("play_item_"),
         "the refusal should name play_item's own session: {errors:?}"
+    );
+
+    core.stop().await;
+}
+
+/// The live-observed flavor of session scoping (#593): a foreign key is not
+/// rejected at all -- the Core answers *successfully* with the root list.
+/// This proves the `PerSessionSilentRootReset` knob actually fires, so the
+/// #593 collection pins that run under it are not vacuously green: the fixed
+/// adapter never trips it precisely because it stays in-session.
+#[tokio::test]
+async fn a_foreign_item_key_silently_answers_the_root_when_session_scoping_resets() {
+    let core = FakeRoonCore::start().await;
+    core.set_item_key_scope(ItemKeyScope::PerSessionSilentRootReset)
+        .await;
+    let adapter = connected(&core).await;
+
+    // Session A: browse the root and mint a key.
+    adapter
+        .browse(BrowseOpts {
+            multi_session_key: Some("session_a".into()),
+            pop_all: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let root = adapter
+        .load(LoadOpts {
+            multi_session_key: Some("session_a".into()),
+            count: Some(10),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let library_key = root
+        .items
+        .iter()
+        .find(|i| i.title == "Library")
+        .and_then(|i| i.item_key.clone())
+        .unwrap();
+
+    // Session B browses session A's key: no error, but the answer is the
+    // ROOT list -- the exact silent misdirection the operator's Core showed
+    // (#593's read-only probe).
+    let result = adapter
+        .browse(BrowseOpts {
+            multi_session_key: Some("session_b".into()),
+            item_key: Some(library_key),
+            ..Default::default()
+        })
+        .await
+        .expect("the reset is silent: no error surfaces anywhere");
+    let list = result.list.expect("the reset answers with a list");
+    assert_eq!(
+        list.title, "Explore",
+        "a foreign key lands the session back at the root, not in Library"
+    );
+    assert_eq!(list.level, 0, "root level, not one level down");
+    assert!(
+        core.errors_sent().await.is_empty(),
+        "no refusal is ever sent -- that silence is the hazard"
     );
 
     core.stop().await;
@@ -2281,6 +2342,271 @@ async fn roon_collections_station_added_mid_session_appears_without_restart() {
         "WOSU-HD2 WOSU Public Media: Classical 101"
     );
     assert_eq!(items[0]["playable"], true);
+
+    core.stop().await;
+}
+
+/// The #593 library shape: Library -> Artists -> one artist (live capture --
+/// see `artist_live`) -> albums, under the live-observed key scoping
+/// (`PerSessionSilentRootReset`: a key browsed outside its own session
+/// silently answers the root).
+fn artists_library() -> FakeLibrary {
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![FakeItem::list("Library").with_children(vec![
+        FakeItem::list("Artists").with_children(vec![artist_live(
+            "/Passenger.",
+            vec![
+                album_live(
+                    "Flight of the Crow",
+                    "Passenger",
+                    &["Month of Sundays", "What You're Thinking"],
+                ),
+                album_live("Runaway", "Passenger", &["Hell or High Water"]),
+            ],
+        )]),
+        FakeItem::list("Albums").with_children(vec![album_live(
+            "Runaway",
+            "Passenger",
+            &["Hell or High Water"],
+        )]),
+    ])];
+    library
+}
+
+/// Walk root -> Local Library -> Artists -> artist, returning the final
+/// level's `(session_key, value)` -- the album listing #593 is about.
+async fn walk_to_artist(adapter: &Arc<RoonAdapter>, node: &str) -> (String, serde_json::Value) {
+    let mut level = adapter
+        .content(
+            "collections_browse",
+            &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
+        )
+        .await
+        .unwrap();
+    let mut session = level["session_key"].as_str().unwrap().to_string();
+    for title in ["Local Library", node] {
+        let key = level["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["title"] == title)
+            .unwrap_or_else(|| panic!("row {title} missing: {level:?}"))["item_key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        level = adapter
+            .content(
+                "collections_browse",
+                &json!({
+                    "zone_id": "roon:zone_1",
+                    "item_key": key,
+                    "session_key": session,
+                    "limit": 20,
+                    "offset": 0,
+                }),
+            )
+            .await
+            .unwrap();
+        session = level["session_key"].as_str().unwrap().to_string();
+    }
+    (session, level)
+}
+
+/// #593: albums listed at the Artists level must be dual navigable+playable.
+///
+/// The root cause this pins against: `peek_playability` used to browse the
+/// album's `item_key` inside a disposable `peek_<nanos>` session, assuming
+/// keys resolve across sessions. The operator's production Core scopes them
+/// per session and *silently answers the root list* for a foreign key
+/// (probed read-only, 2026-08 -- see `ItemKeyScope::PerSessionSilentRootReset`),
+/// so the peek judged the root's rows, found no play verb, and every album
+/// under Artists rendered navigable-only (chevron, no Play). Under
+/// `ItemKeyScope::Global` -- the fake's default and the old assumption --
+/// this test would pass even with the disposable-session peek, which is
+/// exactly how the bug shipped; the scoped knob is the load-bearing part.
+#[tokio::test]
+async fn roon_collections_artist_level_albums_are_dual_under_session_scoped_keys() {
+    let core = FakeRoonCore::start_with(artists_library()).await;
+    core.set_item_key_scope(ItemKeyScope::PerSessionSilentRootReset)
+        .await;
+    let adapter = connected(&core).await;
+
+    let (_, artists) = walk_to_artist(&adapter, "Artists").await;
+    let artist_row = &artists["items"][0];
+    assert_eq!(artist_row["title"], "/Passenger.");
+    assert_eq!(
+        artist_row["navigable"], true,
+        "an artist opens to its albums: {artists:?}"
+    );
+    assert_eq!(
+        artist_row["playable"], true,
+        "the artist level leads with a Play Artist verb, so the artist row \
+         itself is also directly playable: {artists:?}"
+    );
+    assert_eq!(
+        artist_row["subtitle"], "2 Albums",
+        "the album-count subtitle survives the mapping: {artists:?}"
+    );
+
+    let (session, artist_level) = walk_to_artist(&adapter, "Artists").await;
+    let artist_key = artist_level["items"][0]["item_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let albums = adapter
+        .content(
+            "collections_browse",
+            &json!({
+                "zone_id": "roon:zone_1",
+                "item_key": artist_key,
+                "session_key": session,
+                "limit": 20,
+                "offset": 0,
+            }),
+        )
+        .await
+        .unwrap();
+    let rows = albums["items"].as_array().unwrap();
+    let titles: Vec<&str> = rows.iter().map(|i| i["title"].as_str().unwrap()).collect();
+    assert_eq!(
+        titles,
+        vec!["Flight of the Crow", "Runaway"],
+        "the Play Artist verb row stays filtered; the albums stay: {albums:?}"
+    );
+    for album in rows {
+        assert_eq!(
+            album["playable"], true,
+            "#593: an album at the artist level must carry a play ref: {album:?}"
+        );
+        assert_eq!(
+            album["navigable"], true,
+            "an album must also still open to its tracks: {album:?}"
+        );
+        assert!(
+            album["image_key"].is_string(),
+            "album artwork must survive the mapping: {album:?}"
+        );
+    }
+
+    // The play ref an artist-level album mints must actually resolve -- in
+    // the same session it was listed in (the whole point of #593's fix).
+    let album_key = rows[0]["item_key"].as_str().unwrap();
+    let session_key = albums["session_key"].as_str().unwrap();
+    let message = adapter
+        .play_ref(
+            album_key,
+            session_key,
+            "roon:zone_fake_1",
+            PlayAction::Play,
+            "Flight of the Crow",
+        )
+        .await
+        .expect("playing an artist-level album ref must succeed");
+    assert!(
+        message.contains("Play Now") || message.contains("Play Album"),
+        "the album's Play Album menu resolves to a real invocation: {message}"
+    );
+
+    core.stop().await;
+}
+
+/// #593 (companion report): the Library / Albums node must list its albums
+/// dual navigable+playable under the same live-observed key scoping. The
+/// row shape is identical to the artist level's (list-hinted, artist
+/// subtitle, artwork, "Play Album" wrapper one level down), so this pins
+/// the top-level node the operator's screenshot showed empty.
+///
+/// (The operator's Core *itself* currently answers the real Albums node
+/// with `count: 0` -- verified read-only through the raw `/roon/browse`
+/// passthrough, so no UHC-side change can affect that; this test pins that
+/// whenever the Core does serve album rows, UHC lists them correctly.)
+#[tokio::test]
+async fn roon_collections_albums_node_lists_albums_dual_under_session_scoped_keys() {
+    let core = FakeRoonCore::start_with(artists_library()).await;
+    core.set_item_key_scope(ItemKeyScope::PerSessionSilentRootReset)
+        .await;
+    let adapter = connected(&core).await;
+
+    let (_, albums) = walk_to_artist(&adapter, "Albums").await;
+    let rows = albums["items"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "the album row must be listed: {albums:?}");
+    assert_eq!(rows[0]["title"], "Runaway");
+    assert_eq!(
+        rows[0]["playable"], true,
+        "#593: an album under the Albums node must carry a play ref: {albums:?}"
+    );
+    assert_eq!(rows[0]["navigable"], true, "{albums:?}");
+
+    core.stop().await;
+}
+
+/// #593's fix peeks inside the caller's own session, which pushes the peeked
+/// level onto that session's stack -- so the peek must pop back out, or
+/// `content()`'s fetch-ahead loop (whose bare `load`s page the *current*
+/// level) would page the last peeked album's tracks instead of the artist's
+/// remaining albums. Forced here: limit 2 over [verb row, 4 albums] maps
+/// one album short, so fetch-ahead loads offset 2 *after* two peeks ran.
+#[tokio::test]
+async fn roon_collections_peeks_do_not_derail_fetch_ahead_paging() {
+    let mut library = FakeLibrary::standard();
+    library.root_items =
+        vec![
+            FakeItem::list("Library").with_children(vec![FakeItem::list("Artists").with_children(
+                vec![artist_live(
+                    "Prolific",
+                    vec![
+                        album_live("Album One", "Prolific", &["T1"]),
+                        album_live("Album Two", "Prolific", &["T2"]),
+                        album_live("Album Three", "Prolific", &["T3"]),
+                        album_live("Album Four", "Prolific", &["T4"]),
+                    ],
+                )],
+            )]),
+        ];
+    let core = FakeRoonCore::start_with(library).await;
+    core.set_item_key_scope(ItemKeyScope::PerSessionSilentRootReset)
+        .await;
+    let adapter = connected(&core).await;
+
+    let (session, artists) = walk_to_artist(&adapter, "Artists").await;
+    let artist_key = artists["items"][0]["item_key"].as_str().unwrap();
+    let page = adapter
+        .content(
+            "collections_browse",
+            &json!({
+                "zone_id": "roon:zone_1",
+                "item_key": artist_key,
+                "session_key": session,
+                "limit": 2,
+                "offset": 0,
+            }),
+        )
+        .await
+        .unwrap();
+    let titles: Vec<&str> = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["title"].as_str().unwrap())
+        .collect();
+    assert!(
+        titles.iter().all(|t| t.starts_with("Album")),
+        "fetch-ahead must keep paging the artist's albums, not a peeked \
+         album's tracks: {titles:?}"
+    );
+    assert!(
+        titles.contains(&"Album Two"),
+        "the fetch-ahead round after the filtered verb row delivers the \
+         next album: {titles:?}"
+    );
+    // Raw rows: [Play Artist, four albums] = 5 total. limit 2 consumes 2
+    // raw rows (1 album), fetch-ahead consumes 2 more (2 albums) and stops
+    // with the page filled; one raw row genuinely remains.
+    assert_eq!(
+        page["next_offset"].as_u64(),
+        Some(4),
+        "further raw rows remain past what was consumed: {page:?}"
+    );
 
     core.stop().await;
 }

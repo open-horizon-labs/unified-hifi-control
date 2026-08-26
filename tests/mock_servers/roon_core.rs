@@ -316,6 +316,38 @@ pub fn playlist_live(title: &str, tracks: &[(&str, &str)]) -> FakeItem {
     FakeItem::list(title).with_children(children)
 }
 
+/// An artist level shaped exactly as the operator's real Core served one
+/// under Library / Artists (issue #593, recorded 2026-08 via the raw
+/// `/roon/browse` endpoint against the production install):
+///
+/// ```json
+/// {"list":{"title":"/Passenger.","count":3,"level":3,"subtitle":"2 Albums"},
+///  "items":[
+///   {"title":"Play Artist","item_key":"2383:0","hint":"action_list"},
+///   {"title":"Flight of the Crow","subtitle":"Passenger","item_key":"2383:1",
+///    "hint":"list","image_key":"e2ce..."},
+///   {"title":"Runaway","subtitle":"Passenger","item_key":"2383:2",
+///    "hint":"list","image_key":"5b18..."}]}
+/// ```
+///
+/// The artist's own row (one level up, at the Artists list) is `hint: list`
+/// with an "N Albums" subtitle and artwork. The album rows *here* are
+/// `hint: list` too -- they are the rows #593 reported rendering with no
+/// Play -- and each album's own level leads with a "Play Album"
+/// `action_list` wrapper (pass [`album_live`] results in for that shape).
+pub fn artist_live(name: &str, albums: Vec<FakeItem>) -> FakeItem {
+    let mut children = vec![FakeItem::action_list("Play Artist").with_children(play_actions())];
+    let album_count = albums.len();
+    children.extend(albums);
+    FakeItem::list(name)
+        .with_subtitle(&format!(
+            "{album_count} Album{}",
+            if album_count == 1 { "" } else { "s" }
+        ))
+        .with_image_key(&format!("img_{}", name.to_lowercase().replace(' ', "_")))
+        .with_children(children)
+}
+
 /// A live-radio station row, shaped exactly as the operator's real Core
 /// served one under "My Live Radio" (issue #587, recorded 2026-08 via the
 /// raw `/roon/browse` endpoint against the production install):
@@ -437,14 +469,27 @@ impl FakeLibrary {
 /// That is [`ItemKeyScope::PerSession`] behaviour, and if it is right then
 /// `/roon/play_item` is broken as #405 feared and #396's ref design changes.
 ///
-/// The default here stays `Global` because that is what the adapter's code assumes,
-/// and these tests describe the adapter. **Do not read the default as a claim about
-/// Roon.** `a_foreign_item_key_is_rejected_when_keys_are_session_scoped` exercises
-/// the other setting; flip the default once the operator's rig settles it.
+/// # The operator's rig has now settled it (issue #593, 2026-08)
 ///
-/// Two caveats against over-reading the citations: Home Assistant's integration is
-/// not UHC and may reuse keys differently, and neither source states the *rule* —
-/// only that reuse fails in practice.
+/// Probed read-only against the production Core through UHC's own
+/// `/roon/browse`: keys do **not** cross sessions -- and the failure mode is
+/// neither of the two the citations suggested. A foreign key in a fresh
+/// session answers *successfully* with the root list
+/// ([`ItemKeyScope::PerSessionSilentRootReset`] has the transcript). This is
+/// exactly what broke #593: `peek_playability` peeked in a disposable
+/// session, silently judged the root instead of the album, and no error ever
+/// surfaced.
+///
+/// The default here stays `Global` because most existing tests describe the
+/// adapter's session-internal behavior, where scope never comes into play.
+/// Tests guarding against cross-session assumptions (#593's pins) must set
+/// `set_item_key_scope(PerSessionSilentRootReset)` explicitly -- and any new
+/// adapter code path that browses a key must be exercised under it.
+///
+/// Two caveats against over-reading the third-party citations: Home Assistant's
+/// integration is not UHC and may reuse keys differently, and neither source
+/// states the *rule* — only that reuse fails in practice. The #593 probe
+/// outranks both for the cross-session question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemKeyScope {
     /// Any session may use any key. Matches what this repo assumes today. Default —
@@ -453,6 +498,23 @@ pub enum ItemKeyScope {
     /// A key only resolves in the session that minted it; elsewhere the Core
     /// answers `InvalidItemKey`.
     PerSession,
+    /// A key only resolves in the session that minted it; elsewhere the Core
+    /// answers **successfully with the root list** -- no error at all.
+    ///
+    /// This is the empirical answer to the type-level docs' open question,
+    /// recorded off the operator's production Core (Roon 2.x, 2026-08,
+    /// issue #593's read-only probe through UHC's own `/roon/browse`):
+    /// a key minted in one `multi_session_key`, browsed inside a fresh one,
+    /// returned `action: "list"` with the root ("Explore", `level: 0`) list
+    /// every time -- freshly minted keys included. The same probe showed
+    /// keys of a level still on a session's stack keep resolving *within*
+    /// that session after descending elsewhere (browsing a sibling key
+    /// jumps back to its level). The silence is the dangerous part: #593's
+    /// missing-Play bug was `peek_playability` reading the root's rows as
+    /// the peeked album's and never finding a play verb, with no error
+    /// anywhere -- [`ItemKeyScope::PerSession`]'s loud refusal could not
+    /// have modeled that.
+    PerSessionSilentRootReset,
 }
 
 /// One MOO request as it arrived, for assertions about what the adapter sent.
@@ -1507,6 +1569,36 @@ async fn handle_browse(
         drop(state);
         refuse(core, writer, "InvalidItemKey", req_id, &session_key).await;
         return;
+    }
+
+    // --- per-session scoping, silent flavor ---------------------------------
+    // Observed live (issue #593, see `ItemKeyScope::PerSessionSilentRootReset`):
+    // a key this session was never served answers with the ROOT list, exactly
+    // as if the request had been `pop_all` -- successfully, with no error.
+    if state.item_key_scope == ItemKeyScope::PerSessionSilentRootReset {
+        if let Some(key) = item_key {
+            let foreign = !state
+                .minted
+                .get(key)
+                .is_some_and(|sessions| sessions.contains(&session_key));
+            if foreign && !state.reject_next_browse {
+                let root_level = Level {
+                    title: root_title.to_string(),
+                    items: state.arena.root_children.clone(),
+                };
+                let session = state.sessions.entry(session_key.clone()).or_default();
+                session.levels = vec![root_level];
+                // Same epoch semantics as `pop_all`: the reset re-mints the
+                // root level's keys freshly (matching the live probe, where
+                // the reset handed out new `<int>:<int>` keys each time).
+                session.epoch += 1;
+                let list = current_list(&state, &session_key);
+                drop(state);
+                let body = json!({ "action": "list", "list": list });
+                respond(core, writer, "COMPLETE", "Success", req_id, Some(&body)).await;
+                return;
+            }
+        }
     }
 
     // --- error injection ---------------------------------------------------

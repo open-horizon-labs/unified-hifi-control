@@ -410,7 +410,10 @@ pub async fn handle_search(
                             if crate::adapters::roon::is_ungrounded_grouping(&item) {
                                 (true, false)
                             } else if let Some(zone_id) = args.zone_id.as_deref() {
-                                state.roon.classify_navigability(zone_id, &item).await
+                                state
+                                    .roon
+                                    .classify_navigability(zone_id, &session_key, &item)
+                                    .await
                             } else {
                                 // No zone to peek playability with (#398: an
                                 // absent zone_id still routes search to Roon) --
