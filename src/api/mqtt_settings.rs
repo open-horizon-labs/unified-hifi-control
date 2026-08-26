@@ -62,6 +62,18 @@ pub struct MqttStatusResponse {
     /// something the user should fill in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Whether Home Assistant is actually reading what we publish (#610):
+    /// `"consuming"`, `"not_configured"`, or `"unknown"`.
+    ///
+    /// The layer above `connection`. #607 made "we reached the broker"
+    /// honest; this one exists because a broker we reach happily can still
+    /// have nobody on the other side of it - which is exactly what produced
+    /// a perfect status block and zero Home Assistant entities.
+    pub home_assistant: String,
+    /// Why we cannot tell, when `home_assistant` is `"unknown"`. Absent
+    /// otherwise, the same convention as `last_error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub home_assistant_detail: Option<String>,
 }
 
 impl From<crate::mqtt::MqttStatus> for MqttStatusResponse {
@@ -79,6 +91,8 @@ impl From<crate::mqtt::MqttStatus> for MqttStatusResponse {
             discovery_prefix: status.discovery_prefix,
             has_username: status.has_username,
             has_password: status.has_password,
+            home_assistant: status.home_assistant.as_str().to_string(),
+            home_assistant_detail: status.home_assistant_detail,
             source: status.source.map(|source| {
                 match source {
                     MqttConfigSource::User => "user",
@@ -169,6 +183,7 @@ pub async fn configure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mqtt::consumer::HomeAssistantState;
     use crate::mqtt::{MqttConnectionState, MqttStatus};
 
     fn sample_response() -> MqttStatusResponse {
@@ -186,6 +201,8 @@ mod tests {
             has_username: true,
             has_password: true,
             source: Some("user".to_string()),
+            home_assistant: "consuming".to_string(),
+            home_assistant_detail: None,
         }
     }
 
@@ -222,6 +239,8 @@ mod tests {
             has_username: false,
             has_password: false,
             source: Some(MqttConfigSource::Environment),
+            home_assistant: HomeAssistantState::Unknown,
+            home_assistant_detail: None,
         };
         let response = MqttStatusResponse::from(status);
         assert!(response.running, "the task is alive - that much was true");
@@ -260,7 +279,79 @@ mod tests {
             has_username: false,
             has_password: false,
             source: None,
+            home_assistant: HomeAssistantState::default(),
+            home_assistant_detail: None,
         });
         assert_eq!(response.connection, "disconnected");
+    }
+
+    /// The #610 shape: everything about *our* side is perfect - configured,
+    /// enabled, running, connected - and the thing the user actually wanted
+    /// still is not happening. That combination has to be expressible in one
+    /// status block, or Settings has no way to tell the truth about it.
+    #[test]
+    fn a_connected_publisher_can_still_report_that_nobody_is_consuming() {
+        let response = MqttStatusResponse::from(MqttStatus {
+            configured: true,
+            enabled: true,
+            running: true,
+            connection: MqttConnectionState::Connected,
+            last_error: None,
+            host: Some("core-mosquitto".to_string()),
+            port: Some(1883),
+            tls: Some(false),
+            base_topic: Some("unified-hifi".to_string()),
+            discovery_prefix: Some("homeassistant".to_string()),
+            has_username: true,
+            has_password: true,
+            source: Some(MqttConfigSource::Environment),
+            home_assistant: HomeAssistantState::NotConfigured,
+            home_assistant_detail: None,
+        });
+        assert_eq!(response.connection, "connected");
+        assert_eq!(response.home_assistant, "not_configured");
+    }
+
+    /// "We cannot tell" has to survive to the wire with its reason attached.
+    /// Serializing it as anything else would either invent a problem or
+    /// invent a success.
+    #[test]
+    fn an_undetermined_consumer_state_carries_its_reason() {
+        let json = serde_json::to_value(MqttStatusResponse::from(MqttStatus {
+            configured: true,
+            enabled: true,
+            running: true,
+            connection: MqttConnectionState::Connected,
+            last_error: None,
+            host: Some("broker.lan".to_string()),
+            port: Some(1883),
+            tls: Some(false),
+            base_topic: Some("unified-hifi".to_string()),
+            discovery_prefix: Some("homeassistant".to_string()),
+            has_username: false,
+            has_password: false,
+            source: Some(MqttConfigSource::User),
+            home_assistant: HomeAssistantState::Unknown,
+            home_assistant_detail: Some("not running as a Home Assistant add-on".to_string()),
+        }))
+        .expect("serialize");
+        assert_eq!(json["home_assistant"], "unknown");
+        assert_eq!(
+            json["home_assistant_detail"],
+            "not running as a Home Assistant add-on"
+        );
+    }
+
+    /// A settled answer carries no dangling explanation, so Settings has
+    /// nothing stale to render beside it - the same rule `last_error`
+    /// follows once connected (#607).
+    #[test]
+    fn a_settled_consumer_state_omits_the_detail_field() {
+        let json = serde_json::to_value(sample_response()).expect("serialize");
+        assert_eq!(json["home_assistant"], "consuming");
+        assert!(
+            json.get("home_assistant_detail").is_none(),
+            "an absent detail must not serialize as null: {json}"
+        );
     }
 }

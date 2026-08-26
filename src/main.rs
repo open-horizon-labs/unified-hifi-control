@@ -7,7 +7,7 @@
 mod server {
     use unified_hifi_control::{
         adapters, aggregator, api, app, bus, config, coordinator, embedded, firmware, knobs, mcp,
-        mdns,
+        mdns, mqtt,
     };
 
     // Import load_app_settings for checking adapter enabled state
@@ -744,6 +744,21 @@ mod server {
             },
             Err(error) => tracing::warn!("MQTT credential store unavailable: {error}"),
         }
+
+        // Whether anyone is actually *reading* what the publisher publishes
+        // (#610). Everything above only establishes UHC's own half: a broker
+        // it reaches, discovery messages it sends. Home Assistant will not
+        // show a single entity unless its own MQTT integration has been added
+        // by hand, and that is invisible from the broker side - which is how
+        // an install with a flawless MQTT status block produced no entities
+        // at all.
+        //
+        // Started unconditionally, not just when the publisher is on: the
+        // question is about Home Assistant, and having the answer ready is
+        // what lets Settings say something useful the moment publishing is
+        // switched on. Outside the add-on this returns immediately without
+        // spawning anything.
+        mqtt::consumer::spawn_core_poll(state.mqtt.consumer_monitor());
 
         // Clone state for shutdown diagnostics
         let state_for_shutdown = state.clone();
