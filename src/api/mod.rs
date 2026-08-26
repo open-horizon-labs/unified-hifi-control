@@ -344,7 +344,7 @@ impl AppState {
         // The Spotify tunnel (#538) spawns an `ssh` child process; wire the
         // server's own shutdown token in so a graceful shutdown kills it
         // too, instead of relying solely on the manual stop / OAuth
-        // completion / fifteen-minute cap paths.
+        // completion / lifetime-cap paths.
         provider_auth.bind_shutdown(shutdown.clone());
         Self {
             roon,

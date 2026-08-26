@@ -203,6 +203,11 @@ pub struct SpotifyTunnelStatus {
     pub expires_at: Option<u64>,
     #[serde(default)]
     pub seconds_remaining: Option<u64>,
+    /// Post-allocation self-probe through the public URL: `None` while the
+    /// check is still running, `Some(true)` when a real HTTP round trip
+    /// succeeded, `Some(false)` when the address did not answer.
+    #[serde(default)]
+    pub verified: Option<bool>,
     #[serde(default)]
     pub message: Option<String>,
 }

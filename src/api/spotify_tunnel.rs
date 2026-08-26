@@ -9,7 +9,7 @@
 //!
 //! The tunnel is scoped to one OAuth attempt: it starts when the user clicks
 //! "Get an HTTPS address", and is torn down when authorization completes
-//! (success or failure), when the user stops it, on a fifteen-minute safety
+//! (success or failure), when the user stops it, on a 55-minute safety
 //! timeout, or when the server shuts down. While it is active this UHC
 //! server is briefly reachable from the public internet at the tunnel's
 //! URL; the callback endpoint behind it only ever accepts the single-use,
@@ -38,7 +38,23 @@ use tokio_util::sync::CancellationToken;
 /// Hard cap on tunnel lifetime, regardless of activity. A beginner should
 /// never end up with a forgotten tunnel silently keeping this server
 /// internet-reachable.
-pub const TUNNEL_MAX_LIFETIME: Duration = Duration::from_secs(15 * 60);
+///
+/// The cap must comfortably outlast a first-time Spotify enrollment: the
+/// user copies the URL, creates an app in Spotify's developer dashboard,
+/// registers the redirect URI, copies the client ID/secret back, saves, and
+/// only then clicks Connect. A 15-minute cap was observed to expire mid-
+/// dashboard (#592), so the redirect landed on a dead tunnel as
+/// ERR_CONNECTION_RESET. pinggy's anonymous tunnels are dropped server-side
+/// at 60 minutes; capping just under that keeps the expiry message ours.
+pub const TUNNEL_MAX_LIFETIME: Duration = Duration::from_secs(55 * 60);
+
+/// How long a tunnel stays up after the OAuth callback has concluded. The
+/// callback response itself (and the settings page it redirects the browser
+/// to) travels back through the tunnel, so tearing the tunnel down inline in
+/// the callback handler reset the very TCP connection carrying the "success"
+/// redirect -- the ERR_CONNECTION_RESET defect in #592. A short grace period
+/// lets the redirect and the follow-up page load finish first.
+pub const TUNNEL_CALLBACK_GRACE: Duration = Duration::from_secs(60);
 
 /// How long to wait for one provider to print a public URL before giving up
 /// on it and falling back to the next.
@@ -82,7 +98,12 @@ impl TunnelProviderKind {
                     "ServerAliveInterval=30".to_string(),
                     "-o".to_string(),
                     "ExitOnForwardFailure=yes".to_string(),
-                    format!("-R0:localhost:{port}"),
+                    // `127.0.0.1` rather than `localhost`: inside containers
+                    // (HA add-on, NAS container station) `localhost` can
+                    // resolve to `::1` while UHC listens on IPv4 only, in
+                    // which case every public request dies as a connection
+                    // reset even though the tunnel URL was printed fine.
+                    format!("-R0:127.0.0.1:{port}"),
                     "a.pinggy.io".to_string(),
                 ],
             ),
@@ -100,7 +121,7 @@ impl TunnelProviderKind {
                     "-o".to_string(),
                     "ExitOnForwardFailure=yes".to_string(),
                     "-R".to_string(),
-                    format!("80:localhost:{port}"),
+                    format!("80:127.0.0.1:{port}"),
                     "localhost.run".to_string(),
                 ],
             ),
@@ -263,6 +284,51 @@ impl TunnelLauncher for RealTunnelLauncher {
     }
 }
 
+/// Checks that a freshly allocated public URL actually carries HTTP back to
+/// this server. A tunnel can print a URL and still be dead end-to-end (wrong
+/// forward target, relay in the wrong mode); without a probe the user only
+/// discovers that at the worst possible moment -- when Spotify redirects
+/// back (#592). Returns `Some(reachable)` or `None` when no probe is
+/// available (tests).
+#[async_trait::async_trait]
+pub(crate) trait TunnelProbe: Send + Sync {
+    async fn probe(&self, url: &str) -> Option<bool>;
+}
+
+/// Probes by fetching this server's own tunnel-status endpoint through the
+/// public URL. Any well-formed HTTP response proves the round trip; the
+/// endpoint itself is a harmless read.
+pub(crate) struct RealTunnelProbe;
+
+#[async_trait::async_trait]
+impl TunnelProbe for RealTunnelProbe {
+    async fn probe(&self, url: &str) -> Option<bool> {
+        let target = format!("{url}/api/providers/spotify/tunnel/status");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .ok()?;
+        match client.get(&target).send().await {
+            Ok(response) => Some(response.status().is_success()),
+            Err(_) => Some(false),
+        }
+    }
+}
+
+/// A probe that reports nothing, keeping `verified` at `None`. Used by unit
+/// tests (via `with_launcher`) so exercising the state machine never
+/// performs network I/O.
+#[cfg(test)]
+pub(crate) struct NullTunnelProbe;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl TunnelProbe for NullTunnelProbe {
+    async fn probe(&self, _url: &str) -> Option<bool> {
+        None
+    }
+}
+
 struct RealTunnelProcess {
     child: Child,
     stdout: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
@@ -316,10 +382,16 @@ pub enum TunnelStatus {
     /// A provider is being tried.
     Starting { provider: &'static str },
     /// A public URL is live. `expires_at` is a Unix-epoch second timestamp.
+    /// `verified` reports the post-allocation self-probe through the public
+    /// URL: `None` while the probe is still running, `Some(true)` once a
+    /// real HTTP round trip succeeded, `Some(false)` when the public URL did
+    /// not answer -- shown to the user before they walk into Spotify's
+    /// dashboard with a dead address (#592).
     Active {
         url: String,
         provider: &'static str,
         expires_at: u64,
+        verified: Option<bool>,
     },
     /// Every provider failed, the tunnel timed out, or it exited
     /// unexpectedly. `message` is written to be read directly by a
@@ -339,6 +411,7 @@ fn now_secs() -> u64 {
 /// OAuth flow it exists to unblock.
 pub struct SpotifyTunnelManager {
     launcher: Arc<dyn TunnelLauncher>,
+    prober: Arc<dyn TunnelProbe>,
     status: Arc<RwLock<TunnelStatus>>,
     /// Bumped on every `start`/`stop` so a background task from a
     /// superseded attempt can tell its result is stale and stop writing to
@@ -359,14 +432,25 @@ pub struct SpotifyTunnelManager {
 
 impl Default for SpotifyTunnelManager {
     fn default() -> Self {
-        Self::with_launcher(Arc::new(RealTunnelLauncher))
+        Self::with_parts(Arc::new(RealTunnelLauncher), Arc::new(RealTunnelProbe))
     }
 }
 
 impl SpotifyTunnelManager {
+    /// Test constructor: scripted launcher, no reachability probe (so unit
+    /// tests never touch the network and `verified` stays `None`).
+    #[cfg(test)]
     pub(crate) fn with_launcher(launcher: Arc<dyn TunnelLauncher>) -> Self {
+        Self::with_parts(launcher, Arc::new(NullTunnelProbe))
+    }
+
+    pub(crate) fn with_parts(
+        launcher: Arc<dyn TunnelLauncher>,
+        prober: Arc<dyn TunnelProbe>,
+    ) -> Self {
         Self {
             launcher,
+            prober,
             status: Arc::new(RwLock::new(TunnelStatus::Idle)),
             generation: Arc::new(AtomicU64::new(0)),
             cancel: Arc::new(Mutex::new(None)),
@@ -439,6 +523,25 @@ impl SpotifyTunnelManager {
         *self.status.write().await = TunnelStatus::Idle;
     }
 
+    /// Tears the tunnel down `delay` from now, unless a newer `start`/`stop`
+    /// has superseded this tunnel in the meantime (generation-guarded, so a
+    /// deferred stop can never kill a tunnel it was not scheduled for).
+    ///
+    /// Used by the OAuth callback: the callback's own HTTP response -- and
+    /// the settings page it redirects to -- still travel through the tunnel,
+    /// so stopping inline resets the connection carrying the redirect
+    /// (#592). See `TUNNEL_CALLBACK_GRACE`.
+    pub fn stop_after(self: &Arc<Self>, delay: Duration) {
+        let manager = self.clone();
+        let generation = self.generation.load(Ordering::SeqCst);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if manager.generation.load(Ordering::SeqCst) == generation {
+                manager.stop().await;
+            }
+        });
+    }
+
     async fn stop_locked(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         if let Some(token) = self.cancel.lock().await.take() {
@@ -505,12 +608,14 @@ impl SpotifyTunnelManager {
                     self.set_status_if_current(
                         generation,
                         TunnelStatus::Active {
-                            url,
+                            url: url.clone(),
                             provider: provider.label(),
                             expires_at,
+                            verified: None,
                         },
                     )
                     .await;
+                    self.spawn_reachability_probe(generation, url);
                     self.supervise_active(process.as_mut(), generation, &token, shutdown.as_ref())
                         .await;
                     return;
@@ -544,9 +649,44 @@ impl SpotifyTunnelManager {
         .await;
     }
 
+    /// One-shot self-check through the freshly allocated public URL,
+    /// recorded into `TunnelStatus::Active::verified` if this tunnel is
+    /// still the current one when the probe returns. A URL that prints but
+    /// cannot carry HTTP back to this server is exactly the failure the user
+    /// otherwise discovers only when Spotify's redirect dies (#592).
+    fn spawn_reachability_probe(self: &Arc<Self>, generation: u64, url: String) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let Some(reachable) = manager.prober.probe(&url).await else {
+                return;
+            };
+            if manager.generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let mut status = manager.status.write().await;
+            let updated = match &*status {
+                TunnelStatus::Active {
+                    url: current_url,
+                    provider,
+                    expires_at,
+                    ..
+                } if *current_url == url => Some(TunnelStatus::Active {
+                    url: url.clone(),
+                    provider,
+                    expires_at: *expires_at,
+                    verified: Some(reachable),
+                }),
+                _ => None,
+            };
+            if let Some(updated) = updated {
+                *status = updated;
+            }
+        });
+    }
+
     /// Once a URL is live, keep reading events until the tunnel is
     /// cancelled (manual stop or OAuth completion), the process exits on
-    /// its own, or the fifteen-minute cap is reached.
+    /// its own, or the lifetime cap (`TUNNEL_MAX_LIFETIME`) is reached.
     async fn supervise_active(
         &self,
         process: &mut dyn TunnelProcess,
@@ -569,8 +709,11 @@ impl SpotifyTunnelManager {
                 () = &mut deadline => {
                     process.kill();
                     self.set_status_if_current(generation, TunnelStatus::Error {
-                        message: "The tunnel timed out after 15 minutes and was closed. Click \
-                                  \"Get an HTTPS address\" again for a fresh URL.".to_string(),
+                        message: format!(
+                            "The tunnel timed out after {} minutes and was closed. Click \
+                             \"Get an HTTPS address\" again for a fresh URL.",
+                            TUNNEL_MAX_LIFETIME.as_secs() / 60
+                        ),
                     }).await;
                     return;
                 }
@@ -658,6 +801,11 @@ pub struct TunnelStatusResponse {
     pub expires_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seconds_remaining: Option<u64>,
+    /// Post-allocation self-probe result: absent while the probe is still
+    /// running, `true` once an HTTP round trip through the public URL
+    /// succeeded, `false` when the public address did not answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -671,6 +819,7 @@ impl From<TunnelStatus> for TunnelStatusResponse {
                 url: None,
                 expires_at: None,
                 seconds_remaining: None,
+                verified: None,
                 message: None,
             },
             TunnelStatus::Starting { provider } => Self {
@@ -679,18 +828,21 @@ impl From<TunnelStatus> for TunnelStatusResponse {
                 url: None,
                 expires_at: None,
                 seconds_remaining: None,
+                verified: None,
                 message: None,
             },
             TunnelStatus::Active {
                 url,
                 provider,
                 expires_at,
+                verified,
             } => Self {
                 phase: "active",
                 provider: Some(provider),
                 url: Some(url),
                 expires_at: Some(expires_at),
                 seconds_remaining: Some(expires_at.saturating_sub(now_secs())),
+                verified,
                 message: None,
             },
             TunnelStatus::Error { message } => Self {
@@ -699,6 +851,7 @@ impl From<TunnelStatus> for TunnelStatusResponse {
                 url: None,
                 expires_at: None,
                 seconds_remaining: None,
+                verified: None,
                 message: Some(message),
             },
         }
@@ -1087,9 +1240,161 @@ mod tests {
             url: "https://example.pinggy.link".to_string(),
             provider: "pinggy.io",
             expires_at: now_secs() + 100,
+            verified: Some(true),
         });
         assert_eq!(response.phase, "active");
         assert_eq!(response.url.as_deref(), Some("https://example.pinggy.link"));
         assert!(response.seconds_remaining.unwrap() <= 100);
+        assert_eq!(response.verified, Some(true));
+    }
+
+    /// #592 regression: the `ssh -R` forward target must be the IPv4
+    /// loopback literal, not `localhost`. Inside containers `localhost` can
+    /// resolve to `::1` while UHC listens on IPv4 only, in which case the
+    /// tunnel prints a URL that resets every public request.
+    #[test]
+    fn tunnel_commands_forward_to_the_ipv4_loopback_literal() {
+        let (program, args) = TunnelProviderKind::Pinggy.command(8088);
+        assert_eq!(program, "ssh");
+        assert!(args.contains(&"-R0:127.0.0.1:8088".to_string()), "{args:?}");
+        let (program, args) = TunnelProviderKind::LocalhostRun.command(8088);
+        assert_eq!(program, "ssh");
+        assert!(args.contains(&"80:127.0.0.1:8088".to_string()), "{args:?}");
+    }
+
+    /// #592 regression: a 15-minute cap expired while the user was still
+    /// working through Spotify's developer dashboard, so the consent
+    /// redirect landed on a dead tunnel as ERR_CONNECTION_RESET. The cap
+    /// must outlast a first-time enrollment (>= 20 minutes demonstrated
+    /// live) while staying under pinggy's 60-minute anonymous-tunnel limit
+    /// so the expiry message shown to the user is ours.
+    #[test]
+    fn lifetime_cap_outlasts_a_first_time_dashboard_round_trip() {
+        assert!(TUNNEL_MAX_LIFETIME >= Duration::from_secs(20 * 60));
+        assert!(TUNNEL_MAX_LIFETIME < Duration::from_secs(60 * 60));
+    }
+
+    /// #592 state-machine regression: the tunnel stays Active through a slow
+    /// dashboard round trip (20+ minutes) and only expires at the cap.
+    #[tokio::test(start_paused = true)]
+    async fn tunnel_survives_twenty_minutes_then_expires_at_the_cap() {
+        let launcher = FakeLauncher::new(vec![(
+            TunnelProviderKind::Pinggy,
+            ScriptedLaunch::url("https://abc123.a.pinggy.link"),
+        )]);
+        let manager = Arc::new(SpotifyTunnelManager::with_launcher(launcher));
+        manager.start(8088).await;
+        wait_until(&manager, |s| matches!(s, TunnelStatus::Active { .. })).await;
+        tokio::time::advance(Duration::from_secs(20 * 60)).await;
+        assert!(
+            matches!(manager.status().await, TunnelStatus::Active { .. }),
+            "tunnel must still be up 20 minutes in; a user is often still \
+             in Spotify's dashboard at that point (#592)"
+        );
+        tokio::time::advance(TUNNEL_MAX_LIFETIME).await;
+        let status = wait_until(&manager, |s| matches!(s, TunnelStatus::Error { .. })).await;
+        match status {
+            TunnelStatus::Error { message } => {
+                assert!(message.contains("timed out"), "{message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// #592: the OAuth callback's teardown is deferred so the callback
+    /// response can travel back through the tunnel first.
+    #[tokio::test(start_paused = true)]
+    async fn deferred_stop_tears_down_only_after_the_grace_period() {
+        let launcher = FakeLauncher::new(vec![(
+            TunnelProviderKind::Pinggy,
+            ScriptedLaunch::url("https://abc123.a.pinggy.link"),
+        )]);
+        let launcher_ref = launcher.clone();
+        let manager = Arc::new(SpotifyTunnelManager::with_launcher(launcher));
+        manager.start(8088).await;
+        wait_until(&manager, |s| matches!(s, TunnelStatus::Active { .. })).await;
+        manager.stop_after(TUNNEL_CALLBACK_GRACE);
+        // Let the spawned deferred-stop task register its timer before
+        // advancing the paused clock, or the advance passes it by.
+        tokio::task::yield_now().await;
+        tokio::time::advance(TUNNEL_CALLBACK_GRACE - Duration::from_secs(1)).await;
+        assert!(
+            matches!(manager.status().await, TunnelStatus::Active { .. }),
+            "the tunnel must survive the grace window: the callback \
+             response and the settings redirect still travel through it"
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        wait_until(&manager, |s| matches!(s, TunnelStatus::Idle)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !launcher_ref.any_process_left_running(),
+            "tunnel process was not killed after the grace period"
+        );
+    }
+
+    /// A deferred stop scheduled for one tunnel must never kill a newer one
+    /// started after it (generation guard).
+    #[tokio::test]
+    async fn deferred_stop_never_kills_a_newer_tunnel() {
+        let launcher = FakeLauncher::new(vec![(
+            TunnelProviderKind::Pinggy,
+            ScriptedLaunch::url("https://abc123.a.pinggy.link"),
+        )]);
+        let manager = Arc::new(SpotifyTunnelManager::with_launcher(launcher));
+        manager.start(8088).await;
+        wait_until(&manager, |s| matches!(s, TunnelStatus::Active { .. })).await;
+        manager.stop_after(Duration::from_millis(50));
+        manager.stop().await;
+        manager.start(8088).await;
+        wait_until(&manager, |s| matches!(s, TunnelStatus::Active { .. })).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            matches!(manager.status().await, TunnelStatus::Active { .. }),
+            "a stale deferred stop killed the newer tunnel"
+        );
+    }
+
+    struct ScriptedProbe(Option<bool>);
+
+    #[async_trait::async_trait]
+    impl TunnelProbe for ScriptedProbe {
+        async fn probe(&self, _url: &str) -> Option<bool> {
+            self.0
+        }
+    }
+
+    /// #592: a printed URL is not a working tunnel. The post-allocation
+    /// self-probe's verdict must land in the Active status so the UI can
+    /// show red/green before the user registers the address with Spotify.
+    #[tokio::test]
+    async fn reachability_probe_verdict_lands_in_active_status() {
+        for verdict in [true, false] {
+            let launcher = FakeLauncher::new(vec![(
+                TunnelProviderKind::Pinggy,
+                ScriptedLaunch::url("https://abc123.a.pinggy.link"),
+            )]);
+            let manager = Arc::new(SpotifyTunnelManager::with_parts(
+                launcher,
+                Arc::new(ScriptedProbe(Some(verdict))),
+            ));
+            manager.start(8088).await;
+            let status = wait_until(&manager, |s| {
+                matches!(
+                    s,
+                    TunnelStatus::Active {
+                        verified: Some(_),
+                        ..
+                    }
+                )
+            })
+            .await;
+            match status {
+                TunnelStatus::Active { url, verified, .. } => {
+                    assert_eq!(url, "https://abc123.a.pinggy.link");
+                    assert_eq!(verified, Some(verdict));
+                }
+                other => panic!("expected Active, got {other:?}"),
+            }
+        }
     }
 }
