@@ -288,6 +288,9 @@ fn SpotifyDeviceCard(
     } else {
         base_image_url.to_string()
     };
+    // #581: map the origin-absolute art path onto the runtime base path so
+    // it survives an ingress prefix (identity in direct mode).
+    let image_url = crate::app::base_path::href(&image_url);
 
     rsx! {
         article { class: "zone-card",

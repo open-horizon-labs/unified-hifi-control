@@ -87,7 +87,10 @@ fn row_now_playing(np: Option<&NowPlaying>) -> Option<RowNowPlaying> {
     if track.is_empty() || track == "Idle" {
         return None;
     }
-    let image_url = resolve_image_url(Some(np));
+    // #581: same mapping the armed header applies -- picker rows are behind
+    // the ingress prefix too, and an unmapped path 404s against Home
+    // Assistant instead of reaching us.
+    let image_url = crate::app::base_path::href(&resolve_image_url(Some(np)));
     Some(RowNowPlaying {
         track,
         is_playing: np.is_playing,
@@ -363,6 +366,7 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
                                                         if np.has_image {
                                                             img {
                                                                 class: "zones-strip-picker-art",
+                                                                // base-path-ok: mapped in `row_now_playing`.
                                                                 src: "{np.image_url}",
                                                                 alt: "Album art"
                                                             }
