@@ -332,8 +332,8 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
                                                     }
                                                     div { class: "zones-strip-picker-meta",
                                                         div { class: "zones-strip-picker-name-row",
-                                                            span { "{zone.zone_name}" }
-                                                            span { class: "badge badge-secondary", "{crate::app::api::source_label(&source)}" }
+                                                            span { class: "zones-strip-picker-name", "{zone.zone_name}" }
+                                                            span { class: "badge badge-secondary flex-shrink-0", "{crate::app::api::source_label(&source)}" }
                                                         }
                                                         if let Some(np) = &row_np {
                                                             div { class: "zones-strip-picker-np",

@@ -723,12 +723,19 @@
     border-top: 1px solid var(--border-default);
   }
 
+  /* #594: no `flex-nowrap` fallback below `sm` -- transport (~164px) and
+     volume (~152px) are fixed-width siblings that leave almost no room for
+     the art+meta target on a 375-430px screen, so the row overflowed and the
+     art thumbnail read as "clipped". Letting the target take its own full
+     row on narrow screens (see `.zones-strip-target`'s `basis-full`) and
+     wrapping the rest below fixes that without shrinking any control below
+     its 44px hit target. Reverts to the original single row at `sm`+. */
   .zones-strip-inner {
-    @apply mx-auto flex max-w-7xl items-center gap-3 px-3 py-2 sm:px-6 lg:px-8;
+    @apply mx-auto flex max-w-7xl flex-wrap items-center gap-3 px-3 py-2 sm:flex-nowrap sm:px-6 lg:px-8;
   }
 
   .zones-strip-target {
-    @apply flex min-w-0 flex-1 items-center gap-3 rounded-lg p-1.5 text-left;
+    @apply flex min-w-0 basis-full items-center gap-3 rounded-lg px-3 py-1.5 text-left sm:basis-auto sm:flex-1;
   }
   .zones-strip-target:hover {
     background: var(--surface-hover);
@@ -742,9 +749,14 @@
     @apply size-10 flex-shrink-0 rounded-md object-cover sm:size-12;
     background: var(--surface-base);
   }
+  /* #594: a themed border so the "no artwork" tile keeps a visible edge on
+     OLED, where `--surface-base` is near-black against an equally dark
+     strip background -- previously the empty tile could read as an
+     unstyled/invisible box rather than a deliberate placeholder. */
   .zones-strip-art--empty {
-    @apply flex items-center justify-center text-lg;
+    @apply flex items-center justify-center border text-lg;
     color: var(--text-muted);
+    border-color: var(--border-subtle);
   }
 
   .zones-strip-meta {
@@ -801,7 +813,7 @@
      `.library-row` -- so it visibly reads as clickable, distinct from the
      `.zones-strip-picker-controls` button group beside it (divider below). */
   .zones-strip-picker-item {
-    @apply flex w-full min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-md px-3 py-2 text-left text-sm transition-colors;
+    @apply flex min-w-0 basis-full cursor-pointer items-center gap-2 rounded-md px-3 py-2 text-left text-sm transition-colors sm:basis-auto sm:flex-1;
   }
   .zones-strip-picker-item:hover {
     background: var(--surface-hover);
@@ -813,9 +825,15 @@
 
   /* #585: a picker row with now-playing state becomes a mini-controller --
      art, track, playing indicator, play/pause, and volume nudge -- while an
-     idle row (no `RowNowPlaying`) stays the original compact name + badge. */
+     idle row (no `RowNowPlaying`) stays the original compact name + badge.
+     #594: on a 375-430px screen the mini-controller's own control rail
+     (play/pause + volume nudges, ~210px) left almost nothing for name/track,
+     the same squeeze the armed header had -- `flex-wrap` here lets the
+     select-target take the full row and the controls wrap to their own line
+     below, same pattern as `.zones-strip-inner`/`.zones-strip-target`.
+     Single row returns at `sm`+. */
   .zones-strip-picker-row {
-    @apply flex w-full min-w-0 items-center gap-1;
+    @apply flex min-w-0 flex-wrap items-center gap-1 sm:flex-nowrap;
   }
 
   .zones-strip-picker-art {
@@ -823,15 +841,29 @@
     background: var(--surface-base);
   }
   .zones-strip-picker-art--empty {
-    @apply flex items-center justify-center text-sm;
+    @apply flex items-center justify-center border text-sm;
     color: var(--text-muted);
+    border-color: var(--border-subtle);
   }
 
   .zones-strip-picker-meta {
     @apply flex min-w-0 flex-1 flex-col gap-0.5;
   }
+  /* #594: needs its own `min-w-0` -- without it, the untruncated zone-name
+     span below could push this row (and the whole picker item) wider than
+     its flex-1 parent, overflowing into `.zones-strip-picker-controls`
+     instead of truncating. Same reasoning `.zones-strip-picker-np` already
+     applied to its own track span. */
   .zones-strip-picker-name-row {
-    @apply flex items-center gap-2;
+    @apply flex min-w-0 items-center gap-2;
+  }
+  /* #594: the zone name itself had no truncation class, so a long name
+     could overflow the row uncontained -- the one piece of text in this
+     component that didn't already truncate like its header counterpart
+     (`.zones-strip-zone-name`), which read as "uneven alignment" between
+     the armed header and the picker rows. */
+  .zones-strip-picker-name {
+    @apply min-w-0 truncate;
   }
   .zones-strip-picker-np {
     @apply flex min-w-0 items-center gap-1.5;
@@ -843,10 +875,15 @@
 
   /* Divider (not a background) keeps the boundary between the row's
      select-target and its own controls legible without implying the
-     controls are a second clickable "row" (owner feedback on #585). */
+     controls are a second clickable "row" (owner feedback on #585).
+     #594: when `.zones-strip-picker-row` wraps below `sm`, this becomes
+     its own full-width line under the select-target -- a left border reads
+     as a stray vertical tick there, so the divider moves to the top and the
+     buttons right-align, then reverts to the original left-divider,
+     left-aligned layout once the row stops wrapping. */
   .zones-strip-picker-controls {
-    @apply flex flex-shrink-0 items-center gap-1 py-1 pl-2 pr-1;
-    border-left: 1px solid var(--border-subtle);
+    @apply flex w-full flex-shrink-0 items-center justify-end gap-1 border-t py-1 pl-0 pr-1 sm:w-auto sm:justify-start sm:border-t-0 sm:border-l sm:pl-2;
+    border-color: var(--border-subtle);
   }
 
   .zones-strip-transfer {
