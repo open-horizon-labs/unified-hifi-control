@@ -61,6 +61,9 @@ pub struct BootstrapResponse {
 
 #[derive(Debug, Serialize)]
 pub struct ControllerStatus {
+    /// Whether controller auth is enabled at all (UHC_REQUIRE_CONTROLLER_AUTH).
+    /// With the gate off (the default), no client should ever prompt.
+    pub auth_required: bool,
     pub authenticated: bool,
     pub bootstrap_required: bool,
     pub expires_at: Option<u64>,
@@ -164,6 +167,7 @@ impl ControllerAuthState {
         let session = self.session(headers).await;
         let inner = self.inner.read().await;
         ControllerStatus {
+            auth_required: controller_auth_required(),
             authenticated: session.is_some(),
             bootstrap_required: inner.bootstrap_hash.is_some(),
             expires_at: session.map(|s| s.expires_at),

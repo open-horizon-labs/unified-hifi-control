@@ -81,6 +81,8 @@ pub fn suppress_controller_unauthorized(message: String) -> Option<String> {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ControllerStatus {
     pub authenticated: bool,
+    #[serde(default)]
+    pub auth_required: bool,
     pub bootstrap_required: bool,
     #[serde(default)]
     pub expires_at: Option<u64>,

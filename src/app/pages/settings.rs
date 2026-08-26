@@ -603,7 +603,7 @@ pub fn Settings() -> Element {
     use_effect(move || {
         spawn(async move {
             if let Ok(status) = crate::app::api::fetch_controller_status().await {
-                if status.bootstrap_required && !status.authenticated {
+                if status.auth_required && status.bootstrap_required && !status.authenticated {
                     crate::app::controller_auth::open_bootstrap_prompt();
                 }
             }
@@ -1923,7 +1923,7 @@ pub fn Settings() -> Element {
                                         p { class: "mt-1 text-xs text-muted", "Most setups can leave this blank -- UHC signs in securely without it. Only fill this in if you specifically created your Spotify app to require one." }
                                     }
                                 }
-                                label { class: "mt-3 block text-sm font-medium", r#for: "spotify-redirect-uri", "Redirect URI (optional)" }
+                                label { class: "mt-3 block text-sm font-medium", r#for: "spotify-redirect-uri", "Redirect URI" }
                                 input {
                                     id: "spotify-redirect-uri",
                                     class: "input mt-1 min-h-11 w-full",
