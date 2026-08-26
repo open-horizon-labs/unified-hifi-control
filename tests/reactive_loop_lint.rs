@@ -19,6 +19,22 @@
 //! 2. Inside a `use_memo(move || { .. })` closure: any signal write at all. Memos must be
 //!    pure projections of their inputs; writing a signal from one is a side effect that
 //!    can create the same kind of feedback loop (and violates memo purity regardless).
+//! 3. Inside a `use_effect`/`use_memo` closure declared in a `#[component]` function
+//!    with parameters: any reference to a component prop, or to a top-level `let` local
+//!    derived from one (e.g. `let route_tab = tab.clone().unwrap_or_default();`). Props
+//!    are plain values, not signals -- a hook closure that captures one has no reactive
+//!    dependency on it, so a prop-only change re-renders the component without rerunning
+//!    the hook and the hook's output goes stale (#566: the Library page's breadcrumb
+//!    resync, armed-zone, selected-source, and tab-reload hooks all had exactly this).
+//!    The sanctioned fix is `use_reactive!`: `use_effect(use_reactive!(|prop| { .. }))`
+//!    diffs the prop across renders and reruns the hook when it changes. Hooks already
+//!    wrapped that way are exempt (the prop enters as a closure *parameter*, not a
+//!    capture) -- and the lint parses the `use_reactive!(|p| ..)` closure out of the
+//!    macro token stream so patterns 1 and 2 keep applying inside it. Derived-local
+//!    tracking is deliberately shallow: top-level `let` bindings only, and a binding
+//!    whose initializer calls a `use_*` hook (`use_signal`, `use_memo`, ...) is NOT
+//!    treated as prop-derived -- it produces a reactive container, which is the fix,
+//!    not the bug.
 //!
 //! Identifier resolution is name-based within the closure scope, matching the precision
 //! level the sibling lints already accept (e.g. `await_in_lock_lint`'s guard tracking).
@@ -43,7 +59,7 @@
 //! #560's fix (`.peek()`) removed the only known violation, so any allow added later is
 //! new debt that must be reviewed, not inherited.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use syn::visit::Visit;
@@ -174,12 +190,130 @@ struct Finding {
     message: String,
 }
 
+/// Records references (pattern 3) to component props / prop-derived locals inside a
+/// hook closure body. Unlike [`SignalUsageVisitor`], this deliberately does NOT prune
+/// `spawn(..)` blocks: the hazard is "the hook can't be *triggered* by this value", and
+/// a prop consumed only inside the spawned block still means the hook's behavior should
+/// change when the prop does.
+struct PropCaptureVisitor<'a> {
+    props: &'a HashSet<String>,
+    /// Closure parameters (e.g. the prop re-bound by `use_reactive!(|prop| ..)`) --
+    /// exempt, they're fed the diffed value, not captured stale.
+    excluded: HashSet<String>,
+    captures: HashMap<String, Access>,
+}
+
+impl<'ast> Visit<'ast> for PropCaptureVisitor<'_> {
+    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+        if let Some(ident) = path.path.get_ident() {
+            let name = ident.to_string();
+            if self.props.contains(&name) && !self.excluded.contains(&name) {
+                use syn::spanned::Spanned;
+                self.captures.entry(name).or_insert(Access {
+                    line: path.span().start().line,
+                });
+            }
+        }
+        syn::visit::visit_expr_path(self, path);
+    }
+}
+
+/// Collects every identifier bound by a pattern anywhere in the visited tree --
+/// `let` bindings, `for` loops, `if let`/`while let`, match arms, nested-closure
+/// parameters. Used to exempt closure-local rebindings from pattern 3.
+struct BoundNameCollector {
+    names: HashSet<String>,
+}
+
+impl<'ast> Visit<'ast> for BoundNameCollector {
+    fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
+        self.names.insert(pat.ident.to_string());
+        syn::visit::visit_pat_ident(self, pat);
+    }
+}
+
+/// Identifier names bound by a closure's parameter list (simple idents and tuple
+/// patterns of idents -- the shapes `use_reactive!` and plain hook closures produce).
+fn closure_param_names(closure: &ExprClosure) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for input in &closure.inputs {
+        collect_pat_idents(input, &mut names);
+    }
+    names
+}
+
+fn collect_pat_idents(pat: &syn::Pat, out: &mut HashSet<String>) {
+    match pat {
+        syn::Pat::Ident(pi) => {
+            out.insert(pi.ident.to_string());
+        }
+        syn::Pat::Type(pt) => collect_pat_idents(&pt.pat, out),
+        syn::Pat::Tuple(t) => {
+            for elem in &t.elems {
+                collect_pat_idents(elem, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether an expression contains a call to any `use_*` hook. A `let` binding
+/// initialized through one (`let x = use_signal(|| prop.clone());`) yields a reactive
+/// container, not a stale prop alias, so pattern 3 must not propagate prop-ness into it.
+fn contains_hook_call(expr: &Expr) -> bool {
+    struct HookCallFinder {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for HookCallFinder {
+        fn visit_expr_call(&mut self, call: &'ast ExprCall) {
+            if let Expr::Path(path) = &*call.func {
+                if let Some(seg) = path.path.segments.last() {
+                    if seg.ident.to_string().starts_with("use_") {
+                        self.found = true;
+                    }
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+    let mut finder = HookCallFinder { found: false };
+    finder.visit_expr(expr);
+    finder.found
+}
+
+/// Whether an expression references any identifier in `names` (as a bare path).
+fn references_any(expr: &Expr, names: &HashSet<String>) -> bool {
+    struct RefFinder<'a> {
+        names: &'a HashSet<String>,
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for RefFinder<'_> {
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            if let Some(ident) = path.path.get_ident() {
+                if self.names.contains(&ident.to_string()) {
+                    self.found = true;
+                }
+            }
+            syn::visit::visit_expr_path(self, path);
+        }
+    }
+    let mut finder = RefFinder {
+        names,
+        found: false,
+    };
+    finder.visit_expr(expr);
+    finder.found
+}
+
 /// Walks a whole file looking for `use_effect`/`use_memo` calls and analyzing their
 /// closures for self-subscribing reads/writes (pattern 1) or any write at all
 /// (pattern 2).
 struct ReactiveLoopVisitor {
     current_file: String,
     findings: Vec<Finding>,
+    /// Props (and top-level prop-derived locals) of the enclosing `#[component]`
+    /// function, when there is one with parameters. Drives pattern 3.
+    component_props: Option<HashSet<String>>,
 }
 
 impl ReactiveLoopVisitor {
@@ -187,12 +321,59 @@ impl ReactiveLoopVisitor {
         Self {
             current_file: file,
             findings: Vec::new(),
+            component_props: None,
         }
     }
 
     fn analyze_closure(&mut self, closure: &ExprClosure, kind: HookKind) {
         let mut usage = SignalUsageVisitor::new(matches!(kind, HookKind::Effect));
         usage.visit_expr(&closure.body);
+
+        // Pattern 3: component prop (or prop-derived local) captured by the hook
+        // closure. Closure parameters are exempt -- `use_reactive!(|prop| ..)` re-binds
+        // the prop as a parameter fed from the diffing signal, which is the fix. So is
+        // any name the closure body re-binds itself (a `let`, `for`, `if let`, match
+        // arm, or nested-closure pattern): `for zone in list` inside the closure is the
+        // loop's local, not the `zone` prop. The exclusion is body-wide rather than
+        // properly scoped, so a closure that BOTH captures a prop AND rebinds that same
+        // name elsewhere in its body would mask the capture -- accepted imprecision,
+        // consistent with the sibling lints' name-based resolution.
+        if let Some(props) = &self.component_props {
+            let mut excluded = closure_param_names(closure);
+            let mut bound = BoundNameCollector {
+                names: HashSet::new(),
+            };
+            bound.visit_expr(&closure.body);
+            excluded.extend(bound.names);
+            let mut capture = PropCaptureVisitor {
+                props,
+                excluded,
+                captures: HashMap::new(),
+            };
+            capture.visit_expr(&closure.body);
+            let mut names: Vec<_> = capture.captures.keys().cloned().collect();
+            names.sort();
+            for name in names {
+                let access = &capture.captures[&name];
+                self.findings.push(Finding {
+                    file: self.current_file.clone(),
+                    line: access.line,
+                    message: format!(
+                        "`{name}` is a component prop (or a local derived from one) \
+                         captured by a {} closure (line {}). Props are plain values -- \
+                         the hook has no reactive dependency on them, so a prop-only \
+                         change re-renders the component without rerunning the hook and \
+                         its output goes stale (#566). Wrap the closure in \
+                         `use_reactive!(|{name}| ..)`.",
+                        match kind {
+                            HookKind::Effect => "use_effect",
+                            HookKind::Memo => "use_memo",
+                        },
+                        access.line
+                    ),
+                });
+            }
+        }
 
         match kind {
             HookKind::Effect => {
@@ -243,6 +424,55 @@ enum HookKind {
 }
 
 impl<'ast> Visit<'ast> for ReactiveLoopVisitor {
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        let is_component = item.attrs.iter().any(|attr| {
+            attr.path()
+                .segments
+                .last()
+                .map(|s| s.ident == "component")
+                .unwrap_or(false)
+        });
+
+        let saved = self.component_props.take();
+        if is_component {
+            let mut props: HashSet<String> = item
+                .sig
+                .inputs
+                .iter()
+                .filter_map(|arg| match arg {
+                    syn::FnArg::Typed(pt) => match &*pt.pat {
+                        syn::Pat::Ident(pi) => Some(pi.ident.to_string()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+
+            if !props.is_empty() {
+                // Propagate prop-ness through top-level `let` aliases, in statement
+                // order (`let route_tab = tab.clone().unwrap_or_default();` makes
+                // `route_tab` a prop for pattern 3). Bindings initialized through a
+                // `use_*` hook are containers, not aliases -- see the module header.
+                for stmt in &item.block.stmts {
+                    if let syn::Stmt::Local(local) = stmt {
+                        let mut bound = HashSet::new();
+                        collect_pat_idents(&local.pat, &mut bound);
+                        if let Some(init) = &local.init {
+                            if !contains_hook_call(&init.expr) && references_any(&init.expr, &props)
+                            {
+                                props.extend(bound);
+                            }
+                        }
+                    }
+                }
+                self.component_props = Some(props);
+            }
+        }
+
+        syn::visit::visit_item_fn(self, item);
+        self.component_props = saved;
+    }
+
     fn visit_expr_call(&mut self, call: &'ast ExprCall) {
         let hook = if let Expr::Path(path) = &*call.func {
             path.path.segments.last().and_then(|seg| {
@@ -259,8 +489,25 @@ impl<'ast> Visit<'ast> for ReactiveLoopVisitor {
         };
 
         if let Some(kind) = hook {
-            if let Some(Expr::Closure(closure)) = call.args.first() {
-                self.analyze_closure(closure, kind);
+            match call.args.first() {
+                Some(Expr::Closure(closure)) => self.analyze_closure(closure, kind),
+                // `use_effect(use_reactive!(|prop| { .. }))`: the macro's token stream
+                // is itself closure-shaped -- parse it back out so patterns 1 and 2
+                // still see the body, and pattern 3 sees `prop` as a parameter (exempt).
+                Some(Expr::Macro(mac))
+                    if mac
+                        .mac
+                        .path
+                        .segments
+                        .last()
+                        .map(|s| s.ident == "use_reactive")
+                        .unwrap_or(false) =>
+                {
+                    if let Ok(closure) = syn::parse2::<ExprClosure>(mac.mac.tokens.clone()) {
+                        self.analyze_closure(&closure, kind);
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -354,9 +601,14 @@ fn no_self_subscribing_signal_writes() {
 
     if !all_violations.is_empty() {
         let mut error_msg = String::from(
-            "\n\nFound self-subscribing signal write(s) in use_effect/use_memo!\n\
-             A synchronous effect that tracked-reads a signal and then writes that same \
-             signal re-subscribes itself and re-triggers forever (#560).\n\n\
+            "\n\nFound reactive-dependency hazard(s) in use_effect/use_memo!\n\
+             Two bug classes are linted here: (a) a synchronous effect that tracked-reads \
+             a signal and then writes that same signal re-subscribes itself and \
+             re-triggers forever (#560); (b) a hook closure in a #[component] fn that \
+             captures a component prop (or a local derived from one) has no reactive \
+             dependency on it, so a prop-only change re-renders the component without \
+             rerunning the hook and its output goes stale (#566) -- wrap the closure in \
+             `use_reactive!(|prop| ..)`.\n\n\
              Fix by reading with `.peek()` instead of the tracked call/`.read()` when the \
              value isn't meant to drive the effect:\n\
              ```rust\n\
@@ -509,6 +761,184 @@ fn allows_pure_use_memo() {
     assert!(
         result.violations.is_empty(),
         "Should not flag a pure use_memo with no writes"
+    );
+}
+
+#[test]
+fn detects_prop_capture_in_component_effect() {
+    // The #566 hazard class: a route prop (here via its conventional local alias)
+    // captured by a use_effect closure with no reactive dependency on it.
+    let bad_code = r#"
+        #[component]
+        fn Library(tab: Option<String>) -> Element {
+            let route_tab = tab.clone().unwrap_or_default();
+            use_effect(move || {
+                let _ = route_tab.clone();
+                refresh(false);
+            });
+            rsx! {}
+        }
+    "#;
+
+    let result = analyze_source("test.rs", bad_code);
+    assert_eq!(
+        result.violations.len(),
+        1,
+        "Should flag the untracked prop-alias capture: {:?}",
+        result
+            .violations
+            .iter()
+            .map(|f| &f.message)
+            .collect::<Vec<_>>()
+    );
+    assert!(result.violations[0].message.contains("route_tab"));
+}
+
+#[test]
+fn detects_prop_capture_in_component_memo() {
+    let bad_code = r#"
+        #[component]
+        fn Library(source: Option<String>) -> Element {
+            let selected = use_memo(move || resolve_source(source.as_deref()));
+            rsx! {}
+        }
+    "#;
+
+    let result = analyze_source("test.rs", bad_code);
+    assert_eq!(
+        result.violations.len(),
+        1,
+        "Should flag the prop captured by a use_memo closure"
+    );
+}
+
+#[test]
+fn allows_use_reactive_wrapped_prop() {
+    // The sanctioned fix: the prop enters as a use_reactive! closure parameter.
+    let good_code = r#"
+        #[component]
+        fn Library(tab: Option<String>) -> Element {
+            let route_tab = tab.clone().unwrap_or_default();
+            use_effect(use_reactive!(|route_tab| {
+                let _ = route_tab;
+                refresh(false);
+            }));
+            let selected = use_memo(use_reactive!(|route_tab| resolve_source(&route_tab)));
+            rsx! {}
+        }
+    "#;
+
+    let result = analyze_source("test.rs", good_code);
+    assert!(
+        result.violations.is_empty(),
+        "use_reactive!-wrapped hooks must not be flagged: {:?}",
+        result
+            .violations
+            .iter()
+            .map(|f| &f.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn detects_self_subscribing_write_inside_use_reactive() {
+    // Pattern 1 must keep applying inside a use_reactive!-wrapped effect body.
+    let bad_code = r#"
+        #[component]
+        fn Library(tab: Option<String>) -> Element {
+            use_effect(use_reactive!(|tab| {
+                let next = generation() + 1;
+                generation.set(next);
+            }));
+            rsx! {}
+        }
+    "#;
+
+    let result = analyze_source("test.rs", bad_code);
+    assert_eq!(
+        result.violations.len(),
+        1,
+        "Pattern 1 should still fire inside the use_reactive! closure body"
+    );
+    assert!(result.violations[0].message.contains("generation"));
+}
+
+#[test]
+fn allows_signal_derived_from_prop() {
+    // `use_signal(|| prop.clone())` deliberately seeds a signal from a prop -- the
+    // signal is a reactive container, not a stale alias, so effects tracking it are
+    // fine and `armed` must not inherit prop-ness.
+    let good_code = r#"
+        #[component]
+        fn Library(zone: Option<String>) -> Element {
+            let armed = use_signal(|| zone.clone());
+            use_effect(move || {
+                let _ = armed();
+            });
+            rsx! {}
+        }
+    "#;
+
+    let result = analyze_source("test.rs", good_code);
+    assert!(
+        result.violations.is_empty(),
+        "A use_signal-seeded binding is not a prop alias"
+    );
+}
+
+#[test]
+fn allows_closure_local_shadowing_of_prop_names() {
+    // `zone` here is the for-loop's local (and the nested closure's param), not the
+    // component prop -- the real library.rs effects iterate `for zone in list` inside
+    // components whose route prop is also named `zone`.
+    let good_code = r#"
+        #[component]
+        fn Library(zone: Option<String>, source: Option<String>) -> Element {
+            use_effect(move || {
+                let list = zones_list();
+                for zone in list {
+                    push(zone.zone_id);
+                }
+                if let Some(zone) = resolved() {
+                    push(zone);
+                }
+            });
+            let picked = use_memo(move || {
+                let source = selected_source();
+                zones_list().into_iter().find(|z| z.source == source)
+            });
+            rsx! {}
+        }
+    "#;
+
+    let result = analyze_source("test.rs", good_code);
+    assert!(
+        result.violations.is_empty(),
+        "Closure-local rebindings of prop names must not be flagged: {:?}",
+        result
+            .violations
+            .iter()
+            .map(|f| &f.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn ignores_prop_like_captures_outside_component_fns() {
+    // Pattern 3 is scoped to #[component] functions: plain helpers and hook fns have
+    // arguments, not reactive props.
+    let good_code = r#"
+        fn use_thing(flag: bool) {
+            use_effect(move || {
+                let _ = flag;
+            });
+        }
+    "#;
+
+    let result = analyze_source("test.rs", good_code);
+    assert!(
+        result.violations.is_empty(),
+        "Non-#[component] fns are out of pattern 3's scope"
     );
 }
 

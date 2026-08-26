@@ -436,8 +436,16 @@ pub fn Library(
     // Armed target zone: resolved from the URL / last-used / now-playing,
     // written back into the URL and localStorage so it survives a refresh
     // and shows up in shared links.
+    //
+    // `use_reactive!` on `route_zone` is load-bearing, same hazard class as
+    // #566's breadcrumb resync: `zone` is a plain route prop, so an effect
+    // that merely captures it has no reactive dependency on it. A zone-strip
+    // click (`arm_zone`) pushes a new `zone` query param and re-renders this
+    // component, but without `use_reactive!` nothing this effect *tracks*
+    // changed -- it wouldn't rerun until some unrelated zones/now-playing
+    // update, so the click read as a no-op whenever nothing was playing.
     let mut armed_zone_id = use_signal(|| route_zone.clone());
-    use_effect(move || {
+    use_effect(use_reactive!(|route_zone| {
         let list = zones_list();
         if list.is_empty() {
             return;
@@ -449,14 +457,19 @@ pub fn Library(
             }
             save_last_zone(&zone.zone_id);
         }
-    });
+    }));
 
-    // Selected browse source.
-    let selected_source = use_memo(move || {
+    // Selected browse source. `use_reactive!` on `route_source` is
+    // load-bearing (same class as the `route_zone` effect above): `source`
+    // is a plain route prop, so without it this memo recomputes only when
+    // the zone list or armed zone changes. A source-picker click
+    // (`select_source`) changes only the `source` query param -- the memo
+    // kept returning the old source and the click read as a no-op.
+    let selected_source = use_memo(use_reactive!(|route_source| {
         let list = zones_list();
         let armed = armed_zone_id().and_then(|id| list.iter().find(|z| z.zone_id == id).cloned());
         resolve_source(route_source.as_deref(), armed.as_ref(), &browsable_zones())
-    });
+    }));
 
     // The zone this page issues /api/collections and /api/play_ref calls
     // against: prefer the armed zone if it matches the selected source,
@@ -536,15 +549,23 @@ pub fn Library(
 
     // Reload the level whenever source, tab, browse zone, or breadcrumb
     // path changes.
-    use_effect(move || {
+    //
+    // `use_reactive!` on `route_tab` is load-bearing (same class as the
+    // `route_zone` effect above): `tab` is a plain route prop, and the old
+    // `let _ = route_tab.clone();` captured it without tracking anything. A
+    // tab switch at the breadcrumb root (e.g. Browse -> Playlists, stack
+    // [] == [], source and zone unchanged) changed no tracked dependency,
+    // so this effect never reran and the old tab's items stayed on screen
+    // under the new tab's header.
+    use_effect(use_reactive!(|route_tab| {
         let _ = selected_source();
         let _ = browse_zone_id();
-        let _ = route_tab.clone();
+        let _ = route_tab;
         let _ = breadcrumbs.read().clone();
         if browse_zone_id().is_some() {
             refresh(false);
         }
-    });
+    }));
 
     // Navigate helper: push a fresh URL for the given state, keeping the
     // rest of the query intact.
