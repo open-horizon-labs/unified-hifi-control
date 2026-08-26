@@ -293,6 +293,21 @@ fn default_spotify_redirect_uri() -> String {
     DEFAULT_SPOTIFY_REDIRECT_URI.to_string()
 }
 
+/// Whether *this browser* is talking to UHC over loopback. Drives which
+/// variant of the Spotify callback step (#570 follow-up) renders: a
+/// loopback browser can use the plain HTTP loopback callback directly, but
+/// every other origin -- a NAS accessed from another device, which is the
+/// common case -- needs the HTTPS tunnel, so showing the loopback URL as
+/// the primary instruction there just walks a beginner into registering a
+/// callback Spotify will never redirect to.
+#[cfg(target_arch = "wasm32")]
+fn browser_is_loopback_origin() -> bool {
+    web_sys::window()
+        .and_then(|window| window.location().hostname().ok())
+        .map(|hostname| matches!(hostname.as_str(), "127.0.0.1" | "localhost" | "::1"))
+        .unwrap_or(false)
+}
+
 /// Feedback for the Spotify OAuth redirect back to Settings. Kept separate
 /// from `callback_feedback`'s `web_sys` lookup so the query-string parsing and
 /// per-error-code messaging stay covered by ordinary (non-wasm) unit tests.
@@ -542,6 +557,12 @@ pub fn Settings() -> Element {
     let mut spotify_tunnel = use_signal(SpotifyTunnelStatus::default);
     let mut spotify_tunnel_busy = use_signal(|| false);
     let spotify_tunnel_url_copy_state = use_signal(CopyState::default);
+    // Defaults to the loopback-primary layout (today's behavior, and what
+    // SSR renders) so hydration has nothing to reconcile; a mount-only
+    // effect below flips it once the real browser origin is known. No
+    // tracked signal is read in that effect, so -- like the controller-auth
+    // status check above -- it runs exactly once (reactive-loop-lint).
+    let spotify_remote_origin = use_signal(|| false);
     let mut musicassistant_action = use_signal(ProviderActionState::default);
     let mut musicassistant_error = use_signal(|| None::<String>);
     let mut musicassistant_host = use_signal(String::new);
@@ -568,6 +589,38 @@ pub fn Settings() -> Element {
         crate::app::api::fetch_json::<AppSettings>("/api/settings")
             .await
             .ok()
+    });
+
+    // Proactively check controller-auth status once on mount (#570): the
+    // Settings page hosts every owner-gated action (Spotify client
+    // settings, its tunnel, Music Assistant, Apple Music pairing), so a
+    // fresh NAS install can be routed into the bootstrap prompt before the
+    // user even attempts a save, not just after it 401s. No tracked signal
+    // is read here, so -- like `settings_context::use_settings_provider`'s
+    // equivalent effect -- this runs exactly once per mount rather than
+    // looping (reactive-loop-lint).
+    #[cfg(target_arch = "wasm32")]
+    use_effect(move || {
+        spawn(async move {
+            if let Ok(status) = crate::app::api::fetch_controller_status().await {
+                if status.bootstrap_required && !status.authenticated {
+                    crate::app::controller_auth::open_bootstrap_prompt();
+                }
+            }
+        });
+    });
+
+    // Determine the real browser origin once mounted (see
+    // `browser_is_loopback_origin`'s doc comment for why this can't just be
+    // computed inline during render: SSR has no origin to read, so the
+    // signal starts at the loopback-primary default and this corrects it
+    // after hydration).
+    #[cfg(target_arch = "wasm32")]
+    use_effect(move || {
+        let mut spotify_remote_origin = spotify_remote_origin;
+        if !browser_is_loopback_origin() {
+            spotify_remote_origin.set(true);
+        }
     });
 
     // Sync settings to signals when loaded
@@ -951,7 +1004,9 @@ pub fn Settings() -> Element {
                 }
                 Err(error) => {
                     spotify_action.set(ProviderActionState::Failed);
-                    spotify_error.set(Some(error));
+                    // A `controller_unauthorized` 401 already opened the
+                    // bootstrap prompt (#570); don't also show its raw text.
+                    spotify_error.set(crate::app::api::suppress_controller_unauthorized(error));
                 }
             }
         });
@@ -973,7 +1028,7 @@ pub fn Settings() -> Element {
                 }
                 Err(error) => {
                     spotify_action.set(ProviderActionState::Failed);
-                    spotify_error.set(Some(error));
+                    spotify_error.set(crate::app::api::suppress_controller_unauthorized(error));
                 }
             }
         });
@@ -1013,7 +1068,7 @@ pub fn Settings() -> Element {
                 }
                 Err(error) => {
                     spotify_action.set(ProviderActionState::Failed);
-                    spotify_error.set(Some(error));
+                    spotify_error.set(crate::app::api::suppress_controller_unauthorized(error));
                 }
             }
         });
@@ -1056,11 +1111,17 @@ pub fn Settings() -> Element {
                     }
                 }
                 Err(error) => {
-                    spotify_tunnel.set(SpotifyTunnelStatus {
-                        phase: "error".to_string(),
-                        message: Some(error),
-                        ..Default::default()
-                    });
+                    // A `controller_unauthorized` 401 already opened the
+                    // bootstrap prompt (#570); leave the tunnel panel idle
+                    // rather than also reporting a (confusingly permanent
+                    // sounding) tunnel error banner underneath it.
+                    if let Some(error) = crate::app::api::suppress_controller_unauthorized(error) {
+                        spotify_tunnel.set(SpotifyTunnelStatus {
+                            phase: "error".to_string(),
+                            message: Some(error),
+                            ..Default::default()
+                        });
+                    }
                 }
             }
             spotify_tunnel_busy.set(false);
@@ -1127,7 +1188,8 @@ pub fn Settings() -> Element {
                 }
                 Err(error) => {
                     musicassistant_action.set(ProviderActionState::Failed);
-                    musicassistant_error.set(Some(error));
+                    musicassistant_error
+                        .set(crate::app::api::suppress_controller_unauthorized(error));
                 }
             }
         });
@@ -1726,86 +1788,110 @@ pub fn Settings() -> Element {
                                         a { href: "https://developer.spotify.com/dashboard", target: "_blank", rel: "noopener noreferrer", class: "link", "Spotify Developer Dashboard" }
                                         "."
                                     }
-                                    li {
-                                        "In that app's settings, add the callback URL shown below under \"Redirect URIs\", exactly as written."
-                                        div { class: "mt-2 flex flex-col gap-2 sm:flex-row sm:items-stretch",
-                                            code {
-                                                id: "spotify-callback-url-display",
-                                                class: "block min-w-0 flex-1 overflow-x-auto break-all rounded-md bg-hover px-3 py-3 text-xs select-all",
-                                                "{spotify_redirect_uri()}"
-                                            }
-                                            button {
-                                                r#type: "button",
-                                                class: "btn btn-outline btn-sm shrink-0",
-                                                aria_label: "Copy Spotify callback URL",
-                                                onclick: move |_| copy_to_clipboard(spotify_redirect_uri(), spotify_callback_copy_state),
-                                                span { aria_live: "polite", "{spotify_callback_copy_state().label(\"Copy URL\")}" }
+                                    if spotify_remote_origin() {
+                                        // Remote/LAN origin -- the common case (a NAS or any
+                                        // machine other than the one running the browser).
+                                        // Spotify only accepts plain HTTP loopback callbacks, so
+                                        // this browser's origin cannot use the loopback URL at
+                                        // all; showing it here as a primary instruction is what
+                                        // used to walk beginners into registering the wrong
+                                        // callback while a contradicting tunnel box sat further
+                                        // down the page. The tunnel button and its result now
+                                        // live inline in this step instead.
+                                        li {
+                                            "Add the callback URL below under \"Redirect URIs\", exactly as written."
+                                            p { class: "mt-1 text-xs text-muted", "UHC is running on a NAS or another machine, so Spotify needs an HTTPS address to send you back to. Nothing to install, no terminal needed -- click the button and UHC gives you the exact URL to register." }
+                                            if spotify_tunnel_status.is_active() {
+                                                div { class: "mt-2 rounded-md border border-default bg-hover p-3",
+                                                    div { class: "flex flex-col gap-2 sm:flex-row sm:items-stretch",
+                                                        code {
+                                                            id: "spotify-callback-url-display",
+                                                            class: "block min-w-0 flex-1 overflow-x-auto break-all rounded-md bg-elevated px-3 py-3 text-xs select-all",
+                                                            "{spotify_redirect_uri()}"
+                                                        }
+                                                        button {
+                                                            r#type: "button",
+                                                            class: "btn btn-outline btn-sm shrink-0",
+                                                            aria_label: "Copy tunnel callback URL",
+                                                            onclick: move |_| copy_to_clipboard(spotify_redirect_uri(), spotify_tunnel_url_copy_state),
+                                                            span { aria_live: "polite", "{spotify_tunnel_url_copy_state().label(\"Copy URL\")}" }
+                                                        }
+                                                    }
+                                                    if let Some(minutes) = spotify_tunnel_minutes_remaining {
+                                                        p { class: "mt-2 text-xs text-muted",
+                                                            "Closes automatically in about {minutes} minute(s), or as soon as authorization completes -- whichever comes first."
+                                                        }
+                                                    }
+                                                    p { class: "mt-2 text-xs text-muted", "Live via {spotify_tunnel_provider_label}. While it's open, this server is briefly reachable from the public internet at that address; only the in-progress Spotify sign-in is accepted through it." }
+                                                    button {
+                                                        r#type: "button",
+                                                        class: "btn btn-ghost btn-sm mt-2",
+                                                        disabled: spotify_tunnel_busy(),
+                                                        aria_busy: spotify_tunnel_busy(),
+                                                        onclick: stop_spotify_tunnel,
+                                                        "Stop tunnel"
+                                                    }
+                                                }
+                                            } else {
+                                                div { class: "mt-2",
+                                                    button {
+                                                        r#type: "button",
+                                                        class: "btn btn-outline min-h-11 w-full sm:w-auto",
+                                                        disabled: spotify_tunnel_busy() || spotify_tunnel_status.is_starting(),
+                                                        aria_busy: spotify_tunnel_busy() || spotify_tunnel_status.is_starting(),
+                                                        onclick: start_spotify_tunnel,
+                                                        if spotify_tunnel_status.is_starting() {
+                                                            "Opening a tunnel via {spotify_tunnel_provider_label}…"
+                                                        } else {
+                                                            "Get an HTTPS address"
+                                                        }
+                                                    }
+                                                    if let Some(message) = spotify_tunnel_error_message.clone() {
+                                                        p { class: "mt-2 status-err", role: "alert", "{message}" }
+                                                    }
+                                                }
                                             }
                                         }
-                                        p { class: "mt-2 text-xs text-muted", "This is the default loopback callback — it only works when your browser runs on the same machine as UHC. On a NAS or another machine, click \"Get an HTTPS address\" below: UHC opens a temporary secure tunnel and gives you the exact URL to register instead. (Spotify only accepts plain HTTP for 127.0.0.1/::1.)" }
-                                    }
-                                    li { "Copy that app's Client ID (and Client Secret, if you're not using PKCE) into the fields below." }
-                                    li { "Save client settings, then click Connect Spotify and approve access on Spotify's consent page." }
-                                    li { "If something goes wrong, the message below the Connect button explains what to fix — most often a callback URL that doesn't match exactly." }
-                                }
-                                div { class: "mt-4 rounded-md border border-default bg-elevated p-3", aria_label: "Remote UHC setup instructions",
-                                    h5 { class: "font-medium", "Using UHC from another device or a NAS?" }
-                                    p { class: "mt-1 text-sm text-secondary", "Spotify requires HTTPS for anything other than 127.0.0.1/::1. Get a temporary HTTPS address for this UHC server -- nothing to install, no terminal needed. While it's open, this server is briefly reachable from the public internet at that address; only the in-progress Spotify sign-in is accepted through it. UHC closes it after 15 minutes either way, well inside the free tunnel provider's own 60-minute limit." }
-                                    if spotify_tunnel_status.is_active() {
-                                        div { class: "mt-3 rounded-md border border-default bg-hover p-3",
-                                            p { class: "text-sm text-secondary",
-                                                "Tunnel is live via {spotify_tunnel_provider_label}. Paste this into the Spotify app's Redirect URIs -- step 2 above already shows it too:"
-                                            }
+                                    } else {
+                                        // Loopback origin -- this browser and UHC are the same
+                                        // machine, so the plain HTTP loopback callback just works.
+                                        li {
+                                            "Add the callback URL shown below under \"Redirect URIs\", exactly as written."
                                             div { class: "mt-2 flex flex-col gap-2 sm:flex-row sm:items-stretch",
                                                 code {
-                                                    class: "block min-w-0 flex-1 overflow-x-auto break-all rounded-md bg-elevated px-3 py-3 text-xs select-all",
+                                                    id: "spotify-callback-url-display",
+                                                    class: "block min-w-0 flex-1 overflow-x-auto break-all rounded-md bg-hover px-3 py-3 text-xs select-all",
                                                     "{spotify_redirect_uri()}"
                                                 }
                                                 button {
                                                     r#type: "button",
                                                     class: "btn btn-outline btn-sm shrink-0",
-                                                    aria_label: "Copy tunnel callback URL",
-                                                    onclick: move |_| copy_to_clipboard(spotify_redirect_uri(), spotify_tunnel_url_copy_state),
-                                                    span { aria_live: "polite", "{spotify_tunnel_url_copy_state().label(\"Copy URL\")}" }
+                                                    aria_label: "Copy Spotify callback URL",
+                                                    onclick: move |_| copy_to_clipboard(spotify_redirect_uri(), spotify_callback_copy_state),
+                                                    span { aria_live: "polite", "{spotify_callback_copy_state().label(\"Copy URL\")}" }
                                                 }
                                             }
-                                            if let Some(minutes) = spotify_tunnel_minutes_remaining {
-                                                p { class: "mt-2 text-xs text-muted",
-                                                    "Closes automatically in about {minutes} minute(s), or as soon as authorization completes -- whichever comes first."
-                                                }
-                                            }
-                                            button {
-                                                r#type: "button",
-                                                class: "btn btn-ghost btn-sm mt-2",
-                                                disabled: spotify_tunnel_busy(),
-                                                aria_busy: spotify_tunnel_busy(),
-                                                onclick: stop_spotify_tunnel,
-                                                "Stop tunnel"
-                                            }
-                                        }
-                                    } else {
-                                        button {
-                                            r#type: "button",
-                                            class: "btn btn-outline mt-3 min-h-11 w-full sm:w-auto",
-                                            disabled: spotify_tunnel_busy() || spotify_tunnel_status.is_starting(),
-                                            aria_busy: spotify_tunnel_busy() || spotify_tunnel_status.is_starting(),
-                                            onclick: start_spotify_tunnel,
-                                            if spotify_tunnel_status.is_starting() {
-                                                "Opening a tunnel via {spotify_tunnel_provider_label}…"
-                                            } else {
-                                                "Get an HTTPS address"
-                                            }
-                                        }
-                                        if let Some(message) = spotify_tunnel_error_message.clone() {
-                                            p { class: "mt-2 status-err", role: "alert", "{message}" }
+                                            p { class: "mt-2 text-xs text-muted", "This works because your browser is on the same machine as UHC. Opening this page from another device or a NAS switches this step to a temporary HTTPS tunnel automatically." }
                                         }
                                     }
-                                    details { class: "mt-3",
-                                        summary { class: "cursor-pointer text-sm text-secondary select-none", "Advanced: bring your own HTTPS" }
-                                        div { class: "mt-2 space-y-1",
-                                            p { class: "text-sm text-secondary", "Prefer your own tunnel? Start one to this UHC server (for example ", code { "cloudflared tunnel --url http://127.0.0.1:8088" }, " or Tailscale Funnel), open its HTTPS URL in this browser, then set the Redirect URI below to that tunnel's callback address before registering it above." }
-                                            p { class: "text-sm text-secondary", "Stop the tunnel after authorization; reauthorizing later needs a new tunnel (built-in or your own) and a newly registered callback URL." }
+                                    li { "Copy that app's Client ID into the field below. Most setups don't need the Client Secret -- see \"Advanced\" if you specifically set one up." }
+                                    li { "Save client settings, then click Connect Spotify and approve access on Spotify's consent page." }
+                                    li { "If something goes wrong, the message below the Connect button explains what to fix — most often a callback URL that doesn't match exactly." }
+                                }
+                                details { class: "mt-4",
+                                    summary { class: "cursor-pointer text-sm text-secondary select-none", "Advanced: bring your own HTTPS" }
+                                    div { class: "mt-2 space-y-2",
+                                        if spotify_remote_origin() {
+                                            div {
+                                                p { class: "text-sm text-secondary", "UHC's default loopback callback only works when your browser runs on the exact same machine as UHC:" }
+                                                code {
+                                                    class: "mt-2 block min-w-0 overflow-x-auto break-all rounded-md bg-hover px-3 py-3 text-xs select-all",
+                                                    "{DEFAULT_SPOTIFY_REDIRECT_URI}"
+                                                }
+                                            }
                                         }
+                                        p { class: "text-sm text-secondary", "Prefer your own tunnel? Start one to this UHC server (for example ", code { "cloudflared tunnel --url http://127.0.0.1:8088" }, " or Tailscale Funnel), open its HTTPS URL in this browser, then set the Redirect URI field below to that tunnel's callback address before registering it above." }
+                                        p { class: "text-sm text-secondary", "Stop the tunnel after authorization; reauthorizing later needs a new tunnel (built-in or your own) and a newly registered callback URL." }
                                     }
                                 }
                                 label { class: "mt-4 block text-sm font-medium", r#for: "spotify-client-id", "Client ID" }
@@ -1819,17 +1905,23 @@ pub fn Settings() -> Element {
                                         spotify_client_id.set(event.value());
                                     },
                                 }
-                                label { class: "mt-3 block text-sm font-medium", r#for: "spotify-client-secret", "Client secret (optional for PKCE)" }
-                                input {
-                                    id: "spotify-client-secret",
-                                    class: "input mt-1 min-h-11 w-full",
-                                    r#type: "password",
-                                    value: spotify_client_secret(),
-                                    autocomplete: "new-password",
-                                    oninput: move |event| {
-                                        spotify_local_setup_saved.set(false);
-                                        spotify_client_secret.set(event.value());
-                                    },
+                                details { class: "mt-3",
+                                    summary { class: "cursor-pointer text-sm font-medium select-none", "Advanced: client secret" }
+                                    div { class: "mt-2",
+                                        label { class: "block text-sm font-medium", r#for: "spotify-client-secret", "Client secret" }
+                                        input {
+                                            id: "spotify-client-secret",
+                                            class: "input mt-1 min-h-11 w-full",
+                                            r#type: "password",
+                                            value: spotify_client_secret(),
+                                            autocomplete: "new-password",
+                                            oninput: move |event| {
+                                                spotify_local_setup_saved.set(false);
+                                                spotify_client_secret.set(event.value());
+                                            },
+                                        }
+                                        p { class: "mt-1 text-xs text-muted", "Most setups can leave this blank -- UHC signs in securely without it. Only fill this in if you specifically created your Spotify app to require one." }
+                                    }
                                 }
                                 label { class: "mt-3 block text-sm font-medium", r#for: "spotify-redirect-uri", "Redirect URI (optional)" }
                                 input {

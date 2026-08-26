@@ -366,7 +366,12 @@ fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         Json(AuthError {
-            error: "Controller authentication required",
+            // Shared with the client-side detector in
+            // `crate::app::api::CONTROLLER_UNAUTHORIZED_MESSAGE` so the two
+            // sides cannot drift apart (#570): the browser fetch helpers
+            // match this exact text to route into the bootstrap prompt
+            // instead of rendering the raw HTTP error.
+            error: crate::app::api::CONTROLLER_UNAUTHORIZED_MESSAGE,
             code: "controller_unauthorized",
         }),
     )

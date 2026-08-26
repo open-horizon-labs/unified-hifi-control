@@ -104,9 +104,44 @@ For a local or QNAP install, open Settings in the browser you will use for
 authorization. The Spotify card's "Client settings" pane now walks through the
 whole flow as numbered steps: create/open an app in the Spotify Developer
 Dashboard, copy the exact callback URL shown there (with a one-click copy
-button) into the app's Redirect URIs, paste the Client ID (and Client Secret,
-if not using PKCE) into the fields below, save, then Connect. Leave the client
-secret blank to use Authorization Code with PKCE.
+button) into the app's Redirect URIs, paste the Client ID into the field
+below, save, then Connect. The client secret lives in a collapsed "Advanced"
+section and can almost always stay blank — UHC signs in securely without it;
+only fill it in if your Spotify app was specifically set up to require one.
+
+### First save on a NAS: the owner bootstrap prompt (#570)
+
+On a fresh NAS install, `/api/providers/*` (Spotify client settings, OAuth
+start/revoke, the tunnel endpoints) and Apple Music pairing are always
+owner-gated — see `requires_controller_auth` in
+`src/api/controller_auth.rs`. The first time you save Spotify client settings
+or click **Get an HTTPS address**, UHC does not just fail with a raw
+`HTTP 401`: the Settings UI catches the `controller_unauthorized` response
+(see `crate::app::api::response_error` and
+`crate::app::controller_auth::open_bootstrap_prompt` in
+`src/app/controller_auth.rs`) and opens an in-page **Owner setup required**
+prompt instead. It explains, in beginner language, that this is a one-time
+step and tells you where to find the token:
+
+- **QNAP**: `$QPKG_ROOT/unified-hifi-control.log` (the log file icon in QTS
+  App Center → UHC).
+- **Synology, Docker, or a plain binary install**: the server log or console
+  output where UHC started — look for the line beginning
+  `UHC controller bootstrap token`.
+- If your operator set `UHC_BOOTSTRAP_TOKEN` in the environment, use that
+  value instead; UHC never echoes an operator-supplied token to the log.
+
+Paste the token into the prompt, which posts it to
+`POST /api/controller/bootstrap`. On success UHC mints a browser session
+cookie plus a CSRF token; the prompt closes and the page reports that owner
+access is unlocked. Click the original button (Save, Connect, Get an HTTPS
+address) again and it now succeeds — the CSRF token is attached automatically
+to every state-changing request from then on (see
+`crate::app::controller_auth::current_csrf_token`, mirrored into
+`localStorage` so it survives a page reload without a second bootstrap). The
+bootstrap token itself is single-use: once accepted, the same token cannot be
+replayed, and `GET /api/controller/status` reports `bootstrap_required:
+false` afterward.
 
 If the browser is not on the UHC host, Spotify accepts plain HTTP only for
 explicit loopback callbacks (`127.0.0.1` or `::1`); anything else — a remote

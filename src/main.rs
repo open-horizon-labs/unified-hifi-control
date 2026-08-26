@@ -505,7 +505,9 @@ mod server {
         .with_reliable_commands(reliable_commands);
         if let Some(bootstrap_token) = state.controller_auth.take_bootstrap_secret().await {
             tracing::info!(
-                "UHC controller bootstrap token (display once; do not put it in a tunnel URL): {}",
+                "UHC controller bootstrap token (display once; do not put it in a tunnel URL): {}. \
+                 Paste it into the \"Owner setup required\" prompt shown the first time you save \
+                 provider settings (e.g. Spotify) or click Get an HTTPS address in Settings.",
                 bootstrap_token
             );
         }
