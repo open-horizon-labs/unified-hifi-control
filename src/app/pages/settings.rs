@@ -352,6 +352,18 @@ const SPOTIFY_INFO_PANEL_CLOSED: &str = "absolute right-0 top-full z-20 mt-1 w-7
 const MQTT_INFO_PANEL_OPEN: &str = "absolute left-0 top-full z-20 mt-1 w-80 max-w-[85vw] rounded-md border border-default bg-elevated p-3 text-left text-xs text-secondary shadow-lg";
 const MQTT_INFO_PANEL_CLOSED: &str = "absolute left-0 top-full z-20 mt-1 w-80 max-w-[85vw] rounded-md border border-default bg-elevated p-3 text-left text-xs text-secondary shadow-lg hidden group-hover:block";
 
+/// How often Settings re-reads `/api/mqtt/status` while the publisher is on
+/// (#607). A broker going away produces no SSE event, so without this the
+/// section would keep claiming whatever was true when the page loaded.
+const MQTT_STATUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long to wait after saving broker settings before re-reading the
+/// status (#607). The connection has not been attempted yet at the moment
+/// the POST returns, so the immediate refresh can only ever say
+/// "connecting"; this second look is what turns into a verdict while the
+/// user is still watching.
+const MQTT_POST_SAVE_RECHECK: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Whether *this browser* is talking to UHC over loopback. Drives which
 /// variant of the Spotify callback step (#570 follow-up) renders: a
 /// loopback browser can use the plain HTTP loopback callback directly, but
@@ -1075,6 +1087,31 @@ pub fn Settings() -> Element {
         }
     });
 
+    // Broker connectivity changes with the network, not with UHC's own bus,
+    // so a broker dying (or a corrected hostname starting to answer) emits
+    // no SSE event and the discovery-refresh above never fires for it. Poll
+    // while the publisher is switched on (#607), in the same shape as the
+    // Spotify tunnel poll above: the guard signal is only `peek`ed, and the
+    // refresh happens inside `spawn` rather than in the effect body, so
+    // neither subscribes this effect to its own write.
+    let mut mqtt_polling = use_signal(|| false);
+    use_effect(move || {
+        if !mqtt_enabled() || *mqtt_polling.peek() {
+            return;
+        }
+        mqtt_polling.set(true);
+        spawn(async move {
+            loop {
+                dioxus_sdk_time::sleep(MQTT_STATUS_POLL_INTERVAL).await;
+                if !*mqtt_enabled.peek() {
+                    break;
+                }
+                mqtt_status.restart();
+            }
+            mqtt_polling.set(false);
+        });
+    });
+
     // Refresh discovery on SSE events
     let event_count = sse.event_count;
     use_effect(move || {
@@ -1374,6 +1411,13 @@ pub fn Settings() -> Element {
                 Ok(_) => {
                     mqtt_action.set(ProviderActionState::Success);
                     mqtt_password.set(String::new());
+                    mqtt_status.restart();
+                    // The POST returns before the publisher has dialled the
+                    // new broker, so that first refresh can only say
+                    // "connecting". Look again once there has been time to
+                    // succeed or fail (#607) - a typo'd host should produce
+                    // its explanation while the user is still on the button.
+                    dioxus_sdk_time::sleep(MQTT_POST_SAVE_RECHECK).await;
                     mqtt_status.restart();
                 }
                 Err(error) => {
@@ -1864,12 +1908,26 @@ pub fn Settings() -> Element {
                                 td { class: "py-2 px-3",
                                     if mqtt_enabled() {
                                         if let Some(status) = mqtt_status.read().clone().flatten() {
-                                            if status.running {
+                                            // "Publishing" now means the broker
+                                            // answered, not merely that the task
+                                            // started (#607). A broker that never
+                                            // answers used to land in this same
+                                            // branch and read as success.
+                                            if status.is_connected() {
                                                 if status.is_environment_managed() {
                                                     span { class: "status-ok", "✓ Publishing · via add-on" }
                                                 } else {
                                                     span { class: "status-ok", "✓ Publishing" }
                                                 }
+                                            } else if status.connection_problem().is_some() {
+                                                button {
+                                                    r#type: "button",
+                                                    class: "status-err underline",
+                                                    onclick: move |_| scroll_to_element("mqtt-anchor"),
+                                                    "Can't reach the broker — see why"
+                                                }
+                                            } else if status.running {
+                                                span { class: "text-yellow-500", "Connecting…" }
                                             } else if status.configured {
                                                 span { class: "text-yellow-500", "Configured · waiting" }
                                             } else {
@@ -2767,23 +2825,29 @@ pub fn Settings() -> Element {
                     }
                     div { class: "card p-5 sm:p-6",
                         if let Some(status) = mqtt_status.read().clone().flatten() {
-                            div { class: "text-sm",
+                            div { class: "text-sm", id: "mqtt-connection-status",
                                 if status.is_environment_managed() {
                                     // The add-on already did this. Saying so
                                     // is what keeps the form below from
                                     // reading as an unfinished setup step.
-                                    p { class: "font-medium", "Set up by the Home Assistant add-on" }
-                                    if status.running {
-                                        // "Publishing", not "Connected":
-                                        // `running` means the publisher task
-                                        // is alive, which it stays while
-                                        // retrying an unreachable broker.
-                                        p { class: "mt-1 status-ok", "Publishing your zones to Home Assistant" }
-                                    } else {
-                                        p { class: "mt-1 text-yellow-500", "Not publishing yet" }
-                                    }
-                                } else if status.running {
+                                    p { class: "font-medium mb-1", "Set up by the Home Assistant add-on" }
+                                }
+                                // One line for what is actually happening,
+                                // driven by real broker connectivity rather
+                                // than by "the task exists" (#607). Only the
+                                // first branch is success; a broker that
+                                // never answers now has to say so.
+                                if status.is_connected() {
                                     p { class: "status-ok", "Publishing your zones to Home Assistant" }
+                                } else if let Some(problem) = status.connection_problem() {
+                                    p { class: "status-err font-medium",
+                                        "Can't reach your broker at "
+                                        "{status.broker_address().unwrap_or_default()}"
+                                    }
+                                    p { class: "mt-1 text-secondary", "{problem}" }
+                                    p { class: "mt-1 text-secondary", "Nothing is reaching Home Assistant until this is fixed. UHC keeps trying, so correcting the details below is enough — no restart needed." }
+                                } else if status.running {
+                                    p { class: "text-yellow-500", "Connecting to your broker…" }
                                 } else if status.configured {
                                     p { class: "text-yellow-500", "Configured, not currently connected" }
                                 } else {
@@ -2794,11 +2858,12 @@ pub fn Settings() -> Element {
                                     p { class: "font-medium", "No broker yet — nothing is being published" }
                                     p { class: "mt-1 text-secondary", "Add your broker below and your zones and controllers show up in Home Assistant as entities." }
                                 }
-                                if let Some(host) = status.host.as_ref() {
-                                    p { class: "mt-1 text-secondary",
-                                        "Current broker: "
-                                        if status.tls.unwrap_or(false) { "mqtts://" } else { "mqtt://" }
-                                        "{host}:{status.port.unwrap_or_default()}"
+                                // The address is already in the error line
+                                // above when there is one; repeating it there
+                                // would just pad the failure state out.
+                                if status.connection_problem().is_none() {
+                                    if let Some(address) = status.broker_address() {
+                                        p { class: "mt-1 text-secondary", "Current broker: {address}" }
                                     }
                                 }
                             }

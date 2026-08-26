@@ -276,7 +276,19 @@ pub struct MqttConfigureRequest {
 pub struct MqttStatusResponse {
     pub configured: bool,
     pub enabled: bool,
+    /// The publisher task exists. Not the same as reaching the broker
+    /// (#607) - see [`MqttStatusResponse::is_connected`].
     pub running: bool,
+    /// `"disconnected"`, `"connecting"`, or `"connected"` (#607). Defaults
+    /// to empty against a server that predates the field, which
+    /// [`MqttStatusResponse::is_connected`] treats as "not connected".
+    #[serde(default)]
+    pub connection: String,
+    /// Raw reason the last connection attempt failed (#607). Rendered
+    /// through [`MqttStatusResponse::connection_problem`] rather than shown
+    /// verbatim.
+    #[serde(default)]
+    pub last_error: Option<String>,
     pub host: Option<String>,
     pub port: Option<u16>,
     pub tls: Option<bool>,
@@ -297,6 +309,75 @@ impl MqttStatusResponse {
     /// than from something the user typed in.
     pub fn is_environment_managed(&self) -> bool {
         self.source.as_deref() == Some("environment")
+    }
+
+    /// The broker really answered and entities are being published (#607).
+    /// This - not `running` - is the only honest basis for saying so.
+    pub fn is_connected(&self) -> bool {
+        self.connection == "connected"
+    }
+
+    /// The publisher is up but has not reached the broker: either the first
+    /// attempt has not landed yet, or it keeps failing. `connection_problem`
+    /// tells those two apart.
+    pub fn is_connecting(&self) -> bool {
+        self.connection == "connecting"
+    }
+
+    /// `mqtt://host:port` for the configured broker, so an error can name
+    /// the address it is about instead of leaving the user to guess.
+    pub fn broker_address(&self) -> Option<String> {
+        let host = self.host.as_ref()?;
+        let scheme = if self.tls.unwrap_or(false) {
+            "mqtts"
+        } else {
+            "mqtt"
+        };
+        Some(format!("{scheme}://{host}:{}", self.port.unwrap_or_default()))
+    }
+
+    /// One plain sentence explaining `last_error`, or `None` when there is
+    /// nothing wrong to report (#607).
+    ///
+    /// The raw `rumqttc` text is accurate but unreadable ("I/O: failed to
+    /// lookup address information: nodename nor servname provided, or not
+    /// known"). Each branch below names the *fix*, because that is the
+    /// whole reason the issue asked for the error to reach the user:
+    /// "wrong password" and "wrong hostname" look identical otherwise.
+    /// Anything unrecognised falls through verbatim rather than being
+    /// flattened into a useless generic - an unknown failure the user can
+    /// paste into a search beats a reassuring lie.
+    pub fn connection_problem(&self) -> Option<String> {
+        // A live connection supersedes whatever went wrong before it.
+        if self.is_connected() {
+            return None;
+        }
+        let error = self.last_error.as_ref()?;
+        let lowered = error.to_lowercase();
+        let explanation = if lowered.contains("lookup address")
+            || lowered.contains("nodename nor servname")
+            || lowered.contains("name or service not known")
+            || lowered.contains("no such host")
+        {
+            "That address could not be found. Check the broker's name for a typo."
+        } else if lowered.contains("connection refused") {
+            "Nothing answered there. Check the port, and that the broker is switched on."
+        } else if lowered.contains("not authorized")
+            || lowered.contains("notauthorized")
+            || lowered.contains("bad user name")
+            || lowered.contains("badusername")
+        {
+            "The broker turned us away. Check the username and password."
+        } else if lowered.contains("no route to host") || lowered.contains("network unreachable") {
+            "That address could not be reached from here. Check they are on the same network."
+        } else if lowered.contains("timed out") || lowered.contains("timeout") {
+            "The broker did not answer in time."
+        } else if lowered.contains("certificate") || lowered.contains("tls") {
+            "The secure connection was refused. Check the Use TLS setting matches the broker."
+        } else {
+            return Some(error.clone());
+        };
+        Some(explanation.to_string())
     }
 }
 
@@ -1143,4 +1224,112 @@ async fn response_error(resp: web_sys::Response) -> String {
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn post_json_no_response<T: Serialize>(_url: &str, _body: &T) -> Result<(), String> {
     Err("post_json_no_response is only available in browser".to_string())
+}
+
+#[cfg(test)]
+mod mqtt_status_tests {
+    use super::MqttStatusResponse;
+
+    fn retrying(last_error: &str) -> MqttStatusResponse {
+        MqttStatusResponse {
+            configured: true,
+            enabled: true,
+            // The #607 shape: the task is alive, the broker is not there.
+            running: true,
+            connection: "connecting".to_string(),
+            last_error: Some(last_error.to_string()),
+            host: Some("core-mosquitto".to_string()),
+            port: Some(1883),
+            tls: Some(false),
+            ..MqttStatusResponse::default()
+        }
+    }
+
+    #[test]
+    fn running_alone_is_never_read_as_connected() {
+        let status = retrying("I/O: failed to lookup address information");
+        assert!(status.running);
+        assert!(!status.is_connected());
+        assert!(status.is_connecting());
+    }
+
+    #[test]
+    fn an_unknown_host_is_explained_as_a_typo_to_check() {
+        let status = retrying(
+            "I/O: failed to lookup address information: nodename nor servname provided, or not known",
+        );
+        assert_eq!(
+            status.connection_problem().as_deref(),
+            Some("That address could not be found. Check the broker's name for a typo.")
+        );
+    }
+
+    #[test]
+    fn rejected_credentials_are_explained_as_credentials() {
+        let status = retrying("Connection refused, return code `NotAuthorized`");
+        // Deliberately not the "nothing answered there" branch: the raw
+        // text contains "refused" too, and telling the user to check the
+        // port when the password is wrong sends them the wrong way.
+        assert_eq!(
+            status.connection_problem().as_deref(),
+            Some("The broker turned us away. Check the username and password.")
+        );
+    }
+
+    #[test]
+    fn a_dead_port_is_explained_as_a_port_or_a_stopped_broker() {
+        let status = retrying("I/O: Connection refused (os error 61)");
+        assert_eq!(
+            status.connection_problem().as_deref(),
+            Some("Nothing answered there. Check the port, and that the broker is switched on.")
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_failure_is_passed_through_rather_than_swallowed() {
+        let status = retrying("Mqtt state: Invalid state for a given operation");
+        assert_eq!(
+            status.connection_problem().as_deref(),
+            Some("Mqtt state: Invalid state for a given operation")
+        );
+    }
+
+    #[test]
+    fn a_connected_publisher_reports_no_problem() {
+        let mut status = retrying("I/O: Connection refused (os error 61)");
+        status.connection = "connected".to_string();
+        status.last_error = None;
+        assert!(status.is_connected());
+        assert_eq!(status.connection_problem(), None);
+    }
+
+    /// A server that predates #607 sends no `connection` field. Absent
+    /// evidence of a connection must not read as one.
+    #[test]
+    fn a_status_without_the_field_is_not_treated_as_connected() {
+        let status: MqttStatusResponse = serde_json::from_str(
+            r#"{"configured":true,"enabled":true,"running":true,"host":"a","port":1883,
+                "tls":false,"base_topic":"unified-hifi","discovery_prefix":"homeassistant",
+                "has_username":false,"has_password":false}"#,
+        )
+        .expect("deserialize");
+        assert!(status.running);
+        assert!(!status.is_connected());
+        assert_eq!(status.connection_problem(), None);
+    }
+
+    #[test]
+    fn the_broker_address_names_the_scheme_and_port() {
+        let mut status = retrying("boom");
+        assert_eq!(
+            status.broker_address().as_deref(),
+            Some("mqtt://core-mosquitto:1883")
+        );
+        status.tls = Some(true);
+        status.port = Some(8883);
+        assert_eq!(
+            status.broker_address().as_deref(),
+            Some("mqtts://core-mosquitto:8883")
+        );
+    }
 }

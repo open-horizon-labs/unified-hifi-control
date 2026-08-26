@@ -40,7 +40,7 @@ use unified_hifi_control::bus::{
 };
 use unified_hifi_control::knobs::store::KnobStatusUpdate;
 use unified_hifi_control::knobs::KnobStore;
-use unified_hifi_control::mqtt::MqttPublisher;
+use unified_hifi_control::mqtt::{MqttConnectionState, MqttPublisher, MqttStatus};
 
 /// Isolate `UHC_CONFIG_DIR` for the one test below that starts a real
 /// `LmsAdapter`, which persists its configured host to disk. No other test
@@ -305,6 +305,74 @@ async fn wait_until<F: Fn() -> bool>(predicate: F, deadline: Duration) -> bool {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     predicate()
+}
+
+/// Poll [`MqttPublisher::status`] until it reports `expected`, returning the
+/// status either way so the caller can assert on `last_error` too (#607).
+async fn wait_for_connection(
+    publisher: &MqttPublisher,
+    expected: MqttConnectionState,
+    deadline: Duration,
+) -> MqttStatus {
+    let started = tokio::time::Instant::now();
+    loop {
+        let status = publisher.status().await;
+        if status.connection == expected || started.elapsed() >= deadline {
+            return status;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A TCP pass-through in front of the real broker, so a test can cut a
+/// *live, already-connected* session at will. `rumqttd::Broker::start`
+/// blocks its thread for the broker's lifetime and exposes no shutdown
+/// hook, so killing the broker itself is not an option; dropping the
+/// sockets underneath the publisher produces the same thing the publisher
+/// cares about - a connection that worked and then stopped working.
+struct BrokerProxy {
+    port: u16,
+    accept: tokio::task::JoinHandle<()>,
+    connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl BrokerProxy {
+    async fn start(target_port: u16) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let port = listener.local_addr().expect("proxy addr").port();
+        let connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::default();
+        let tracked = connections.clone();
+        let accept = tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                let handle = tokio::spawn(async move {
+                    if let Ok(mut outbound) =
+                        tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await
+                    {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+                #[allow(clippy::unwrap_used)] // test-local mutex, nothing here panics under it
+                tracked.lock().unwrap().push(handle);
+            }
+        });
+        Self {
+            port,
+            accept,
+            connections,
+        }
+    }
+
+    /// Stop forwarding and drop every live socket, so the publisher's
+    /// connection dies and its reconnect attempts find nothing listening.
+    fn cut(&self) {
+        self.accept.abort();
+        #[allow(clippy::unwrap_used)] // test-local mutex
+        for handle in self.connections.lock().unwrap().drain(..) {
+            handle.abort();
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -572,12 +640,177 @@ async fn tolerates_an_unreachable_broker() {
         "task keeps retrying, not crashed"
     );
 
+    // #607: `running` stayed true here, and used to be the *only* thing
+    // Settings could ask - which is why a broker that never answers looked
+    // exactly like one that did. The connection state has to disagree with
+    // `running`, and has to carry the reason.
+    let status = wait_for_connection(
+        &publisher,
+        MqttConnectionState::Connecting,
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(status.running, "the task is alive - that much was true");
+    assert_eq!(
+        status.connection,
+        MqttConnectionState::Connecting,
+        "an unreachable broker is never 'connected'"
+    );
+    let error = status
+        .last_error
+        .expect("a failed connection must say why it failed");
+    assert!(
+        error.to_lowercase().contains("refused") || error.to_lowercase().contains("connection"),
+        "the reason must be usable, got {error:?}"
+    );
+
     // Must still stop promptly even mid-retry-loop.
     let stopped = timeout(Duration::from_secs(6), publisher.shutdown()).await;
     assert!(
         stopped.is_ok(),
         "shutdown must not hang on an unreachable broker"
     );
+    // With no task there is no connection, whatever the last one reported.
+    let status = publisher.status().await;
+    assert!(!status.running);
+    assert_eq!(status.connection, MqttConnectionState::Disconnected);
+    assert_eq!(status.last_error, None);
+}
+
+/// The positive half of #607: against a broker that really answers, the
+/// status says `connected` and carries no error. Without this the fix could
+/// be satisfied by never reporting success at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reachable_broker_is_reported_as_connected() {
+    let port = free_port();
+    start_test_broker(port);
+    wait_for_broker_ready(port, Duration::from_secs(5)).await;
+
+    let bus = create_bus();
+    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let aggregator_task = aggregator.clone();
+    tokio::spawn(async move {
+        aggregator_task.run_with_ready(ready_tx).await;
+    });
+    ready_rx.await.expect("aggregator ready");
+
+    let publisher = MqttPublisher::new(
+        bus.clone(),
+        aggregator.clone(),
+        Arc::new(AdapterRegistry::default()),
+        isolated_knob_store(),
+    );
+    publisher
+        .configure(MqttCredentialRecord {
+            host: "127.0.0.1".to_string(),
+            port,
+            tls: false,
+            username: None,
+            password: None,
+            base_topic: "unified-hifi".to_string(),
+            discovery_prefix: "homeassistant".to_string(),
+            source: Default::default(),
+        })
+        .await;
+    publisher.set_enabled(true).await;
+
+    let status = wait_for_connection(
+        &publisher,
+        MqttConnectionState::Connected,
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(
+        status.connection,
+        MqttConnectionState::Connected,
+        "a broker that accepted the CONNECT must read as connected, got {status:?}"
+    );
+    assert_eq!(
+        status.last_error, None,
+        "a working connection must not keep showing a stale error"
+    );
+
+    publisher.shutdown().await;
+}
+
+/// The un-latching case the issue calls out: a connection that succeeded and
+/// then died must fall back out of `connected`, not stay there forever on
+/// the strength of one `ConnAck`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_that_dies_stops_being_reported_as_connected() {
+    let broker_port = free_port();
+    start_test_broker(broker_port);
+    wait_for_broker_ready(broker_port, Duration::from_secs(5)).await;
+    // The publisher talks to the proxy, not the broker, so the test can cut
+    // a live session (see `BrokerProxy`).
+    let proxy = BrokerProxy::start(broker_port).await;
+
+    let bus = create_bus();
+    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let aggregator_task = aggregator.clone();
+    tokio::spawn(async move {
+        aggregator_task.run_with_ready(ready_tx).await;
+    });
+    ready_rx.await.expect("aggregator ready");
+
+    let publisher = MqttPublisher::new(
+        bus.clone(),
+        aggregator.clone(),
+        Arc::new(AdapterRegistry::default()),
+        isolated_knob_store(),
+    );
+    publisher
+        .configure(MqttCredentialRecord {
+            host: "127.0.0.1".to_string(),
+            port: proxy.port,
+            tls: false,
+            username: None,
+            password: None,
+            base_topic: "unified-hifi".to_string(),
+            discovery_prefix: "homeassistant".to_string(),
+            source: Default::default(),
+        })
+        .await;
+    publisher.set_enabled(true).await;
+
+    let connected = wait_for_connection(
+        &publisher,
+        MqttConnectionState::Connected,
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(
+        connected.connection,
+        MqttConnectionState::Connected,
+        "precondition: the publisher must reach the broker first, got {connected:?}"
+    );
+
+    proxy.cut();
+
+    let after = wait_for_connection(
+        &publisher,
+        MqttConnectionState::Connecting,
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_eq!(
+        after.connection,
+        MqttConnectionState::Connecting,
+        "a dropped connection must not stay 'connected', got {after:?}"
+    );
+    assert!(
+        after.last_error.is_some(),
+        "the drop must be explained, got {after:?}"
+    );
+    assert!(
+        after.running,
+        "the task is still alive and retrying - which is exactly why `running` \
+         could never have answered this question"
+    );
+
+    publisher.shutdown().await;
 }
 
 /// Command round-trip for a legacy (non-registry) zone (#529): an HA `volume_set` and a `play`

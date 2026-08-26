@@ -68,13 +68,110 @@ pub const DEFAULT_DISCOVERY_PREFIX: &str = "homeassistant";
 pub const DEFAULT_PORT: u16 = 1883;
 pub const DEFAULT_TLS_PORT: u16 = 8883;
 
+/// Whether the publisher is actually talking to a broker (#607).
+///
+/// Deliberately *not* the same question as [`MqttStatus::running`], which
+/// only says the background task exists. `rumqttc` retries a broker it
+/// cannot reach forever, so a task can be alive and healthy while nothing
+/// has ever been published - which is what made a typo'd broker host look
+/// identical to a working one in Settings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MqttConnectionState {
+    /// No publisher task is running at all (switched off, or configured but
+    /// not enabled).
+    #[default]
+    Disconnected,
+    /// A task is running and trying to reach the broker. Because `rumqttc`
+    /// retries indefinitely, this is also where a *failed* attempt lands -
+    /// [`MqttStatus::last_error`] carries why the last one failed.
+    Connecting,
+    /// The broker accepted the connection (`ConnAck`) and it has not failed
+    /// since. Only this state means entities are really being published.
+    Connected,
+}
+
+impl MqttConnectionState {
+    /// Wire form for `/api/mqtt/status`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disconnected => "disconnected",
+            Self::Connecting => "connecting",
+            Self::Connected => "connected",
+        }
+    }
+}
+
+/// Live connection state shared between one publisher task and
+/// [`MqttPublisher::status`] (#607).
+///
+/// A `std::sync::RwLock` rather than the runtime's async `Mutex`: the task
+/// records transitions inline in its `select!` arms, and awaiting the
+/// runtime lock there would tie the event loop to whatever
+/// `configure`/`set_enabled` is doing (they hold it across `stop_task`,
+/// which waits up to 5s for this very task to exit).
+#[derive(Debug)]
+struct ConnectionMonitor {
+    inner: std::sync::RwLock<ConnectionSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ConnectionSnapshot {
+    state: MqttConnectionState,
+    last_error: Option<String>,
+}
+
+impl ConnectionMonitor {
+    /// A monitor for a task that is about to start dialling the broker.
+    fn connecting() -> Self {
+        Self {
+            inner: std::sync::RwLock::new(ConnectionSnapshot {
+                state: MqttConnectionState::Connecting,
+                last_error: None,
+            }),
+        }
+    }
+
+    fn snapshot(&self) -> ConnectionSnapshot {
+        self.inner
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    /// The broker accepted us. Clears any previous error: it described an
+    /// attempt that has since been superseded by a working one.
+    fn connected(&self) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.state = MqttConnectionState::Connected;
+            guard.last_error = None;
+        }
+    }
+
+    /// The connection failed, or dropped after having succeeded. Never
+    /// latches `Connected`: `rumqttc` will dial again, so the honest state
+    /// is "connecting", annotated with why the last attempt ended.
+    fn interrupted(&self, error: impl Into<String>) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.state = MqttConnectionState::Connecting;
+            guard.last_error = Some(error.into());
+        }
+    }
+}
+
+/// One live publisher task, with the connection state it reports into.
+struct RunningTask {
+    shutdown: CancellationToken,
+    handle: JoinHandle<()>,
+    connection: Arc<ConnectionMonitor>,
+}
+
 /// Lifecycle state guarded together so configure/enable/disable never race
 /// each other into starting two publisher tasks.
 #[derive(Default)]
 struct Runtime {
     record: Option<MqttCredentialRecord>,
     enabled: bool,
-    task: Option<(CancellationToken, JoinHandle<()>)>,
+    task: Option<RunningTask>,
 }
 
 /// Optional MQTT publisher. Held on `AppState` as `Arc<MqttPublisher>`;
@@ -101,7 +198,17 @@ pub struct MqttPublisher {
 pub struct MqttStatus {
     pub configured: bool,
     pub enabled: bool,
+    /// Whether the publisher's background task exists. Kept as-is (#607):
+    /// it answers "did we start", not "are we connected" - see
+    /// [`MqttStatus::connection`] for the latter.
     pub running: bool,
+    /// Real broker connectivity (#607), independent of `running`.
+    pub connection: MqttConnectionState,
+    /// Why the last connection attempt failed, verbatim from `rumqttc`.
+    /// Present while retrying; cleared on a successful `ConnAck`. "bad
+    /// credentials" and "unknown host" need different fixes, so the text
+    /// has to survive as far as the user.
+    pub last_error: Option<String>,
     pub host: Option<String>,
     pub port: Option<u16>,
     pub tls: Option<bool>,
@@ -190,8 +297,8 @@ impl MqttPublisher {
             let previous_task = if !enabled { runtime.task.take() } else { None };
             (runtime.record.clone(), previous_task)
         };
-        if let Some((shutdown, handle)) = previous_task {
-            stop_task(shutdown, handle).await;
+        if let Some(task) = previous_task {
+            stop_task(task).await;
         }
         if enabled {
             self.restart(record).await;
@@ -204,8 +311,8 @@ impl MqttPublisher {
             let mut runtime = self.runtime.lock().await;
             runtime.task.take()
         };
-        if let Some((shutdown, handle)) = previous_task {
-            stop_task(shutdown, handle).await;
+        if let Some(task) = previous_task {
+            stop_task(task).await;
         }
 
         let Some(record) = record else {
@@ -216,7 +323,8 @@ impl MqttPublisher {
         };
 
         let shutdown = CancellationToken::new();
-        let task = tokio::spawn(run(
+        let connection = Arc::new(ConnectionMonitor::connecting());
+        let handle = tokio::spawn(run(
             record,
             self.bus.clone(),
             self.aggregator.clone(),
@@ -224,17 +332,23 @@ impl MqttPublisher {
             self.knobs.clone(),
             self.reliable_commands_snapshot(),
             self.base_url_snapshot(),
+            connection.clone(),
             shutdown.clone(),
         ));
+        let task = RunningTask {
+            shutdown,
+            handle,
+            connection,
+        };
 
         let mut runtime = self.runtime.lock().await;
         // Another caller may have already disabled/reconfigured while this
         // task was spawning; only keep it if still enabled.
         if runtime.enabled {
-            runtime.task = Some((shutdown, task));
+            runtime.task = Some(task);
         } else {
             drop(runtime);
-            stop_task(shutdown, task).await;
+            stop_task(task).await;
         }
     }
 
@@ -246,12 +360,26 @@ impl MqttPublisher {
         self.runtime.lock().await.record.is_some()
     }
 
+    /// Real broker connectivity, as opposed to [`Self::is_running`] (#607).
+    pub async fn connection_state(&self) -> MqttConnectionState {
+        self.status().await.connection
+    }
+
     pub async fn status(&self) -> MqttStatus {
         let runtime = self.runtime.lock().await;
+        // No task means no connection, whatever the last one reported: the
+        // monitor is owned by the task and dies with it.
+        let connection = runtime
+            .task
+            .as_ref()
+            .map(|task| task.connection.snapshot())
+            .unwrap_or_default();
         MqttStatus {
             configured: runtime.record.is_some(),
             enabled: runtime.enabled,
             running: runtime.task.is_some(),
+            connection: connection.state,
+            last_error: connection.last_error,
             host: runtime.record.as_ref().map(|r| r.host.clone()),
             port: runtime.record.as_ref().map(|r| r.port),
             tls: runtime.record.as_ref().map(|r| r.tls),
@@ -276,15 +404,15 @@ impl MqttPublisher {
             let mut runtime = self.runtime.lock().await;
             runtime.task.take()
         };
-        if let Some((shutdown, handle)) = previous_task {
-            stop_task(shutdown, handle).await;
+        if let Some(task) = previous_task {
+            stop_task(task).await;
         }
     }
 }
 
-async fn stop_task(shutdown: CancellationToken, handle: JoinHandle<()>) {
-    shutdown.cancel();
-    if tokio::time::timeout(Duration::from_secs(5), handle)
+async fn stop_task(task: RunningTask) {
+    task.shutdown.cancel();
+    if tokio::time::timeout(Duration::from_secs(5), task.handle)
         .await
         .is_err()
     {
@@ -668,6 +796,11 @@ async fn handle_incoming_publish(
 /// the underlying TCP/TLS connection on its own; this loop only needs to
 /// re-announce state on every fresh `ConnAck`, since a new MQTT session (or
 /// a broker restart) has no memory of what was previously retained here.
+///
+/// It also reports what the event loop is actually doing into `connection`
+/// (#607), because "this task is alive" and "the broker answered" are not
+/// the same fact - the task stays alive indefinitely retrying a host that
+/// will never resolve.
 #[allow(clippy::too_many_arguments)]
 async fn run(
     record: MqttCredentialRecord,
@@ -677,6 +810,7 @@ async fn run(
     knobs: KnobStore,
     reliable_commands: Option<CommandGateway>,
     base_url: String,
+    connection: Arc<ConnectionMonitor>,
     shutdown: CancellationToken,
 ) {
     let availability_topic = topics::availability_topic(&record.base_topic);
@@ -714,6 +848,9 @@ async fn run(
             event = eventloop.poll() => {
                 match event {
                     Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                        // The one moment we know entities are really
+                        // reaching a broker (#607).
+                        connection.connected();
                         announce_all_zones(
                             &client,
                             &record,
@@ -747,8 +884,16 @@ async fn run(
                         )
                         .await;
                     }
+                    // The broker hung up on us. `rumqttc` dials again, so
+                    // this is "connecting", never a latched "connected".
+                    Ok(Event::Incoming(Packet::Disconnect)) => {
+                        connection.interrupted("the broker closed the connection");
+                    }
                     Ok(_) => {}
                     Err(error) => {
+                        // Recorded before the log line, so /api/mqtt/status
+                        // and the log can never disagree about why.
+                        connection.interrupted(error.to_string());
                         tracing::warn!("MQTT publisher connection error: {error}");
                         tokio::time::sleep(Duration::from_secs(2)).await;
                     }

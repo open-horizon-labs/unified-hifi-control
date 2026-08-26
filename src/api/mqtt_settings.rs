@@ -36,7 +36,19 @@ pub struct MqttConfigureRequest {
 pub struct MqttStatusResponse {
     pub configured: bool,
     pub enabled: bool,
+    /// The publisher's background task exists. NOT connectivity: the task
+    /// stays alive while `rumqttc` retries a broker that never answers
+    /// (#607). Use `connection` for "are we actually publishing".
     pub running: bool,
+    /// `"disconnected"` (no task), `"connecting"` (task running, broker has
+    /// not accepted us - or dropped us and we are retrying), or
+    /// `"connected"` (#607).
+    pub connection: String,
+    /// Why the last connection attempt failed, if one has. Present while
+    /// retrying, absent once connected. Carried through to Settings because
+    /// "wrong password" and "wrong host" are entirely different fixes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
     pub host: Option<String>,
     pub port: Option<u16>,
     pub tls: Option<bool>,
@@ -58,6 +70,8 @@ impl From<crate::mqtt::MqttStatus> for MqttStatusResponse {
             configured: status.configured,
             enabled: status.enabled,
             running: status.running,
+            connection: status.connection.as_str().to_string(),
+            last_error: status.last_error,
             host: status.host,
             port: status.port,
             tls: status.tls,
@@ -155,13 +169,15 @@ pub async fn configure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mqtt::{MqttConnectionState, MqttStatus};
 
-    #[test]
-    fn status_response_never_serializes_the_password() {
-        let response = MqttStatusResponse {
+    fn sample_response() -> MqttStatusResponse {
+        MqttStatusResponse {
             configured: true,
             enabled: true,
             running: true,
+            connection: "connected".to_string(),
+            last_error: None,
             host: Some("broker.local".to_string()),
             port: Some(1883),
             tls: Some(false),
@@ -170,11 +186,81 @@ mod tests {
             has_username: true,
             has_password: true,
             source: Some("user".to_string()),
-        };
-        let json = serde_json::to_string(&response).expect("serialize");
+        }
+    }
+
+    #[test]
+    fn status_response_never_serializes_the_password() {
+        let json = serde_json::to_string(&sample_response()).expect("serialize");
         // `has_password` (a bool) is expected; the literal secret is not -
         // `MqttStatusResponse` has no field that could carry it, and this
         // pins that down structurally rather than trusting the field list.
         assert!(!json.contains("\"password\":"));
+    }
+
+    /// The regression #607 is about: `running` alone said "true" for a
+    /// broker whose hostname does not resolve. `connection` and
+    /// `last_error` have to carry the truth alongside it, and `running`
+    /// has to keep its old meaning rather than being redefined.
+    #[test]
+    fn a_retrying_publisher_serializes_as_running_but_not_connected() {
+        let status = MqttStatus {
+            configured: true,
+            enabled: true,
+            running: true,
+            connection: MqttConnectionState::Connecting,
+            last_error: Some(
+                "I/O: failed to lookup address information: nodename nor servname provided, \
+                 or not known"
+                    .to_string(),
+            ),
+            host: Some("core-mosquitto".to_string()),
+            port: Some(1883),
+            tls: Some(false),
+            base_topic: Some("unified-hifi".to_string()),
+            discovery_prefix: Some("homeassistant".to_string()),
+            has_username: false,
+            has_password: false,
+            source: Some(MqttConfigSource::Environment),
+        };
+        let response = MqttStatusResponse::from(status);
+        assert!(response.running, "the task is alive - that much was true");
+        assert_eq!(response.connection, "connecting");
+        assert!(response
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("lookup address information")));
+    }
+
+    /// A connected publisher reports no error, so Settings has nothing
+    /// stale to display next to a working broker.
+    #[test]
+    fn connected_status_carries_no_error_and_omits_the_field() {
+        let json = serde_json::to_value(sample_response()).expect("serialize");
+        assert_eq!(json["connection"], "connected");
+        assert!(
+            json.get("last_error").is_none(),
+            "an absent error must not serialize as null: {json}"
+        );
+    }
+
+    #[test]
+    fn an_idle_publisher_reports_disconnected() {
+        let response = MqttStatusResponse::from(MqttStatus {
+            configured: false,
+            enabled: false,
+            running: false,
+            connection: MqttConnectionState::default(),
+            last_error: None,
+            host: None,
+            port: None,
+            tls: None,
+            base_topic: None,
+            discovery_prefix: None,
+            has_username: false,
+            has_password: false,
+            source: None,
+        });
+        assert_eq!(response.connection, "disconnected");
     }
 }
