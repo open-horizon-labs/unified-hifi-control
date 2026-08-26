@@ -503,6 +503,10 @@ mod server {
             shutdown_token.clone(),
         )
         .with_reliable_commands(reliable_commands);
+        // The Spotify tunnel forwards to this server over loopback; record
+        // the port the listener actually bound so the tunnel never trusts a
+        // proxy-rewritten Host header for its forward target (#592).
+        state.provider_auth.bind_local_port(config.port);
         if let Some(bootstrap_token) = state.controller_auth.take_bootstrap_secret().await {
             tracing::info!(
                 "UHC controller bootstrap token (display once; do not put it in a tunnel URL): {}. \

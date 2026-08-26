@@ -149,11 +149,22 @@ QNAP, a different machine on the LAN — needs HTTPS. The "Using UHC from
 another device or a NAS?" panel below the callback URL has a **Get an HTTPS
 address** button for this: it asks UHC's server to open a temporary tunnel to
 itself and shows the resulting `https://…` callback URL with a copy button,
-so a first-time user never has to install or run anything. The Redirect URI
-field is pre-filled with that URL's callback path; paste the same URL into
-the Spotify dashboard's Redirect URIs, save client settings, then Connect.
-The tunnel closes itself automatically once authorization completes (success
-or failure), after 15 minutes, or via its own "Stop tunnel" button — while it
+so a first-time user never has to install or run anything. After allocation
+UHC probes its own public URL once and shows the result (reachable or not)
+before the user registers it with Spotify. The Redirect URI field is
+pre-filled with that URL's callback path while it still holds the loopback
+default; a previously saved address is never silently replaced — a
+divergence between the live tunnel and the saved Redirect URI is surfaced
+as a warning (and `oauth/start` refuses with `tunnel_redirect_mismatch`),
+because tunnel providers mint a new subdomain on every start and the
+authorize request always uses the saved Redirect URI verbatim. Paste the
+shown URL into the Spotify dashboard's Redirect URIs, save client settings,
+then Connect. The tunnel closes itself shortly after authorization
+completes (success or failure; teardown is deferred a minute so the
+callback response and settings redirect still travel through it), after 55
+minutes (under pinggy's own 60-minute anonymous-tunnel limit, and long
+enough for a first-time dashboard round trip), or via its own "Stop
+tunnel" button — while it
 is open, this UHC server is briefly reachable from the public internet at
 that address, though the callback endpoint behind it only ever accepts the
 single in-flight OAuth `state` token, so no extra trust is extended to
