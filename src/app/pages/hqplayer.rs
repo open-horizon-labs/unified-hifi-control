@@ -515,6 +515,12 @@ pub fn HqPlayer() -> Element {
     let matrix_data = matrix.read().clone();
     let zones_list = zones_list_signal();
     let links_list = links_signal();
+    let mut zone_match_key_parts = links_list
+        .iter()
+        .map(|link| format!("{}={}", link.zone_id, link.instance))
+        .collect::<Vec<_>>();
+    zone_match_key_parts.sort();
+    let zone_match_key = zone_match_key_parts.join("|");
     let instances_list = instances
         .read()
         .clone()
