@@ -84,6 +84,18 @@ pub fn BootstrapPrompt() -> Element {
                                 class: "input w-full mb-3",
                                 r#type: "password",
                                 autocomplete: "off",
+                                // This dialog typically opens while the user's focus is
+                                // elsewhere (they're copying the token from a server log or
+                                // terminal in another window). Without an explicit focus
+                                // target, the first click back into this browser window can
+                                // go toward refocusing the window itself rather than the
+                                // control under the cursor -- an OS/browser-level behavior
+                                // no page script can fully prevent -- which reads as a
+                                // "first click did nothing" bug on whatever happens to be
+                                // clicked first (reported against Unlock). Autofocusing the
+                                // token field means that returning click, wherever it lands,
+                                // has somewhere useful to go from the very first attempt.
+                                autofocus: true,
                                 placeholder: "Paste the token from the server log",
                                 value: "{token}",
                                 oninput: move |e| token.set(e.value()),
