@@ -284,6 +284,20 @@ pub struct MqttStatusResponse {
     pub discovery_prefix: Option<String>,
     pub has_username: bool,
     pub has_password: bool,
+    /// `"user"`, `"environment"`, or absent while unconfigured (#605).
+    /// `"environment"` means the Home Assistant add-on supplied the broker
+    /// from the Supervisor, so Settings shows it as managed rather than
+    /// inviting the user to fill in details they never entered.
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+impl MqttStatusResponse {
+    /// Whether the active broker came from the Home Assistant add-on rather
+    /// than from something the user typed in.
+    pub fn is_environment_managed(&self) -> bool {
+        self.source.as_deref() == Some("environment")
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

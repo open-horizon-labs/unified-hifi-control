@@ -345,6 +345,13 @@ fn default_spotify_redirect_uri() -> String {
 const SPOTIFY_INFO_PANEL_OPEN: &str = "absolute right-0 top-full z-20 mt-1 w-72 max-w-[85vw] rounded-md border border-default bg-elevated p-3 text-left text-xs text-secondary shadow-lg";
 const SPOTIFY_INFO_PANEL_CLOSED: &str = "absolute right-0 top-full z-20 mt-1 w-72 max-w-[85vw] rounded-md border border-default bg-elevated p-3 text-left text-xs text-secondary shadow-lg hidden group-hover:block";
 
+/// The same ⓘ disclosure for the MQTT section (#605), which needs one panel
+/// rather than the stepper's one-per-step. Anchored `left-0` because it
+/// hangs off a heading at the left edge, where the Spotify panel's
+/// right-anchoring would push it off-screen.
+const MQTT_INFO_PANEL_OPEN: &str = "absolute left-0 top-full z-20 mt-1 w-80 max-w-[85vw] rounded-md border border-default bg-elevated p-3 text-left text-xs text-secondary shadow-lg";
+const MQTT_INFO_PANEL_CLOSED: &str = "absolute left-0 top-full z-20 mt-1 w-80 max-w-[85vw] rounded-md border border-default bg-elevated p-3 text-left text-xs text-secondary shadow-lg hidden group-hover:block";
+
 /// Whether *this browser* is talking to UHC over loopback. Drives which
 /// variant of the Spotify callback step (#570 follow-up) renders: a
 /// loopback browser can use the plain HTTP loopback callback directly, but
@@ -653,6 +660,12 @@ pub fn Settings() -> Element {
     let mut mqtt_base_topic = use_signal(|| "unified-hifi".to_string());
     let mut mqtt_discovery_prefix = use_signal(|| "homeassistant".to_string());
     let mut mqtt_tls = use_signal(|| false);
+    // ⓘ disclosure for what the Home Assistant side has to do (#605).
+    let mut mqtt_info_open = use_signal(|| false);
+    // When the add-on supplies the broker there is nothing for the user to
+    // fill in, so the manual form starts collapsed rather than sitting there
+    // pre-filled and inviting them to re-enter settings they never chose.
+    let mut mqtt_manual_open = use_signal(|| false);
     let mut confirmed_settings = use_signal(|| None::<AppSettings>);
 
     // Hide knobs signal (LMS/HQPlayer visibility follows adapter enabled state)
@@ -1532,6 +1545,21 @@ pub fn Settings() -> Element {
             SPOTIFY_INFO_PANEL_CLOSED
         }
     };
+    let mqtt_info_panel_class = if mqtt_info_open() {
+        MQTT_INFO_PANEL_OPEN
+    } else {
+        MQTT_INFO_PANEL_CLOSED
+    };
+    // The Home Assistant add-on hands the broker over from the Supervisor
+    // (#605). When it has, there is nothing here for the user to fill in, so
+    // the manual form collapses behind an opt-in rather than presenting
+    // itself as the setup step.
+    let mqtt_env_managed = mqtt_status
+        .read()
+        .clone()
+        .flatten()
+        .is_some_and(|status| status.is_environment_managed());
+    let mqtt_show_manual_form = !mqtt_env_managed || mqtt_manual_open();
 
     rsx! {
         Layout {
@@ -1828,18 +1856,34 @@ pub fn Settings() -> Element {
                                         span { class: "badge badge-secondary", "Alpha" }
                                     }
                                 }
+                                // The broker form lives in its own section far
+                                // below this table, so a user who flips the
+                                // toggle with no broker saved would otherwise
+                                // get silence. Say what is missing here, and
+                                // offer the jump (#605).
                                 td { class: "py-2 px-3",
                                     if mqtt_enabled() {
                                         if let Some(status) = mqtt_status.read().clone().flatten() {
                                             if status.running {
-                                                span { class: "status-ok", "✓ Connected" }
+                                                if status.is_environment_managed() {
+                                                    span { class: "status-ok", "✓ Connected · via add-on" }
+                                                } else {
+                                                    span { class: "status-ok", "✓ Connected" }
+                                                }
                                             } else if status.configured {
                                                 span { class: "text-yellow-500", "Configured · waiting" }
                                             } else {
-                                                span { class: "text-muted", "Setup required" }
+                                                button {
+                                                    r#type: "button",
+                                                    class: "text-yellow-500 underline",
+                                                    onclick: move |_| scroll_to_element("mqtt-anchor"),
+                                                    "No broker yet — set one up"
+                                                }
                                             }
                                         } else { "..." }
-                                    } else { span { class: "text-muted", "-" } }
+                                    } else {
+                                        span { class: "text-muted", "Off — no Home Assistant entities" }
+                                    }
                                 }
                             }
                             // Controllers (page only, no adapter)
@@ -2691,21 +2735,60 @@ pub fn Settings() -> Element {
                     hidden: !mqtt_enabled(),
                     aria_labelledby: "mqtt-heading",
                     div { class: "mb-4",
-                        h2 { id: "mqtt-heading", class: "text-xl font-semibold flex items-center gap-2",
-                            "MQTT / Home Assistant"
-                            span { class: "badge badge-secondary", "Alpha" }
+                        div { class: "flex items-center gap-2",
+                            h2 { id: "mqtt-heading", class: "text-xl font-semibold flex items-center gap-2",
+                                "MQTT / Home Assistant"
+                                span { class: "badge badge-secondary", "Alpha" }
+                            }
+                            // One-line summary above, the rest behind ⓘ - the
+                            // same disclosure the Spotify stepper uses (#597),
+                            // so the setup path never becomes a wall of text.
+                            span { class: "group relative shrink-0",
+                                button {
+                                    r#type: "button",
+                                    class: "flex h-8 w-8 items-center justify-center rounded-full text-muted",
+                                    aria_expanded: mqtt_info_open(),
+                                    aria_controls: "mqtt-info",
+                                    aria_label: "More about Home Assistant entities",
+                                    onclick: move |_| {
+                                        let open = *mqtt_info_open.peek();
+                                        mqtt_info_open.set(!open);
+                                    },
+                                    "ⓘ"
+                                }
+                                div { id: "mqtt-info", class: mqtt_info_panel_class, role: "note",
+                                    p { "Home Assistant discovers the zones by itself, so there is nothing to add per zone - no YAML, no entity list. Set up Home Assistant's MQTT integration, point it at the same broker you enter here, and the entities appear." }
+                                    p { class: "mt-2", "Each zone becomes a media player you can play, pause, and set the volume on. Each hardware controller becomes its own device." }
+                                    p { class: "mt-2", "Advanced: the discovery prefix below has to match the one Home Assistant's MQTT integration uses. Leave it at \"homeassistant\" unless you changed it there." }
+                                }
+                            }
                         }
-                        p { class: "text-muted text-sm", "Publish every UHC zone to Home Assistant over MQTT discovery. Broker credentials are encrypted and never returned to this page." }
+                        p { class: "text-muted text-sm mt-1", "Your zones and controllers show up in Home Assistant as entities. Point Home Assistant's MQTT integration at the same broker and they appear on their own." }
                     }
                     div { class: "card p-5 sm:p-6",
                         if let Some(status) = mqtt_status.read().clone().flatten() {
                             div { class: "text-sm",
-                                if status.running {
-                                    p { class: "status-ok", "Connected to broker" }
+                                if status.is_environment_managed() {
+                                    // The add-on already did this. Saying so
+                                    // is what keeps the form below from
+                                    // reading as an unfinished setup step.
+                                    p { class: "font-medium", "Set up by the Home Assistant add-on" }
+                                    if status.running {
+                                        p { class: "mt-1 status-ok", "Connected — your zones are in Home Assistant" }
+                                    } else {
+                                        p { class: "mt-1 text-yellow-500", "Not connected to the broker yet" }
+                                    }
+                                } else if status.running {
+                                    p { class: "status-ok", "Connected — your zones are in Home Assistant" }
                                 } else if status.configured {
                                     p { class: "text-yellow-500", "Configured, not currently connected" }
                                 } else {
-                                    p { class: "text-muted", "Setup required" }
+                                    // The failure this whole section existed
+                                    // to explain: unconfigured used to read
+                                    // "Setup required" and leave the user to
+                                    // work out what they were missing out on.
+                                    p { class: "font-medium", "No broker yet — nothing is being published" }
+                                    p { class: "mt-1 text-secondary", "Add your broker below and your zones and controllers show up in Home Assistant as entities." }
                                 }
                                 if let Some(host) = status.host.as_ref() {
                                     p { class: "mt-1 text-secondary",
@@ -2716,7 +2799,18 @@ pub fn Settings() -> Element {
                                 }
                             }
                         }
+                        if mqtt_env_managed && !mqtt_show_manual_form {
+                            button {
+                                id: "mqtt-use-own-broker",
+                                r#type: "button",
+                                class: "btn btn-secondary mt-4 min-h-11",
+                                onclick: move |_| mqtt_manual_open.set(true),
+                                "Use a different broker"
+                            }
+                            p { class: "mt-2 text-xs text-muted", "Broker settings you save here replace the add-on's and are kept across restarts." }
+                        }
                         div { class: "mt-4 grid gap-4 sm:grid-cols-2",
+                            hidden: !mqtt_show_manual_form,
                             div {
                                 label { class: "block text-sm font-medium", r#for: "mqtt-host", "Broker host" }
                                 input { id: "mqtt-host", class: "input mt-1 min-h-11 w-full", value: mqtt_host(), autocomplete: "url", placeholder: "homeassistant.local", oninput: move |event| mqtt_host.set(event.value()) }
@@ -2743,12 +2837,14 @@ pub fn Settings() -> Element {
                             }
                         }
                         label { class: "mt-4 flex items-center gap-2 text-sm",
+                            hidden: !mqtt_show_manual_form,
                             input { r#type: "checkbox", checked: mqtt_tls(), onchange: move |event| mqtt_tls.set(event.checked()) }
                             "Use TLS"
                         }
-                        button { id: "mqtt-save-settings", r#type: "button", class: "btn btn-primary mt-5 min-h-11", disabled: mqtt_action() == ProviderActionState::Loading, aria_busy: mqtt_action() == ProviderActionState::Loading, onclick: save_mqtt,
+                        button { id: "mqtt-save-settings", r#type: "button", class: "btn btn-primary mt-5 min-h-11", hidden: !mqtt_show_manual_form, disabled: mqtt_action() == ProviderActionState::Loading, aria_busy: mqtt_action() == ProviderActionState::Loading, onclick: save_mqtt,
                             if mqtt_action() == ProviderActionState::Loading { "Saving…" } else { "Save and connect" }
                         }
+                        p { class: "mt-2 text-xs text-muted", hidden: !mqtt_show_manual_form, "The broker password is encrypted and never sent back to this page." }
                         p { class: "mt-2 text-sm status-err", hidden: mqtt_error().is_none(), role: "alert", "{mqtt_error().unwrap_or_default()}" }
                     }
                 }
