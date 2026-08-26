@@ -78,8 +78,11 @@ pub fn Layout(props: LayoutProps) -> Element {
         // `asset!()` -- that would pull it into the wasm bundle. It
         // feature-detects `document.modelContext` itself and is a no-op on
         // every browser that doesn't have it yet.
+        // #581: resolved through the runtime base path so the hydrated
+        // client renders the same (possibly ingress-prefixed) src the
+        // server's HTML rewrite emitted. Identity in direct mode.
         document::Script {
-            src: "/webmcp-bridge.js",
+            src: crate::app::base_path::href("/webmcp-bridge.js"),
             defer: true
         }
 

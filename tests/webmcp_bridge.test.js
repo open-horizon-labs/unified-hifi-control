@@ -258,3 +258,61 @@ test("Bridge.callTool recovers from a transport failure as an isError result and
   await b.callTool("hifi_status", {});
   assert.ok(fetchStub2Calls.includes("initialize"), "a dropped session must be re-initialized");
 });
+
+// ---------------------------------------------------------------------------
+// Base-path awareness (#581): behind HA Ingress the server injects a
+// uhc-base-path meta tag; the bridge must issue /mcp under that prefix.
+// ---------------------------------------------------------------------------
+
+function docWithMeta(content) {
+  return {
+    querySelector: (sel) =>
+      sel === 'meta[name="uhc-base-path"]' && content !== null
+        ? { getAttribute: (n) => (n === "content" ? content : null) }
+        : null,
+  };
+}
+
+test("docBasePath reads the injected meta tag and trims trailing slashes", () => {
+  assert.equal(bridge.docBasePath(docWithMeta("/api/hassio_ingress/tok")), "/api/hassio_ingress/tok");
+  assert.equal(bridge.docBasePath(docWithMeta("/api/hassio_ingress/tok/")), "/api/hassio_ingress/tok");
+});
+
+test("docBasePath is empty in direct mode and for degenerate values", () => {
+  assert.equal(bridge.docBasePath(docWithMeta(null)), "");
+  assert.equal(bridge.docBasePath(docWithMeta("")), "");
+  assert.equal(bridge.docBasePath(docWithMeta("/")), "");
+  assert.equal(bridge.docBasePath(docWithMeta("not-rooted")), "");
+  assert.equal(bridge.docBasePath(undefined), "");
+});
+
+test("Bridge posts to the prefixed MCP endpoint when constructed with one", async () => {
+  const urls = [];
+  const fetchStub = async (url, init) => {
+    urls.push(url);
+    const req = JSON.parse(init.body);
+    if (req.method === "initialize") {
+      return sseResponse({ jsonrpc: "2.0", id: req.id, result: {} }, { "mcp-session-id": "sess-1" });
+    }
+    return sseResponse({ jsonrpc: "2.0", id: req.id, result: { content: [], isError: false } }, {});
+  };
+  const b = new bridge.Bridge(fetchStub, null, "/api/hassio_ingress/tok/mcp");
+  await b.callTool("hifi_status", {});
+  assert.ok(urls.length > 0);
+  assert.ok(urls.every((u) => u === "/api/hassio_ingress/tok/mcp"));
+});
+
+test("Bridge defaults to /mcp when no endpoint is given (direct mode)", async () => {
+  const urls = [];
+  const fetchStub = async (url, init) => {
+    urls.push(url);
+    const req = JSON.parse(init.body);
+    if (req.method === "initialize") {
+      return sseResponse({ jsonrpc: "2.0", id: req.id, result: {} }, { "mcp-session-id": "sess-1" });
+    }
+    return sseResponse({ jsonrpc: "2.0", id: req.id, result: { content: [], isError: false } }, {});
+  };
+  const b = new bridge.Bridge(fetchStub, null);
+  await b.callTool("hifi_status", {});
+  assert.ok(urls.every((u) => u === "/mcp"));
+});

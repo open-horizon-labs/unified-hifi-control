@@ -268,8 +268,10 @@ pub fn use_sse_provider() {
                 return;
             }
 
-            // Create EventSource connection to /events
-            let es = match EventSource::new("/events") {
+            // Create EventSource connection to /events (base-path aware for
+            // ingress/subpath deployments, #581 -- identity in direct mode)
+            let events_url = crate::app::base_path::href("/events");
+            let es = match EventSource::new(&events_url) {
                 Ok(es) => es,
                 Err(e) => {
                     web_sys::console::error_1(

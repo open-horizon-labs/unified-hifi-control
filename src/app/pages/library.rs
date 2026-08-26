@@ -130,14 +130,19 @@ fn effective_tab(requested: Tab, visible: &[Tab]) -> Tab {
 }
 
 /// #573 defect 2 pin: the API's `image` fields (`CollectionItem::image`,
-/// `SearchResult::image`) are complete same-origin URLs
+/// `SearchResult::image`) are complete origin-absolute URLs
 /// (`/api/collections/image?ref=...`) and are used **verbatim** as
 /// `<img src>`. This helper is the single place a row image becomes a `src`;
 /// the double-prefix regression ("/api/collections/image?ref={image}" around
 /// an already-full path, 404ing every image) cannot re-enter through rsx
 /// string interpolation as long as rendering goes through here.
-fn image_src(image: &str) -> &str {
-    image
+///
+/// #581: under an ingress/subpath proxy the browser must issue the URL with
+/// the runtime base path prepended -- `base_path::href` is the same single
+/// resolver every fetch helper uses, and it is the identity in direct mode,
+/// so the verbatim pin above still holds where it was minted.
+fn image_src(image: &str) -> String {
+    crate::app::base_path::href(image)
 }
 
 /// One breadcrumb: what the user picked, and the opaque path it opened.
