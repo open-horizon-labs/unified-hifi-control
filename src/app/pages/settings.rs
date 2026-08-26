@@ -674,6 +674,8 @@ pub fn Settings() -> Element {
     let mut mqtt_tls = use_signal(|| false);
     // ⓘ disclosure for what the Home Assistant side has to do (#605).
     let mut mqtt_info_open = use_signal(|| false);
+    // The same disclosure for the integration card (#613).
+    let mut ha_info_open = use_signal(|| false);
     // When the add-on supplies the broker there is nothing for the user to
     // fill in, so the manual form starts collapsed rather than sitting there
     // pre-filled and inviting them to re-enter settings they never chose.
@@ -988,6 +990,18 @@ pub fn Settings() -> Element {
         crate::app::api::fetch_json::<MqttStatusResponse>("/api/mqtt/status")
             .await
             .ok()
+    });
+    // Where UHC's own Home Assistant integration stands (#613). Fetched once
+    // rather than polled: the two things it reports - what the add-on did on
+    // this start, and whether Home Assistant has loaded the result - only
+    // change when the add-on restarts or Home Assistant does, and either of
+    // those reloads this page anyway.
+    let ha_integration = use_resource(|| async {
+        crate::app::api::fetch_json::<crate::app::api::HomeAssistantIntegrationStatus>(
+            "/api/home-assistant/integration",
+        )
+        .await
+        .ok()
     });
 
     use_effect(move || {
@@ -1607,6 +1621,11 @@ pub fn Settings() -> Element {
     } else {
         MQTT_INFO_PANEL_CLOSED
     };
+    let ha_info_panel_class = if ha_info_open() {
+        MQTT_INFO_PANEL_OPEN
+    } else {
+        MQTT_INFO_PANEL_CLOSED
+    };
     // The Home Assistant add-on hands the broker over from the Supervisor
     // (#605). When it has, there is nothing here for the user to fill in, so
     // the manual form collapses behind an opt-in rather than presenting
@@ -1617,6 +1636,11 @@ pub fn Settings() -> Element {
         .flatten()
         .is_some_and(|status| status.is_environment_managed());
     let mqtt_show_manual_form = !mqtt_env_managed || mqtt_manual_open();
+    // Running as the Home Assistant add-on (#613). Everything add-on-specific
+    // on this page hangs off this: the integration card, and the fact that
+    // MQTT is optional here rather than the way in.
+    let ha_status = ha_integration.read().clone().flatten();
+    let is_addon = ha_status.as_ref().is_some_and(|status| status.addon);
 
     rsx! {
         Layout {
@@ -1933,7 +1957,7 @@ pub fn Settings() -> Element {
                                                 // itself is going (#610). This
                                                 // row used to show a green tick
                                                 // for exactly that case.
-                                                if status.home_assistant_missing() {
+                                                if status.should_warn_home_assistant_missing() {
                                                     button {
                                                         r#type: "button",
                                                         class: "text-yellow-500 underline text-left",
@@ -1965,6 +1989,13 @@ pub fn Settings() -> Element {
                                                 }
                                             }
                                         } else { "..." }
+                                    } else if is_addon {
+                                        // Under the add-on this is not a
+                                        // missing feature (#613): the
+                                        // integration above already puts
+                                        // zones into Home Assistant, and
+                                        // MQTT is a second, optional route.
+                                        span { class: "text-muted", "Off — not needed, the integration handles this" }
                                     } else {
                                         span { class: "text-muted", "Off — no Home Assistant entities" }
                                     }
@@ -2813,6 +2844,120 @@ pub fn Settings() -> Element {
                 }
             }
 
+            // Home Assistant integration (#613). Add-on only: on a standalone
+            // install the add-on never ran, so there is no install to report
+            // and no restart to ask for, and this whole block stays out of
+            // the way.
+            if let Some(ha) = ha_status.clone() {
+                if ha.addon {
+                    section {
+                        id: "ha-integration",
+                        class: "mb-8",
+                        aria_labelledby: "ha-integration-heading",
+                        div { class: "mb-4",
+                            div { class: "flex items-center gap-2",
+                                h2 { id: "ha-integration-heading", class: "text-xl font-semibold",
+                                    "Home Assistant"
+                                }
+                                // Same ⓘ disclosure as the MQTT section
+                                // (#597): one line on screen, the detail
+                                // one click away.
+                                span { class: "group relative shrink-0",
+                                    button {
+                                        r#type: "button",
+                                        class: "flex h-8 w-8 items-center justify-center rounded-full text-muted",
+                                        aria_expanded: ha_info_open(),
+                                        aria_controls: "ha-integration-info",
+                                        aria_label: "More about the Home Assistant integration",
+                                        onclick: move |_| {
+                                            let open = *ha_info_open.peek();
+                                            ha_info_open.set(!open);
+                                        },
+                                        "ⓘ"
+                                    }
+                                    div { id: "ha-integration-info", class: ha_info_panel_class, role: "note",
+                                        p { "This add-on copies the Unified Hi-Fi Control integration into Home Assistant for you. Home Assistant only picks up new integrations when it starts, which is why it needs one restart." }
+                                        p { class: "mt-2", "After the restart, look under Settings → Devices & services → Discovered. UHC finds itself on your network, so there is nothing to type." }
+                                        p { class: "mt-2", "Each zone becomes a media player you can play, pause, seek, group, and set the volume on." }
+                                        p { class: "mt-2", "A copy you installed yourself through HACS, or one you have edited, is never overwritten." }
+                                        p { class: "mt-2", "Turn this off with the add-on's install_integration option if you would rather manage it yourself." }
+                                    }
+                                }
+                            }
+                            p { class: "text-muted text-sm mt-1",
+                                "Your zones as Home Assistant media players. No broker needed."
+                            }
+                        }
+                        div { class: "card p-5 sm:p-6",
+                            div { class: "text-sm",
+                                if ha.needs_restart {
+                                    // The one thing on this page that asks
+                                    // the user to act. It is also invisible
+                                    // everywhere else: nothing in Home
+                                    // Assistant says "an add-on left an
+                                    // integration here for you".
+                                    p { id: "ha-needs-restart", class: "text-yellow-500 font-medium",
+                                        "Restart Home Assistant once to finish setting this up"
+                                    }
+                                    p { class: "mt-1 text-secondary",
+                                        "The integration is installed and waiting. Go to Settings → System, then use the restart button at the top right."
+                                    }
+                                    p { class: "mt-1 text-secondary",
+                                        "After that, Unified Hi-Fi Control appears under Settings → Devices & services → Discovered."
+                                    }
+                                } else if ha.is_loaded() {
+                                    p { id: "ha-integration-loaded", class: "status-ok",
+                                        "Home Assistant has the integration — your zones are media players there"
+                                    }
+                                    p { class: "mt-1 text-secondary",
+                                        "If you have not added it yet, it is waiting under Settings → Devices & services → Discovered."
+                                    }
+                                } else if ha.install_blocked() {
+                                    // Everything the add-on could not do.
+                                    // One line each, and always an
+                                    // alternative - UHC itself is fine.
+                                    p { id: "ha-integration-blocked", class: "status-err font-medium",
+                                        "The integration could not be installed"
+                                    }
+                                    p { class: "mt-1 text-secondary",
+                                        match ha.install.as_deref() {
+                                            Some("skipped_readonly") | Some("skipped_unmapped") => "The add-on could not write to Home Assistant's configuration folder. Everything else here keeps working.",
+                                            Some("unavailable") => "This version of the add-on does not carry the integration yet. Updating the add-on is the fix.",
+                                            _ => "Check the add-on's Log tab for the reason. Everything else here keeps working.",
+                                        }
+                                    }
+                                    p { class: "mt-1 text-secondary",
+                                        "You can also install it through HACS, or set up MQTT below instead."
+                                    }
+                                } else if ha.install.as_deref() == Some("skipped_disabled") {
+                                    p { class: "text-secondary",
+                                        "Not installed — the add-on's install_integration option is off."
+                                    }
+                                } else if ha.install.as_deref() == Some("skipped_foreign") {
+                                    p { class: "text-secondary",
+                                        "You have your own copy of the integration installed. The add-on leaves it alone."
+                                    }
+                                } else if ha.install.as_deref() == Some("skipped_modified") {
+                                    p { class: "text-secondary",
+                                        "Your edited copy of the integration is being kept as-is."
+                                    }
+                                } else {
+                                    // Files are in place; whether Home
+                                    // Assistant has them is `unknown` - a
+                                    // restart instruction here would be a
+                                    // guess, so say only what is certain.
+                                    p { class: "text-secondary",
+                                        "The integration is installed. If your zones are not in Home Assistant yet, restart Home Assistant once and look under Settings → Devices & services → Discovered."
+                                    }
+                                }
+                                if let Some(version) = ha.version.clone() {
+                                    p { class: "mt-2 text-muted text-xs", "Integration version {version}" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             div { id: "mqtt-anchor",
                 section {
                     class: "mb-8",
@@ -2853,7 +2998,14 @@ pub fn Settings() -> Element {
                                 }
                             }
                         }
-                        p { class: "text-muted text-sm mt-1", "Your zones and controllers show up in Home Assistant as entities. Point Home Assistant's MQTT integration at the same broker and they appear on their own." }
+                        p { class: "text-muted text-sm mt-1",
+                            if is_addon {
+                                // #613: MQTT is no longer the way in here.
+                                "Optional. The integration above already puts your zones in Home Assistant; this publishes them over MQTT as well, for setups that want it."
+                            } else {
+                                "Your zones and controllers show up in Home Assistant as entities. Point Home Assistant's MQTT integration at the same broker and they appear on their own."
+                            }
+                        }
                     }
                     div { class: "card p-5 sm:p-6",
                         if let Some(status) = mqtt_status.read().clone().flatten() {
@@ -2869,18 +3021,32 @@ pub fn Settings() -> Element {
                                 // than by "the task exists" (#607). Only the
                                 // first branch is success; a broker that
                                 // never answers now has to say so.
-                                if status.home_assistant_missing() {
+                                if status.should_warn_home_assistant_missing() {
                                     // The failure #610 is about: our own half
                                     // is flawless, and the user still has no
                                     // entities. The click path is the whole
                                     // fix, so it stays on screen rather than
                                     // behind the ⓘ - only the reassurance
                                     // moves in there.
+                                    //
+                                    // #613 added the gate: only warn someone
+                                    // who chose to publish. The add-on used
+                                    // to switch MQTT on by itself, and this
+                                    // warning then blamed the user for not
+                                    // finishing a setup they never started.
                                     p { id: "mqtt-ha-missing", class: "text-yellow-500 font-medium",
                                         "Your zones are being published, but Home Assistant isn't set up to receive them"
                                     }
                                     p { class: "mt-1 text-secondary",
                                         "In Home Assistant, go to Settings → Devices & services → Add integration → MQTT. Your zones then appear on their own."
+                                    }
+                                } else if status.home_assistant_missing() {
+                                    // Same fact, nobody asked for it. State
+                                    // it plainly and point at the thing that
+                                    // does work, rather than raising an alarm
+                                    // about a setting the add-on chose.
+                                    p { id: "mqtt-ha-missing-quiet", class: "text-secondary",
+                                        "Publishing to your broker. Home Assistant's MQTT integration isn't set up, so nothing is reading it — which is fine if you are using the integration above instead."
                                     }
                                 } else if status.home_assistant_is_consuming() {
                                     p { id: "mqtt-ha-consuming", class: "status-ok",

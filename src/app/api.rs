@@ -311,6 +311,63 @@ pub struct MqttStatusResponse {
     /// Why we cannot tell, when we cannot (#610). Diagnostic, not copy.
     #[serde(default)]
     pub home_assistant_detail: Option<String>,
+    /// Whether a person deliberately chose to publish over MQTT, rather than
+    /// the Home Assistant add-on having switched it on for them (#613).
+    ///
+    /// Defaults to `false` against a server that predates the field, which
+    /// is the quiet direction: an old server pairs with old behaviour, where
+    /// the add-on auto-enabled MQTT, and that is precisely the case that
+    /// should not produce a warning.
+    #[serde(default)]
+    pub user_opted_in: bool,
+}
+
+/// Where UHC's own Home Assistant integration stands (#613), from
+/// `GET /api/home-assistant/integration`.
+///
+/// Every field is inert outside the Home Assistant add-on, so a standalone
+/// install renders none of this rather than instructions that make no sense
+/// there.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct HomeAssistantIntegrationStatus {
+    /// Whether UHC is running as the Home Assistant add-on.
+    #[serde(default)]
+    pub addon: bool,
+    /// What the add-on did on this start: `"installed"`, `"updated"`,
+    /// `"current"`, `"skipped_*"`, `"unavailable"`, `"failed"`.
+    #[serde(default)]
+    pub install: Option<String>,
+    /// Version now in Home Assistant's config directory.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Why, when the outcome alone is not actionable. Diagnostic, not copy.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// `"loaded"`, `"not_loaded"`, or `"unknown"`.
+    #[serde(default)]
+    pub loaded: String,
+    /// The integration is installed and Home Assistant has not loaded it:
+    /// one restart away from working. The server never sets this on a guess.
+    #[serde(default)]
+    pub needs_restart: bool,
+}
+
+impl HomeAssistantIntegrationStatus {
+    /// Home Assistant has the integration running. Nothing to tell the user.
+    pub fn is_loaded(&self) -> bool {
+        self.loaded == "loaded"
+    }
+
+    /// The add-on could not put the integration in place, and the user has
+    /// to do something about it. Not the same as `!needs_restart`: skipping
+    /// because a copy is already there, or because the user opted out, is
+    /// not a problem.
+    pub fn install_blocked(&self) -> bool {
+        matches!(
+            self.install.as_deref(),
+            Some("skipped_readonly" | "skipped_unmapped" | "unavailable" | "failed")
+        )
+    }
 }
 
 impl MqttStatusResponse {
@@ -356,12 +413,33 @@ impl MqttStatusResponse {
         self.is_connected() && self.home_assistant == "not_configured"
     }
 
+    /// Whether to *warn* about [`Self::home_assistant_missing`] (#613).
+    ///
+    /// The fact and the warning came apart when the add-on started
+    /// installing UHC's own Home Assistant integration. MQTT is then
+    /// optional, and an add-on that switched it on by itself would otherwise
+    /// have UHC scolding the user for not finishing a setup they never
+    /// started. So the warning needs a person behind it: someone who saved
+    /// broker settings, or who flipped the toggle.
+    ///
+    /// Standalone installs are unaffected in practice - they have no add-on
+    /// to auto-enable anything, so anyone publishing there opted in.
+    pub fn should_warn_home_assistant_missing(&self) -> bool {
+        self.home_assistant_missing() && self.user_opted_in
+    }
+
     /// We are publishing but cannot establish whether anyone reads it -
     /// typically a UHC that is not running as a Home Assistant add-on, so
     /// there is no Supervisor to ask. Worth one quiet, non-accusatory line;
     /// never a warning.
     pub fn home_assistant_undetermined(&self) -> bool {
         self.is_connected() && !self.home_assistant_is_consuming() && !self.home_assistant_missing()
+    }
+
+    /// The broker is filled in and waiting, but publishing is off (#613).
+    /// The one-click opt-in state an add-on user lands in.
+    pub fn ready_to_opt_in(&self) -> bool {
+        self.configured && !self.enabled && self.is_environment_managed()
     }
 
     /// `mqtt://host:port` for the configured broker, so an error can name
