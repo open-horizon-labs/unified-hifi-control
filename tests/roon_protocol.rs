@@ -31,8 +31,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mock_servers::roon_core::{
-    album, album_live, playlist, playlist_live, zone_with_grouping, FakeItem, FakeLibrary,
-    FakeRoonCore, Hint, ItemKeyScope,
+    album, album_live, playlist, playlist_live, radio_station, zone_with_grouping, FakeItem,
+    FakeLibrary, FakeRoonCore, Hint, ItemKeyScope,
 };
 use roon_api::browse::{BrowseOpts, LoadOpts};
 use unified_hifi_control::adapters::roon::{PlayAction, RoonAdapter, SearchSource};
@@ -2100,6 +2100,187 @@ async fn roon_collections_no_results_placeholder_is_not_listed() {
         level["next_offset"].is_null(),
         "an empty level must not advertise Load more (#573 defect 8): {level:?}"
     );
+
+    core.stop().await;
+}
+
+/// #587: a live Core marks radio station rows under "My Live Radio"
+/// `hint: action` (browsing a station plays it immediately) -- see
+/// `radio_station`'s docs for the captured wire shape. #578's classification
+/// treated every `action` row as a play verb and filtered stations out, so
+/// the node listed as empty despite stations existing. Stations must list as
+/// playable leaves; the My Live Radio folder itself must be navigable but
+/// not offer a Play that could only error.
+#[tokio::test]
+async fn roon_collections_my_live_radio_lists_stations_as_playable_leaves() {
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![
+        FakeItem::list("My Live Radio").with_children(vec![radio_station(
+            "WOSU-HD2 WOSU Public Media: Classical 101",
+            "Columbus, Ohio, USA FM 89.7 HD2 English",
+        )]),
+    ];
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let root = adapter
+        .content(
+            "collections_browse",
+            &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
+        )
+        .await
+        .unwrap();
+    let radio_row = &root["items"][0];
+    assert_eq!(radio_row["title"], "My Live Radio");
+    assert_eq!(
+        radio_row["navigable"], true,
+        "the radio folder must stay browsable: {root:?}"
+    );
+    assert_eq!(
+        radio_row["playable"], false,
+        "a folder of stations offers no play verb to invoke -- a Play ref \
+         here could only error (#587): {root:?}"
+    );
+    let session_key = root["session_key"].as_str().unwrap().to_string();
+    let radio_key = radio_row["item_key"].as_str().unwrap().to_string();
+
+    let level = adapter
+        .content(
+            "collections_browse",
+            &json!({
+                "zone_id": "roon:zone_1",
+                "item_key": radio_key,
+                "session_key": session_key,
+                "limit": 20,
+                "offset": 0,
+            }),
+        )
+        .await
+        .unwrap();
+    let items = level["items"].as_array().unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "the station row must not be filtered as a play verb (#587): {level:?}"
+    );
+    assert_eq!(
+        items[0]["title"],
+        "WOSU-HD2 WOSU Public Media: Classical 101"
+    );
+    assert_eq!(
+        items[0]["subtitle"], "Columbus, Ohio, USA FM 89.7 HD2 English",
+        "the station's location/language subtitle survives the mapping"
+    );
+    assert_eq!(
+        items[0]["playable"], true,
+        "browsing a station plays it -- it must mint a play ref: {level:?}"
+    );
+    assert_eq!(
+        items[0]["navigable"], false,
+        "a station is a leaf: entering it would invoke playback, so it must \
+         not be offered as a folder: {level:?}"
+    );
+    assert!(
+        items[0]["image_key"].is_string(),
+        "station artwork must survive the mapping: {level:?}"
+    );
+
+    core.stop().await;
+}
+
+/// #587 acceptance: a station added in Roon's own app while UHC is running
+/// (modeled as a mid-session library mutation) appears on the next browse of
+/// My Live Radio -- same adapter connection, no restart. Also pins the empty
+/// state on the way: before the station exists, the node lists cleanly empty
+/// (the "No Results" placeholder stays filtered).
+#[tokio::test]
+async fn roon_collections_station_added_mid_session_appears_without_restart() {
+    let mut library = FakeLibrary::standard();
+    library.root_items =
+        vec![FakeItem::list("My Live Radio").with_children(vec![FakeItem::new("No Results")])];
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    // Walk 1: the node is empty (placeholder filtered, no phantom rows).
+    let root = adapter
+        .content(
+            "collections_browse",
+            &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
+        )
+        .await
+        .unwrap();
+    let session_key = root["session_key"].as_str().unwrap().to_string();
+    let radio_key = root["items"][0]["item_key"].as_str().unwrap().to_string();
+    let empty = adapter
+        .content(
+            "collections_browse",
+            &json!({
+                "zone_id": "roon:zone_1",
+                "item_key": radio_key,
+                "session_key": session_key,
+                "limit": 20,
+                "offset": 0,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        empty["items"].as_array().unwrap().is_empty(),
+        "before the station exists the node lists cleanly empty: {empty:?}"
+    );
+
+    // The operator adds a station in Roon's own app.
+    core.set_children_by_title(
+        "My Live Radio",
+        vec![radio_station(
+            "WOSU-HD2 WOSU Public Media: Classical 101",
+            "Columbus, Ohio, USA FM 89.7 HD2 English",
+        )],
+    )
+    .await;
+
+    // Walk 2: a fresh root walk (what the UI does on every Browse-tab entry)
+    // sees the station -- no adapter restart, same connection.
+    let root2 = adapter
+        .content(
+            "collections_browse",
+            &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
+        )
+        .await
+        .unwrap();
+    let session2 = root2["session_key"].as_str().unwrap().to_string();
+    assert_ne!(
+        session2, session_key,
+        "every root walk mints a fresh browse session -- staleness cannot \
+         come from session reuse"
+    );
+    let radio_key2 = root2["items"][0]["item_key"].as_str().unwrap().to_string();
+    let level = adapter
+        .content(
+            "collections_browse",
+            &json!({
+                "zone_id": "roon:zone_1",
+                "item_key": radio_key2,
+                "session_key": session2,
+                "limit": 20,
+                "offset": 0,
+            }),
+        )
+        .await
+        .unwrap();
+    let items = level["items"].as_array().unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "the added station appears without restart: {level:?}"
+    );
+    assert_eq!(
+        items[0]["title"],
+        "WOSU-HD2 WOSU Public Media: Classical 101"
+    );
+    assert_eq!(items[0]["playable"], true);
 
     core.stop().await;
 }

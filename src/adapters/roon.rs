@@ -247,16 +247,32 @@ pub(crate) fn is_ungrounded_grouping(item: &BrowseItem) -> bool {
 /// came back `items: []`. The two kinds must be told apart:
 ///
 /// - `hint: action` rows fire immediately when browsed (the #545 live repro's
-///   "Play Playlist") -- always an action row, never content.
-/// - `hint: action_list` rows are only action rows when they read as a play
-///   verb *and* carry none of the content signals every live track row
-///   carried (an artist subtitle, artwork). A track named "Play That Funky
-///   Music" keeps its subtitle/artwork and stays content; a bare
-///   "Play Album"/"Play Playlist"/"Shuffle" wrapper row has neither.
+///   "Play Playlist").
+/// - `hint: action_list` rows open a menu when browsed.
+///
+/// #587: *neither* hint alone decides. #578's lineage treated every
+/// `hint: action` row as a verb, but a live Core marks **radio station rows**
+/// under My Live Radio `hint: action` too -- browsing a station plays it
+/// immediately, so the hint is honest, yet the row is addressable content.
+/// Captured off the operator's Core (Roon 2.x, 2026-08, issue #587):
+///
+/// ```json
+/// {"title":"WOSU-HD2 WOSU Public Media: Classical 101",
+///  "subtitle":"Columbus, Ohio, USA FM 89.7 HD2 English",
+///  "item_key":"1646:0","hint":"action","image_key":"afd6..."}
+/// ```
+///
+/// Dropping every `action` row emptied My Live Radio exactly the way #545's
+/// "drop every action-hinted row" emptied albums. So both action-ish hints
+/// now share the same belt-and-braces test: a row is a *verb* only when it
+/// reads as one of Roon's play verbs *and* carries none of the content
+/// signals every live content row carried (a subtitle, artwork). A track
+/// named "Play That Funky Music" and a station named "WOSU-HD2" both keep
+/// their subtitle/artwork (and neither title is a verb) and stay content; a
+/// bare "Play Album"/"Play Playlist"/"Shuffle" wrapper row has neither.
 pub(crate) fn is_immediate_action_row(item: &BrowseItem) -> bool {
     match item.hint {
-        Some(ItemHint::Action) => true,
-        Some(ItemHint::ActionList) => {
+        Some(ItemHint::Action) | Some(ItemHint::ActionList) => {
             item.subtitle.as_deref().is_none_or(str::is_empty)
                 && item.image_key.is_none()
                 && is_play_verb_title(&item.title)
@@ -2307,30 +2323,28 @@ impl RoonAdapter {
                 ..Default::default()
             })
             .await?;
-        let action_rows_seen = loaded
-            .items
-            .iter()
-            .filter(|item| {
-                matches!(
-                    item.hint,
-                    Some(ItemHint::Action) | Some(ItemHint::ActionList)
-                )
-            })
-            .count();
         // #573 defect 1: `action_list`-hinted track rows are content, not
         // action rows (see `is_immediate_action_row`) -- only the verb rows
         // that get filtered out of listings count against "other content"
         // here, or an album whose whole peek window is [Play Album,
         // track, track, ...] would read as a pure action leaf and lose its
-        // navigability. `playable` stays judged on the broad action count:
-        // any action-ish row one level down means Roon can play this
-        // directly.
+        // navigability.
+        //
+        // #587: `playable` is judged on the same verb-row count, no longer on
+        // "any action-ish hint one level down". A live Core marks radio
+        // station rows `hint: action` (see `is_immediate_action_row`'s
+        // captured shape), so the broad count read a folder of stations
+        // (My Live Radio) as directly playable -- but invoking it has no
+        // verb row to walk, so the minted Play ref could only ever error
+        // ("Action 'Play Now' not available"). Every genuinely playable
+        // container observed live leads with a verb row ("Play Album",
+        // "Play Playlist", ...), which is exactly what this counts.
         let immediate_action_rows = loaded
             .items
             .iter()
             .filter(|item| is_immediate_action_row(item))
             .count();
-        let playable = action_rows_seen > 0;
+        let playable = immediate_action_rows > 0;
         let has_other_content = loaded.list.count > immediate_action_rows;
         Ok((playable, has_other_content))
     }
@@ -4495,14 +4509,36 @@ mod defect_573_row_classification {
             "Queue",
             "Start Radio",
         ] {
-            assert!(
-                is_immediate_action_row(&item(title, Some(ItemHint::ActionList))),
-                "{title} (action_list) must classify as an action row"
-            );
+            for hint in [ItemHint::ActionList, ItemHint::Action] {
+                assert!(
+                    is_immediate_action_row(&item(title, Some(hint.clone()))),
+                    "{title} ({hint:?}) must classify as an action row"
+                );
+            }
         }
-        // A plain `action` hint always fires immediately, whatever its title.
-        assert!(is_immediate_action_row(&item(
-            "Anything",
+    }
+
+    /// #587: a live Core marks radio station rows under My Live Radio
+    /// `hint: action` (browsing one plays it immediately) -- they are
+    /// content, not verb rows. Shape captured off the operator's Core; see
+    /// `is_immediate_action_row`'s docs.
+    #[test]
+    fn action_hinted_radio_station_rows_are_content() {
+        let mut station = item(
+            "WOSU-HD2 WOSU Public Media: Classical 101",
+            Some(ItemHint::Action),
+        );
+        station.subtitle = Some("Columbus, Ohio, USA FM 89.7 HD2 English".to_string());
+        station.image_key = Some("afd611dd".to_string());
+        assert!(
+            !is_immediate_action_row(&station),
+            "a station row with subtitle and artwork is content"
+        );
+
+        // Even a bare station (no subtitle, no artwork) survives: its title
+        // is not one of Roon's play verbs.
+        assert!(!is_immediate_action_row(&item(
+            "WOSU-HD2",
             Some(ItemHint::Action)
         )));
     }
