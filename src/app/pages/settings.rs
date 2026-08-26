@@ -3341,7 +3341,7 @@ mod tests {
         let mismatch =
             spotify_callback_feedback("?spotify=error&reason=token_exchange_failed").unwrap();
         assert!(mismatch.is_error);
-        assert!(mismatch.message.contains("callback URL"));
+        assert!(mismatch.message.contains("does not exactly match"));
 
         let unknown_reason = spotify_callback_feedback("?spotify=error&reason=made_up").unwrap();
         assert!(unknown_reason.is_error);
