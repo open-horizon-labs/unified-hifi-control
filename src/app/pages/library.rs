@@ -598,6 +598,8 @@ pub fn Library(
     let loading = use_signal(|| false);
     let error = use_signal(|| None::<LevelError>);
     let mut status = use_signal(|| None::<String>);
+    // Monotonic guard so a delayed auto-clear never erases a NEWER toast.
+    let mut status_generation = use_signal(|| 0u64);
 
     let refresh = use_callback(move |append: bool| {
         let Some(zone_id) = browse_zone_id() else {
@@ -650,6 +652,12 @@ pub fn Library(
         let _ = browse_zone_id();
         let _ = route_tab;
         let _ = breadcrumbs.read().clone();
+        // The play-status toast ("Playing", "Added to queue") describes an
+        // action taken on the level the user was on -- it must not follow
+        // them around the library (live report: a lone "Playing" haunting
+        // every page). Write-only here: `status` is never read in this
+        // effect, so no self-subscription.
+        status.set(None);
         // Tracked so the level refetches when the served-tab set arrives and
         // downgrades a deep-linked unsupported tab to Browse (#573 defect 6).
         let _ = visible_tabs();
@@ -817,6 +825,12 @@ pub fn Library(
                 Err(message) => message,
             };
             status.set(Some(message));
+            let generation = status_generation.peek().wrapping_add(1);
+            status_generation.set(generation);
+            dioxus_sdk_time::sleep(std::time::Duration::from_secs(5)).await;
+            if *status_generation.peek() == generation {
+                status.set(None);
+            }
         });
     });
 
