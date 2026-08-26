@@ -570,6 +570,25 @@ pub fn Settings() -> Element {
             .ok()
     });
 
+    // Proactively check controller-auth status once on mount (#570): the
+    // Settings page hosts every owner-gated action (Spotify client
+    // settings, its tunnel, Music Assistant, Apple Music pairing), so a
+    // fresh NAS install can be routed into the bootstrap prompt before the
+    // user even attempts a save, not just after it 401s. No tracked signal
+    // is read here, so -- like `settings_context::use_settings_provider`'s
+    // equivalent effect -- this runs exactly once per mount rather than
+    // looping (reactive-loop-lint).
+    #[cfg(target_arch = "wasm32")]
+    use_effect(move || {
+        spawn(async move {
+            if let Ok(status) = crate::app::api::fetch_controller_status().await {
+                if status.bootstrap_required && !status.authenticated {
+                    crate::app::controller_auth::open_bootstrap_prompt();
+                }
+            }
+        });
+    });
+
     // Sync settings to signals when loaded
     use_effect(move || {
         if let Some(Some(s)) = settings.read().as_ref() {
@@ -951,7 +970,9 @@ pub fn Settings() -> Element {
                 }
                 Err(error) => {
                     spotify_action.set(ProviderActionState::Failed);
-                    spotify_error.set(Some(error));
+                    // A `controller_unauthorized` 401 already opened the
+                    // bootstrap prompt (#570); don't also show its raw text.
+                    spotify_error.set(crate::app::api::suppress_controller_unauthorized(error));
                 }
             }
         });
@@ -973,7 +994,7 @@ pub fn Settings() -> Element {
                 }
                 Err(error) => {
                     spotify_action.set(ProviderActionState::Failed);
-                    spotify_error.set(Some(error));
+                    spotify_error.set(crate::app::api::suppress_controller_unauthorized(error));
                 }
             }
         });
@@ -1013,7 +1034,7 @@ pub fn Settings() -> Element {
                 }
                 Err(error) => {
                     spotify_action.set(ProviderActionState::Failed);
-                    spotify_error.set(Some(error));
+                    spotify_error.set(crate::app::api::suppress_controller_unauthorized(error));
                 }
             }
         });
@@ -1056,11 +1077,17 @@ pub fn Settings() -> Element {
                     }
                 }
                 Err(error) => {
-                    spotify_tunnel.set(SpotifyTunnelStatus {
-                        phase: "error".to_string(),
-                        message: Some(error),
-                        ..Default::default()
-                    });
+                    // A `controller_unauthorized` 401 already opened the
+                    // bootstrap prompt (#570); leave the tunnel panel idle
+                    // rather than also reporting a (confusingly permanent
+                    // sounding) tunnel error banner underneath it.
+                    if let Some(error) = crate::app::api::suppress_controller_unauthorized(error) {
+                        spotify_tunnel.set(SpotifyTunnelStatus {
+                            phase: "error".to_string(),
+                            message: Some(error),
+                            ..Default::default()
+                        });
+                    }
                 }
             }
             spotify_tunnel_busy.set(false);
@@ -1127,7 +1154,8 @@ pub fn Settings() -> Element {
                 }
                 Err(error) => {
                     musicassistant_action.set(ProviderActionState::Failed);
-                    musicassistant_error.set(Some(error));
+                    musicassistant_error
+                        .set(crate::app::api::suppress_controller_unauthorized(error));
                 }
             }
         });
@@ -1744,7 +1772,7 @@ pub fn Settings() -> Element {
                                         }
                                         p { class: "mt-2 text-xs text-muted", "This is the default loopback callback — it only works when your browser runs on the same machine as UHC. On a NAS or another machine, click \"Get an HTTPS address\" below: UHC opens a temporary secure tunnel and gives you the exact URL to register instead. (Spotify only accepts plain HTTP for 127.0.0.1/::1.)" }
                                     }
-                                    li { "Copy that app's Client ID (and Client Secret, if you're not using PKCE) into the fields below." }
+                                    li { "Copy that app's Client ID into the field below. Most setups don't need the Client Secret -- see \"Advanced\" if you specifically set one up." }
                                     li { "Save client settings, then click Connect Spotify and approve access on Spotify's consent page." }
                                     li { "If something goes wrong, the message below the Connect button explains what to fix — most often a callback URL that doesn't match exactly." }
                                 }
@@ -1819,17 +1847,23 @@ pub fn Settings() -> Element {
                                         spotify_client_id.set(event.value());
                                     },
                                 }
-                                label { class: "mt-3 block text-sm font-medium", r#for: "spotify-client-secret", "Client secret (optional for PKCE)" }
-                                input {
-                                    id: "spotify-client-secret",
-                                    class: "input mt-1 min-h-11 w-full",
-                                    r#type: "password",
-                                    value: spotify_client_secret(),
-                                    autocomplete: "new-password",
-                                    oninput: move |event| {
-                                        spotify_local_setup_saved.set(false);
-                                        spotify_client_secret.set(event.value());
-                                    },
+                                details { class: "mt-3",
+                                    summary { class: "cursor-pointer text-sm font-medium select-none", "Advanced: client secret" }
+                                    div { class: "mt-2",
+                                        label { class: "block text-sm font-medium", r#for: "spotify-client-secret", "Client secret" }
+                                        input {
+                                            id: "spotify-client-secret",
+                                            class: "input mt-1 min-h-11 w-full",
+                                            r#type: "password",
+                                            value: spotify_client_secret(),
+                                            autocomplete: "new-password",
+                                            oninput: move |event| {
+                                                spotify_local_setup_saved.set(false);
+                                                spotify_client_secret.set(event.value());
+                                            },
+                                        }
+                                        p { class: "mt-1 text-xs text-muted", "Most setups can leave this blank -- UHC signs in securely without it. Only fill this in if you specifically created your Spotify app to require one." }
+                                    }
                                 }
                                 label { class: "mt-3 block text-sm font-medium", r#for: "spotify-redirect-uri", "Redirect URI (optional)" }
                                 input {

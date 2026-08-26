@@ -85,3 +85,15 @@ browser session and CSRF checks. The Spotify OAuth callback is authenticated
 by its pending state/PKCE exchange instead of the browser cookie. Read-only
 device/status pages remain available, and native Apple bridge bearer routes
 remain independent.
+
+Independent of that switch, `/api/providers/*` and Apple Music pairing are
+*always* owner-gated (`requires_controller_auth` in
+`src/api/controller_auth.rs`) — a fresh install cannot let any reachable
+client replace OAuth credentials or mint a companion pairing before the owner
+bootstraps. The Settings UI's client-side counterpart to this contract lives
+in `src/app/controller_auth.rs` and `src/app/components/bootstrap_prompt.rs`:
+every fetch helper in `src/app/api.rs` routes a `controller_unauthorized`
+response into an in-page bootstrap prompt (token → `POST
+/api/controller/bootstrap` → CSRF token stored for subsequent requests)
+instead of surfacing the raw `HTTP 401`. See "First save on a NAS: the owner
+bootstrap prompt" in `docs/streaming-adapters.md` for the full walkthrough.

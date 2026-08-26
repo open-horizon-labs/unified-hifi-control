@@ -7,12 +7,14 @@ use dioxus::prelude::*;
 
 pub mod api;
 pub mod components;
+pub mod controller_auth;
 pub mod embedded_assets;
 pub mod pages;
 pub mod settings_context;
 pub mod sse;
 pub mod theme;
 
+use components::BootstrapPrompt;
 use pages::{HqPlayer, Knobs, Library, Lms, Settings, Spotify, Zones};
 use settings_context::use_settings_provider;
 use sse::use_sse_provider;
@@ -110,6 +112,10 @@ pub fn App() -> Element {
             content: "{settings_bootstrap_json}"
         }
         Router::<Route> {}
+        // Mounted once at the app root so any page's owner-gated fetch can
+        // open it via `crate::app::controller_auth::open_bootstrap_prompt`
+        // without threading state through every route (#570).
+        BootstrapPrompt {}
     }
 }
 
