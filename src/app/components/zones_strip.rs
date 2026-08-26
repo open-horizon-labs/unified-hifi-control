@@ -118,7 +118,8 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
         })
         .unwrap_or_default();
 
-    let image_url = resolve_image_url(np);
+    // #581: resolve through the runtime base path (identity in direct mode).
+    let image_url = crate::app::base_path::href(&resolve_image_url(np));
     let has_image = !image_url.is_empty();
 
     let volume = np.and_then(|n| n.volume);

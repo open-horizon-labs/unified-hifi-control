@@ -986,6 +986,16 @@ mod server {
             router.serve_dioxus_application(serve_config(), app::App)
         };
 
+        // HA Ingress (#581): outermost layer so it sees the final HTML
+        // (including the injected bootstrap snippet above). A pure
+        // passthrough unless UHC_INGRESS=1 AND the request came from the
+        // Supervisor's proxy with a valid X-Ingress-Path -- direct mode
+        // never observes it. See src/api/ingress.rs.
+        let router = router.layer(api::ingress::IngressRewriteLayer);
+        if api::ingress::ingress_enabled() {
+            tracing::info!("HA Ingress mode enabled (UHC_INGRESS=1)");
+        }
+
         // Start server with graceful shutdown
         tracing::info!("Listening on http://{}", addr);
 

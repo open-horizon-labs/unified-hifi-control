@@ -65,6 +65,11 @@
   "use strict";
 
   var MCP_ENDPOINT = "/mcp";
+  // #581: mirrors BASE_PATH_META in src/app/base_path.rs. Behind an ingress
+  // /subpath proxy the server injects this meta tag; the bridge must issue
+  // its /mcp POSTs under the same prefix or they escape the proxy. Absent
+  // tag (direct mode) resolves to "" and the endpoint stays "/mcp".
+  var BASE_PATH_META = "uhc-base-path";
   var MCP_SESSION_HEADER = "mcp-session-id";
   var CSRF_HEADER = "x-uhc-csrf-token";
   // Mirrors `CSRF_STORAGE_KEY` in src/app/controller_auth.rs exactly -- this
@@ -158,9 +163,22 @@
     return { content: [{ type: "text", text: String(message) }], isError: true };
   }
 
-  function Bridge(fetchImpl, storage) {
+  /// The runtime base path the server advertised (see BASE_PATH_META), or
+  /// "" when there is none. Exported for unit testing.
+  function docBasePath(doc) {
+    if (!doc || typeof doc.querySelector !== "function") return "";
+    var meta = doc.querySelector('meta[name="' + BASE_PATH_META + '"]');
+    var value = (meta && meta.getAttribute("content")) || "";
+    value = value.replace(/\/+$/, "");
+    // Same shape rule as base_path::normalize: a rooted, non-degenerate path.
+    if (value.charAt(0) !== "/" || value.length < 2) return "";
+    return value;
+  }
+
+  function Bridge(fetchImpl, storage, endpoint) {
     this._fetch = fetchImpl;
     this._storage = storage;
+    this._endpoint = endpoint || MCP_ENDPOINT;
     this._sessionId = null;
     this._nextId = 1;
   }
@@ -197,7 +215,7 @@
     if (!isNotification) body.id = self._nextId++;
 
     return self
-      ._fetch(MCP_ENDPOINT, {
+      ._fetch(self._endpoint, {
         method: "POST",
         headers: headers,
         credentials: "same-origin",
@@ -303,7 +321,11 @@
     if (!doc || !doc.modelContext || typeof doc.modelContext.registerTool !== "function") {
       return;
     }
-    var bridge = new Bridge(root.fetch.bind(root), safeLocalStorage(root));
+    var bridge = new Bridge(
+      root.fetch.bind(root),
+      safeLocalStorage(root),
+      docBasePath(doc) + MCP_ENDPOINT
+    );
     bridge.registerAll(doc.modelContext).catch(function (e) {
       if (root.console && root.console.error) {
         root.console.error("WebMCP bridge: failed to register UHC tools", e);
@@ -322,6 +344,7 @@
   return {
     install: install,
     Bridge: Bridge,
+    docBasePath: docBasePath,
     isToolAllowed: isToolAllowed,
     parseSseJson: parseSseJson,
     envelopeToCallToolResult: envelopeToCallToolResult,

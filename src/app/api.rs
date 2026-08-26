@@ -942,7 +942,11 @@ pub async fn fetch_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, St
     let opts = RequestInit::new();
     opts.set_method("GET");
 
-    let request = Request::new_with_str_and_init(url, &opts).map_err(|e| format!("{:?}", e))?;
+    // Ingress/subpath deployments (#581): every fetch flows through this
+    // helper and its POST siblings below, so this is the one place request
+    // URLs pick up the runtime base path. Identity in direct mode.
+    let url = crate::app::base_path::href(url);
+    let request = Request::new_with_str_and_init(&url, &opts).map_err(|e| format!("{:?}", e))?;
 
     let resp_value = JsFuture::from(window.fetch_with_request(&request))
         .await
@@ -1002,7 +1006,9 @@ pub async fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
     opts.set_headers(&headers);
     opts.set_body(&wasm_bindgen::JsValue::from_str(&body_str));
 
-    let request = Request::new_with_str_and_init(url, &opts).map_err(|e| format!("{:?}", e))?;
+    // See the base-path comment in `fetch_json` (#581).
+    let url = crate::app::base_path::href(url);
+    let request = Request::new_with_str_and_init(&url, &opts).map_err(|e| format!("{:?}", e))?;
 
     let resp_value = JsFuture::from(window.fetch_with_request(&request))
         .await
@@ -1057,7 +1063,9 @@ pub async fn post_json_no_response<T: Serialize>(url: &str, body: &T) -> Result<
     opts.set_headers(&headers);
     opts.set_body(&wasm_bindgen::JsValue::from_str(&body_str));
 
-    let request = Request::new_with_str_and_init(url, &opts).map_err(|e| format!("{:?}", e))?;
+    // See the base-path comment in `fetch_json` (#581).
+    let url = crate::app::base_path::href(url);
+    let request = Request::new_with_str_and_init(&url, &opts).map_err(|e| format!("{:?}", e))?;
 
     let resp_value = JsFuture::from(window.fetch_with_request(&request))
         .await

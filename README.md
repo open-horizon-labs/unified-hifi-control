@@ -188,6 +188,15 @@ Both are new; see
 [docs/home_assistant_integration.md](docs/home_assistant_integration.md)
 for setup and current limitations.
 
+There's also a Supervisor-managed **Home Assistant add-on** (Tier 1: its own
+tab, no ingress yet) for OS/Supervised/Home Assistant Green installs — no
+manual container setup required:
+
+[![Add add-on repository to my Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fopen-horizon-labs%2Fuhc-home-assistant-addon)
+
+See the [uhc-home-assistant-addon](https://github.com/open-horizon-labs/uhc-home-assistant-addon)
+repository for install details.
+
 ## Architecture
 
 ```
@@ -329,6 +338,6 @@ local runner: it always builds the server and its matching WASM bundle together.
 
 As of v2.5.0, this project is licensed under the [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/) license.
 
-Versions up to and including v2.4.1-prior-license were released under a custom source-available license (see LICENSE-PRIOR).
+Versions up to and including v2.4.1-prior-license were released under a custom source-available license (see [docs/LICENSE-PRIOR.md](docs/LICENSE-PRIOR.md)).
 
 For commercial licensing inquiries, see [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).

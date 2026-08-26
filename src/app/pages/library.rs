@@ -130,14 +130,19 @@ fn effective_tab(requested: Tab, visible: &[Tab]) -> Tab {
 }
 
 /// #573 defect 2 pin: the API's `image` fields (`CollectionItem::image`,
-/// `SearchResult::image`) are complete same-origin URLs
+/// `SearchResult::image`) are complete origin-absolute URLs
 /// (`/api/collections/image?ref=...`) and are used **verbatim** as
 /// `<img src>`. This helper is the single place a row image becomes a `src`;
 /// the double-prefix regression ("/api/collections/image?ref={image}" around
 /// an already-full path, 404ing every image) cannot re-enter through rsx
 /// string interpolation as long as rendering goes through here.
-fn image_src(image: &str) -> &str {
-    image
+///
+/// #581: under an ingress/subpath proxy the browser must issue the URL with
+/// the runtime base path prepended -- `base_path::href` is the same single
+/// resolver every fetch helper uses, and it is the identity in direct mode,
+/// so the verbatim pin above still holds where it was minted.
+fn image_src(image: &str) -> String {
+    crate::app::base_path::href(image)
 }
 
 /// One breadcrumb: what the user picked, and the opaque path it opened.
@@ -598,6 +603,8 @@ pub fn Library(
     let loading = use_signal(|| false);
     let error = use_signal(|| None::<LevelError>);
     let mut status = use_signal(|| None::<String>);
+    // Monotonic guard so a delayed auto-clear never erases a NEWER toast.
+    let mut status_generation = use_signal(|| 0u64);
 
     let refresh = use_callback(move |append: bool| {
         let Some(zone_id) = browse_zone_id() else {
@@ -650,6 +657,12 @@ pub fn Library(
         let _ = browse_zone_id();
         let _ = route_tab;
         let _ = breadcrumbs.read().clone();
+        // The play-status toast ("Playing", "Added to queue") describes an
+        // action taken on the level the user was on -- it must not follow
+        // them around the library (live report: a lone "Playing" haunting
+        // every page). Write-only here: `status` is never read in this
+        // effect, so no self-subscription.
+        status.set(None);
         // Tracked so the level refetches when the served-tab set arrives and
         // downgrades a deep-linked unsupported tab to Browse (#573 defect 6).
         let _ = visible_tabs();
@@ -817,6 +830,12 @@ pub fn Library(
                 Err(message) => message,
             };
             status.set(Some(message));
+            let generation = status_generation.peek().wrapping_add(1);
+            status_generation.set(generation);
+            dioxus_sdk_time::sleep(std::time::Duration::from_secs(5)).await;
+            if *status_generation.peek() == generation {
+                status.set(None);
+            }
         });
     });
 
