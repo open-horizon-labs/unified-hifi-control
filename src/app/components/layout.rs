@@ -73,6 +73,15 @@ pub fn Layout(props: LayoutProps) -> Element {
             sizes: "180x180",
             href: "{*APPLE_TOUCH_ICON_DATA_URL}"
         }
+        // WebMCP bridge (#579): a plain static file (public/webmcp-bridge.js,
+        // served by src/main.rs / src/embedded.rs), deliberately NOT an
+        // `asset!()` -- that would pull it into the wasm bundle. It
+        // feature-detects `document.modelContext` itself and is a no-op on
+        // every browser that doesn't have it yet.
+        document::Script {
+            src: "/webmcp-bridge.js",
+            defer: true
+        }
 
         // Body content
         Nav {

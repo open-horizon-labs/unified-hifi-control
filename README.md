@@ -249,6 +249,16 @@ Control your hi-fi with natural language. The bridge includes an MCP server so C
 
 The MCP endpoint is unauthenticated like the rest of the bridge — see [Security and Network Exposure](#security-and-network-exposure).
 
+### WebMCP (alpha)
+
+UHC's web UI also exposes these same tools in-page via
+[WebMCP](https://blog.cloudflare.com/webmcp/) (`document.modelContext`), an
+emerging browser standard shipping *experimentally* in Chrome 146 at the time
+of writing. A WebMCP-capable browser agent visiting the web UI can discover
+and call the playback/content tools above with no MCP client configuration.
+Owner/admin operations are excluded by an explicit tool allowlist — see
+[docs/webmcp.md](docs/webmcp.md) for the bridge design and tool policy.
+
 ### Example Usage
 
 Ask Claude: "Play some jazz piano" or "Queue Hotel California" or "What's playing?" or "Turn the volume down"

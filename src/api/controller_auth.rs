@@ -287,7 +287,14 @@ fn is_public(path: &str) -> bool {
     ) || path.starts_with("/assets/")
         || matches!(
             path,
-            "/favicon.ico" | "/tailwind.css" | "/dx-components-theme.css" | "/apple-touch-icon.png"
+            "/favicon.ico"
+                | "/tailwind.css"
+                | "/dx-components-theme.css"
+                | "/apple-touch-icon.png"
+                // WebMCP bridge (#579): loaded on every page before the
+                // owner may have bootstrapped a controller session, exactly
+                // like the other static assets above.
+                | "/webmcp-bridge.js"
         )
 }
 
@@ -461,6 +468,15 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
     }
+    #[test]
+    fn webmcp_bridge_script_is_public_like_other_static_assets() {
+        // #579: the bridge script must load on every page, including before
+        // the owner has bootstrapped a controller session.
+        assert!(is_public("/webmcp-bridge.js"));
+        assert!(is_public("/tailwind.css"));
+        assert!(!is_public("/webmcp-bridge.js.map"));
+    }
+
     #[test]
     fn bridge_native_routes_are_not_browser_routes() {
         assert!(is_native_bridge("/api/bridges/applemusic/state"));
