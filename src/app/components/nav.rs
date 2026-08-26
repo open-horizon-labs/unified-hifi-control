@@ -69,6 +69,7 @@ pub fn Nav(props: NavProps) -> Element {
                 div { class: "flex items-center",
                     Link { class: "nav-brand flex items-center", to: Route::Library { source: None, tab: None, path: None, zone: None },
                         img {
+                            // base-path-ok: an inlined data: URL carries no path to map.
                             src: "{*LOGO_DATA_URL}",
                             alt: "Hi-Fi Control",
                             class: "h-6 w-6 rounded"

@@ -378,6 +378,10 @@ fn ZoneCard(
         base_image_url
     };
     let has_image = !image_url.is_empty();
+    // #581: the API returns origin-absolute art paths, so behind an ingress
+    // prefix they must be mapped before becoming an `<img src>` or they
+    // escape the proxy and 404 against Home Assistant itself.
+    let image_url = crate::app::base_path::href(&image_url);
 
     // Now playing display
     let (track, artist) = np
