@@ -36,6 +36,56 @@ fn is_musicassistant(zone: &Zone) -> bool {
     zone.zone_id.starts_with("musicassistant:")
 }
 
+/// Verbatim-URL contract, same as the armed target's art: `image_url` is
+/// already a complete same-origin URL; `image_key` is only ever appended as a
+/// cache-busting query param, never substituted in. Shared by the armed
+/// target and every enriched picker row (#585) so the two don't drift.
+fn resolve_image_url(np: Option<&NowPlaying>) -> String {
+    let base_image_url = np.and_then(|n| n.image_url.clone()).unwrap_or_default();
+    let image_key = np.and_then(|n| n.image_key.clone());
+    if let Some(key) = image_key {
+        let sep = if base_image_url.contains('?') {
+            "&"
+        } else {
+            "?"
+        };
+        format!("{}{}k={}", base_image_url, sep, key)
+    } else {
+        base_image_url
+    }
+}
+
+/// A picker row's now-playing summary: `None` when the zone is idle (no
+/// `NowPlaying` entry yet, or its `line1` reads "Idle" -- same idle signal
+/// the armed target uses), keeping idle rows compact per #585's design.
+struct RowNowPlaying {
+    track: String,
+    is_playing: bool,
+    image_url: String,
+    has_image: bool,
+    volume: Option<f32>,
+    volume_type: Option<String>,
+    volume_step: Option<f32>,
+}
+
+fn row_now_playing(np: Option<&NowPlaying>) -> Option<RowNowPlaying> {
+    let np = np?;
+    let track = np.line1.clone().unwrap_or_default();
+    if track.is_empty() || track == "Idle" {
+        return None;
+    }
+    let image_url = resolve_image_url(Some(np));
+    Some(RowNowPlaying {
+        track,
+        is_playing: np.is_playing,
+        has_image: !image_url.is_empty(),
+        image_url,
+        volume: np.volume,
+        volume_type: np.volume_type.clone(),
+        volume_step: np.volume_step,
+    })
+}
+
 #[component]
 pub fn ZonesStrip(props: ZonesStripProps) -> Element {
     let mut picker_open = use_signal(|| false);
@@ -68,18 +118,7 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
         })
         .unwrap_or_default();
 
-    let base_image_url = np.and_then(|n| n.image_url.clone()).unwrap_or_default();
-    let image_key = np.and_then(|n| n.image_key.clone());
-    let image_url = if let Some(key) = image_key {
-        let sep = if base_image_url.contains('?') {
-            "&"
-        } else {
-            "?"
-        };
-        format!("{}{}k={}", base_image_url, sep, key)
-    } else {
-        base_image_url
-    };
+    let image_url = resolve_image_url(np);
     let has_image = !image_url.is_empty();
 
     let volume = np.and_then(|n| n.volume);
@@ -154,11 +193,18 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
                 }
             },
             div { class: "zones-strip-inner",
-                // Art + now playing, doubles as the picker trigger on small screens
+                // Art + now playing, doubles as the picker trigger on small
+                // screens. Transport/volume below are siblings of this
+                // button, not descendants, so they already can't trigger the
+                // picker toggle -- the "whole header row" the owner asked
+                // about is this button, and it already is the full
+                // clickable target with no propagation hazard from the
+                // controls (owner feedback on #585).
                 button {
                     class: "zones-strip-target",
                     r#type: "button",
-                    aria_label: "Switch play target zone",
+                    aria_label: if picker_open() { "Collapse zone picker" } else { "Expand zone picker" },
+                    title: if picker_open() { "Collapse" } else { "Expand" },
                     aria_expanded: picker_open(),
                     onclick: move |_| picker_open.toggle(),
                     if has_image {
@@ -179,7 +225,15 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
                             span { class: "zones-strip-track zones-strip-track--idle", "Nothing playing" }
                         }
                     }
-                    svg { class: "zones-strip-chevron", fill: "none", view_box: "0 0 24 24", stroke: "currentColor", "stroke-width": "2",
+                    // Owner feedback on #585: the chevron read as pure
+                    // decoration. It now rotates with `picker_open` (same
+                    // legibility signal as `aria_expanded`) and follows the
+                    // library-play-btn convention -- visible at reduced
+                    // opacity always (so touch devices see it), full
+                    // strength on hover/focus rather than hover-only.
+                    svg {
+                        class: if picker_open() { "zones-strip-chevron zones-strip-chevron--open" } else { "zones-strip-chevron" },
+                        fill: "none", view_box: "0 0 24 24", stroke: "currentColor", "stroke-width": "2",
                         path { "stroke-linecap": "round", "stroke-linejoin": "round", d: "M6 9l6 6 6-6" }
                     }
                 }
@@ -236,18 +290,93 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
                             for zone in other_zones {
                                 {
                                     let zone_id = zone.zone_id.clone();
+                                    let zone_id_arm = zone_id.clone();
+                                    let zone_id_play = zone_id.clone();
+                                    let zone_id_vol_down = zone_id.clone();
+                                    let zone_id_vol_up = zone_id.clone();
                                     let source = zone.source.clone().unwrap_or_default();
+                                    // Each row's own now-playing summary, read
+                                    // straight from the map the Library page
+                                    // already threads through props (#585) --
+                                    // no new fetch, no new prop, selective
+                                    // lookup per row like the armed target
+                                    // above.
+                                    let row_np = row_now_playing(props.now_playing.get(&zone.zone_id));
                                     rsx! {
                                         li { key: "{zone.zone_id}",
-                                            button {
-                                                class: "zones-strip-picker-item",
-                                                r#type: "button",
-                                                onclick: move |_| {
-                                                    on_arm.call(zone_id.clone());
-                                                    picker_open.set(false);
-                                                },
-                                                span { "{zone.zone_name}" }
-                                                span { class: "badge badge-secondary", "{crate::app::api::source_label(&source)}" }
+                                            div { class: "zones-strip-picker-row",
+                                                // Row click arms the zone. A real <button>
+                                                // (not a div with a click handler) so the row
+                                                // stays keyboard-operable; the controls below
+                                                // are a sibling, not a nested button, and stop
+                                                // propagation so pause/volume don't also
+                                                // re-arm/navigate (#585).
+                                                button {
+                                                    class: "zones-strip-picker-item",
+                                                    r#type: "button",
+                                                    onclick: move |_| {
+                                                        on_arm.call(zone_id_arm.clone());
+                                                        picker_open.set(false);
+                                                    },
+                                                    if let Some(np) = &row_np {
+                                                        if np.has_image {
+                                                            img {
+                                                                class: "zones-strip-picker-art",
+                                                                src: "{np.image_url}",
+                                                                alt: "Album art"
+                                                            }
+                                                        } else {
+                                                            div { class: "zones-strip-picker-art zones-strip-picker-art--empty", "♪" }
+                                                        }
+                                                    }
+                                                    div { class: "zones-strip-picker-meta",
+                                                        div { class: "zones-strip-picker-name-row",
+                                                            span { "{zone.zone_name}" }
+                                                            span { class: "badge badge-secondary", "{crate::app::api::source_label(&source)}" }
+                                                        }
+                                                        if let Some(np) = &row_np {
+                                                            div { class: "zones-strip-picker-np",
+                                                                if np.is_playing {
+                                                                    span { class: "library-eq", aria_label: "Playing",
+                                                                        span {} span {} span {}
+                                                                    }
+                                                                }
+                                                                span { class: "zones-strip-picker-track", "{np.track}" }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if let Some(np) = row_np {
+                                                    div {
+                                                        class: "zones-strip-picker-controls",
+                                                        // stop_propagation: these buttons
+                                                        // control the row's zone directly, they
+                                                        // must not also arm it (#585).
+                                                        onclick: move |evt: Event<MouseData>| evt.stop_propagation(),
+                                                        button {
+                                                            class: "btn btn-outline btn-sm",
+                                                            r#type: "button",
+                                                            aria_label: if np.is_playing { "Pause" } else { "Play" },
+                                                            onclick: move |_| on_control.call((zone_id_play.clone(), "play_pause".to_string())),
+                                                            if np.is_playing {
+                                                                svg { class: "w-4 h-4", fill: "currentColor", view_box: "0 0 24 24",
+                                                                    path { d: "M6 19h4V5H6v14zm8-14v14h4V5h-4z" }
+                                                                }
+                                                            } else {
+                                                                svg { class: "w-4 h-4", fill: "currentColor", view_box: "0 0 24 24",
+                                                                    path { d: "M8 5v14l11-7z" }
+                                                                }
+                                                            }
+                                                        }
+                                                        VolumeControlsCompact {
+                                                            volume: np.volume,
+                                                            volume_type: np.volume_type,
+                                                            volume_step: np.volume_step,
+                                                            on_vol_down: move |_| on_control.call((zone_id_vol_down.clone(), "vol_down".to_string())),
+                                                            on_vol_up: move |_| on_control.call((zone_id_vol_up.clone(), "vol_up".to_string())),
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }

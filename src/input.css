@@ -766,9 +766,21 @@
     color: var(--text-muted);
   }
 
+  /* Owner feedback on #585: the collapse/expand chevron read as decoration.
+     Visible-dimmed-always, full-strength on hover/focus (same convention as
+     `.library-play-btn`, not a hover-only affordance), and it rotates with
+     `picker_open` so the open/closed state is legible without relying on
+     `aria-expanded` alone. */
   .zones-strip-chevron {
-    @apply hidden size-4 flex-shrink-0 sm:block;
+    @apply hidden size-4 flex-shrink-0 opacity-60 transition-all duration-200 sm:block;
     color: var(--text-muted);
+  }
+  .zones-strip-target:hover .zones-strip-chevron,
+  .zones-strip-target:focus-visible .zones-strip-chevron {
+    opacity: 1;
+  }
+  .zones-strip-chevron--open {
+    transform: rotate(180deg);
   }
 
   .zones-strip-transport {
@@ -784,11 +796,57 @@
     @apply flex flex-col gap-1;
   }
 
+  /* Owner feedback on #585: rows read as inert text. `.zones-strip-picker-item`
+     is the row's select-target -- same hover/focus/cursor affordance as
+     `.library-row` -- so it visibly reads as clickable, distinct from the
+     `.zones-strip-picker-controls` button group beside it (divider below). */
   .zones-strip-picker-item {
-    @apply flex w-full items-center justify-between gap-2 rounded-md px-3 py-2 text-left text-sm;
+    @apply flex w-full min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-md px-3 py-2 text-left text-sm transition-colors;
   }
   .zones-strip-picker-item:hover {
     background: var(--surface-hover);
+  }
+  .zones-strip-picker-item:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: -2px;
+  }
+
+  /* #585: a picker row with now-playing state becomes a mini-controller --
+     art, track, playing indicator, play/pause, and volume nudge -- while an
+     idle row (no `RowNowPlaying`) stays the original compact name + badge. */
+  .zones-strip-picker-row {
+    @apply flex w-full min-w-0 items-center gap-1;
+  }
+
+  .zones-strip-picker-art {
+    @apply size-8 flex-shrink-0 rounded object-cover;
+    background: var(--surface-base);
+  }
+  .zones-strip-picker-art--empty {
+    @apply flex items-center justify-center text-sm;
+    color: var(--text-muted);
+  }
+
+  .zones-strip-picker-meta {
+    @apply flex min-w-0 flex-1 flex-col gap-0.5;
+  }
+  .zones-strip-picker-name-row {
+    @apply flex items-center gap-2;
+  }
+  .zones-strip-picker-np {
+    @apply flex min-w-0 items-center gap-1.5;
+  }
+  .zones-strip-picker-track {
+    @apply truncate text-xs;
+    color: var(--text-muted);
+  }
+
+  /* Divider (not a background) keeps the boundary between the row's
+     select-target and its own controls legible without implying the
+     controls are a second clickable "row" (owner feedback on #585). */
+  .zones-strip-picker-controls {
+    @apply flex flex-shrink-0 items-center gap-1 py-1 pl-2 pr-1;
+    border-left: 1px solid var(--border-subtle);
   }
 
   .zones-strip-transfer {
