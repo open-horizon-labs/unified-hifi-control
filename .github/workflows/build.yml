@@ -1385,9 +1385,12 @@ jobs:
   build-synology:
     name: Build Synology SPK (${{ matrix.arch }})
     needs: [plan, build-linux-x64, build-linux-arm, synology-package-test]
+    # DSM rejects prerelease version strings (e.g. 3.7.0-alpha.1), so skip
+    # Synology entirely on prerelease tags rather than failing the matrix.
     if: |
       always() &&
       needs.plan.outputs.build_synology == 'true' &&
+      !contains(needs.plan.outputs.version, '-') &&
       needs.build-linux-x64.result == 'success' &&
       needs.synology-package-test.result == 'success'
     runs-on: ubuntu-latest
@@ -1892,7 +1895,22 @@ jobs:
   upload-release:
     name: Upload to Release
     needs: [plan, build-linux-x64, build-linux-arm, build-macos-universal, build-applemusic-companion-dmg, build-windows, build-linux-packages, build-lms-universal, build-synology, build-qnap-x64, build-qnap-arm]
-    if: needs.plan.outputs.is_release == 'true'
+    # A skipped build-synology (prerelease tags: DSM rejects those version
+    # strings) must not sink the whole release upload — every other artifact
+    # is still required to succeed.
+    if: |
+      always() &&
+      needs.plan.outputs.is_release == 'true' &&
+      needs.build-linux-x64.result == 'success' &&
+      needs.build-linux-arm.result == 'success' &&
+      needs.build-macos-universal.result == 'success' &&
+      needs.build-applemusic-companion-dmg.result == 'success' &&
+      needs.build-windows.result == 'success' &&
+      needs.build-linux-packages.result == 'success' &&
+      needs.build-lms-universal.result == 'success' &&
+      needs.build-qnap-x64.result == 'success' &&
+      needs.build-qnap-arm.result == 'success' &&
+      (needs.build-synology.result == 'success' || needs.build-synology.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write
