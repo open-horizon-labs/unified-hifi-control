@@ -276,6 +276,46 @@ pub fn playlist(title: &str, tracks: &[&str]) -> FakeItem {
     FakeItem::list(title).with_children(children)
 }
 
+/// An album level shaped like the #573 live crawl captured it: the "Play
+/// Album" verb is an `action_list` wrapper, and -- crucially -- **the track
+/// rows themselves are `action_list` hinted too** (entering a track opens
+/// its Play Now/Queue/Start Radio menu), each carrying an artist subtitle
+/// and artwork. The pre-#573 fixtures modeled tracks as `hint: list`, which
+/// is why #545's "drop every action-hinted row" filter passed every test
+/// while emptying every real album ("`{\"items\":[]}` for a 95-track
+/// playlist").
+pub fn album_live(title: &str, artist: &str, tracks: &[&str]) -> FakeItem {
+    let mut children = vec![FakeItem::action_list("Play Album").with_children(play_actions())];
+    for track in tracks {
+        children.push(
+            FakeItem::action_list(track)
+                .with_subtitle(artist)
+                .with_image_key(&format!("img_{}", track.to_lowercase().replace(' ', "_")))
+                .with_children(play_actions()),
+        );
+    }
+    FakeItem::list(title)
+        .with_subtitle(artist)
+        .with_image_key(&format!("img_{}", title.to_lowercase().replace(' ', "_")))
+        .with_children(children)
+}
+
+/// A playlist level shaped like the #573 live crawl: an immediately-invokable
+/// `"Play Playlist"` action alongside `action_list`-hinted track rows with
+/// artist subtitles (the same live shape #545's repro captured, now with the
+/// track hint modeled correctly -- see [`album_live`]).
+pub fn playlist_live(title: &str, tracks: &[(&str, &str)]) -> FakeItem {
+    let mut children = vec![FakeItem::action("Play Playlist")];
+    for (track, artist) in tracks {
+        children.push(
+            FakeItem::action_list(track)
+                .with_subtitle(artist)
+                .with_children(play_actions()),
+        );
+    }
+    FakeItem::list(title).with_children(children)
+}
+
 /// The fake Core's library: a browse root plus a flat set of searchable items.
 #[derive(Debug, Clone)]
 pub struct FakeLibrary {

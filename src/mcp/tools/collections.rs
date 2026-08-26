@@ -71,7 +71,10 @@ pub fn collections_tabs_for_zone(zone_id: &str) -> Vec<&'static str> {
     if matches!(support(target, Capability::Browse), Support::Supported) {
         tabs.push("browse");
     }
-    if matches!(support(target, Capability::SavedPlaylists), Support::Supported) {
+    if matches!(
+        support(target, Capability::SavedPlaylists),
+        Support::Supported
+    ) {
         tabs.push("playlists");
     }
     if matches!(support(target, Capability::Favorites), Support::Supported) {
@@ -690,6 +693,40 @@ fn refuse_foreign_path(env: Envelope) -> Result<CallToolResult, CallToolError> {
             "Browse again from this zone and use that result's path.",
         ),
     )
+}
+
+#[cfg(test)]
+mod tab_gating_tests {
+    use super::*;
+
+    /// #573 defect 6: Roon serves Browse and Playlists only -- Favorites
+    /// and Radio (both the `favorites` capability) are not wired, so the
+    /// Library page must not render those tabs for Roon zones.
+    #[test]
+    fn roon_zones_serve_browse_and_playlists_only() {
+        assert_eq!(
+            collections_tabs_for_zone("roon:zone_1"),
+            vec!["browse", "playlists"]
+        );
+    }
+
+    /// The tab list is exactly the capability table's view: a provider this
+    /// tool does not reach at all serves no tabs.
+    #[test]
+    fn unreached_providers_serve_no_tabs() {
+        assert!(collections_tabs_for_zone("spotify:acct").is_empty());
+        assert!(collections_tabs_for_zone("hqplayer:main").is_empty());
+    }
+
+    /// Music Assistant keeps all four tabs (favorites supported implies the
+    /// Radio tab, which is the same capability under `media_type: radio`).
+    #[test]
+    fn music_assistant_serves_all_tabs() {
+        assert_eq!(
+            collections_tabs_for_zone("musicassistant:player_1"),
+            vec!["browse", "playlists", "favorites", "radio"]
+        );
+    }
 }
 
 fn refuse_unknown_path(env: Envelope) -> Result<CallToolResult, CallToolError> {

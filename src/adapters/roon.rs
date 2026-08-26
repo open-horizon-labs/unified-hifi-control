@@ -257,7 +257,7 @@ pub(crate) fn is_immediate_action_row(item: &BrowseItem) -> bool {
     match item.hint {
         Some(ItemHint::Action) => true,
         Some(ItemHint::ActionList) => {
-            item.subtitle.as_deref().map_or(true, str::is_empty)
+            item.subtitle.as_deref().is_none_or(str::is_empty)
                 && item.image_key.is_none()
                 && is_play_verb_title(&item.title)
         }
@@ -309,7 +309,7 @@ fn is_play_verb_title(title: &str) -> bool {
 /// happens to be titled "No Results" keeps its subtitle/art and stays.
 pub(crate) fn is_no_results_placeholder(item: &BrowseItem) -> bool {
     item.title.eq_ignore_ascii_case("no results")
-        && item.subtitle.as_deref().map_or(true, str::is_empty)
+        && item.subtitle.as_deref().is_none_or(str::is_empty)
         && item.image_key.is_none()
         && !matches!(item.hint, Some(ItemHint::List))
 }
@@ -4467,6 +4467,116 @@ async fn run_roon_loop(
 
 // Startable trait implementation via macro
 crate::impl_startable!(RoonAdapter, "roon", is_configured);
+
+#[cfg(test)]
+mod defect_573_row_classification {
+    use super::*;
+
+    fn item(title: &str, hint: Option<ItemHint>) -> BrowseItem {
+        BrowseItem {
+            title: title.to_string(),
+            subtitle: None,
+            image_key: None,
+            item_key: Some("k".to_string()),
+            hint,
+            input_prompt: None,
+        }
+    }
+
+    /// Every play-verb shape observed live is an action row.
+    #[test]
+    fn verb_rows_are_immediate_action_rows() {
+        for title in [
+            "Play Now",
+            "Play Album",
+            "Play Playlist",
+            "Play Artist",
+            "Shuffle",
+            "Queue",
+            "Start Radio",
+        ] {
+            assert!(
+                is_immediate_action_row(&item(title, Some(ItemHint::ActionList))),
+                "{title} (action_list) must classify as an action row"
+            );
+        }
+        // A plain `action` hint always fires immediately, whatever its title.
+        assert!(is_immediate_action_row(&item(
+            "Anything",
+            Some(ItemHint::Action)
+        )));
+    }
+
+    /// #573 defect 1: an `action_list` track row (artist subtitle, artwork)
+    /// is content, never an action row -- including tracks whose titles
+    /// start with "Play".
+    #[test]
+    fn action_list_track_rows_are_content() {
+        let mut track = item("So What", Some(ItemHint::ActionList));
+        track.subtitle = Some("Miles Davis".to_string());
+        assert!(!is_immediate_action_row(&track));
+
+        let mut tricky = item("Play That Funky Music", Some(ItemHint::ActionList));
+        tricky.subtitle = Some("Wild Cherry".to_string());
+        assert!(
+            !is_immediate_action_row(&tricky),
+            "a track titled with the word Play keeps its subtitle and stays content"
+        );
+
+        // Even a bare action_list row is content unless its title reads as
+        // a known verb.
+        assert!(!is_immediate_action_row(&item(
+            "Blue in Green",
+            Some(ItemHint::ActionList)
+        )));
+
+        // List rows are never action rows.
+        assert!(!is_immediate_action_row(&item(
+            "Play Album",
+            Some(ItemHint::List)
+        )));
+    }
+
+    /// #573 defect 7: the placeholder is matched by title plus the absence
+    /// of every content signal.
+    #[test]
+    fn no_results_placeholder_is_detected() {
+        assert!(is_no_results_placeholder(&item("No Results", None)));
+        assert!(is_no_results_placeholder(&item("no results", None)));
+
+        let mut real_track = item("No Results", None);
+        real_track.subtitle = Some("Some Band".to_string());
+        assert!(
+            !is_no_results_placeholder(&real_track),
+            "a real track titled No Results keeps its subtitle and stays"
+        );
+        assert!(!is_no_results_placeholder(&item(
+            "No Results",
+            Some(ItemHint::List)
+        )));
+    }
+
+    /// #573 defect 5: markup stripping, including the compound live shapes.
+    #[test]
+    fn link_markup_is_stripped_to_plain_names() {
+        assert_eq!(
+            strip_roon_link_markup("[[55418|Michael Jackson]]"),
+            "Michael Jackson"
+        );
+        assert_eq!(
+            strip_roon_link_markup("[[8827258|Willie Colón]] & [[1981050|Rubén Blades]]"),
+            "Willie Colón & Rubén Blades"
+        );
+        assert_eq!(strip_roon_link_markup("plain text"), "plain text");
+        // Malformed shapes pass through verbatim rather than being guessed at.
+        assert_eq!(strip_roon_link_markup("[[no pipe]]"), "[[no pipe]]");
+        assert_eq!(strip_roon_link_markup("[[unterminated"), "[[unterminated");
+        assert_eq!(
+            strip_roon_link_markup("prefix [[1|Name]] suffix"),
+            "prefix Name suffix"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

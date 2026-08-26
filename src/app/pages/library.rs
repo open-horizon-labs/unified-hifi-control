@@ -299,6 +299,19 @@ fn missing_now_playing_zones(
         .collect()
 }
 
+/// A failed level load, split by what went wrong (#573 visual pass V3).
+///
+/// `unreachable` is true only when the HTTP request itself failed -- the one
+/// case "«source» isn't reachable right now." is true of. A well-formed
+/// refusal envelope (a capability gap, an expired path, ...) reaches the
+/// server fine; rendering it under unreachability copy told users the
+/// provider was down when it wasn't.
+#[derive(Clone, Debug, PartialEq)]
+struct LevelError {
+    message: String,
+    unreachable: bool,
+}
+
 /// Fetch one page of the current level and apply it.
 #[allow(clippy::too_many_arguments)]
 async fn load_page(
@@ -312,7 +325,7 @@ async fn load_page(
     mut next_offset: Signal<Option<u32>>,
     mut offset: Signal<u32>,
     mut loading: Signal<bool>,
-    mut error: Signal<Option<String>>,
+    mut error: Signal<Option<LevelError>>,
 ) {
     loading.set(true);
     error.set(None);
@@ -336,15 +349,26 @@ async fn load_page(
             offset.set(request_offset);
         }
         Ok(env) => {
-            error.set(Some(env.error_detail()));
+            error.set(Some(LevelError {
+                message: env.error_detail(),
+                unreachable: false,
+            }));
             if !append {
+                // #573 visual pass V2: clear the whole level, not just the
+                // items -- a stale `next_offset` would render "Load more"
+                // under the error panel.
                 items.set(Vec::new());
+                next_offset.set(None);
             }
         }
         Err(message) => {
-            error.set(Some(message));
+            error.set(Some(LevelError {
+                message,
+                unreachable: true,
+            }));
             if !append {
                 items.set(Vec::new());
+                next_offset.set(None);
             }
         }
     }
@@ -559,7 +583,7 @@ pub fn Library(
     let offset = use_signal(|| 0u32);
     let next_offset = use_signal(|| None::<u32>);
     let loading = use_signal(|| false);
-    let error = use_signal(|| None::<String>);
+    let error = use_signal(|| None::<LevelError>);
     let mut status = use_signal(|| None::<String>);
 
     let refresh = use_callback(move |append: bool| {
@@ -863,12 +887,24 @@ pub fn Library(
                 Link { class: "btn btn-primary", to: Route::Settings {}, "Go to Settings" }
             }
         }
-    } else if let Some(message) = current_error.clone() {
+    } else if let Some(level_error) = current_error.clone() {
         let retry_source = current_source.clone();
+        // #573 visual pass V3: unreachability copy is reserved for actual
+        // network failures; a genuine refusal (a capability gap, an expired
+        // path) renders its own reason instead of claiming the provider is
+        // down.
+        let heading = if level_error.unreachable {
+            format!(
+                "{} isn't reachable right now.",
+                source_label(current_source.as_deref().unwrap_or("this source"))
+            )
+        } else {
+            "This view isn't available.".to_string()
+        };
         rsx! {
             div { class: "library-provider-down",
-                p { "{source_label(current_source.as_deref().unwrap_or(\"this source\"))} isn't reachable right now." }
-                p { class: "text-sm text-muted", "{message}" }
+                p { "{heading}" }
+                p { class: "text-sm text-muted", "{level_error.message}" }
                 button {
                     class: "btn btn-outline",
                     r#type: "button",
@@ -922,6 +958,18 @@ pub fn Library(
                                 li {
                                     key: "{result.title}-{result.subtitle.clone().unwrap_or_default()}",
                                     class: "library-row",
+                                    // #573 visual pass V1: the whole result
+                                    // row opens a navigable hit, same as
+                                    // browse rows.
+                                    onclick: {
+                                        let path = result.path.clone();
+                                        let title = result.title.clone();
+                                        move |_| {
+                                            if let Some(path) = path.clone() {
+                                                open_folder((title.clone(), path.clone()));
+                                            }
+                                        }
+                                    },
                                     div { class: "min-w-0 flex items-center gap-2",
                                         // #573 defect 10: search hits carry
                                         // artwork where the provider supplies
@@ -948,7 +996,10 @@ pub fn Library(
                                                 class: "library-play-btn",
                                                 aria_label: "Play {result.title}",
                                                 r#type: "button",
-                                                onclick: move |_| play_item((item_ref.clone(), "play")),
+                                                onclick: move |evt: Event<MouseData>| {
+                                                    evt.stop_propagation();
+                                                    play_item((item_ref.clone(), "play"));
+                                                },
                                                 "▶"
                                             }
                                         }
@@ -970,7 +1021,13 @@ pub fn Library(
                                                 onclick: {
                                                     let title = result.title.clone();
                                                     let path = path.clone();
-                                                    move |_| open_folder((title.clone(), path.clone()))
+                                                    // stop_propagation: the row's
+                                                    // own click does the same
+                                                    // navigation.
+                                                    move |evt: Event<MouseData>| {
+                                                        evt.stop_propagation();
+                                                        open_folder((title.clone(), path.clone()));
+                                                    }
                                                 },
                                                 svg { class: "w-5 h-5", fill: "none", view_box: "0 0 24 24", stroke: "currentColor", "stroke-width": "2",
                                                     path { "stroke-linecap": "round", "stroke-linejoin": "round", d: "M9 5l7 7-7 7" }
@@ -1050,7 +1107,6 @@ pub fn Library(
                     div { class: "library-tabs",
                         for candidate in visible_tabs() {
                             {
-                                let candidate = candidate;
                                 let active = candidate == current_tab;
                                 rsx! {
                                     button {
@@ -1195,6 +1251,20 @@ fn LibraryRow(
         li {
             class: "library-row library-row--reveal",
             style: "{stagger_style}",
+            // #573 visual pass V1: the whole row is the navigation target
+            // for a navigable item, matching the row-wide hover affordance
+            // -- not just the right-edge chevron. The play/overflow/chevron
+            // buttons stop propagation so their own actions stay separate
+            // hit areas.
+            onclick: {
+                let path = item.path.clone();
+                let title = item.title.clone();
+                move |_| {
+                    if let Some(path) = path.clone() {
+                        on_open((title.clone(), path.clone()));
+                    }
+                }
+            },
             div { class: "min-w-0 flex items-center gap-2",
                 if let Some(image) = item.image.clone() {
                     img {
@@ -1229,7 +1299,10 @@ fn LibraryRow(
                         r#type: "button",
                         onclick: {
                             let item_ref = item_ref.clone();
-                            move |_| on_play((item_ref.clone(), "play"))
+                            move |evt: Event<MouseData>| {
+                                evt.stop_propagation();
+                                on_play((item_ref.clone(), "play"));
+                            }
                         },
                         "▶"
                     }
@@ -1238,7 +1311,10 @@ fn LibraryRow(
                             class: "library-overflow-trigger",
                             aria_label: "More actions for {item.title}",
                             r#type: "button",
-                            onclick: move |_| menu_open.toggle(),
+                            onclick: move |evt: Event<MouseData>| {
+                                evt.stop_propagation();
+                                menu_open.toggle();
+                            },
                             "⋯"
                         }
                         if menu_open() {
@@ -1247,7 +1323,8 @@ fn LibraryRow(
                                     r#type: "button",
                                     onclick: {
                                         let item_ref = item_ref.clone();
-                                        move |_| {
+                                        move |evt: Event<MouseData>| {
+                                            evt.stop_propagation();
                                             menu_open.set(false);
                                             on_play((item_ref.clone(), "next"));
                                         }
@@ -1258,7 +1335,8 @@ fn LibraryRow(
                                     r#type: "button",
                                     onclick: {
                                         let item_ref = item_ref.clone();
-                                        move |_| {
+                                        move |evt: Event<MouseData>| {
+                                            evt.stop_propagation();
                                             menu_open.set(false);
                                             on_play((item_ref.clone(), "queue"));
                                         }
@@ -1277,7 +1355,12 @@ fn LibraryRow(
                         onclick: {
                             let title = item.title.clone();
                             let path = path.clone();
-                            move |_| on_open((title.clone(), path.clone()))
+                            // stop_propagation so the row's own click
+                            // handler (same navigation) doesn't fire twice.
+                            move |evt: Event<MouseData>| {
+                                evt.stop_propagation();
+                                on_open((title.clone(), path.clone()));
+                            }
                         },
                         svg { class: "w-5 h-5", fill: "none", view_box: "0 0 24 24", stroke: "currentColor", "stroke-width": "2",
                             path { "stroke-linecap": "round", "stroke-linejoin": "round", d: "M9 5l7 7-7 7" }
@@ -1306,17 +1389,20 @@ fn LibraryTile(
         li {
             class: "library-tile library-tile--reveal",
             style: "{stagger_style}",
+            // #573 visual pass V1: the whole tile navigates (art, title,
+            // subtitle alike), not just the art block -- the play button
+            // below stops propagation to stay its own hit area.
+            onclick: {
+                let path = item.path.clone();
+                let title = item.title.clone();
+                move |_| {
+                    if let Some(path) = path.clone() {
+                        on_open((title.clone(), path.clone()));
+                    }
+                }
+            },
             div {
                 class: "library-tile-art",
-                onclick: {
-                    let path = item.path.clone();
-                    let title = item.title.clone();
-                    move |_| {
-                        if let Some(path) = path.clone() {
-                            on_open((title.clone(), path.clone()));
-                        }
-                    }
-                },
                 if let Some(image) = item.image.clone() {
                     img {
                         class: "library-tile-art-img",
@@ -1502,5 +1588,51 @@ mod loop_regression_tests {
     fn empty_zone_list_fetches_nothing() {
         let missing = missing_now_playing_zones(&[], &HashMap::new());
         assert!(missing.is_empty());
+    }
+}
+
+/// #573 pins for the Library page's pure helpers.
+#[cfg(test)]
+mod library_defect_pins {
+    use super::*;
+
+    /// Defect 2 pin: the API's `image` field is the complete `<img src>`
+    /// value. It must be used verbatim -- prefixing it again
+    /// (`/api/collections/image?ref={image}` around an already-full path)
+    /// is the double-prefix regression that 404ed every image.
+    #[test]
+    fn api_image_url_is_used_verbatim_as_img_src() {
+        let api_value = "/api/collections/image?ref=ref_abc123";
+        let src = image_src(api_value);
+        assert_eq!(src, api_value, "the API value must pass through verbatim");
+        assert!(
+            !src.contains("?ref=/api/"),
+            "src must never be double-prefixed"
+        );
+    }
+
+    /// Defect 6 pin: a Roon zone's served-tab list hides Favorites and
+    /// Radio; the rendered set is exactly what the server reports.
+    #[test]
+    fn roon_tab_list_hides_favorites_and_radio() {
+        let served = vec!["browse".to_string(), "playlists".to_string()];
+        assert_eq!(visible_tabs_for(&served), vec![Tab::Browse, Tab::Playlists]);
+    }
+
+    /// Defect 6 pin: no tab information (a `/zones` response from a build
+    /// predating `library_tabs`) degrades to showing every tab, never none.
+    #[test]
+    fn missing_tab_information_shows_every_tab() {
+        assert_eq!(visible_tabs_for(&[]), TABS.to_vec());
+    }
+
+    /// Defect 6 pin: a deep link to a tab this provider does not serve
+    /// lands on Browse instead of a permanent refusal page.
+    #[test]
+    fn unsupported_deep_linked_tab_falls_back_to_browse() {
+        let visible = vec![Tab::Browse, Tab::Playlists];
+        assert_eq!(effective_tab(Tab::Favorites, &visible), Tab::Browse);
+        assert_eq!(effective_tab(Tab::Radio, &visible), Tab::Browse);
+        assert_eq!(effective_tab(Tab::Playlists, &visible), Tab::Playlists);
     }
 }

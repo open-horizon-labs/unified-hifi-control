@@ -145,6 +145,14 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
 
     rsx! {
         div { class: "zones-strip",
+            // #573 (visual pass V4): Escape closes the zone picker. Key
+            // events bubble from whichever picker control has focus, so the
+            // strip container is the one place that hears them all.
+            onkeydown: move |evt| {
+                if evt.key() == Key::Escape {
+                    picker_open.set(false);
+                }
+            },
             div { class: "zones-strip-inner",
                 // Art + now playing, doubles as the picker trigger on small screens
                 button {
