@@ -17,10 +17,14 @@
 //!    integration is set up. This is the only source that can say *no*, and
 //!    it needs `homeassistant_api: true` in the add-on's `config.yaml`.
 //! 2. **Home Assistant's birth announcement.** HA's MQTT integration
-//!    publishes `online` to `<discovery_prefix>/status` whenever it connects
-//!    to the broker. UHC is already connected to that broker, so subscribing
-//!    to that topic upgrades the state the moment the user adds the
-//!    integration - no add-on restart, no waiting for the next poll.
+//!    publishes `online` to `homeassistant/status` whenever it connects to
+//!    the broker (see [`DEFAULT_STATUS_TOPIC`] - that topic is *not* derived
+//!    from the discovery prefix). UHC is already connected to that broker, so
+//!    subscribing to it upgrades the state the moment the user adds the
+//!    integration - no add-on restart, no waiting for the next poll. Home
+//!    Assistant's own integration docs name this message as the intended
+//!    trigger for publishers to re-send discovery, which is what makes the
+//!    zones appear seconds after the integration is added.
 //!
 //! Neither source is complete on its own. The core API is unavailable when
 //! UHC is not running as an add-on (or when `homeassistant_api` is missing);
@@ -32,6 +36,8 @@
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+
+use tokio_util::sync::CancellationToken;
 
 /// Add-on environment variable carrying the Supervisor API token. Its
 /// absence is the signal that UHC is not running as a Home Assistant add-on,
@@ -371,7 +377,11 @@ fn core_api_credentials() -> Option<(String, String)> {
 ///
 /// With no token available there is nothing to poll, so no task is spawned at
 /// all - the monitor keeps its honest default and records why.
-pub fn spawn_core_poll(monitor: Arc<ConsumerMonitor>) {
+///
+/// `shutdown` is the server's own token: the poll would otherwise outlive a
+/// Ctrl+C and hang graceful shutdown, since nothing else can interrupt a
+/// sleeping ticker (`tests/spawn_cancellation_lint.rs`).
+pub fn spawn_core_poll(monitor: Arc<ConsumerMonitor>, shutdown: CancellationToken) {
     let Some((url, token)) = core_api_credentials() else {
         monitor.observe(Evidence::CoreUnavailable(NOT_AN_ADDON.to_string()));
         tracing::debug!(
@@ -399,7 +409,10 @@ pub fn spawn_core_poll(monitor: Arc<ConsumerMonitor>) {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut previous: Option<HomeAssistantState> = None;
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
             let evidence = probe_core(&client, &token, &url).await;
             monitor.observe(evidence);
             let current = monitor.snapshot().state;
@@ -586,10 +599,7 @@ mod tests {
             serde_json::json!("nope"),
         ] {
             assert!(
-                matches!(
-                    classify_core_config(&body),
-                    Evidence::CoreUnavailable(_)
-                ),
+                matches!(classify_core_config(&body), Evidence::CoreUnavailable(_)),
                 "{body} should be unavailable, not a claim about Home Assistant"
             );
         }
@@ -620,6 +630,9 @@ mod tests {
         );
         assert!(is_status_topic("ha-prod", "homeassistant/status"));
         assert!(is_status_topic("ha-prod", "ha-prod/status"));
-        assert!(!is_status_topic("ha-prod", "unified-hifi/media_player/x/y/set"));
+        assert!(!is_status_topic(
+            "ha-prod",
+            "unified-hifi/media_player/x/y/set"
+        ));
     }
 }

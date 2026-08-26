@@ -758,7 +758,7 @@ mod server {
         // what lets Settings say something useful the moment publishing is
         // switched on. Outside the add-on this returns immediately without
         // spawning anything.
-        mqtt::consumer::spawn_core_poll(state.mqtt.consumer_monitor());
+        mqtt::consumer::spawn_core_poll(state.mqtt.consumer_monitor(), shutdown_token.clone());
 
         // Clone state for shutdown diagnostics
         let state_for_shutdown = state.clone();
