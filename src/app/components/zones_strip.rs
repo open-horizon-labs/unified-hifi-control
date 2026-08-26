@@ -68,6 +68,19 @@ struct RowNowPlaying {
     volume_step: Option<f32>,
 }
 
+/// Source badge, rendered identically by the armed header and every picker
+/// row (#596) so the two can't drift. A zone without a known source gets no
+/// badge at all rather than an empty pill.
+fn source_badge(source: Option<&str>) -> Element {
+    let Some(source) = source.filter(|s| !s.is_empty()) else {
+        return rsx! {};
+    };
+    let label = crate::app::api::source_label(source);
+    rsx! {
+        span { class: "badge badge-secondary zones-strip-source-badge", "{label}" }
+    }
+}
+
 fn row_now_playing(np: Option<&NowPlaying>) -> Option<RowNowPlaying> {
     let np = np?;
     let track = np.line1.clone().unwrap_or_default();
@@ -127,11 +140,6 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
     let volume_step = np.and_then(|n| n.volume_step);
 
     let armed_id = armed.zone_id.clone();
-    let armed_id_prev = armed_id.clone();
-    let armed_id_play = armed_id.clone();
-    let armed_id_next = armed_id.clone();
-    let armed_id_vol_down = armed_id.clone();
-    let armed_id_vol_up = armed_id.clone();
     let armed_id_transfer = armed_id.clone();
 
     let can_transfer = is_musicassistant(armed);
@@ -176,6 +184,17 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
 
     let on_control = props.on_control;
     let on_arm = props.on_arm;
+    // #596: one handler factory per event shape instead of a cloned zone-id
+    // binding per button. `ctl` covers click handlers, `vol_ctl` the
+    // volume component's unit-typed callbacks.
+    let ctl = |action: &'static str| {
+        let id = armed_id.clone();
+        move |_: Event<MouseData>| on_control.call((id.clone(), action.to_string()))
+    };
+    let vol_ctl = |action: &'static str| {
+        let id = armed_id.clone();
+        move |_: ()| on_control.call((id.clone(), action.to_string()))
+    };
     let other_zones: Vec<Zone> = props
         .zones
         .iter()
@@ -218,7 +237,13 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
                         div { class: "zones-strip-art zones-strip-art--empty", "♪" }
                     }
                     div { class: "zones-strip-meta",
-                        span { class: "zones-strip-zone-name", "{armed.zone_name}" }
+                        // #596: same name+badge grammar as the picker rows --
+                        // the header is the elevated form of the same row,
+                        // not a different layout.
+                        div { class: "zones-strip-name-row",
+                            span { class: "zones-strip-zone-name zones-strip-zone-name--armed", "{armed.zone_name}" }
+                            {source_badge(armed.source.as_deref())}
+                        }
                         if !track.is_empty() {
                             span { class: "zones-strip-track", "{track}" }
                             span { class: "zones-strip-artist", "{artist}" }
@@ -239,12 +264,15 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
                     }
                 }
 
-                // Transport
-                div { class: "zones-strip-transport",
+                // #596: transport + volume live in one right-aligned rail
+                // with fixed column widths, shared with every picker row, so
+                // play / - / value / + sit on the same vertical axes across
+                // the whole strip regardless of name/track length.
+                div { class: "zones-strip-rail",
                     button {
                         class: "btn btn-ghost",
                         aria_label: "Previous track",
-                        onclick: move |_| on_control.call((armed_id_prev.clone(), "previous".to_string())),
+                        onclick: ctl("previous"),
                         svg { class: "w-5 h-5", fill: "currentColor", view_box: "0 0 24 24",
                             path { d: "M6 6h2v12H6zm3.5 6l8.5 6V6z" }
                         }
@@ -252,7 +280,7 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
                     button {
                         class: "btn btn-primary",
                         aria_label: if is_playing { "Pause" } else { "Play" },
-                        onclick: move |_| on_control.call((armed_id_play.clone(), "play_pause".to_string())),
+                        onclick: ctl("play_pause"),
                         if is_playing {
                             svg { class: "w-5 h-5", fill: "currentColor", view_box: "0 0 24 24",
                                 path { d: "M6 19h4V5H6v14zm8-14v14h4V5h-4z" }
@@ -266,19 +294,25 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
                     button {
                         class: "btn btn-ghost",
                         aria_label: "Next track",
-                        onclick: move |_| on_control.call((armed_id_next.clone(), "next".to_string())),
+                        onclick: ctl("next"),
                         svg { class: "w-5 h-5", fill: "currentColor", view_box: "0 0 24 24",
                             path { d: "M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" }
                         }
                     }
-                }
 
-                VolumeControlsCompact {
-                    volume: volume,
-                    volume_type: volume_type,
-                    volume_step: volume_step,
-                    on_vol_down: move |_| on_control.call((armed_id_vol_down.clone(), "vol_down".to_string())),
-                    on_vol_up: move |_| on_control.call((armed_id_vol_up.clone(), "vol_up".to_string())),
+                    // Fixed-width volume slot (see `.zones-strip-volume`):
+                    // tabular numerals in a fixed box so +/- never shift as
+                    // digits change, reserved even for fixed-volume zones so
+                    // the play column never drifts.
+                    div { class: "zones-strip-volume",
+                        VolumeControlsCompact {
+                            volume: volume,
+                            volume_type: volume_type,
+                            volume_step: volume_step,
+                            on_vol_down: vol_ctl("vol_down"),
+                            on_vol_up: vol_ctl("vol_up"),
+                        }
+                    }
                 }
             }
 
@@ -292,10 +326,16 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
                                 {
                                     let zone_id = zone.zone_id.clone();
                                     let zone_id_arm = zone_id.clone();
-                                    let zone_id_play = zone_id.clone();
-                                    let zone_id_vol_down = zone_id.clone();
-                                    let zone_id_vol_up = zone_id.clone();
-                                    let source = zone.source.clone().unwrap_or_default();
+                                    // Same handler-factory pattern as the
+                                    // armed header (#596).
+                                    let row_ctl = |action: &'static str| {
+                                        let id = zone_id.clone();
+                                        move |_: Event<MouseData>| on_control.call((id.clone(), action.to_string()))
+                                    };
+                                    let row_vol_ctl = |action: &'static str| {
+                                        let id = zone_id.clone();
+                                        move |_: ()| on_control.call((id.clone(), action.to_string()))
+                                    };
                                     // Each row's own now-playing summary, read
                                     // straight from the map the Library page
                                     // already threads through props (#585) --
@@ -331,9 +371,12 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
                                                         }
                                                     }
                                                     div { class: "zones-strip-picker-meta",
-                                                        div { class: "zones-strip-picker-name-row",
-                                                            span { class: "zones-strip-picker-name", "{zone.zone_name}" }
-                                                            span { class: "badge badge-secondary flex-shrink-0", "{crate::app::api::source_label(&source)}" }
+                                                        // #596: same name-row / zone-name / track
+                                                        // classes as the armed header -- one
+                                                        // grammar, the header merely elevated.
+                                                        div { class: "zones-strip-name-row",
+                                                            span { class: "zones-strip-zone-name", "{zone.zone_name}" }
+                                                            {source_badge(zone.source.as_deref())}
                                                         }
                                                         if let Some(np) = &row_np {
                                                             div { class: "zones-strip-picker-np",
@@ -342,14 +385,18 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
                                                                         span {} span {} span {}
                                                                     }
                                                                 }
-                                                                span { class: "zones-strip-picker-track", "{np.track}" }
+                                                                span { class: "zones-strip-track zones-strip-track--muted", "{np.track}" }
                                                             }
                                                         }
                                                     }
                                                 }
                                                 if let Some(np) = row_np {
                                                     div {
-                                                        class: "zones-strip-picker-controls",
+                                                        // #596: same fixed-column rail as the
+                                                        // armed header; the spacer stands in for
+                                                        // the header's next-track column so the
+                                                        // play buttons share a vertical axis.
+                                                        class: "zones-strip-rail zones-strip-picker-controls",
                                                         // stop_propagation: these buttons
                                                         // control the row's zone directly, they
                                                         // must not also arm it (#585).
@@ -358,7 +405,7 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
                                                             class: "btn btn-outline btn-sm",
                                                             r#type: "button",
                                                             aria_label: if np.is_playing { "Pause" } else { "Play" },
-                                                            onclick: move |_| on_control.call((zone_id_play.clone(), "play_pause".to_string())),
+                                                            onclick: row_ctl("play_pause"),
                                                             if np.is_playing {
                                                                 svg { class: "w-4 h-4", fill: "currentColor", view_box: "0 0 24 24",
                                                                     path { d: "M6 19h4V5H6v14zm8-14v14h4V5h-4z" }
@@ -369,12 +416,15 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
                                                                 }
                                                             }
                                                         }
-                                                        VolumeControlsCompact {
-                                                            volume: np.volume,
-                                                            volume_type: np.volume_type,
-                                                            volume_step: np.volume_step,
-                                                            on_vol_down: move |_| on_control.call((zone_id_vol_down.clone(), "vol_down".to_string())),
-                                                            on_vol_up: move |_| on_control.call((zone_id_vol_up.clone(), "vol_up".to_string())),
+                                                        span { class: "zones-strip-rail-spacer", aria_hidden: "true" }
+                                                        div { class: "zones-strip-volume",
+                                                            VolumeControlsCompact {
+                                                                volume: np.volume,
+                                                                volume_type: np.volume_type,
+                                                                volume_step: np.volume_step,
+                                                                on_vol_down: row_vol_ctl("vol_down"),
+                                                                on_vol_up: row_vol_ctl("vol_up"),
+                                                            }
                                                         }
                                                     }
                                                 }
