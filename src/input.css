@@ -559,11 +559,18 @@
     @apply flex items-center gap-1 flex-shrink-0;
   }
 
-  /* Play affordance: hidden until hover/focus so the row's own chevron (or
-     plain layout, for a leaf with no folder) stays the primary target. */
+  /* Play affordance: always visible at reduced emphasis (the owner could not
+     find the hover-only version, and touch devices have no hover at all);
+     hover/focus brings it to full strength. */
   .library-play-btn {
-    @apply inline-flex size-9 items-center justify-center rounded-full opacity-0 transition-opacity;
+    @apply inline-flex size-9 items-center justify-center rounded-full opacity-45 transition-opacity;
     color: var(--text-secondary);
+  }
+  @media (hover: none) {
+    .library-play-btn,
+    .library-tile-play {
+      opacity: 1;
+    }
   }
   .library-row:hover .library-play-btn,
   .library-row:focus-within .library-play-btn,

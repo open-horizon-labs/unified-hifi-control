@@ -706,6 +706,29 @@ pub fn Library(
         }
     };
 
+    // A search hit from the "Everywhere" results is NOT a child of the level
+    // the user happens to be standing on -- appending it to the current
+    // breadcrumb stack fabricates a lineage that never existed (live report:
+    // "Library / ... / 10,000 Maniacs / Michael Jackson") and walking those
+    // stale crumbs afterwards desyncs from the provider's browse session.
+    // Opening a search hit starts a FRESH trail rooted at the hit itself.
+    let open_search_hit = {
+        move |(title, folder_path): (String, String)| {
+            let mut search_query = search_query;
+            search_query.set(String::new());
+            let stack = vec![BreadcrumbEntry {
+                title,
+                path: Some(folder_path),
+            }];
+            navigate(
+                selected_source(),
+                Some(current_tab.as_str().to_string()),
+                encode_path(&stack),
+                armed_zone_id(),
+            );
+        }
+    };
+
     let go_to_crumb = {
         move |index: usize| {
             let mut stack = breadcrumbs();
@@ -1000,7 +1023,7 @@ pub fn Library(
                                         let title = result.title.clone();
                                         move |_| {
                                             if let Some(path) = path.clone() {
-                                                open_folder((title.clone(), path.clone()));
+                                                open_search_hit((title.clone(), path.clone()));
                                             }
                                         }
                                     },
@@ -1060,7 +1083,7 @@ pub fn Library(
                                                     // navigation.
                                                     move |evt: Event<MouseData>| {
                                                         evt.stop_propagation();
-                                                        open_folder((title.clone(), path.clone()));
+                                                        open_search_hit((title.clone(), path.clone()));
                                                     }
                                                 },
                                                 svg { class: "w-5 h-5", fill: "none", view_box: "0 0 24 24", stroke: "currentColor", "stroke-width": "2",
