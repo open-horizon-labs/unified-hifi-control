@@ -878,45 +878,53 @@ mod server {
             // embedded like every other public/ file, but (unlike
             // /assets/*) nothing routed requests there, so the SPA
             // fallback answered instead. Registered unconditionally
-            // (not gated on `feature = "web"` like the block below) because
-            // it serves the same embedded PublicAssets data regardless of
-            // that feature.
+            // because it serves the same embedded PublicAssets data in
+            // every mode.
             .route("/fonts/{*path}", get(embedded::serve_embedded_font));
 
-        // Static file routes: only needed for non-web builds (cargo run).
-        // In web/fullstack mode, Dioxus automatically serves public/ directory.
-        #[cfg(not(feature = "web"))]
-        let router = router
-            .route(
-                "/favicon.ico",
-                get(|| embedded::serve_static_file(axum::extract::Path("favicon.ico".to_string()))),
-            )
-            .route(
-                "/apple-touch-icon.png",
-                get(|| {
-                    embedded::serve_static_file(axum::extract::Path(
-                        "apple-touch-icon.png".to_string(),
-                    ))
-                }),
-            )
-            .route(
-                "/tailwind.css",
-                get(|| {
-                    embedded::serve_static_file(axum::extract::Path("tailwind.css".to_string()))
-                }),
-            )
-            .route(
-                "/dx-components-theme.css",
-                get(|| {
-                    embedded::serve_static_file(axum::extract::Path(
-                        "dx-components-theme.css".to_string(),
-                    ))
-                }),
-            );
-
-        // Keep router in scope for web builds (static files served by Dioxus)
-        #[cfg(feature = "web")]
-        let router = router;
+        // Static file routes (favicon, touch icon, stylesheets). Gated at
+        // runtime on the same condition that picks the serve branch below:
+        // with embedded assets we use serve_api_application(), which serves
+        // NO static files — without these routes the app head's stylesheet
+        // links 404 on every page load of the dx-built fullstack server.
+        // Without embedded assets, serve_dioxus_application() nest_services
+        // every file in exe-adjacent public/ itself, and registering these
+        // same paths there makes axum panic at startup on overlapping routes.
+        let router = if embedded::has_embedded_assets() {
+            router
+                .route(
+                    "/favicon.ico",
+                    get(|| {
+                        embedded::serve_static_file(axum::extract::Path(
+                            "favicon.ico".to_string(),
+                        ))
+                    }),
+                )
+                .route(
+                    "/apple-touch-icon.png",
+                    get(|| {
+                        embedded::serve_static_file(axum::extract::Path(
+                            "apple-touch-icon.png".to_string(),
+                        ))
+                    }),
+                )
+                .route(
+                    "/tailwind.css",
+                    get(|| {
+                        embedded::serve_static_file(axum::extract::Path("tailwind.css".to_string()))
+                    }),
+                )
+                .route(
+                    "/dx-components-theme.css",
+                    get(|| {
+                        embedded::serve_static_file(axum::extract::Path(
+                            "dx-components-theme.css".to_string(),
+                        ))
+                    }),
+                )
+        } else {
+            router
+        };
 
         let router = router
             // MCP routes (same port as main app)
