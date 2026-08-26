@@ -1879,8 +1879,8 @@ pub fn Settings() -> Element {
                         // the Connect step (#597: errors live in their step).
                         p {
                             class: "mt-4 status-ok",
-                            hidden: !callback_message.as_ref().is_some_and(|feedback| !feedback.is_error),
-                            aria_hidden: !callback_message.as_ref().is_some_and(|feedback| !feedback.is_error),
+                            hidden: callback_message.as_ref().is_none_or(|feedback| feedback.is_error),
+                            aria_hidden: callback_message.as_ref().is_none_or(|feedback| feedback.is_error),
                             role: "status",
                             aria_live: "polite",
                             "{callback_message.as_ref().filter(|feedback| !feedback.is_error).map(|feedback| feedback.message.as_str()).unwrap_or_default()}"
@@ -1916,7 +1916,7 @@ pub fn Settings() -> Element {
                                         span { class: "font-medium", "Create a Spotify app" }
                                         span {
                                             class: "text-xs text-muted",
-                                            hidden: !(spotify_step1_complete && !spotify_step1_open),
+                                            hidden: !spotify_step1_complete || spotify_step1_open,
                                             "Done -- using your Spotify app"
                                         }
                                     }
@@ -1988,7 +1988,7 @@ pub fn Settings() -> Element {
                                         span { class: "font-medium", "Tell Spotify where to send you back" }
                                         span {
                                             class: "text-xs text-muted",
-                                            hidden: !(spotify_step2_complete && !spotify_step2_open),
+                                            hidden: !spotify_step2_complete || spotify_step2_open,
                                             "Done -- callback address registered"
                                         }
                                     }
@@ -2188,7 +2188,7 @@ pub fn Settings() -> Element {
                                         span { class: "font-medium", "Enter your Client ID" }
                                         span {
                                             class: "text-xs text-muted",
-                                            hidden: !(spotify_step3_complete && !spotify_step3_open),
+                                            hidden: !spotify_step3_complete || spotify_step3_open,
                                             "Done -- saved on this UHC server"
                                         }
                                     }
@@ -2289,7 +2289,7 @@ pub fn Settings() -> Element {
                                         span { class: "font-medium", "Connect your account" }
                                         span {
                                             class: "text-xs status-ok",
-                                            hidden: !(spotify_step4_complete && !spotify_step4_open),
+                                            hidden: !spotify_step4_complete || spotify_step4_open,
                                             "Connected as {spotify_account_display}"
                                         }
                                     }
