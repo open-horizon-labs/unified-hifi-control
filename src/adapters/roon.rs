@@ -237,6 +237,127 @@ pub(crate) fn is_ungrounded_grouping(item: &BrowseItem) -> bool {
     is_category(item) || looks_like_a_result_count_grouping(item)
 }
 
+/// Whether an action-hinted browse row is a *verb* ("Play Playlist",
+/// "Shuffle", ...) rather than playable leaf content (a track).
+///
+/// #573 defect 1: #545 dropped every `hint: action`/`action_list` row from
+/// `hifi_collections browse` listings -- but a live Core marks a playlist's
+/// and an album's **track rows** `action_list` too (entering a track opens
+/// its Play Now/Queue/Start Radio menu), so every album and playlist level
+/// came back `items: []`. The two kinds must be told apart:
+///
+/// - `hint: action` rows fire immediately when browsed (the #545 live repro's
+///   "Play Playlist") -- always an action row, never content.
+/// - `hint: action_list` rows are only action rows when they read as a play
+///   verb *and* carry none of the content signals every live track row
+///   carried (an artist subtitle, artwork). A track named "Play That Funky
+///   Music" keeps its subtitle/artwork and stays content; a bare
+///   "Play Album"/"Play Playlist"/"Shuffle" wrapper row has neither.
+pub(crate) fn is_immediate_action_row(item: &BrowseItem) -> bool {
+    match item.hint {
+        Some(ItemHint::Action) => true,
+        Some(ItemHint::ActionList) => {
+            item.subtitle.as_deref().map_or(true, str::is_empty)
+                && item.image_key.is_none()
+                && is_play_verb_title(&item.title)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a row title reads as one of Roon's play verbs.
+///
+/// The vocabulary is every context verb observed live (#545's repro and the
+/// #573 crawl) plus the canonical three-item menu -- deliberately a closed
+/// list, not a "starts with play" prefix match, so a track that merely starts
+/// with the word "play" cannot be mistaken for a verb (see
+/// [`is_immediate_action_row`]'s second signal for the belt-and-braces
+/// subtitle/artwork requirement on top of this).
+fn is_play_verb_title(title: &str) -> bool {
+    let lower = title.trim().to_lowercase();
+    matches!(
+        lower.as_str(),
+        "play now" | "shuffle" | "queue" | "add next" | "add to queue" | "start radio"
+    ) || lower.strip_prefix("play ").is_some_and(|noun| {
+        matches!(
+            noun,
+            "now"
+                | "album"
+                | "playlist"
+                | "playlists"
+                | "artist"
+                | "track"
+                | "tracks"
+                | "all"
+                | "genre"
+                | "composer"
+                | "work"
+                | "station"
+                | "radio station"
+        )
+    })
+}
+
+/// Whether a row is Roon's "No Results" placeholder rather than content.
+///
+/// #573 defect 7: an empty node (the live crawl's "My Live Radio") comes back
+/// as a single row titled "No Results" that still carries an `item_key`, so
+/// `classify_navigability`'s "non-list row with a key is playable" rule
+/// minted a play ref for it and the UI offered Play on a non-item. Matched by
+/// title plus the absence of every content signal (subtitle, artwork), same
+/// belt-and-braces shape as [`is_immediate_action_row`], so a real track that
+/// happens to be titled "No Results" keeps its subtitle/art and stays.
+pub(crate) fn is_no_results_placeholder(item: &BrowseItem) -> bool {
+    item.title.eq_ignore_ascii_case("no results")
+        && item.subtitle.as_deref().map_or(true, str::is_empty)
+        && item.image_key.is_none()
+        && !matches!(item.hint, Some(ItemHint::List))
+}
+
+/// Strip Roon's `[[id|Name]]` link markup down to `Name`, leaving all other
+/// text untouched.
+///
+/// #573 defect 5: browse `subtitle` fields embed Roon's internal link markup
+/// verbatim -- `[[55418|Michael Jackson]]`, including compound credits like
+/// `[[8827258|Willie Colón]] & [[1981050|Rubén Blades]]`. Clients (the web
+/// UI, `hifi_collections`, `hifi_search`) have no use for the ids, so the
+/// adapter mapping strips them to plain names in one place. Malformed markup
+/// (an unterminated `[[`, no `|`) is passed through literally rather than
+/// guessed at.
+pub(crate) fn strip_roon_link_markup(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("[[") {
+        let (before, after_open) = rest.split_at(start);
+        out.push_str(before);
+        let body = &after_open[2..];
+        match body.find("]]") {
+            Some(end) => {
+                let inner = &body[..end];
+                match inner.split_once('|') {
+                    // `[[id|Name]]` -> `Name`
+                    Some((_, name)) => out.push_str(name),
+                    // `[[something]]` without a `|`: not Roon's link shape;
+                    // keep it verbatim.
+                    None => {
+                        out.push_str("[[");
+                        out.push_str(inner);
+                        out.push_str("]]");
+                    }
+                }
+                rest = &body[end + 2..];
+            }
+            None => {
+                // Unterminated `[[`: keep the rest verbatim.
+                out.push_str(after_open);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Strip "roon:" prefix from zone/output IDs.
 /// MCP and aggregator use prefixed IDs (e.g., "roon:zone_123"), but Roon API expects bare IDs.
 fn strip_roon_prefix(id: &str) -> &str {
@@ -2061,7 +2182,7 @@ impl RoonAdapter {
         }
         self.browse(opts).await?;
 
-        let load = self
+        let mut load = self
             .load(LoadOpts {
                 multi_session_key: Some(session_key.clone()),
                 offset,
@@ -2069,6 +2190,54 @@ impl RoonAdapter {
                 ..Default::default()
             })
             .await?;
+
+        // #573 defect 11: entering an album from a search hit lands on an
+        // intermediate level whose sole row is the album itself again (same
+        // title as the level, `hint: list`), forcing a second click that adds
+        // nothing. When a non-root level's entire content is that one
+        // self-referential list row, descend through it so the caller gets
+        // the real level (the tracks) in one step. The title-equality guard
+        // keeps a legitimate single-child folder (an artist with one album)
+        // untouched. One descent only -- Roon does not nest this shape.
+        if item_key.is_some() && load.list.count == 1 {
+            let only_row = match load.items.first() {
+                Some(row) => Some(row.clone()),
+                // A paged request (offset past the single row) still needs
+                // the row to decide; fetch it without disturbing `offset`.
+                None => self
+                    .load(LoadOpts {
+                        multi_session_key: Some(session_key.clone()),
+                        offset: 0,
+                        count: Some(1),
+                        ..Default::default()
+                    })
+                    .await?
+                    .items
+                    .into_iter()
+                    .next(),
+            };
+            if let Some(row) = only_row {
+                if matches!(row.hint, Some(ItemHint::List)) && row.title == load.list.title {
+                    if let Some(self_key) = row.item_key.as_deref() {
+                        self.browse(BrowseOpts {
+                            multi_session_key: Some(session_key.clone()),
+                            item_key: Some(self_key.to_string()),
+                            zone_or_output_id: Some(bare_zone_id.to_string()),
+                            ..Default::default()
+                        })
+                        .await?;
+                        load = self
+                            .load(LoadOpts {
+                                multi_session_key: Some(session_key.clone()),
+                                offset,
+                                count: Some(limit),
+                                ..Default::default()
+                            })
+                            .await?;
+                    }
+                }
+            }
+        }
 
         // #545: a level must never hand back the very item it was just
         // entered through as one of its own children -- browsing that child
@@ -2148,8 +2317,21 @@ impl RoonAdapter {
                 )
             })
             .count();
+        // #573 defect 1: `action_list`-hinted track rows are content, not
+        // action rows (see `is_immediate_action_row`) -- only the verb rows
+        // that get filtered out of listings count against "other content"
+        // here, or an album whose whole peek window is [Play Album,
+        // track, track, ...] would read as a pure action leaf and lose its
+        // navigability. `playable` stays judged on the broad action count:
+        // any action-ish row one level down means Roon can play this
+        // directly.
+        let immediate_action_rows = loaded
+            .items
+            .iter()
+            .filter(|item| is_immediate_action_row(item))
+            .count();
         let playable = action_rows_seen > 0;
-        let has_other_content = loaded.list.count > action_rows_seen;
+        let has_other_content = loaded.list.count > immediate_action_rows;
         Ok((playable, has_other_content))
     }
 
@@ -2189,6 +2371,90 @@ impl RoonAdapter {
         // play action (an album, a playlist) stays navigable too.
         let navigable = list_hinted && (!playable || has_other_content);
         (navigable, playable)
+    }
+
+    /// Filter and map one raw browse page into `hifi_collections`' item
+    /// shape, appending to `mapped`. Shared by `content()`'s first-page
+    /// mapping and its #573 fetch-ahead loop so the two can never disagree
+    /// about what a listing row is.
+    async fn map_collection_page(
+        &self,
+        zone_id: &str,
+        items: Vec<BrowseItem>,
+        at_collection_root: bool,
+        mapped: &mut Vec<Value>,
+    ) {
+        for item in items {
+            // #573 defect 3: the exact-title category filter
+            // (`is_category`) was verified for *search result* levels only,
+            // but the Library node's real children are titled exactly
+            // "Artists"/"Albums"/"Tracks"/... too -- so it swallowed the
+            // whole Library level down to "Search". Browse levels rely on
+            // the source-independent `"<N> Results"` subtitle signal alone;
+            // search paths (`hifi_search`) keep the stricter dual check.
+            if looks_like_a_result_count_grouping(&item) {
+                continue;
+            }
+            if at_collection_root {
+                // #566 (live install): Roon's browse root also carries its
+                // own "Settings" node -- extension configuration inside
+                // Roon's hierarchy, not music content. It has no `item_key`
+                // (nothing to browse into or play) and was leaking through
+                // as a permanently inert row. Matched by title, documented
+                // as such, and scoped to the true root only, so a
+                // differently-purposed "Settings" row nested deeper in the
+                // hierarchy (if one ever exists) is untouched.
+                if item.title == "Settings" {
+                    continue;
+                }
+                // #573 defect 4: the root's "Playlists" node duplicates the
+                // dedicated Playlists tab (`collections_playlists` enters
+                // the same node by name), so the Browse tab hides it rather
+                // than offering the same list twice.
+                if item.title == "Playlists" {
+                    continue;
+                }
+            }
+            // #545 / #573 defect 1: verb rows ("Play Playlist", "Play
+            // Album", "Shuffle", ...) are the implementation detail
+            // `resolve_item_key` walks to invoke a play action, not
+            // addressable content. But a live Core also marks playlist and
+            // album *track rows* `action_list` -- dropping every
+            // action-hinted row (as #545 first did) emptied every album and
+            // playlist level. `is_immediate_action_row` keeps the verb rows
+            // out while the action_list-hinted playable leaf rows stay.
+            if matches!(item.hint, Some(ItemHint::Header)) || is_immediate_action_row(&item) {
+                continue;
+            }
+            // #573 defect 7: Roon renders an empty node as a "No Results"
+            // placeholder row that still carries an `item_key`; minting a
+            // play ref for it offers Play on a non-item.
+            if is_no_results_placeholder(&item) {
+                continue;
+            }
+            let (navigable, playable) = self.classify_navigability(zone_id, &item).await;
+            // #573 defect 4: at the collection root, "Library" repeats the
+            // page's own name (the UI breadcrumb read "Library / Library").
+            // "Local Library" names the same node distinguishably.
+            let title = if at_collection_root && item.title == "Library" {
+                "Local Library".to_string()
+            } else {
+                // #573 defect 5: strip `[[id|Name]]` link markup.
+                strip_roon_link_markup(&item.title)
+            };
+            mapped.push(serde_json::json!({
+                "title": title,
+                "subtitle": item.subtitle.as_deref().map(strip_roon_link_markup),
+                "item_key": item.item_key,
+                "navigable": navigable,
+                "playable": playable,
+                // #549: Roon's own image_key, resolved through the same
+                // `RoonAdapter::get_image` now-playing art already uses --
+                // `hifi_collections` mints an opaque ref over this rather
+                // than handing it to a client directly.
+                "image_key": item.image_key,
+            }));
+        }
     }
 
     /// Enter a named top-level browse node (`"Playlists"`, ...) in a fresh
@@ -3067,56 +3333,38 @@ impl LibraryAdapter for RoonAdapter {
                         .await?
                 };
                 let mut mapped: Vec<Value> = Vec::new();
-                for item in items {
-                    if is_ungrounded_grouping(&item) {
-                        continue;
+                self.map_collection_page(zone_id, items, at_collection_root, &mut mapped)
+                    .await;
+                // #573 defect 8: `next_offset` used to be computed against
+                // Roon's raw `list.count`, *before* the grouping/action-row
+                // filters above dropped items -- so a fully-filtered page
+                // advertised "Load more" over nothing, potentially forever.
+                // Fetch ahead instead: while the filtered page is still
+                // short and raw rows remain, load and filter further chunks
+                // (bounded), and advertise a next page only when raw rows
+                // genuinely remain past what was consumed.
+                let mut consumed = (offset + limit).min(total);
+                const FETCH_AHEAD_ROUNDS: usize = 4;
+                let mut rounds = 0;
+                while mapped.len() < limit && consumed < total && rounds < FETCH_AHEAD_ROUNDS {
+                    let chunk = self
+                        .load(LoadOpts {
+                            multi_session_key: Some(session_key.clone()),
+                            offset: consumed,
+                            count: Some(limit),
+                            ..Default::default()
+                        })
+                        .await?;
+                    if chunk.items.is_empty() {
+                        consumed = total;
+                        break;
                     }
-                    // #566 (live install): Roon's browse root also carries
-                    // its own "Settings" node -- extension configuration
-                    // inside Roon's hierarchy, not music content. It has no
-                    // `item_key` (nothing to browse into or play) and was
-                    // leaking through as a permanently inert row. Matched by
-                    // title, documented as such, and scoped to the true
-                    // root only, so a differently-purposed "Settings" row
-                    // nested deeper in the hierarchy (if one ever exists) is
-                    // untouched. Real music nodes (Library, Playlists,
-                    // Radio, TIDAL, Qobuz, ...) are never named "Settings"
-                    // and are unaffected.
-                    if at_collection_root && item.title == "Settings" {
-                        continue;
-                    }
-                    // #545: Header/Action/ActionList rows are the
-                    // implementation detail `resolve_item_key` walks to
-                    // invoke a play action, not addressable content -- a
-                    // real Core mixes them into an otherwise-ordinary level
-                    // (e.g. a playlist's own browse: `["Play Playlist",
-                    // <track>, <track>, ...]`), and rendering them as plain
-                    // browse rows is what put a stray "Play Album"/"Play
-                    // Playlist" entry in the list next to real content.
-                    if matches!(
-                        item.hint,
-                        Some(ItemHint::Header)
-                            | Some(ItemHint::Action)
-                            | Some(ItemHint::ActionList)
-                    ) {
-                        continue;
-                    }
-                    let (navigable, playable) = self.classify_navigability(zone_id, &item).await;
-                    mapped.push(serde_json::json!({
-                        "title": item.title,
-                        "subtitle": item.subtitle,
-                        "item_key": item.item_key,
-                        "navigable": navigable,
-                        "playable": playable,
-                        // #549: Roon's own image_key, resolved through the
-                        // same `RoonAdapter::get_image` now-playing art
-                        // already uses -- `hifi_collections` mints an
-                        // opaque ref over this rather than handing it to a
-                        // client directly.
-                        "image_key": item.image_key,
-                    }));
+                    consumed = (consumed + chunk.items.len()).min(total);
+                    self.map_collection_page(zone_id, chunk.items, at_collection_root, &mut mapped)
+                        .await;
+                    rounds += 1;
                 }
-                let next_offset = (total > offset + limit).then_some((offset + limit) as u64);
+                let next_offset = (consumed < total).then_some(consumed as u64);
                 Ok(serde_json::json!({
                     "session_key": session_key,
                     "items": mapped,

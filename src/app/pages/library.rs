@@ -100,6 +100,46 @@ impl Tab {
 
 const TABS: &[Tab] = &[Tab::Browse, Tab::Playlists, Tab::Favorites, Tab::Radio];
 
+/// Which tabs to render for the current browse zone (#573 defect 6).
+///
+/// `library_tabs` is the server's per-provider list (`Zone::library_tabs`),
+/// derived from the same capability facts the matrix reports -- a Roon zone
+/// sends `["browse", "playlists"]`, so Favorites and Radio (which Roon's
+/// collections surface refuses on every call) are never rendered. An empty
+/// list means "no information" (a response from a build predating the
+/// field): degrade to showing every tab rather than none.
+fn visible_tabs_for(library_tabs: &[String]) -> Vec<Tab> {
+    if library_tabs.is_empty() {
+        return TABS.to_vec();
+    }
+    TABS.iter()
+        .copied()
+        .filter(|tab| library_tabs.iter().any(|name| name == tab.as_str()))
+        .collect()
+}
+
+/// The tab actually shown: the route's tab when this provider serves it,
+/// otherwise Browse -- so a deep link to `?tab=favorites` on a Roon zone
+/// lands on a working tab instead of a permanent refusal page.
+fn effective_tab(requested: Tab, visible: &[Tab]) -> Tab {
+    if visible.contains(&requested) {
+        requested
+    } else {
+        Tab::Browse
+    }
+}
+
+/// #573 defect 2 pin: the API's `image` fields (`CollectionItem::image`,
+/// `SearchResult::image`) are complete same-origin URLs
+/// (`/api/collections/image?ref=...`) and are used **verbatim** as
+/// `<img src>`. This helper is the single place a row image becomes a `src`;
+/// the double-prefix regression ("/api/collections/image?ref={image}" around
+/// an already-full path, 404ing every image) cannot re-enter through rsx
+/// string interpolation as long as rendering goes through here.
+fn image_src(image: &str) -> &str {
+    image
+}
+
 /// One breadcrumb: what the user picked, and the opaque path it opened.
 /// The root ("Library") is implicit and never stored -- an empty stack
 /// means "at the root of this tab".
@@ -477,7 +517,18 @@ pub fn Library(
             .map(|z| z.zone_id.clone())
     });
 
-    let current_tab = Tab::parse(&route_tab);
+    // Tabs the current browse zone's provider serves (#573 defect 6), and
+    // the tab actually rendered (the route's tab, downgraded to Browse when
+    // this provider does not serve it).
+    let visible_tabs = use_memo(move || {
+        let list = zones_list();
+        let tabs = browse_zone_id()
+            .and_then(|id| list.iter().find(|z| z.zone_id == id))
+            .map(|z| z.library_tabs.clone())
+            .unwrap_or_default();
+        visible_tabs_for(&tabs)
+    });
+    let current_tab = effective_tab(Tab::parse(&route_tab), &visible_tabs());
     let breadcrumbs = use_signal(|| decode_path(route_path.as_deref()));
 
     // Re-sync local breadcrumb signal when navigation (a row click's
@@ -541,6 +592,9 @@ pub fn Library(
         let _ = browse_zone_id();
         let _ = route_tab.clone();
         let _ = breadcrumbs.read().clone();
+        // Tracked so the level refetches when the served-tab set arrives and
+        // downgrades a deep-linked unsupported tab to Browse (#573 defect 6).
+        let _ = visible_tabs();
         if browse_zone_id().is_some() {
             refresh(false);
         }
@@ -868,10 +922,24 @@ pub fn Library(
                                 li {
                                     key: "{result.title}-{result.subtitle.clone().unwrap_or_default()}",
                                     class: "library-row",
-                                    div { class: "min-w-0",
-                                        p { class: "font-medium truncate", "{result.title}" }
-                                        if let Some(subtitle) = result.subtitle.clone() {
-                                            p { class: "text-sm text-muted truncate", "{subtitle}" }
+                                    div { class: "min-w-0 flex items-center gap-2",
+                                        // #573 defect 10: search hits carry
+                                        // artwork where the provider supplies
+                                        // it -- same verbatim-URL contract as
+                                        // browse rows (see `image_src`).
+                                        if let Some(image) = result.image.clone() {
+                                            img {
+                                                class: "library-row-thumb",
+                                                src: "{image_src(&image)}",
+                                                alt: "",
+                                                loading: "lazy",
+                                            }
+                                        }
+                                        div { class: "min-w-0",
+                                            p { class: "font-medium truncate", "{result.title}" }
+                                            if let Some(subtitle) = result.subtitle.clone() {
+                                                p { class: "text-sm text-muted truncate", "{subtitle}" }
+                                            }
                                         }
                                     }
                                     div { class: "library-row-actions",
@@ -980,9 +1048,9 @@ pub fn Library(
                     }
 
                     div { class: "library-tabs",
-                        for candidate in TABS {
+                        for candidate in visible_tabs() {
                             {
-                                let candidate = *candidate;
+                                let candidate = candidate;
                                 let active = candidate == current_tab;
                                 rsx! {
                                     button {
@@ -1131,7 +1199,9 @@ fn LibraryRow(
                 if let Some(image) = item.image.clone() {
                     img {
                         class: "library-row-thumb",
-                        src: "/api/collections/image?ref={image}",
+                        // #573 defect 2: `image` is already the complete URL;
+                        // it must be used verbatim (see `image_src`).
+                        src: "{image_src(&image)}",
                         alt: "",
                         loading: "lazy",
                     }
@@ -1250,7 +1320,9 @@ fn LibraryTile(
                 if let Some(image) = item.image.clone() {
                     img {
                         class: "library-tile-art-img",
-                        src: "/api/collections/image?ref={image}",
+                        // #573 defect 2: `image` is already the complete URL;
+                        // it must be used verbatim (see `image_src`).
+                        src: "{image_src(&image)}",
                         alt: "",
                         loading: "lazy",
                     }
