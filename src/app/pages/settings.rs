@@ -1067,7 +1067,19 @@ pub fn Settings() -> Element {
         });
     });
 
+    // Fill the broker form from the saved settings ONCE, on the first status
+    // that arrives. Deliberately not on every status: `mqtt_status` is now
+    // re-read on a timer (#607, below) and on SSE discovery refreshes, and
+    // an unguarded rehydrate would reset the fields under a user who is
+    // part-way through typing a new broker address - observed live, where a
+    // corrected host was silently replaced by the stored one between typing
+    // it and pressing Save. Same rule as the Spotify Redirect URI above
+    // (#592): a value the user has entered is never silently replaced.
+    let mut mqtt_form_hydrated = use_signal(|| false);
     use_effect(move || {
+        if *mqtt_form_hydrated.peek() {
+            return;
+        }
         if let Some(Some(status)) = mqtt_status.read().as_ref() {
             if let Some(host) = status.host.as_ref() {
                 mqtt_host.set(host.clone());
@@ -1084,6 +1096,7 @@ pub fn Settings() -> Element {
             if let Some(discovery_prefix) = status.discovery_prefix.as_ref() {
                 mqtt_discovery_prefix.set(discovery_prefix.clone());
             }
+            mqtt_form_hydrated.set(true);
         }
     });
 
