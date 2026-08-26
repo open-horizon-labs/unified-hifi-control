@@ -574,10 +574,6 @@ pub fn Settings() -> Element {
     let mut spotify_tunnel = use_signal(SpotifyTunnelStatus::default);
     let mut spotify_tunnel_busy = use_signal(|| false);
     let spotify_tunnel_url_copy_state = use_signal(CopyState::default);
-    // The live tunnel's callback address no longer matches the Redirect URI
-    // field: surfaced as a warning instead of silently rewriting the field
-    // (#592), since the old address may already be registered with Spotify.
-    let mut spotify_tunnel_mismatch = use_signal(|| false);
     // Guards the while-active status poll loop against duplicate spawns.
     let mut spotify_tunnel_polling = use_signal(|| false);
     // Defaults to the loopback-primary layout (today's behavior, and what
@@ -932,29 +928,20 @@ pub fn Settings() -> Element {
     // mint a new subdomain on every start, so silently swapping the field
     // out from under an address that is already registered in the Spotify
     // dashboard guarantees a "redirect_uri: Not matching configuration"
-    // rejection at Spotify. A divergence is surfaced as a warning with an
-    // explicit "Use this address" action instead, and the server refuses
-    // oauth/start outright while the live tunnel and the saved Redirect URI
-    // disagree.
+    // rejection at Spotify. A divergence is surfaced as a render-derived
+    // warning (`spotify_tunnel_mismatch` below) with an explicit "Use this
+    // address" action instead, and the server refuses oauth/start outright
+    // while the live tunnel and the saved Redirect URI disagree.
     use_effect(move || {
         if let Some(url) = spotify_tunnel().url {
             let tunnel_callback = format!("{url}/api/providers/spotify/oauth/callback");
-            // Deliberately subscribed (not peeked): editing the field by
-            // hand must recompute the mismatch warning. This converges --
-            // the only write below sets the field to `tunnel_callback`,
-            // whose re-run takes the first (no-write) branch.
-            let current = spotify_redirect_uri();
-            if current == tunnel_callback {
-                spotify_tunnel_mismatch.set(false);
-            } else if current.trim().is_empty() || current == default_spotify_redirect_uri() {
+            let current = spotify_redirect_uri.peek().clone();
+            if current != tunnel_callback
+                && (current.trim().is_empty() || current == default_spotify_redirect_uri())
+            {
                 spotify_redirect_uri.set(tunnel_callback);
                 spotify_local_setup_saved.set(false);
-                spotify_tunnel_mismatch.set(false);
-            } else {
-                spotify_tunnel_mismatch.set(true);
             }
-        } else {
-            spotify_tunnel_mismatch.set(false);
         }
     });
 
@@ -1379,6 +1366,16 @@ pub fn Settings() -> Element {
     let spotify_tunnel_callback_for_copy = spotify_tunnel_callback.clone();
     let spotify_tunnel_callback_for_use = spotify_tunnel_callback.clone();
     let spotify_tunnel_verified = spotify_tunnel_status.verified;
+    // The live tunnel's callback address no longer matches the Redirect URI
+    // field: surfaced as a warning instead of silently rewriting the field
+    // (#592), since the old address may already be registered with Spotify.
+    // Render-derived (not a stored signal) so hand-editing the field
+    // recomputes it immediately.
+    let spotify_tunnel_redirect_value = spotify_redirect_uri();
+    let spotify_tunnel_mismatch = spotify_tunnel_status.url.is_some()
+        && spotify_tunnel_redirect_value != spotify_tunnel_callback
+        && !spotify_tunnel_redirect_value.trim().is_empty()
+        && spotify_tunnel_redirect_value != default_spotify_redirect_uri();
     let spotify_account = spotify_account_result
         .as_ref()
         .and_then(|response| response.account.as_ref());
@@ -1918,7 +1915,7 @@ pub fn Settings() -> Element {
                                                             p { class: "mt-2 text-xs text-muted", "Checking that this address answers from the internet…" }
                                                         },
                                                     }
-                                                    if spotify_tunnel_mismatch() {
+                                                    if spotify_tunnel_mismatch {
                                                         div { class: "mt-2 rounded-md border border-default p-2", role: "alert",
                                                             p { class: "text-xs status-err",
                                                                 "Your HTTPS address changed and no longer matches the Redirect URI field below. Update the redirect URI registered in the Spotify dashboard to this new address, then apply it here and save again before connecting."
@@ -1929,7 +1926,6 @@ pub fn Settings() -> Element {
                                                                 onclick: move |_| {
                                                                     spotify_redirect_uri.set(spotify_tunnel_callback_for_use.clone());
                                                                     spotify_local_setup_saved.set(false);
-                                                                    spotify_tunnel_mismatch.set(false);
                                                                 },
                                                                 "Use this address"
                                                             }
