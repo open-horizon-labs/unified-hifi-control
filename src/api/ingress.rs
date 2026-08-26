@@ -297,10 +297,22 @@ mod tests {
         // Default rule (no override env var set in the test process; if a
         // developer machine sets it, these become the override's semantics,
         // so pin via ip_matches directly).
-        assert!(ip_matches(&"172.30.32.2".parse().unwrap(), "172.30.32.0/23"));
-        assert!(ip_matches(&"172.30.33.7".parse().unwrap(), "172.30.32.0/23"));
-        assert!(!ip_matches(&"172.30.34.1".parse().unwrap(), "172.30.32.0/23"));
-        assert!(!ip_matches(&"192.168.1.50".parse().unwrap(), "172.30.32.0/23"));
+        assert!(ip_matches(
+            &"172.30.32.2".parse().unwrap(),
+            "172.30.32.0/23"
+        ));
+        assert!(ip_matches(
+            &"172.30.33.7".parse().unwrap(),
+            "172.30.32.0/23"
+        ));
+        assert!(!ip_matches(
+            &"172.30.34.1".parse().unwrap(),
+            "172.30.32.0/23"
+        ));
+        assert!(!ip_matches(
+            &"192.168.1.50".parse().unwrap(),
+            "172.30.32.0/23"
+        ));
         assert!(ip_matches(&"127.0.0.1".parse().unwrap(), "127.0.0.0/8"));
         assert!(ip_matches(&"127.0.0.1".parse().unwrap(), "127.0.0.1"));
         assert!(!ip_matches(&"::1".parse().unwrap(), "172.30.32.0/23"));

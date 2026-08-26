@@ -112,8 +112,14 @@ mod tests {
             href_with_base(base, "https://ma.example/image.jpg"),
             "https://ma.example/image.jpg"
         );
-        assert_eq!(href_with_base(base, "data:image/png;base64,xyz"), "data:image/png;base64,xyz");
-        assert_eq!(href_with_base(base, "//cdn.example/x.js"), "//cdn.example/x.js");
+        assert_eq!(
+            href_with_base(base, "data:image/png;base64,xyz"),
+            "data:image/png;base64,xyz"
+        );
+        assert_eq!(
+            href_with_base(base, "//cdn.example/x.js"),
+            "//cdn.example/x.js"
+        );
         assert_eq!(href_with_base(base, "relative/path"), "relative/path");
     }
 
