@@ -1866,9 +1866,9 @@ pub fn Settings() -> Element {
                                         if let Some(status) = mqtt_status.read().clone().flatten() {
                                             if status.running {
                                                 if status.is_environment_managed() {
-                                                    span { class: "status-ok", "✓ Connected · via add-on" }
+                                                    span { class: "status-ok", "✓ Publishing · via add-on" }
                                                 } else {
-                                                    span { class: "status-ok", "✓ Connected" }
+                                                    span { class: "status-ok", "✓ Publishing" }
                                                 }
                                             } else if status.configured {
                                                 span { class: "text-yellow-500", "Configured · waiting" }
@@ -2774,12 +2774,16 @@ pub fn Settings() -> Element {
                                     // reading as an unfinished setup step.
                                     p { class: "font-medium", "Set up by the Home Assistant add-on" }
                                     if status.running {
-                                        p { class: "mt-1 status-ok", "Connected — your zones are in Home Assistant" }
+                                        // "Publishing", not "Connected":
+                                        // `running` means the publisher task
+                                        // is alive, which it stays while
+                                        // retrying an unreachable broker.
+                                        p { class: "mt-1 status-ok", "Publishing your zones to Home Assistant" }
                                     } else {
-                                        p { class: "mt-1 text-yellow-500", "Not connected to the broker yet" }
+                                        p { class: "mt-1 text-yellow-500", "Not publishing yet" }
                                     }
                                 } else if status.running {
-                                    p { class: "status-ok", "Connected — your zones are in Home Assistant" }
+                                    p { class: "status-ok", "Publishing your zones to Home Assistant" }
                                 } else if status.configured {
                                     p { class: "text-yellow-500", "Configured, not currently connected" }
                                 } else {
@@ -2803,7 +2807,7 @@ pub fn Settings() -> Element {
                             button {
                                 id: "mqtt-use-own-broker",
                                 r#type: "button",
-                                class: "btn btn-secondary mt-4 min-h-11",
+                                class: "btn btn-outline mt-4 min-h-11",
                                 onclick: move |_| mqtt_manual_open.set(true),
                                 "Use a different broker"
                             }
