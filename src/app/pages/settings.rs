@@ -415,7 +415,7 @@ fn spotify_oauth_error_message(reason: Option<&str>) -> String {
             "Spotify did not return an authorization code. Click Connect Spotify to try again.".to_string()
         }
         Some("token_exchange_failed") => {
-            "Spotify rejected the sign-in exchange. This usually means the callback URL registered in the Spotify dashboard does not exactly match the Redirect URI shown below. Fix the mismatch, save, and Connect again.".to_string()
+            "Spotify rejected the sign-in exchange. This usually means the address registered in your Spotify app does not exactly match the one saved in step 2. Fix the mismatch, save, and Connect again.".to_string()
         }
         Some("token_storage_failed") => {
             "Spotify authorized, but the token could not be saved on this UHC server. Check the server's credential storage and try Connect again.".to_string()
@@ -1414,7 +1414,16 @@ pub fn Settings() -> Element {
     // feedback vanish as soon as any signal re-rendered the page (#597 probe
     // finding). SSR still renders no feedback (the non-wasm helper returns
     // None), and only `hidden` attributes differ on hydration.
-    let spotify_callback_snapshot = use_signal(callback_feedback);
+    // Captured in a mount-only effect -- not a signal initializer -- so the
+    // read happens strictly in the hydrated client, matching the
+    // remote-origin pattern above (#570): no tracked signal is read inside,
+    // so it runs exactly once (reactive-loop-lint).
+    let mut spotify_callback_snapshot = use_signal(|| None::<CallbackFeedback>);
+    use_effect(move || {
+        if let Some(feedback) = callback_feedback() {
+            spotify_callback_snapshot.set(Some(feedback));
+        }
+    });
     let callback_message = spotify_callback_snapshot();
     let spotify_status_is_error = spotify_error().is_some();
     let spotify_status_message =
