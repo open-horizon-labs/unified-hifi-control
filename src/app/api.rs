@@ -302,6 +302,15 @@ pub struct MqttStatusResponse {
     /// inviting the user to fill in details they never entered.
     #[serde(default)]
     pub source: Option<String>,
+    /// Whether Home Assistant is actually reading what we publish (#610):
+    /// `"consuming"`, `"not_configured"`, or `"unknown"`. Defaults to empty
+    /// against a server that predates the field, which every helper below
+    /// treats as "cannot tell" - the safe direction.
+    #[serde(default)]
+    pub home_assistant: String,
+    /// Why we cannot tell, when we cannot (#610). Diagnostic, not copy.
+    #[serde(default)]
+    pub home_assistant_detail: Option<String>,
 }
 
 impl MqttStatusResponse {
@@ -322,6 +331,37 @@ impl MqttStatusResponse {
     /// tells those two apart.
     pub fn is_connecting(&self) -> bool {
         self.connection == "connecting"
+    }
+
+    /// Home Assistant's MQTT integration is set up and reading the broker,
+    /// so the zones we publish really do become entities (#610).
+    pub fn home_assistant_is_consuming(&self) -> bool {
+        self.home_assistant == "consuming"
+    }
+
+    /// The #610 case, and the only one that earns a call to action: we are
+    /// genuinely publishing, and Home Assistant has positively been found
+    /// *not* to have its MQTT integration set up.
+    ///
+    /// Gated on [`Self::is_connected`] on purpose. An unreachable broker is
+    /// its own, louder problem with its own fix (#607), and stacking a
+    /// second alarm on top of it would send the user to configure an
+    /// integration that could not have helped yet.
+    ///
+    /// Gated on the *positive* `not_configured` on purpose too: `unknown`
+    /// deliberately does not reach here, because accusing someone of not
+    /// having set up an integration we simply could not check would be the
+    /// same dishonesty in the opposite direction.
+    pub fn home_assistant_missing(&self) -> bool {
+        self.is_connected() && self.home_assistant == "not_configured"
+    }
+
+    /// We are publishing but cannot establish whether anyone reads it -
+    /// typically a UHC that is not running as a Home Assistant add-on, so
+    /// there is no Supervisor to ask. Worth one quiet, non-accusatory line;
+    /// never a warning.
+    pub fn home_assistant_undetermined(&self) -> bool {
+        self.is_connected() && !self.home_assistant_is_consuming() && !self.home_assistant_missing()
     }
 
     /// `mqtt://host:port` for the configured broker, so an error can name

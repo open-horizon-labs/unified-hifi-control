@@ -1927,7 +1927,20 @@ pub fn Settings() -> Element {
                                             // answers used to land in this same
                                             // branch and read as success.
                                             if status.is_connected() {
-                                                if status.is_environment_managed() {
+                                                // Publishing into a broker
+                                                // nobody reads is not success,
+                                                // however well the publishing
+                                                // itself is going (#610). This
+                                                // row used to show a green tick
+                                                // for exactly that case.
+                                                if status.home_assistant_missing() {
+                                                    button {
+                                                        r#type: "button",
+                                                        class: "text-yellow-500 underline text-left",
+                                                        onclick: move |_| scroll_to_element("mqtt-anchor"),
+                                                        "Publishing, but Home Assistant isn't set up to receive it"
+                                                    }
+                                                } else if status.is_environment_managed() {
                                                     span { class: "status-ok", "✓ Publishing · via add-on" }
                                                 } else {
                                                     span { class: "status-ok", "✓ Publishing" }
@@ -2829,6 +2842,12 @@ pub fn Settings() -> Element {
                                 }
                                 div { id: "mqtt-info", class: mqtt_info_panel_class, role: "note",
                                     p { "Home Assistant discovers the zones by itself, so there is nothing to add per zone - no YAML, no entity list. Set up Home Assistant's MQTT integration, point it at the same broker you enter here, and the entities appear." }
+                                    // The two questions the on-screen call to
+                                    // action provokes but should not grow to
+                                    // answer (#610): "which broker?" and
+                                    // "do I have to restart anything?".
+                                    p { class: "mt-2", "Adding that integration is a separate step in Home Assistant, under Settings → Devices & services → Add integration → MQTT. If you use the Mosquitto add-on it normally fills the broker in for you." }
+                                    p { class: "mt-2", "Nothing here needs restarting afterwards - UHC notices Home Assistant arriving and re-sends everything within a few seconds." }
                                     p { class: "mt-2", "Each zone becomes a media player you can play, pause, and set the volume on. Each hardware controller becomes its own device." }
                                     p { class: "mt-2", "Advanced: the discovery prefix below has to match the one Home Assistant's MQTT integration uses. Leave it at \"homeassistant\" unless you changed it there." }
                                 }
@@ -2850,7 +2869,24 @@ pub fn Settings() -> Element {
                                 // than by "the task exists" (#607). Only the
                                 // first branch is success; a broker that
                                 // never answers now has to say so.
-                                if status.is_connected() {
+                                if status.home_assistant_missing() {
+                                    // The failure #610 is about: our own half
+                                    // is flawless, and the user still has no
+                                    // entities. The click path is the whole
+                                    // fix, so it stays on screen rather than
+                                    // behind the ⓘ - only the reassurance
+                                    // moves in there.
+                                    p { id: "mqtt-ha-missing", class: "text-yellow-500 font-medium",
+                                        "Your zones are being published, but Home Assistant isn't set up to receive them"
+                                    }
+                                    p { class: "mt-1 text-secondary",
+                                        "In Home Assistant, go to Settings → Devices & services → Add integration → MQTT. Your zones then appear on their own."
+                                    }
+                                } else if status.home_assistant_is_consuming() {
+                                    p { id: "mqtt-ha-consuming", class: "status-ok",
+                                        "Publishing your zones — Home Assistant is receiving them"
+                                    }
+                                } else if status.is_connected() {
                                     p { class: "status-ok", "Publishing your zones to Home Assistant" }
                                 } else if let Some(problem) = status.connection_problem() {
                                     p { class: "status-err font-medium",
@@ -2870,6 +2906,16 @@ pub fn Settings() -> Element {
                                     // work out what they were missing out on.
                                     p { class: "font-medium", "No broker yet — nothing is being published" }
                                     p { class: "mt-1 text-secondary", "Add your broker below and your zones and controllers show up in Home Assistant as entities." }
+                                }
+                                // We are publishing and genuinely cannot tell
+                                // whether anyone reads it - a UHC that is not
+                                // an add-on has no Supervisor to ask (#610).
+                                // Muted and factual: "we did not check" must
+                                // never be dressed up as "you did not do it".
+                                if status.home_assistant_undetermined() {
+                                    p { id: "mqtt-ha-unknown", class: "mt-1 text-xs text-muted",
+                                        "These only become entities once Home Assistant's own MQTT integration is added (Settings → Devices & services → Add integration → MQTT). UHC can't check that from here."
+                                    }
                                 }
                                 // The address is already in the error line
                                 // above when there is one; repeating it there

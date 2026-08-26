@@ -30,6 +30,7 @@
 //! the next tick.
 
 pub mod command;
+pub mod consumer;
 pub mod discovery;
 pub mod knob_command;
 pub mod knob_discovery;
@@ -52,6 +53,7 @@ use crate::bus::runtime::CommandGateway;
 use crate::bus::{BusEvent, SharedBus, Zone};
 use crate::knobs::store::Knob;
 use crate::knobs::KnobStore;
+use consumer::{ConsumerMonitor, HomeAssistantState};
 
 pub use crate::api::credentials::{MqttConfigSource, MqttCredentialRecord};
 
@@ -190,6 +192,13 @@ pub struct MqttPublisher {
     /// this struct lives behind, exactly like `AppState::reliable_commands` starts `None` and is
     /// attached via `AppState::with_reliable_commands`.
     reliable_commands: std::sync::RwLock<Option<CommandGateway>>,
+    /// Whether Home Assistant is actually reading what we publish (#610).
+    ///
+    /// Held here rather than on the publisher task because it is a fact
+    /// about Home Assistant, not about our broker connection: it has to
+    /// survive the publisher being reconfigured, and the Supervisor poll
+    /// task that writes to it runs whether or not the publisher is on.
+    consumer: Arc<ConsumerMonitor>,
 }
 
 /// Snapshot of publisher state for the settings API, deliberately excluding
@@ -220,6 +229,14 @@ pub struct MqttStatus {
     /// unconfigured. Lets Settings show an add-on-managed broker as managed
     /// instead of inviting the user to re-type details they never entered.
     pub source: Option<MqttConfigSource>,
+    /// Whether Home Assistant's own MQTT integration is reading what we
+    /// publish (#610). The layer above `connection`: a broker we reach
+    /// happily can still have nobody on the other side of it.
+    pub home_assistant: HomeAssistantState,
+    /// Why we cannot tell, when we cannot. Only ever set alongside
+    /// [`consumer::HomeAssistantState::Unknown`]; the same raw-reason
+    /// convention as [`MqttStatus::last_error`].
+    pub home_assistant_detail: Option<String>,
 }
 
 impl MqttPublisher {
@@ -237,7 +254,15 @@ impl MqttPublisher {
             base_url: std::sync::RwLock::new(String::new()),
             runtime: Mutex::new(Runtime::default()),
             reliable_commands: std::sync::RwLock::new(None),
+            consumer: Arc::new(ConsumerMonitor::new()),
         }
+    }
+
+    /// The Home Assistant consumer belief (#610), shared so the Supervisor
+    /// poll task in `main` can record its own observations into the same
+    /// place the publisher's event loop records birth announcements.
+    pub fn consumer_monitor(&self) -> Arc<ConsumerMonitor> {
+        self.consumer.clone()
     }
 
     /// Attach the reliable command gateway (#529) so inbound HA commands for legacy
@@ -333,6 +358,7 @@ impl MqttPublisher {
             self.reliable_commands_snapshot(),
             self.base_url_snapshot(),
             connection.clone(),
+            self.consumer.clone(),
             shutdown.clone(),
         ));
         let task = RunningTask {
@@ -366,6 +392,7 @@ impl MqttPublisher {
     }
 
     pub async fn status(&self) -> MqttStatus {
+        let consumer = self.consumer.snapshot();
         let runtime = self.runtime.lock().await;
         // No task means no connection, whatever the last one reported: the
         // monitor is owned by the task and dies with it.
@@ -394,6 +421,8 @@ impl MqttPublisher {
                 .as_ref()
                 .is_some_and(|r| r.password.as_ref().is_some_and(|p| !p.is_empty())),
             source: runtime.record.as_ref().map(|r| r.source),
+            home_assistant: consumer.state,
+            home_assistant_detail: consumer.detail,
         }
     }
 
@@ -811,6 +840,7 @@ async fn run(
     reliable_commands: Option<CommandGateway>,
     base_url: String,
     connection: Arc<ConnectionMonitor>,
+    consumer: Arc<ConsumerMonitor>,
     shutdown: CancellationToken,
 ) {
     let availability_topic = topics::availability_topic(&record.base_topic);
@@ -851,6 +881,18 @@ async fn run(
                         // The one moment we know entities are really
                         // reaching a broker (#607).
                         connection.connected();
+                        // Listen for Home Assistant announcing itself on the
+                        // same broker (#610). Re-subscribed on every fresh
+                        // connection because a new MQTT session carries no
+                        // subscriptions over.
+                        for topic in consumer::status_topics(&record.discovery_prefix) {
+                            if let Err(error) = client.subscribe(&topic, QoS::AtLeastOnce).await {
+                                tracing::warn!(
+                                    topic,
+                                    "MQTT Home Assistant status subscription failed: {error}"
+                                );
+                            }
+                        }
                         announce_all_zones(
                             &client,
                             &record,
@@ -870,6 +912,53 @@ async fn run(
                             &mut knob_slugs,
                         )
                         .await;
+                    }
+                    Ok(Event::Incoming(Packet::Publish(publish)))
+                        if consumer::is_status_topic(
+                            &record.discovery_prefix,
+                            &publish.topic,
+                        ) =>
+                    {
+                        // Home Assistant just said something on its own
+                        // status topic (#610). Only `online` means anything;
+                        // an `offline` will-message is deliberately not
+                        // treated as bad news - see `consumer::apply`.
+                        if let Some(evidence) =
+                            consumer::parse_status_payload(&publish.payload)
+                        {
+                            consumer.observe(evidence);
+                            // Home Assistant's own integration docs ask
+                            // publishers to treat the birth message as the
+                            // trigger to (re)send their discovery payloads.
+                            // Ours are retained, so HA would find them
+                            // anyway, but re-announcing here is what makes
+                            // "add the MQTT integration and the zones
+                            // appear" true within seconds rather than on
+                            // HA's next discovery sweep.
+                            tracing::info!(
+                                "Home Assistant announced itself on the broker; \
+                                 re-publishing discovery"
+                            );
+                            announce_all_zones(
+                                &client,
+                                &record,
+                                &aggregator,
+                                &base_url,
+                                &availability_topic,
+                                &mut zone_slugs,
+                            )
+                            .await;
+                            announce_all_knobs(
+                                &client,
+                                &record,
+                                &knobs,
+                                &aggregator,
+                                &availability_topic,
+                                &mut known_knob_ids,
+                                &mut knob_slugs,
+                            )
+                            .await;
+                        }
                     }
                     Ok(Event::Incoming(Packet::Publish(publish))) => {
                         handle_incoming_publish(
