@@ -321,6 +321,23 @@ impl MusicAssistantCredentialStore {
     }
 }
 
+/// Who supplied a stored [`MqttCredentialRecord`]. The distinction is what
+/// lets the startup bootstrap in [`crate::api::mqtt_bootstrap`] adopt
+/// environment-provided broker settings (the Home Assistant add-on hands
+/// them over from the Supervisor) without ever overwriting broker settings
+/// the user typed in themselves.
+///
+/// [`MqttConfigSource::User`] is the serde default on purpose: records
+/// written before this field existed came from `POST /api/mqtt/configure`,
+/// i.e. from the user, and must keep winning over the environment.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MqttConfigSource {
+    #[default]
+    User,
+    Environment,
+}
+
 /// Broker connection details for the optional Home Assistant MQTT publisher
 /// (#508), kept in one encrypted record because the broker password is a
 /// secret alongside otherwise-plain connection settings.
@@ -335,6 +352,11 @@ pub struct MqttCredentialRecord {
     pub password: Option<String>,
     pub base_topic: String,
     pub discovery_prefix: String,
+    /// Provenance (#605). Participates in `PartialEq` so the startup
+    /// bootstrap can tell "the same environment config as last boot" from
+    /// "the same settings, but the user owns them now".
+    #[serde(default)]
+    pub source: MqttConfigSource,
 }
 
 impl std::fmt::Debug for MqttCredentialRecord {
@@ -348,6 +370,7 @@ impl std::fmt::Debug for MqttCredentialRecord {
             .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
             .field("base_topic", &self.base_topic)
             .field("discovery_prefix", &self.discovery_prefix)
+            .field("source", &self.source)
             .finish()
     }
 }

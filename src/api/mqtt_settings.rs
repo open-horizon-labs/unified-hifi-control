@@ -8,7 +8,7 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 
-use super::credentials::{MqttCredentialRecord, MqttCredentialStore};
+use super::credentials::{MqttConfigSource, MqttCredentialRecord, MqttCredentialStore};
 use super::AppState;
 use crate::mqtt::{DEFAULT_BASE_TOPIC, DEFAULT_DISCOVERY_PREFIX, DEFAULT_PORT, DEFAULT_TLS_PORT};
 
@@ -44,6 +44,12 @@ pub struct MqttStatusResponse {
     pub discovery_prefix: Option<String>,
     pub has_username: bool,
     pub has_password: bool,
+    /// `"user"`, `"environment"`, or absent while unconfigured (#605).
+    /// `"environment"` means the Home Assistant add-on supplied the broker
+    /// from the Supervisor, which Settings renders as managed rather than as
+    /// something the user should fill in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 impl From<crate::mqtt::MqttStatus> for MqttStatusResponse {
@@ -59,6 +65,13 @@ impl From<crate::mqtt::MqttStatus> for MqttStatusResponse {
             discovery_prefix: status.discovery_prefix,
             has_username: status.has_username,
             has_password: status.has_password,
+            source: status.source.map(|source| {
+                match source {
+                    MqttConfigSource::User => "user",
+                    MqttConfigSource::Environment => "environment",
+                }
+                .to_string()
+            }),
         }
     }
 }
@@ -122,6 +135,10 @@ pub async fn configure(
             .discovery_prefix
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| DEFAULT_DISCOVERY_PREFIX.to_string()),
+        // Saving through this endpoint is what makes the configuration the
+        // user's own: from here on the startup environment bootstrap (#605)
+        // leaves it alone, even under the Home Assistant add-on.
+        source: MqttConfigSource::User,
     };
 
     store.save(&record).map_err(|error| {
@@ -152,6 +169,7 @@ mod tests {
             discovery_prefix: Some("homeassistant".to_string()),
             has_username: true,
             has_password: true,
+            source: Some("user".to_string()),
         };
         let json = serde_json::to_string(&response).expect("serialize");
         // `has_password` (a bool) is expected; the literal secret is not -

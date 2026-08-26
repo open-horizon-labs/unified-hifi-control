@@ -636,22 +636,110 @@ mod server {
         // bus consumer with no zones of its own, so it does not join
         // `startable_adapters`/the coordinator - just a background task
         // this settings toggle and encrypted broker record turn on or off.
+        //
+        // Broker settings come from one of two places (#605): the user's own
+        // encrypted record, or `UHC_MQTT_*` handed over by the Home Assistant
+        // add-on, which reads them from the Supervisor. `mqtt_bootstrap::plan`
+        // owns the precedence between them; the log line below always names
+        // the winner, so an install with no entities can be diagnosed from
+        // the add-on log alone.
         state.mqtt.set_base_url(base_url.clone());
+        let environment_mqtt = match api::mqtt_bootstrap::from_env() {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(
+                    "Ignoring MQTT environment configuration: {error}. \
+                     Configure the broker in Settings instead."
+                );
+                None
+            }
+        };
         match api::credentials::MqttCredentialStore::from_env() {
             Ok(store) => match store.load() {
-                Ok(Some(record)) => {
-                    state.mqtt.configure(record).await;
-                    if app_settings.adapters.mqtt {
-                        state.mqtt.set_enabled(true).await;
+                Ok(stored) => {
+                    use api::mqtt_bootstrap::MqttBootstrap;
+                    match api::mqtt_bootstrap::plan(stored, environment_mqtt) {
+                        MqttBootstrap::ApplyEnvironment(record) => {
+                            let host = record.host.clone();
+                            let port = record.port;
+                            // Save before enabling: a publisher running off a
+                            // record that never reached disk would come back
+                            // unconfigured on the next boot.
+                            match store.save(&record) {
+                                Ok(()) => {
+                                    state.mqtt.configure(record).await;
+                                    if api::enable_mqtt_in_settings() {
+                                        state.mqtt.set_enabled(true).await;
+                                        tracing::info!(
+                                            broker = %format!("{host}:{port}"),
+                                            "MQTT configured from environment (Home Assistant add-on); publisher enabled"
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            "MQTT configured from environment (Home Assistant add-on) \
+                                             but the setting could not be saved; enable it in Settings"
+                                        );
+                                    }
+                                }
+                                Err(error) => tracing::warn!(
+                                    "MQTT environment configuration could not be saved: {error}"
+                                ),
+                            }
+                        }
+                        MqttBootstrap::EnvironmentUnchanged(record) => {
+                            let host = record.host.clone();
+                            let port = record.port;
+                            state.mqtt.configure(record).await;
+                            // Deliberately no re-enable: the toggle was
+                            // persisted when this config was first applied, so
+                            // `app_settings` now carries the user's answer.
+                            if app_settings.adapters.mqtt {
+                                state.mqtt.set_enabled(true).await;
+                            }
+                            tracing::info!(
+                                broker = %format!("{host}:{port}"),
+                                enabled = app_settings.adapters.mqtt,
+                                "MQTT configured from environment (Home Assistant add-on); unchanged since last start"
+                            );
+                        }
+                        MqttBootstrap::UseStored(record) => {
+                            let host = record.host.clone();
+                            let port = record.port;
+                            let source = record.source;
+                            state.mqtt.configure(record).await;
+                            if app_settings.adapters.mqtt {
+                                state.mqtt.set_enabled(true).await;
+                            }
+                            match source {
+                                api::credentials::MqttConfigSource::User => tracing::info!(
+                                    broker = %format!("{host}:{port}"),
+                                    enabled = app_settings.adapters.mqtt,
+                                    "MQTT configured from your saved settings (these win over the environment)"
+                                ),
+                                api::credentials::MqttConfigSource::Environment => tracing::info!(
+                                    broker = %format!("{host}:{port}"),
+                                    enabled = app_settings.adapters.mqtt,
+                                    "MQTT using the broker a previous environment bootstrap saved; \
+                                     the environment no longer supplies one"
+                                ),
+                            }
+                        }
+                        MqttBootstrap::Unconfigured => {
+                            if app_settings.adapters.mqtt {
+                                tracing::info!(
+                                    "MQTT publisher enabled in settings but no broker is configured yet"
+                                );
+                            } else {
+                                tracing::info!(
+                                    "MQTT publisher not configured; no Home Assistant entities will be published"
+                                );
+                            }
+                        }
                     }
                 }
-                Ok(None) => {
-                    if app_settings.adapters.mqtt {
-                        tracing::info!(
-                            "MQTT publisher enabled in settings but no broker is configured yet"
-                        );
-                    }
-                }
+                // An unreadable record is never overwritten: the environment
+                // bootstrap would otherwise destroy a user's broker settings
+                // over a transient decryption failure.
                 Err(error) => tracing::warn!("MQTT credential record unavailable: {error}"),
             },
             Err(error) => tracing::warn!("MQTT credential store unavailable: {error}"),

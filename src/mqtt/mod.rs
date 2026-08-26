@@ -53,7 +53,7 @@ use crate::bus::{BusEvent, SharedBus, Zone};
 use crate::knobs::store::Knob;
 use crate::knobs::KnobStore;
 
-pub use crate::api::credentials::MqttCredentialRecord;
+pub use crate::api::credentials::{MqttConfigSource, MqttCredentialRecord};
 
 /// How often knob state/discovery is re-published, since the knob store has
 /// no bus events of its own to react to (see module doc).
@@ -109,6 +109,10 @@ pub struct MqttStatus {
     pub discovery_prefix: Option<String>,
     pub has_username: bool,
     pub has_password: bool,
+    /// Who supplied the active broker settings (#605). `None` while
+    /// unconfigured. Lets Settings show an add-on-managed broker as managed
+    /// instead of inviting the user to re-type details they never entered.
+    pub source: Option<MqttConfigSource>,
 }
 
 impl MqttPublisher {
@@ -261,6 +265,7 @@ impl MqttPublisher {
                 .record
                 .as_ref()
                 .is_some_and(|r| r.password.as_ref().is_some_and(|p| !p.is_empty())),
+            source: runtime.record.as_ref().map(|r| r.source),
         }
     }
 

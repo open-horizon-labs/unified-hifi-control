@@ -345,6 +345,7 @@ async fn discovers_publishes_state_and_routes_commands_over_a_real_broker() {
             password: None,
             base_topic: "unified-hifi".to_string(),
             discovery_prefix: "homeassistant".to_string(),
+            source: Default::default(),
         })
         .await;
     publisher.set_enabled(true).await;
@@ -561,6 +562,7 @@ async fn tolerates_an_unreachable_broker() {
             password: None,
             base_topic: "unified-hifi".to_string(),
             discovery_prefix: "homeassistant".to_string(),
+            source: Default::default(),
         })
         .await;
     publisher.set_enabled(true).await;
@@ -655,6 +657,7 @@ async fn mqtt_command_for_a_legacy_zone_routes_through_the_command_gateway_to_lm
             password: None,
             base_topic: "unified-hifi".to_string(),
             discovery_prefix: "homeassistant".to_string(),
+            source: Default::default(),
         })
         .await;
     publisher.set_enabled(true).await;
@@ -784,6 +787,7 @@ async fn knob_discovery_state_and_zone_select_round_trip_over_a_real_broker() {
             password: None,
             base_topic: "unified-hifi".to_string(),
             discovery_prefix: "homeassistant".to_string(),
+            source: Default::default(),
         })
         .await;
     publisher.set_enabled(true).await;
