@@ -43,6 +43,7 @@ pub mod apple_bridge;
 pub mod browse;
 pub mod controller_auth;
 pub mod credentials;
+pub mod ingress;
 pub mod mqtt_settings;
 pub mod provider_auth;
 pub mod spotify_tunnel;

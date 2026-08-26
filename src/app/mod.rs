@@ -6,6 +6,7 @@
 use dioxus::prelude::*;
 
 pub mod api;
+pub mod base_path;
 pub mod components;
 pub mod controller_auth;
 pub mod embedded_assets;
@@ -83,6 +84,22 @@ pub fn App() -> Element {
     #[cfg(not(target_arch = "wasm32"))]
     let mcp_endpoint = try_consume_context::<McpEndpoint>().unwrap_or_default();
     use_context_provider(|| mcp_endpoint.clone());
+
+    // HA Ingress (#581): when the document was served behind a subpath
+    // proxy (the server injected a uhc-base-path meta tag), the router must
+    // treat that prefix as its base path -- Link hrefs, pushes, and route
+    // parsing all include it. Provided before Router mounts so it shadows
+    // the default (prefixless) WebHistory the web launch installs at the
+    // root. Direct mode has no meta tag and keeps the default history.
+    #[cfg(all(target_arch = "wasm32", feature = "web"))]
+    use_hook(|| {
+        let base = base_path::base_path();
+        if !base.is_empty() {
+            provide_context::<std::rc::Rc<dyn dioxus::history::History>>(std::rc::Rc::new(
+                dioxus::web::WebHistory::new(Some(base), true),
+            ));
+        }
+    });
 
     // Initialize SSE context at app root (single EventSource for all pages)
     use_sse_provider();

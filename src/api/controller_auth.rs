@@ -230,6 +230,20 @@ pub async fn middleware(
     // its always-on protection of provider routes) set
     // UHC_REQUIRE_CONTROLLER_AUTH=1; the add-on and docs surface that choice.
     let owner_operation = requires_controller_auth(path);
+    // HA Ingress (#581): a request proxied by the Supervisor is already
+    // authenticated by the user's Home Assistant session -- a strictly
+    // stronger boundary than the bootstrap cookie. Trust is triple-gated
+    // (UHC_INGRESS=1 set only by the add-on's run.sh, the peer must be the
+    // Supervisor's proxy network, and X-Ingress-Path must be present and
+    // well-formed -- see crate::api::ingress). Same-origin/CSRF cannot apply
+    // through the proxy: the browser Origin is the HA frontend's origin and
+    // Host is the internal proxy address, so they never match; the proxy
+    // itself is what guarantees the request came from an authenticated HA
+    // session. Direct-port requests never satisfy the peer gate and keep the
+    // full posture below, even on an ingress-enabled install.
+    if super::ingress::trusted_ingress_request(&request) {
+        return next.run(request).await;
+    }
     if !controller_auth_required() {
         return next.run(request).await;
     }
