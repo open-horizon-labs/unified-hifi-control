@@ -875,14 +875,21 @@ mod server {
             .route("/control", get(control_redirect))
             .route("/admin", get(settings_redirect))
             // Embedded WASM/JS assets (ADR 002: serve from memory, no disk extraction)
-            .route("/assets/{*path}", get(embedded::serve_embedded_asset))
-            // #560: fonts 404'd on the built server -- public/fonts/ is
-            // embedded like every other public/ file, but (unlike
-            // /assets/*) nothing routed requests there, so the SPA
-            // fallback answered instead. Registered unconditionally
-            // because it serves the same embedded PublicAssets data in
-            // every mode.
-            .route("/fonts/{*path}", get(embedded::serve_embedded_font));
+            .route("/assets/{*path}", get(embedded::serve_embedded_asset));
+
+        // #560: fonts 404'd on the built server -- public/fonts/ is
+        // embedded like every other public/ file, but (unlike /assets/*)
+        // nothing routed requests there, so the SPA fallback answered
+        // instead. Gated at runtime rather than on `feature = "web"`
+        // because it serves embedded PublicAssets data regardless of that
+        // feature -- but only when embedded assets exist: without them,
+        // serve_dioxus_application() below serves exe-adjacent public/
+        // itself, and a second /fonts route would make axum panic.
+        let router = if embedded::has_embedded_assets() {
+            router.route("/fonts/{*path}", get(embedded::serve_embedded_font))
+        } else {
+            router
+        };
 
         // Static file routes (favicon, touch icon, stylesheets). Gated at
         // runtime on the same condition that picks the serve branch below:
@@ -897,9 +904,7 @@ mod server {
                 .route(
                     "/favicon.ico",
                     get(|| {
-                        embedded::serve_static_file(axum::extract::Path(
-                            "favicon.ico".to_string(),
-                        ))
+                        embedded::serve_static_file(axum::extract::Path("favicon.ico".to_string()))
                     }),
                 )
                 .route(
