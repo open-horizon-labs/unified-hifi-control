@@ -220,12 +220,15 @@ pub async fn middleware(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    // Provisioning and credential transitions are always installation-owner
-    // operations.  They must not inherit the opt-in compatibility switch:
-    // otherwise a fresh LAN/tunnel install lets any reachable client replace
-    // OAuth credentials or mint an Apple companion pairing before the owner
-    // has even completed bootstrap.  The switch remains for the broader
-    // playback/MCP surface while existing clients adopt the session cookie.
+    // Controller auth is OPT-IN, full stop (owner decision, 2026-08-26).
+    // An earlier revision force-gated provider/credential routes even with
+    // the switch off, on the theory that a fresh LAN install shouldn't let
+    // any reachable client replace OAuth credentials -- but that shipped a
+    // mandatory bootstrap ceremony to trusting home-LAN installs that never
+    // asked for it, contradicting docs/controller-auth.md's own "intentionally
+    // opt-in" contract. Installations that want the owner gate (including
+    // its always-on protection of provider routes) set
+    // UHC_REQUIRE_CONTROLLER_AUTH=1; the add-on and docs surface that choice.
     let owner_operation = requires_controller_auth(path);
     // HA Ingress (#581): a request proxied by the Supervisor is already
     // authenticated by the user's Home Assistant session -- a strictly
@@ -241,7 +244,7 @@ pub async fn middleware(
     if super::ingress::trusted_ingress_request(&request) {
         return next.run(request).await;
     }
-    if !controller_auth_required() && !owner_operation {
+    if !controller_auth_required() {
         return next.run(request).await;
     }
     // The browser shell and hardware/status protocol remain reachable on a
