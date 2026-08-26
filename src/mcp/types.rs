@@ -78,6 +78,11 @@ pub struct McpNowPlaying {
 /// Spotify/Apple Music/Music Assistant's generic search has no grouping or
 /// browse concept, so they always leave this `None` (see
 /// `crate::mcp::tools::library::handle_search`'s per-route docs).
+/// `image` (#573 defect 10) follows `hifi_collections`' artwork convention
+/// exactly: a same-origin `/api/collections/image?ref=...` path over an
+/// opaque minted token, present only when the provider supplied art for the
+/// hit. Only Roon sets it today -- the other providers' generic search
+/// results carry no image key (see `handle_search`'s per-route mappings).
 #[derive(Debug, Serialize)]
 pub struct McpSearchResult {
     pub title: String,
@@ -86,6 +91,8 @@ pub struct McpSearchResult {
     pub r#ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 /// `hifi_play`'s structured payload: the adapter's own message about what it

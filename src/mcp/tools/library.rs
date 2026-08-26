@@ -219,6 +219,7 @@ pub async fn handle_search(
                             // grouping row or browsable container in its
                             // response shape to mint a path for.
                             path: None,
+                            image: None,
                         });
                     }
                     Ok(env.json_result(&mcp_results))
@@ -250,6 +251,7 @@ pub async fn handle_search(
                             // (`LibrarySearchResult`) has no grouping or
                             // browse concept -- see #566's audit.
                             path: None,
+                            image: None,
                         });
                     }
                     Ok(env.json_result(&mcp_results))
@@ -283,6 +285,7 @@ pub async fn handle_search(
                             // exposes MA's real browse hierarchy
                             // separately, via `MusicAssistantBrowse`.)
                             path: None,
+                            image: None,
                         });
                     }
                     Ok(env.json_result(&mcp_results))
@@ -325,6 +328,7 @@ pub async fn handle_search(
                             // flat catalog/library hits -- no grouping or
                             // browse concept -- see #566's audit.
                             path: None,
+                            image: None,
                         });
                     }
                     Ok(env.json_result(&mcp_results))
@@ -346,14 +350,31 @@ pub async fn handle_search(
                 Ok((session_key, results)) => {
                     let mut mcp_results = Vec::with_capacity(results.len());
                     for item in results {
+                        // #573 defect 10: search hits carry artwork where
+                        // Roon supplies it, resolved through the identical
+                        // opaque-ref URL browse rows use.
+                        let image = crate::mcp::tools::collections::mint_image(
+                            state,
+                            args.zone_id.as_deref().unwrap_or_default(),
+                            item.image_key.as_deref(),
+                        )
+                        .await;
+                        // #573 defect 5: strip `[[id|Name]]` link markup at
+                        // the mapping, same as `hifi_collections`.
+                        let title = crate::adapters::roon::strip_roon_link_markup(&item.title);
+                        let subtitle = item
+                            .subtitle
+                            .as_deref()
+                            .map(crate::adapters::roon::strip_roon_link_markup);
                         let Some(item_key) = item.item_key.clone() else {
                             // No item_key -- a header or non-navigable row.
                             // Nothing to mint a ref or path from.
                             mcp_results.push(McpSearchResult {
-                                title: item.title,
-                                subtitle: item.subtitle,
+                                title,
+                                subtitle,
                                 r#ref: None,
                                 path: None,
+                                image,
                             });
                             continue;
                         };
@@ -425,10 +446,11 @@ pub async fn handle_search(
                             None
                         };
                         mcp_results.push(McpSearchResult {
-                            title: item.title,
-                            subtitle: item.subtitle,
+                            title,
+                            subtitle,
                             r#ref: ref_token,
                             path,
+                            image,
                         });
                     }
                     Ok(env.json_result(&mcp_results))

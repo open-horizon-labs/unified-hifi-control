@@ -114,6 +114,13 @@ pub struct ZoneInfo {
     /// on this instead of a hardcoded `musicassistant:` prefix check, so LMS
     /// and Roon zones light up as their slices land, without a web change.
     pub browse_supported: bool,
+    /// Which Library-page tabs this zone's provider serves (#573 defect 6):
+    /// a subset of `["browse", "playlists", "favorites", "radio"]`, derived
+    /// from the same capability facts `hifi_capabilities` reports (see
+    /// `crate::mcp::tools::collections::collections_tabs_for_zone`). The web
+    /// Library page hides tabs missing from this list instead of rendering
+    /// ones whose every call would be refused.
+    pub library_tabs: Vec<&'static str>,
 }
 
 /// GET /knob/zones response
@@ -179,6 +186,7 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
             browse_supported: crate::mcp::tools::collections::zone_supports_hifi_collections(
                 &z.zone_id,
             ),
+            library_tabs: crate::mcp::tools::collections::collections_tabs_for_zone(&z.zone_id),
             zone_id: z.zone_id,
             zone_name: z.zone_name,
             source: z.source,
@@ -1686,6 +1694,7 @@ mod tests {
             volume_control: None,
             dsp: None,
             browse_supported: false,
+            library_tabs: Vec::new(),
         }
     }
 

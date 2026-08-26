@@ -40,6 +40,81 @@ pub struct LmsStatus {
 }
 
 // =============================================================================
+// Controller-auth types (#570)
+//
+// Client-side mirrors of `src/api/controller_auth.rs`'s wire types. That
+// module gates provider/credential routes behind a one-time owner bootstrap
+// token; these types and helpers let the Settings UI (and any other
+// owner-gated call site) drive `GET /api/controller/status` and
+// `POST /api/controller/bootstrap` without duplicating field names that
+// could drift from the server shape.
+// =============================================================================
+
+/// The exact `error` text `src/api/controller_auth.rs::unauthorized()` uses
+/// for a `controller_unauthorized` 401. A shared constant (referenced
+/// directly from that server-side function) rather than two independently
+/// typed literals, so detection here can never silently drift from the
+/// message it is matching against.
+pub const CONTROLLER_UNAUTHORIZED_MESSAGE: &str = "Controller authentication required";
+
+/// True when a fetch helper's formatted `Err(String)` came from the
+/// controller-auth 401 gate. `response_error` below already routes this case
+/// into the bootstrap prompt as a side effect; callers that render their own
+/// error text should pass their `Err` through
+/// [`suppress_controller_unauthorized`] so the raw HTTP text is not also
+/// shown next to the prompt.
+pub fn is_controller_unauthorized_error(message: &str) -> bool {
+    message.ends_with(CONTROLLER_UNAUTHORIZED_MESSAGE)
+}
+
+/// Drop a `controller_unauthorized` error (it already opened the bootstrap
+/// prompt) and pass every other error through unchanged, for call sites that
+/// display fetch errors directly.
+pub fn suppress_controller_unauthorized(message: String) -> Option<String> {
+    if is_controller_unauthorized_error(&message) {
+        None
+    } else {
+        Some(message)
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ControllerStatus {
+    pub authenticated: bool,
+    pub bootstrap_required: bool,
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ControllerBootstrapRequest {
+    pub token: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct ControllerBootstrapResponse {
+    pub authenticated: bool,
+    pub csrf_token: String,
+    pub expires_at: u64,
+}
+
+/// `GET /api/controller/status`.
+pub async fn fetch_controller_status() -> Result<ControllerStatus, String> {
+    fetch_json("/api/controller/status").await
+}
+
+/// `POST /api/controller/bootstrap`.
+pub async fn bootstrap_controller(token: &str) -> Result<ControllerBootstrapResponse, String> {
+    post_json(
+        "/api/controller/bootstrap",
+        &ControllerBootstrapRequest {
+            token: token.to_string(),
+        },
+    )
+    .await
+}
+
+// =============================================================================
 // Settings Types
 // =============================================================================
 
@@ -279,6 +354,14 @@ pub struct Zone {
     /// will refuse every call.
     #[serde(default)]
     pub browse_supported: bool,
+    /// Which Library-page tabs this zone's provider serves (#573 defect 6):
+    /// a subset of `["browse", "playlists", "favorites", "radio"]`, derived
+    /// server-side from the capability matrix. `default`s to empty, which
+    /// the Library page treats as "no information -- show every tab" so a
+    /// response from a build predating this field degrades to the old
+    /// behavior rather than hiding everything.
+    #[serde(default)]
+    pub library_tabs: Vec<String>,
 }
 
 // =============================================================================
@@ -458,7 +541,11 @@ pub struct CollectionItem {
     pub path: Option<String>,
     #[serde(rename = "ref", default)]
     pub item_ref: Option<String>,
-    /// Opaque artwork ref, resolved via `GET /api/collections/image?ref=...`.
+    /// Artwork URL, used verbatim as an `<img src>`. The server sends the
+    /// complete same-origin path (`/api/collections/image?ref=...`) --
+    /// #573 defect 2: the UI must never prepend anything to it (an earlier
+    /// draft documented this as a bare ref and the UI double-prefixed it,
+    /// 404ing every image).
     #[serde(default)]
     pub image: Option<String>,
 }
@@ -577,6 +664,11 @@ pub struct SearchResult {
     /// same way (open into browse, push a breadcrumb).
     #[serde(default)]
     pub path: Option<String>,
+    /// Artwork URL (#573 defect 10) -- same contract as
+    /// `CollectionItem::image`: a complete same-origin path, used verbatim
+    /// as an `<img src>`.
+    #[serde(default)]
+    pub image: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -891,6 +983,17 @@ pub async fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
     headers
         .set("Content-Type", "application/json")
         .map_err(|e| format!("{:?}", e))?;
+    // Attach the double-submit CSRF token from a completed bootstrap (#570).
+    // The server's controller-auth middleware requires this header on every
+    // non-GET/HEAD request once a session cookie exists -- see
+    // `csrf_matches` in `src/api/controller_auth.rs`. Before bootstrap (or
+    // when controller auth is off entirely) there is no token to attach and
+    // the header is simply omitted.
+    if let Some(token) = crate::app::controller_auth::current_csrf_token() {
+        headers
+            .set("x-uhc-csrf-token", &token)
+            .map_err(|e| format!("{:?}", e))?;
+    }
 
     let body_str = serde_json::to_string(body).map_err(|e| e.to_string())?;
 
@@ -940,6 +1043,12 @@ pub async fn post_json_no_response<T: Serialize>(url: &str, body: &T) -> Result<
     headers
         .set("Content-Type", "application/json")
         .map_err(|e| format!("{:?}", e))?;
+    // See the matching comment in `post_json` above (#570).
+    if let Some(token) = crate::app::controller_auth::current_csrf_token() {
+        headers
+            .set("x-uhc-csrf-token", &token)
+            .map_err(|e| format!("{:?}", e))?;
+    }
 
     let body_str = serde_json::to_string(body).map_err(|e| e.to_string())?;
 
@@ -990,6 +1099,14 @@ async fn response_error(resp: web_sys::Response) -> String {
                 body
             }
         });
+    // Route every fetch helper's controller-auth 401 into the bootstrap
+    // prompt instead of leaving the caller to render this raw string
+    // (#570). This is the single interception point: `fetch_json`,
+    // `post_json`, and `post_json_no_response` all funnel their non-ok
+    // responses through here.
+    if status == 401 && detail == CONTROLLER_UNAUTHORIZED_MESSAGE {
+        crate::app::controller_auth::open_bootstrap_prompt();
+    }
     format!("HTTP {status}: {detail}")
 }
 

@@ -21,6 +21,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # Copy manifests first (for dependency caching)
 COPY Cargo.toml Cargo.lock Dioxus.toml Makefile ./
+# build.rs sets UHC_VERSION/UHC_GIT_SHA via cargo:rustc-env; main.rs's env!()
+# macros fail to compile without it, so it must be present for every cargo
+# invocation (including the dummy-source dependency-caching build below).
+COPY build.rs ./
 
 # Create dummy source for dependency caching
 RUN mkdir -p src/app && \
