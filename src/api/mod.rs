@@ -44,6 +44,7 @@ pub mod browse;
 pub mod controller_auth;
 pub mod credentials;
 pub mod ingress;
+pub mod mqtt_bootstrap;
 pub mod mqtt_settings;
 pub mod provider_auth;
 pub mod spotify_tunnel;
@@ -3230,6 +3231,17 @@ fn mutate_app_settings(mutate: impl FnOnce(&mut AppSettings)) -> bool {
     let mut settings = load_app_settings();
     mutate(&mut settings);
     save_app_settings_locked(&settings)
+}
+
+/// Turn the MQTT publisher on in persisted settings during the startup
+/// environment bootstrap (#605).
+///
+/// Persisting matters as much as enabling does. Enabling only in memory would
+/// leave `app-settings.json` saying `mqtt: false`, so the *next* boot could
+/// not tell "the add-on switched this on for you" from "you switched it off",
+/// and the user's later decision to turn it off would not survive a restart.
+pub fn enable_mqtt_in_settings() -> bool {
+    mutate_app_settings(|settings| settings.adapters.mqtt = true)
 }
 
 /// Overwrite the settings wholesale. Test-only on purpose.
