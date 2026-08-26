@@ -27,9 +27,13 @@
 //!    zones appear seconds after the integration is added.
 //!
 //! Neither source is complete on its own. The core API is unavailable when
-//! UHC is not running as an add-on (or when `homeassistant_api` is missing);
-//! the birth message is published with `retain: false`, so an HA that
-//! connected *before* UHC subscribed is invisible until it next reconnects.
+//! UHC is not running as an add-on (or when `homeassistant_api` is missing).
+//! The birth message, for its part, only tells us anything when Home
+//! Assistant happens to connect while we are subscribed: an HA that was
+//! already connected before UHC started may not announce itself again for
+//! hours, and its retain flag is configurable rather than guaranteed, so
+//! silence on that topic proves nothing either way.
+//!
 //! Hence three states, not two - see [`HomeAssistantState`]. "We cannot tell"
 //! is a real answer and gets said out loud rather than being rounded to
 //! either good news or an accusation.
