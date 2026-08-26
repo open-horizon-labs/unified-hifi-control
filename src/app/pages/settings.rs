@@ -289,7 +289,34 @@ fn scroll_to_element(_id: &str) {}
 
 #[cfg(target_arch = "wasm32")]
 fn current_location_search() -> Option<String> {
-    web_sys::window()?.location().search().ok()
+    let window = web_sys::window()?;
+    if let Ok(search) = window.location().search() {
+        if !search.is_empty() {
+            return Some(search);
+        }
+    }
+    // The router normalizes the URL -- dropping the OAuth-return query --
+    // before this page's first client render, so `location.search` is
+    // already empty by the time anything here can read it (#597 probe
+    // finding). The browser keeps the document's original navigation URL in
+    // the performance timeline; recover the query from there. Memoized
+    // (idempotently -- hydration can initialize the page's hooks more than
+    // once) so every reader in this document sees the same value; a real
+    // reload of the normalized URL naturally clears it, because the fresh
+    // navigation entry carries no query.
+    use std::sync::OnceLock;
+    static NAVIGATION_QUERY: OnceLock<Option<String>> = OnceLock::new();
+    NAVIGATION_QUERY
+        .get_or_init(|| {
+            let entries = window.performance()?.get_entries_by_type("navigation");
+            let entry = entries.get(0);
+            use wasm_bindgen::JsCast;
+            let entry = entry.dyn_ref::<web_sys::PerformanceEntry>()?;
+            let name = entry.name();
+            let (_, query) = name.split_once('?')?;
+            Some(format!("?{query}"))
+        })
+        .clone()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1381,7 +1408,14 @@ pub fn Settings() -> Element {
     let apple_st = apple_bridge_status.read().clone().and_then(Result::ok);
     let apple_music_state = apple_music_status_state(apple_st.as_ref());
     let apple_music_live_count = apple_music_live_companion_count(apple_st.as_ref());
-    let callback_message = callback_feedback();
+    // Snapshot the OAuth-return query once, on the first client render: the
+    // router normalizes the URL (dropping `?spotify=...&reason=...`) shortly
+    // after hydration, so re-reading `location.search` every render made the
+    // feedback vanish as soon as any signal re-rendered the page (#597 probe
+    // finding). SSR still renders no feedback (the non-wasm helper returns
+    // None), and only `hidden` attributes differ on hydration.
+    let spotify_callback_snapshot = use_signal(callback_feedback);
+    let callback_message = spotify_callback_snapshot();
     let spotify_status_is_error = spotify_error().is_some();
     let spotify_status_message =
         spotify_error().or_else(|| spotify_action().message().map(str::to_string));
