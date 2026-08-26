@@ -2611,6 +2611,44 @@ async fn roon_collections_peeks_do_not_derail_fetch_ahead_paging() {
     core.stop().await;
 }
 
+/// #593 review follow-up: when a peek's position-restoring `pop_levels`
+/// browse fails, the session sits at an unknown level -- the listing must
+/// refuse loudly instead of quietly continuing (an ordinary peek failure
+/// degrades to "navigable, not playable"; a lost position must not, because
+/// the fetch-ahead loop's bare `load`s would map the peeked child's rows as
+/// the parent's).
+#[tokio::test]
+async fn roon_collections_lost_peek_position_refuses_instead_of_paging_blind() {
+    let core = FakeRoonCore::start_with(artists_library()).await;
+    let adapter = connected(&core).await;
+
+    core.reject_next_pop_levels().await;
+    let error = adapter
+        .content(
+            "collections_browse",
+            &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
+        )
+        .await
+        .expect_err("a lost browse position must fail the listing");
+    assert!(
+        format!("{error:#}").contains("browse position lost"),
+        "the refusal must name the position loss: {error:#}"
+    );
+
+    // One-shot knob: the next walk restores normal service, and the level
+    // maps correctly again -- the failure poisoned nothing durable.
+    let root = adapter
+        .content(
+            "collections_browse",
+            &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
+        )
+        .await
+        .expect("a fresh walk after the transient failure succeeds");
+    assert_eq!(root["items"][0]["title"], "Local Library");
+
+    core.stop().await;
+}
+
 /// #573 defect 8: paging is computed against post-filter reality. A raw
 /// page that filters to nothing (limit 1, first raw row is the "Play
 /// Playlist" verb) fetches ahead and still delivers content, and

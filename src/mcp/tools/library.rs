@@ -410,10 +410,21 @@ pub async fn handle_search(
                             if crate::adapters::roon::is_ungrounded_grouping(&item) {
                                 (true, false)
                             } else if let Some(zone_id) = args.zone_id.as_deref() {
-                                state
+                                match state
                                     .roon
                                     .classify_navigability(zone_id, &session_key, &item)
                                     .await
+                                {
+                                    Ok(classified) => classified,
+                                    // BrowsePositionLost: the search session's
+                                    // browse position is gone, so every further
+                                    // classification in this loop would judge
+                                    // an unknown level. Refuse the search
+                                    // honestly instead of mislabeling hits.
+                                    Err(error) => {
+                                        return env.failed(format!("Search error: {error:#}"));
+                                    }
+                                }
                             } else {
                                 // No zone to peek playability with (#398: an
                                 // absent zone_id still routes search to Roon) --

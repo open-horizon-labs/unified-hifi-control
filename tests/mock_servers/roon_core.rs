@@ -685,6 +685,9 @@ struct CoreState {
     rejection_names: HashMap<String, String>,
     /// One-shot: the next browse, whatever it is, is rejected.
     reject_next_browse: bool,
+    /// One-shot: the next browse carrying `pop_levels` is rejected with
+    /// `InvalidLevels` (see [`FakeRoonCore::reject_next_pop_levels`]).
+    reject_next_pop_levels: bool,
     /// Applied before every response.
     delay: Duration,
     /// Per-item_key delay override, so a test can force responses to arrive out
@@ -753,6 +756,7 @@ impl FakeRoonCore {
             rejected_keys: HashSet::new(),
             rejection_names: HashMap::new(),
             reject_next_browse: false,
+            reject_next_pop_levels: false,
             delay: Duration::ZERO,
             key_delays: HashMap::new(),
             level_delays: HashMap::new(),
@@ -887,6 +891,14 @@ impl FakeRoonCore {
 
     pub async fn set_item_key_scope(&self, scope: ItemKeyScope) {
         self.state.write().await.item_key_scope = scope;
+    }
+
+    /// One-shot: refuse the next browse that carries `pop_levels` (with
+    /// `InvalidLevels`). Targets the position-restoring pop of a playability
+    /// peek specifically -- `reject_next_browse` cannot, because the peek's
+    /// own descending browse comes first (#593 review follow-up).
+    pub async fn reject_next_pop_levels(&self) {
+        self.state.write().await.reject_next_pop_levels = true;
     }
 
     /// Replace the children of the node titled `parent_title`, mid-run.
@@ -1568,6 +1580,14 @@ async fn handle_browse(
         state.reject_next_browse = false;
         drop(state);
         refuse(core, writer, "InvalidItemKey", req_id, &session_key).await;
+        return;
+    }
+
+    // --- targeted pop_levels rejection (#593 review follow-up) --------------
+    if pop_levels.is_some() && state.reject_next_pop_levels {
+        state.reject_next_pop_levels = false;
+        drop(state);
+        refuse(core, writer, "InvalidLevels", req_id, &session_key).await;
         return;
     }
 
