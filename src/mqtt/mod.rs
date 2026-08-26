@@ -55,7 +55,7 @@ use crate::knobs::store::Knob;
 use crate::knobs::KnobStore;
 use consumer::{ConsumerMonitor, HomeAssistantState};
 
-pub use crate::api::credentials::{MqttConfigSource, MqttCredentialRecord};
+pub use crate::api::credentials::{MqttConfigSource, MqttCredentialRecord, MqttEnableSource};
 
 /// How often knob state/discovery is re-published, since the knob store has
 /// no bus events of its own to react to (see module doc).
@@ -173,6 +173,10 @@ struct RunningTask {
 struct Runtime {
     record: Option<MqttCredentialRecord>,
     enabled: bool,
+    /// Who last switched `enabled` on (#613), mirrored from
+    /// `app-settings.json` so the settings API can answer it without a disk
+    /// read on every five-second poll.
+    enable_source: MqttEnableSource,
     task: Option<RunningTask>,
 }
 
@@ -229,6 +233,12 @@ pub struct MqttStatus {
     /// unconfigured. Lets Settings show an add-on-managed broker as managed
     /// instead of inviting the user to re-type details they never entered.
     pub source: Option<MqttConfigSource>,
+    /// Who turned the publisher on (#613). Distinct from [`MqttStatus::source`],
+    /// which is about the broker settings: an add-on user can deliberately
+    /// enable publishing against a broker they never typed in. Only a
+    /// deliberate enable earns the "Home Assistant isn't receiving this"
+    /// warning.
+    pub enable_source: MqttEnableSource,
     /// Whether Home Assistant's own MQTT integration is reading what we
     /// publish (#610). The layer above `connection`: a broker we reach
     /// happily can still have nobody on the other side of it.
@@ -421,9 +431,18 @@ impl MqttPublisher {
                 .as_ref()
                 .is_some_and(|r| r.password.as_ref().is_some_and(|p| !p.is_empty())),
             source: runtime.record.as_ref().map(|r| r.source),
+            enable_source: runtime.enable_source,
             home_assistant: consumer.state,
             home_assistant_detail: consumer.detail,
         }
+    }
+
+    /// Record who switched the publisher on (#613). Called at startup from
+    /// the persisted setting and again whenever `POST /api/settings` changes
+    /// the toggle, so the answer survives a restart the same way the toggle
+    /// itself does.
+    pub async fn set_enable_source(&self, source: MqttEnableSource) {
+        self.runtime.lock().await.enable_source = source;
     }
 
     /// Stop the publisher for shutdown, publishing "offline" for a clean

@@ -8,7 +8,9 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 
-use super::credentials::{MqttConfigSource, MqttCredentialRecord, MqttCredentialStore};
+use super::credentials::{
+    MqttConfigSource, MqttCredentialRecord, MqttCredentialStore, MqttEnableSource,
+};
 use super::AppState;
 use crate::mqtt::{DEFAULT_BASE_TOPIC, DEFAULT_DISCOVERY_PREFIX, DEFAULT_PORT, DEFAULT_TLS_PORT};
 
@@ -62,6 +64,16 @@ pub struct MqttStatusResponse {
     /// something the user should fill in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Whether a person deliberately chose to publish over MQTT (#613),
+    /// rather than the add-on having switched it on for them.
+    ///
+    /// Either half counts: saving broker settings through
+    /// `POST /api/mqtt/configure` (which marks the record `"user"`), or
+    /// flipping the toggle in Settings. It gates one thing - the
+    /// "Home Assistant isn't receiving this" warning - because warning
+    /// someone about a publisher they never asked for is noise, and #605
+    /// auto-enabling MQTT under the add-on made that the common case.
+    pub user_opted_in: bool,
     /// Whether Home Assistant is actually reading what we publish (#610):
     /// `"consuming"`, `"not_configured"`, or `"unknown"`.
     ///
@@ -91,6 +103,8 @@ impl From<crate::mqtt::MqttStatus> for MqttStatusResponse {
             discovery_prefix: status.discovery_prefix,
             has_username: status.has_username,
             has_password: status.has_password,
+            user_opted_in: status.source == Some(MqttConfigSource::User)
+                || status.enable_source == MqttEnableSource::User,
             home_assistant: status.home_assistant.as_str().to_string(),
             home_assistant_detail: status.home_assistant_detail,
             source: status.source.map(|source| {

@@ -43,6 +43,7 @@ pub mod apple_bridge;
 pub mod browse;
 pub mod controller_auth;
 pub mod credentials;
+pub mod ha_integration;
 pub mod ingress;
 pub mod mqtt_bootstrap;
 pub mod mqtt_settings;
@@ -3065,6 +3066,18 @@ pub struct AppSettings {
     pub hide_lms_page: bool,
     #[serde(default)]
     pub adapters: AdapterSettings,
+    /// Who turned `adapters.mqtt` on (#613).
+    ///
+    /// Not part of `AdapterSettings` because it is not an adapter toggle: it
+    /// is provenance for one, and the only thing that reads it is the
+    /// decision about whether to warn that Home Assistant is not consuming
+    /// what UHC publishes. Under the add-on, publishing that nobody asked
+    /// for must not produce a warning about nobody receiving it.
+    ///
+    /// `POST /api/settings` sets this itself rather than trusting the body,
+    /// so the client never has to know the field exists.
+    #[serde(default)]
+    pub mqtt_enabled_by: crate::api::credentials::MqttEnableSource,
     /// Zone IDs the user has hidden from every zone list.
     ///
     /// `Option` rather than `Vec` because this type is both the stored shape *and* the request body
@@ -3175,6 +3188,7 @@ impl Default for AppSettings {
                 musicassistant: false,
                 mqtt: false,
             },
+            mqtt_enabled_by: crate::api::credentials::MqttEnableSource::Automatic,
         }
     }
 }
@@ -3241,7 +3255,13 @@ fn mutate_app_settings(mutate: impl FnOnce(&mut AppSettings)) -> bool {
 /// not tell "the add-on switched this on for you" from "you switched it off",
 /// and the user's later decision to turn it off would not survive a restart.
 pub fn enable_mqtt_in_settings() -> bool {
-    mutate_app_settings(|settings| settings.adapters.mqtt = true)
+    mutate_app_settings(|settings| {
+        settings.adapters.mqtt = true;
+        // Nobody chose this; the environment did (#613). Recording that is
+        // what keeps the "Home Assistant isn't receiving this" warning off a
+        // publisher the user never asked for.
+        settings.mqtt_enabled_by = credentials::MqttEnableSource::Automatic;
+    })
 }
 
 /// Overwrite the settings wholesale. Test-only on purpose.
@@ -3368,6 +3388,21 @@ pub async fn api_settings_post_handler(
         if new_settings.zone_names.is_none() {
             new_settings.zone_names = current.zone_names.clone();
         }
+        // Provenance for the MQTT toggle (#613), decided here rather than
+        // taken from the body: a request that flips `mqtt` from off to on is
+        // a person clicking a switch, which is exactly what makes the
+        // "Home Assistant isn't receiving this" warning fair to show. Turning
+        // it off clears the flag, so a later automatic enable does not
+        // inherit a choice made about a different broker.
+        new_settings.mqtt_enabled_by = if new_settings.adapters.mqtt {
+            if current.adapters.mqtt {
+                current.mqtt_enabled_by
+            } else {
+                credentials::MqttEnableSource::User
+            }
+        } else {
+            credentials::MqttEnableSource::Automatic
+        };
         *current = new_settings.clone();
     });
 
@@ -3493,6 +3528,14 @@ pub async fn api_settings_post_handler(
     // simply turns its background publisher task on or off.
     if old_adapters.mqtt != new_adapters.mqtt {
         state.mqtt.set_enabled(new_adapters.mqtt).await;
+        // Keep the live publisher's copy of the provenance in step with the
+        // one just persisted (#613), so the status endpoint stops or starts
+        // qualifying for the "Home Assistant isn't receiving this" warning
+        // in the same request that flipped the toggle.
+        state
+            .mqtt
+            .set_enable_source(new_settings.mqtt_enabled_by)
+            .await;
         applied_transitions.push("mqtt");
     }
 

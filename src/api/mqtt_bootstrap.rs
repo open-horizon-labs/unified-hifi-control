@@ -23,8 +23,22 @@
 //!    record actually changes. Once the setting is on disk, a user who turns
 //!    the toggle back off stays off across restarts - later boots see an
 //!    unchanged record and leave the toggle alone.
+//! 4. **Under the add-on, nothing is switched on at all (#613).** The add-on
+//!    installs UHC's own Home Assistant integration, which needs no broker,
+//!    so publishing every zone to MQTT by default means publishing to
+//!    something nobody asked for. The broker details are still adopted and
+//!    saved, which is the part with real value: the settings form comes up
+//!    filled in, and turning MQTT on is one click with nothing to type.
+//!    Standalone installs are unaffected - there, MQTT is the route into
+//!    Home Assistant, and auto-enabling it is the right default.
 //!
-//! The bootstrap decision itself is a pure function, [`plan`], so all four
+//!    This applies only to a configuration UHC has *not* seen before. An
+//!    install that was already publishing keeps publishing: its record is
+//!    unchanged, so it takes the `EnvironmentUnchanged` path and the toggle
+//!    in `app-settings.json` - already `true` - is left exactly as it is.
+//!    Upgrading never tears down something that works.
+//!
+//! The bootstrap decision itself is a pure function, [`plan`], so all five
 //! rules are unit-testable without touching the filesystem or the environment.
 
 use super::credentials::{MqttConfigSource, MqttCredentialRecord};
@@ -53,9 +67,15 @@ pub enum MqttBootstrap {
     /// memory, write nothing, and do not re-enable - that decision was made
     /// (and persisted) on the boot that first applied it.
     EnvironmentUnchanged(MqttCredentialRecord),
-    /// Save this record and turn the publisher on, so entities appear without
-    /// the user having to find the toggle.
-    ApplyEnvironment(MqttCredentialRecord),
+    /// Save this record. `enable` says whether to switch the publisher on
+    /// as well: true for a standalone install, where MQTT is the only route
+    /// into Home Assistant, and false under the add-on, where the installed
+    /// integration already is that route and the broker details are being
+    /// saved only so the user can opt in with one click (#613).
+    ApplyEnvironment {
+        record: MqttCredentialRecord,
+        enable: bool,
+    },
 }
 
 /// Read `UHC_MQTT_*` from the process environment.
@@ -137,11 +157,16 @@ fn parse_bool(value: &str) -> Option<bool> {
 
 /// Decide what startup does, given the stored record and the environment's.
 ///
+/// `running_as_addon` is the only piece of context that is not about the two
+/// records, and it decides rule 4: whether adopting a new environment config
+/// also switches publishing on.
+///
 /// Pure on purpose: the precedence rules in this module's documentation are
 /// the whole feature, and they are the part worth pinning down in tests.
 pub fn plan(
     stored: Option<MqttCredentialRecord>,
     environment: Option<MqttCredentialRecord>,
+    running_as_addon: bool,
 ) -> MqttBootstrap {
     match (stored, environment) {
         (None, None) => MqttBootstrap::Unconfigured,
@@ -152,11 +177,17 @@ pub fn plan(
             MqttBootstrap::UseStored(stored)
         }
         // Rules 2 and 3: an unchanged environment config writes nothing and
-        // re-enables nothing.
+        // re-enables nothing. This is also the migration path for an add-on
+        // install that was already publishing before rule 4 existed - it
+        // keeps whatever `app-settings.json` says, which is `true`.
         (Some(stored), Some(environment)) if stored == environment => {
             MqttBootstrap::EnvironmentUnchanged(stored)
         }
-        (_, Some(environment)) => MqttBootstrap::ApplyEnvironment(environment),
+        (_, Some(environment)) => MqttBootstrap::ApplyEnvironment {
+            record: environment,
+            // Rule 4.
+            enable: !running_as_addon,
+        },
     }
 }
 
@@ -276,8 +307,11 @@ mod tests {
     #[test]
     fn environment_applies_when_nothing_is_stored() {
         assert_eq!(
-            plan(None, Some(env_record())),
-            MqttBootstrap::ApplyEnvironment(env_record())
+            plan(None, Some(env_record()), false),
+            MqttBootstrap::ApplyEnvironment {
+                record: env_record(),
+                enable: true,
+            }
         );
     }
 
@@ -287,7 +321,7 @@ mod tests {
         // user's own broker is what stays configured - and because the plan
         // is `UseStored`, nothing re-enables the publisher behind their back.
         assert_eq!(
-            plan(Some(user_record()), Some(env_record())),
+            plan(Some(user_record()), Some(env_record()), false),
             MqttBootstrap::UseStored(user_record())
         );
     }
@@ -300,7 +334,7 @@ mod tests {
         let mut stored = env_record();
         stored.source = MqttConfigSource::User;
         assert_eq!(
-            plan(Some(stored.clone()), Some(env_record())),
+            plan(Some(stored.clone()), Some(env_record()), false),
             MqttBootstrap::UseStored(stored)
         );
     }
@@ -310,7 +344,7 @@ mod tests {
         // No save, no re-enable: restarting must not churn the encrypted
         // credential file or resurrect a toggle the user switched off.
         assert_eq!(
-            plan(Some(env_record()), Some(env_record())),
+            plan(Some(env_record()), Some(env_record()), false),
             MqttBootstrap::EnvironmentUnchanged(env_record())
         );
     }
@@ -320,8 +354,11 @@ mod tests {
         let mut rotated = env_record();
         rotated.password = Some("rotated".to_string());
         assert_eq!(
-            plan(Some(env_record()), Some(rotated.clone())),
-            MqttBootstrap::ApplyEnvironment(rotated)
+            plan(Some(env_record()), Some(rotated.clone()), false),
+            MqttBootstrap::ApplyEnvironment {
+                record: rotated,
+                enable: true,
+            }
         );
     }
 
@@ -332,13 +369,77 @@ mod tests {
         // rather than deleting the user's encrypted record out from under
         // them; turning the publisher off is the Settings toggle's job.
         assert_eq!(
-            plan(Some(env_record()), None),
+            plan(Some(env_record()), None, false),
             MqttBootstrap::UseStored(env_record())
         );
     }
 
     #[test]
     fn nothing_stored_and_nothing_in_the_environment_is_unconfigured() {
-        assert_eq!(plan(None, None), MqttBootstrap::Unconfigured);
+        assert_eq!(plan(None, None, false), MqttBootstrap::Unconfigured);
+    }
+
+    #[test]
+    fn under_the_addon_a_new_broker_is_filled_in_but_not_switched_on() {
+        // #613: the add-on installs the Home Assistant integration, so MQTT
+        // is optional there. Saving the record is what makes opting in one
+        // click with nothing to type; enabling it would be publishing every
+        // zone to a broker the user never asked to publish to.
+        assert_eq!(
+            plan(None, Some(env_record()), true),
+            MqttBootstrap::ApplyEnvironment {
+                record: env_record(),
+                enable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn standalone_still_switches_a_new_broker_on() {
+        // Outside the add-on there is no integration doing the job instead,
+        // so MQTT remains the route into Home Assistant and #605's behaviour
+        // is exactly right.
+        assert_eq!(
+            plan(None, Some(env_record()), false),
+            MqttBootstrap::ApplyEnvironment {
+                record: env_record(),
+                enable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn an_addon_install_that_was_already_publishing_is_left_alone() {
+        // The migration case: someone upgrading with MQTT already running.
+        // The stored record is unchanged, so this is `EnvironmentUnchanged`,
+        // which touches neither the record nor the toggle - whatever
+        // `app-settings.json` says (for them, enabled) still holds.
+        assert_eq!(
+            plan(Some(env_record()), Some(env_record()), true),
+            MqttBootstrap::EnvironmentUnchanged(env_record())
+        );
+    }
+
+    #[test]
+    fn under_the_addon_a_rotated_password_does_not_switch_publishing_on() {
+        // Credentials the Supervisor rotates must not become a back door for
+        // re-enabling a publisher the user left off.
+        let mut rotated = env_record();
+        rotated.password = Some("rotated".to_string());
+        assert_eq!(
+            plan(Some(env_record()), Some(rotated.clone()), true),
+            MqttBootstrap::ApplyEnvironment {
+                record: rotated,
+                enable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn the_users_own_broker_still_wins_under_the_addon() {
+        assert_eq!(
+            plan(Some(user_record()), Some(env_record()), true),
+            MqttBootstrap::UseStored(user_record())
+        );
     }
 }

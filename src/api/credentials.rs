@@ -338,6 +338,28 @@ pub enum MqttConfigSource {
     Environment,
 }
 
+/// Who switched the MQTT publisher on (#613).
+///
+/// Separate from [`MqttConfigSource`], which is about the broker *settings*:
+/// a user can perfectly well turn publishing on against a broker the add-on
+/// filled in for them, and that is a deliberate choice even though the
+/// settings are not theirs. The distinction decides one thing - whether UHC
+/// warns that Home Assistant is not consuming what it publishes. Warning
+/// someone about a setting they never chose is how #605 ended up nagging
+/// add-on users about MQTT they did not ask for.
+///
+/// [`MqttEnableSource::Automatic`] is the serde default on purpose. Records
+/// written before this field existed came from the add-on's own startup
+/// bootstrap, which enabled publishing without asking; treating them as the
+/// user's choice would resurrect exactly the warning this removes.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MqttEnableSource {
+    #[default]
+    Automatic,
+    User,
+}
+
 /// Broker connection details for the optional Home Assistant MQTT publisher
 /// (#508), kept in one encrypted record because the broker password is a
 /// secret alongside otherwise-plain connection settings.

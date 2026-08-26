@@ -363,7 +363,7 @@ pub const NOT_AN_ADDON: &str =
 /// Separated from [`spawn_core_poll`] so the precedence is visible: an
 /// explicit override always wins over the Supervisor's own token, because
 /// someone who set one is deliberately pointing at a specific instance.
-fn core_api_credentials() -> Option<(String, String)> {
+pub fn core_api_credentials() -> Option<(String, String)> {
     let non_empty = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
     let url = non_empty(CORE_URL_ENV).unwrap_or_else(|| CORE_CONFIG_URL.to_string());
     let token = non_empty(CORE_TOKEN_ENV).or_else(|| non_empty(SUPERVISOR_TOKEN_ENV))?;

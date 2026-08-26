@@ -644,6 +644,18 @@ mod server {
         // the winner, so an install with no entities can be diagnosed from
         // the add-on log alone.
         state.mqtt.set_base_url(base_url.clone());
+        // Whether the add-on's run.sh started us (#613). It decides one thing
+        // here: a broker handed over by the Supervisor is adopted either way,
+        // but only a standalone install has MQTT switched on for it, because
+        // only there is MQTT the route into Home Assistant.
+        let running_as_addon = api::ha_integration::running_as_addon();
+        // Mirror the persisted provenance of the MQTT toggle so
+        // `GET /api/mqtt/status` can answer "did a person choose this?"
+        // without reading app-settings.json on every poll.
+        state
+            .mqtt
+            .set_enable_source(app_settings.mqtt_enabled_by)
+            .await;
         let environment_mqtt = match api::mqtt_bootstrap::from_env() {
             Ok(config) => config,
             Err(error) => {
@@ -658,8 +670,8 @@ mod server {
             Ok(store) => match store.load() {
                 Ok(stored) => {
                     use api::mqtt_bootstrap::MqttBootstrap;
-                    match api::mqtt_bootstrap::plan(stored, environment_mqtt) {
-                        MqttBootstrap::ApplyEnvironment(record) => {
+                    match api::mqtt_bootstrap::plan(stored, environment_mqtt, running_as_addon) {
+                        MqttBootstrap::ApplyEnvironment { record, enable } => {
                             let host = record.host.clone();
                             let port = record.port;
                             // Save before enabling: a publisher running off a
@@ -668,15 +680,28 @@ mod server {
                             match store.save(&record) {
                                 Ok(()) => {
                                     state.mqtt.configure(record).await;
-                                    if api::enable_mqtt_in_settings() {
+                                    if !enable {
+                                        // Add-on install (#613): the broker is
+                                        // now filled in, and that is all. The
+                                        // integration this add-on installs is
+                                        // what puts zones into Home Assistant,
+                                        // so switching MQTT on as well would
+                                        // publish to a broker nobody asked to
+                                        // publish to.
+                                        tracing::info!(
+                                            broker = %format!("{host}:{port}"),
+                                            "MQTT broker details from the Home Assistant add-on saved; \
+                                             publishing stays off until you turn it on in Settings"
+                                        );
+                                    } else if api::enable_mqtt_in_settings() {
                                         state.mqtt.set_enabled(true).await;
                                         tracing::info!(
                                             broker = %format!("{host}:{port}"),
-                                            "MQTT configured from environment (Home Assistant add-on); publisher enabled"
+                                            "MQTT configured from environment; publisher enabled"
                                         );
                                     } else {
                                         tracing::warn!(
-                                            "MQTT configured from environment (Home Assistant add-on) \
+                                            "MQTT configured from environment \
                                              but the setting could not be saved; enable it in Settings"
                                         );
                                     }
@@ -760,6 +785,16 @@ mod server {
         // spawning anything.
         mqtt::consumer::spawn_core_poll(state.mqtt.consumer_monitor(), shutdown_token.clone());
 
+        // Whether Home Assistant has actually loaded the integration the
+        // add-on installed (#613). Same core API, different question: the
+        // files being on disk is not the same as core having them, and the
+        // gap between the two is one Home Assistant restart that nothing
+        // else would tell the user about.
+        api::ha_integration::spawn_load_poll(
+            api::ha_integration::load_monitor(),
+            shutdown_token.clone(),
+        );
+
         // Clone state for shutdown diagnostics
         let state_for_shutdown = state.clone();
 
@@ -791,6 +826,7 @@ mod server {
         let controller_bootstrap = api::controller_auth::bootstrap;
         let controller_status = api::controller_auth::status;
         let api_mqtt_status = api::mqtt_settings::status;
+        let api_ha_integration_status = api::ha_integration::status;
         let api_mqtt_configure = api::mqtt_settings::configure;
         #[rustfmt::skip]
         let router = Router::new()
@@ -812,6 +848,7 @@ mod server {
             // MQTT/Home Assistant discovery publisher settings (#508)
             .route("/api/mqtt/status", get(api_mqtt_status))
             .route("/api/mqtt/configure", post(api_mqtt_configure))
+            .route("/api/home-assistant/integration", get(api_ha_integration_status))
             .route("/api/bridges/applemusic/pair", post(api_bridge_pair))
             .route("/api/bridges/applemusic/discover", post(api_bridge_discover_pairing))
             .route("/api/bridges/applemusic/claim", post(api_bridge_claim))
