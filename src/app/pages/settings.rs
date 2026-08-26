@@ -289,7 +289,34 @@ fn scroll_to_element(_id: &str) {}
 
 #[cfg(target_arch = "wasm32")]
 fn current_location_search() -> Option<String> {
-    web_sys::window()?.location().search().ok()
+    let window = web_sys::window()?;
+    if let Ok(search) = window.location().search() {
+        if !search.is_empty() {
+            return Some(search);
+        }
+    }
+    // The router normalizes the URL -- dropping the OAuth-return query --
+    // before this page's first client render, so `location.search` is
+    // already empty by the time anything here can read it (#597 probe
+    // finding). The browser keeps the document's original navigation URL in
+    // the performance timeline; recover the query from there. Memoized
+    // (idempotently -- hydration can initialize the page's hooks more than
+    // once) so every reader in this document sees the same value; a real
+    // reload of the normalized URL naturally clears it, because the fresh
+    // navigation entry carries no query.
+    use std::sync::OnceLock;
+    static NAVIGATION_QUERY: OnceLock<Option<String>> = OnceLock::new();
+    NAVIGATION_QUERY
+        .get_or_init(|| {
+            let entries = window.performance()?.get_entries_by_type("navigation");
+            let entry = entries.get(0);
+            use wasm_bindgen::JsCast;
+            let entry = entry.dyn_ref::<web_sys::PerformanceEntry>()?;
+            let name = entry.name();
+            let (_, query) = name.split_once('?')?;
+            Some(format!("?{query}"))
+        })
+        .clone()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -309,6 +336,14 @@ const DEFAULT_SPOTIFY_REDIRECT_URI: &str =
 fn default_spotify_redirect_uri() -> String {
     DEFAULT_SPOTIFY_REDIRECT_URI.to_string()
 }
+
+/// Per-step info (ⓘ) disclosure panel for the Spotify stepper (#597).
+/// Written as full literals so Tailwind's `.rs` source scan keeps every
+/// utility. The closed variant still reveals on hover (`group-hover`) for
+/// mouse users; touch and keyboard users pin it open with the ⓘ button,
+/// which swaps in the open variant and sets `aria-expanded`.
+const SPOTIFY_INFO_PANEL_OPEN: &str = "absolute right-0 top-full z-20 mt-1 w-72 max-w-[85vw] rounded-md border border-default bg-elevated p-3 text-left text-xs text-secondary shadow-lg";
+const SPOTIFY_INFO_PANEL_CLOSED: &str = "absolute right-0 top-full z-20 mt-1 w-72 max-w-[85vw] rounded-md border border-default bg-elevated p-3 text-left text-xs text-secondary shadow-lg hidden group-hover:block";
 
 /// Whether *this browser* is talking to UHC over loopback. Drives which
 /// variant of the Spotify callback step (#570 follow-up) renders: a
@@ -380,7 +415,7 @@ fn spotify_oauth_error_message(reason: Option<&str>) -> String {
             "Spotify did not return an authorization code. Click Connect Spotify to try again.".to_string()
         }
         Some("token_exchange_failed") => {
-            "Spotify rejected the sign-in exchange. This usually means the callback URL registered in the Spotify dashboard does not exactly match the Redirect URI shown below. Fix the mismatch, save, and Connect again.".to_string()
+            "Spotify rejected the sign-in exchange. This usually means the address registered in your Spotify app does not exactly match the one saved in step 2. Fix the mismatch, save, and Connect again.".to_string()
         }
         Some("token_storage_failed") => {
             "Spotify authorized, but the token could not be saved on this UHC server. Check the server's credential storage and try Connect again.".to_string()
@@ -562,7 +597,27 @@ pub fn Settings() -> Element {
     let mut spotify_action = use_signal(ProviderActionState::default);
     let mut spotify_error = use_signal(|| None::<String>);
     let mut spotify_local_setup_saved = use_signal(|| false);
-    let mut spotify_editing = use_signal(|| false);
+    // Spotify onboarding stepper (#597). Steps 1 and 2 happen inside
+    // Spotify's developer dashboard where UHC cannot observe completion,
+    // so each carries a one-tap local attestation; steps 3 and 4 derive
+    // purely from server state (client settings saved / account
+    // connected), so landing on the page mid-setup resumes at the right
+    // step. `spotify_reopen_step` re-expands a completed step without
+    // changing its completion.
+    let mut spotify_step_app_done = use_signal(|| false);
+    let mut spotify_step_callback_done = use_signal(|| false);
+    let mut spotify_reopen_step = use_signal(|| None::<u8>);
+    // Which step's info (ⓘ) disclosure is pinned open by click/tap; hover
+    // reveal is CSS-only (group-hover) so touch and mouse both work.
+    let mut spotify_info_open = use_signal(|| None::<u8>);
+    // Which action the shared status message belongs to, so errors render
+    // inside their own step (3 = save, 4 = connect, 5 = disconnect)
+    // rather than as a distant banner.
+    let mut spotify_action_scope = use_signal(|| 0u8);
+    // True while the redirect URI shown in the browser diverges from what
+    // was last saved (manual edits, tunnel fix-up); sends the stepper back
+    // to Save before Connect even when the server is already configured.
+    let mut spotify_resave_needed = use_signal(|| false);
     let mut spotify_client_id = use_signal(String::new);
     let mut spotify_client_secret = use_signal(String::new);
     let mut spotify_redirect_uri = use_signal(default_spotify_redirect_uri);
@@ -941,6 +996,16 @@ pub fn Settings() -> Element {
             {
                 spotify_redirect_uri.set(tunnel_callback);
                 spotify_local_setup_saved.set(false);
+                // Deliberately NOT `spotify_resave_needed.set(true)` here:
+                // this branch also runs when Settings reloads while a tunnel
+                // whose address was already saved is still live (the field
+                // rehydrates to the loopback default and re-aligns to the
+                // tunnel), and forcing the stepper back to Save there would
+                // reopen step 3 on every mid-setup reload (#597). The one
+                // real stale case -- configured under the loopback default,
+                // then a tunnel started without re-saving -- is refused
+                // server-side by oauth/start's tunnel_redirect_mismatch
+                // guard, which renders inside the Connect step.
             }
         }
     });
@@ -1042,6 +1107,7 @@ pub fn Settings() -> Element {
     });
 
     let start_spotify_oauth = move |_| {
+        spotify_action_scope.set(4);
         spotify_action.set(ProviderActionState::Loading);
         spotify_error.set(None);
         spawn(async move {
@@ -1073,6 +1139,7 @@ pub fn Settings() -> Element {
     };
 
     let disconnect_spotify = move |_| {
+        spotify_action_scope.set(5);
         spotify_action.set(ProviderActionState::Loading);
         spotify_error.set(None);
         spawn(async move {
@@ -1095,12 +1162,13 @@ pub fn Settings() -> Element {
     };
 
     let save_spotify_local = move |_| {
+        spotify_action_scope.set(3);
         let client_id = spotify_client_id().trim().to_string();
         let client_secret = spotify_client_secret().trim().to_string();
         let redirect_uri = spotify_redirect_uri().trim().to_string();
         if client_id.is_empty() {
             spotify_action.set(ProviderActionState::Failed);
-            spotify_error.set(Some("Enter the Spotify client ID first.".to_string()));
+            spotify_error.set(Some("Enter your Client ID first.".to_string()));
             return;
         }
         spotify_action.set(ProviderActionState::Loading);
@@ -1120,7 +1188,8 @@ pub fn Settings() -> Element {
                 Ok(response) if response.configured => {
                     spotify_action.set(ProviderActionState::Success);
                     spotify_local_setup_saved.set(true);
-                    spotify_editing.set(false);
+                    spotify_resave_needed.set(false);
+                    spotify_reopen_step.set(None);
                     // Saving collapses the editor; land the user on the next
                     // step (Connect) instead of wherever the browser anchors.
                     scroll_to_element("spotify-connect-button");
@@ -1339,7 +1408,23 @@ pub fn Settings() -> Element {
     let apple_st = apple_bridge_status.read().clone().and_then(Result::ok);
     let apple_music_state = apple_music_status_state(apple_st.as_ref());
     let apple_music_live_count = apple_music_live_companion_count(apple_st.as_ref());
-    let callback_message = callback_feedback();
+    // Snapshot the OAuth-return query once, on the first client render: the
+    // router normalizes the URL (dropping `?spotify=...&reason=...`) shortly
+    // after hydration, so re-reading `location.search` every render made the
+    // feedback vanish as soon as any signal re-rendered the page (#597 probe
+    // finding). SSR still renders no feedback (the non-wasm helper returns
+    // None), and only `hidden` attributes differ on hydration.
+    // Captured in a mount-only effect -- not a signal initializer -- so the
+    // read happens strictly in the hydrated client, matching the
+    // remote-origin pattern above (#570): no tracked signal is read inside,
+    // so it runs exactly once (reactive-loop-lint).
+    let mut spotify_callback_snapshot = use_signal(|| None::<CallbackFeedback>);
+    use_effect(move || {
+        if let Some(feedback) = callback_feedback() {
+            spotify_callback_snapshot.set(Some(feedback));
+        }
+    });
+    let callback_message = spotify_callback_snapshot();
     let spotify_status_is_error = spotify_error().is_some();
     let spotify_status_message =
         spotify_error().or_else(|| spotify_action().message().map(str::to_string));
@@ -1400,6 +1485,53 @@ pub fn Settings() -> Element {
     let spotify_account_error_hint = spotify_account_error
         .map(|error| error.contains("not registered for this application"))
         .unwrap_or(false);
+
+    // Spotify onboarding stepper state (#597). Steps 3 and 4 come from
+    // server state; steps 1 and 2 are dashboard-side actions UHC cannot
+    // observe, so they complete via a one-tap attestation -- or implicitly
+    // once the server is configured (a saved config proves the user got
+    // through the dashboard). A live tunnel whose address no longer matches
+    // the redirect URI reopens step 2 so the warning is never hidden inside
+    // a collapsed step.
+    let spotify_step1_complete = spotify_configured || spotify_step_app_done();
+    let spotify_step2_complete =
+        (spotify_configured || spotify_step_callback_done()) && !spotify_tunnel_mismatch;
+    let spotify_step3_complete = spotify_configured && !spotify_resave_needed();
+    let spotify_step4_complete = spotify_connected;
+    let spotify_current_step: u8 = if !spotify_step1_complete {
+        1
+    } else if !spotify_step2_complete {
+        2
+    } else if !spotify_step3_complete {
+        3
+    } else if !spotify_step4_complete {
+        4
+    } else {
+        5
+    };
+    let spotify_reopened_step = spotify_reopen_step();
+    let spotify_step1_open = spotify_current_step == 1 || spotify_reopened_step == Some(1);
+    let spotify_step2_open = spotify_current_step == 2 || spotify_reopened_step == Some(2);
+    let spotify_step3_open = spotify_current_step == 3 || spotify_reopened_step == Some(3);
+    let spotify_step4_open = spotify_current_step == 4 || spotify_reopened_step == Some(4);
+    let spotify_info_pinned = spotify_info_open();
+    let spotify_scope = spotify_action_scope();
+    let spotify_step_class = |n: u8, complete: bool| {
+        if spotify_current_step == n {
+            "relative rounded-md border border-default bg-elevated p-4"
+        } else if complete {
+            "relative rounded-md border border-default p-4"
+        } else {
+            "relative rounded-md border border-default p-4 opacity-60"
+        }
+    };
+    let spotify_info_panel_class = |n: u8| {
+        if spotify_info_pinned == Some(n) {
+            SPOTIFY_INFO_PANEL_OPEN
+        } else {
+            SPOTIFY_INFO_PANEL_CLOSED
+        }
+    };
 
     rsx! {
         Layout {
@@ -1794,98 +1926,154 @@ pub fn Settings() -> Element {
                             }
                         }
 
+                        // Success feedback from the Spotify return trip stays a
+                        // card-level status line; error feedback renders inside
+                        // the Connect step (#597: errors live in their step).
                         p {
-                            class: if callback_message.as_ref().is_some_and(|feedback| feedback.is_error) { "mt-4 status-err" } else { "mt-4 status-ok" },
-                            hidden: callback_message.is_none(),
-                            aria_hidden: callback_message.is_none(),
-                            role: if callback_message.as_ref().is_some_and(|feedback| feedback.is_error) { "alert" } else { "status" },
+                            class: "mt-4 status-ok",
+                            hidden: callback_message.as_ref().is_none_or(|feedback| feedback.is_error),
+                            aria_hidden: callback_message.as_ref().is_none_or(|feedback| feedback.is_error),
+                            role: "status",
                             aria_live: "polite",
-                            "{callback_message.as_ref().map(|feedback| feedback.message.as_str()).unwrap_or_default()}"
+                            "{callback_message.as_ref().filter(|feedback| !feedback.is_error).map(|feedback| feedback.message.as_str()).unwrap_or_default()}"
                         }
 
-                        // Keep both panes in the hydrated tree. The server can know that
-                        // credentials are configured before the browser's resources resolve;
-                        // conditionally omitting either pane shifts every later event handler.
-                        div { class: "mt-5 grid gap-5 lg:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]",
-                            div {
-                                class: "status-panel rounded-lg p-4 sm:p-5",
-                                hidden: !spotify_configured || spotify_editing(),
-                                aria_hidden: !spotify_configured || spotify_editing(),
-                                role: "status",
-                                aria_live: "polite",
-                                p { class: "font-medium",
-                                    if spotify_connected {
-                                        "Connected · credentials stored on this UHC server"
-                                    } else {
-                                        "Configured on this UHC server"
-                                    }
-                                }
-                                p { class: "mt-1 text-sm text-secondary",
-                                    if spotify_connected {
-                                        "OAuth credentials refresh automatically."
-                                    } else {
-                                        "Connect Spotify to authorize an account; secrets stay on this UHC server."
-                                    }
-                                }
-                                div { class: "mt-4 flex flex-wrap gap-2",
-                                    button {
-                                        r#type: "button",
-                                        class: "btn btn-primary min-h-11",
-                                        disabled: spotify_action() == ProviderActionState::Loading,
-                                        aria_busy: spotify_action() == ProviderActionState::Loading,
-                                        onclick: start_spotify_oauth,
-                                        if spotify_connected { "Reconnect Spotify" } else { "Connect Spotify" }
+                        // Onboarding stepper (#597): exactly one step's action is
+                        // visible at a time; completed steps collapse to a checked
+                        // line that reopens on click; upcoming steps stay dimmed
+                        // and inert. Every step body stays mounted and toggles
+                        // `hidden` so hydration and event handlers never shift and
+                        // step transitions cause no scroll jumps.
+                        ol { class: "mt-5 grid list-none gap-3 p-0", aria_label: "Spotify setup steps",
+
+                            // Step 1 -- create the Spotify app (dashboard-side; completes
+                            // via attestation or implicitly once the server is configured).
+                            li { class: spotify_step_class(1, spotify_step1_complete),
+                                div { class: "flex items-start gap-3",
+                                    span {
+                                        class: if spotify_step1_complete { "flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-default text-xs status-ok" } else { "flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-default text-xs text-muted" },
+                                        aria_hidden: true,
+                                        if spotify_step1_complete { "✓" } else { "1" }
                                     }
                                     button {
                                         r#type: "button",
-                                        class: "btn btn-ghost min-h-11",
-                                        onclick: move |_| spotify_editing.set(true),
-                                        "Edit client settings"
+                                        class: "flex min-w-0 flex-1 cursor-pointer flex-col items-start text-left disabled:cursor-default",
+                                        disabled: !spotify_step1_complete,
+                                        aria_expanded: spotify_step1_open,
+                                        aria_controls: "spotify-step-1-body",
+                                        onclick: move |_| {
+                                            let reopened = *spotify_reopen_step.peek();
+                                            spotify_reopen_step.set(if reopened == Some(1) { None } else { Some(1) });
+                                        },
+                                        span { class: "font-medium", "Create a Spotify app" }
+                                        span {
+                                            class: "text-xs text-muted",
+                                            hidden: !spotify_step1_complete || spotify_step1_open,
+                                            "Done -- using your Spotify app"
+                                        }
+                                    }
+                                    span { class: "group relative shrink-0",
+                                        button {
+                                            r#type: "button",
+                                            class: "flex h-8 w-8 items-center justify-center rounded-full text-muted",
+                                            aria_expanded: spotify_info_pinned == Some(1),
+                                            aria_controls: "spotify-step-1-info",
+                                            aria_label: "More about creating a Spotify app",
+                                            onclick: move |_| {
+                                                let pinned = *spotify_info_open.peek();
+                                                spotify_info_open.set(if pinned == Some(1) { None } else { Some(1) });
+                                            },
+                                            "ⓘ"
+                                        }
+                                        div { id: "spotify-step-1-info", class: spotify_info_panel_class(1), role: "note",
+                                            p { "Spotify only lets an app you own control your players, so you create a free one to act as your personal key. In the dashboard, choose \"Create app\", give it any name, and accept Spotify's terms. Nothing gets published anywhere." }
+                                            p { class: "mt-2", "New apps run in development mode: the Spotify accounts allowed to sign in must be listed on the app's User Management page." }
+                                        }
+                                    }
+                                }
+                                div {
+                                    id: "spotify-step-1-body",
+                                    hidden: !spotify_step1_open,
+                                    aria_hidden: !spotify_step1_open,
+                                    p { class: "mt-2 text-sm text-secondary", "Create a free app in Spotify's developer dashboard -- it takes about a minute." }
+                                    div { class: "mt-3 flex flex-wrap gap-2",
+                                        a {
+                                            class: "btn btn-primary min-h-11 inline-flex items-center",
+                                            href: "https://developer.spotify.com/dashboard",
+                                            target: "_blank",
+                                            rel: "noopener noreferrer",
+                                            "Open the Spotify dashboard"
+                                        }
+                                        button {
+                                            r#type: "button",
+                                            class: "btn btn-outline min-h-11",
+                                            onclick: move |_| {
+                                                spotify_step_app_done.set(true);
+                                                spotify_reopen_step.set(None);
+                                            },
+                                            "I have an app"
+                                        }
                                     }
                                 }
                             }
-                            div {
-                                class: "lg:col-span-2 grid gap-4 sm:grid-cols-2",
-                                hidden: spotify_configured && !spotify_editing(),
-                                aria_hidden: spotify_configured && !spotify_editing(),
-                            div { class: "rounded-md border border-default p-4",
-                                h4 { class: "font-medium", "Connect Spotify" }
-                                p { class: "mt-2 text-sm text-secondary", "After saving the client settings below, open Spotify’s consent page, approve playback access, and return here. Your token stays on this UHC server." }
-                                button {
-                                    id: "spotify-connect-button",
-                                    r#type: "button",
-                                    class: "btn btn-primary mt-4 min-h-11 w-full sm:w-auto",
-                                    disabled: spotify_action() == ProviderActionState::Loading || !spotify_local_setup_saved(),
-                                    aria_busy: spotify_action() == ProviderActionState::Loading,
-                                    onclick: start_spotify_oauth,
-                                    if spotify_action() == ProviderActionState::Loading { "Opening Spotify…" } else if spotify_local_setup_saved() { "Connect Spotify" } else { "Save setup first" }
-                                }
-                                if !spotify_local_setup_saved() {
-                                    p { class: "mt-2 text-xs text-muted", "Enter and save your Spotify client ID in Client settings before connecting." }
-                                }
-                            }
-                            div { class: "rounded-md border border-default p-4",
-                                h4 { class: "font-medium", "Client settings" }
-                                p { class: "mt-2 text-sm text-secondary", "UHC stores the OAuth client settings server-side and refreshes access automatically. This same walkthrough applies whether you're connecting for the first time or reauthorizing later." }
-                                ol { class: "mt-3 list-decimal space-y-3 pl-5 text-sm text-secondary",
-                                    li {
-                                        "Create (or open) an app in the "
-                                        a { href: "https://developer.spotify.com/dashboard", target: "_blank", rel: "noopener noreferrer", class: "link", "Spotify Developer Dashboard" }
-                                        "."
+
+                            // Step 2 -- register the callback address. The tunnel
+                            // button is the primary path when the browser is not on
+                            // the UHC machine; manual entry lives under Advanced.
+                            li { class: spotify_step_class(2, spotify_step2_complete),
+                                div { class: "flex items-start gap-3",
+                                    span {
+                                        class: if spotify_step2_complete { "flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-default text-xs status-ok" } else { "flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-default text-xs text-muted" },
+                                        aria_hidden: true,
+                                        if spotify_step2_complete { "✓" } else { "2" }
                                     }
+                                    button {
+                                        r#type: "button",
+                                        class: "flex min-w-0 flex-1 cursor-pointer flex-col items-start text-left disabled:cursor-default",
+                                        disabled: !spotify_step2_complete,
+                                        aria_expanded: spotify_step2_open,
+                                        aria_controls: "spotify-step-2-body",
+                                        onclick: move |_| {
+                                            let reopened = *spotify_reopen_step.peek();
+                                            spotify_reopen_step.set(if reopened == Some(2) { None } else { Some(2) });
+                                        },
+                                        span { class: "font-medium", "Tell Spotify where to send you back" }
+                                        span {
+                                            class: "text-xs text-muted",
+                                            hidden: !spotify_step2_complete || spotify_step2_open,
+                                            "Done -- callback address registered"
+                                        }
+                                    }
+                                    span { class: "group relative shrink-0",
+                                        button {
+                                            r#type: "button",
+                                            class: "flex h-8 w-8 items-center justify-center rounded-full text-muted",
+                                            aria_expanded: spotify_info_pinned == Some(2),
+                                            aria_controls: "spotify-step-2-info",
+                                            aria_label: "More about the callback address",
+                                            onclick: move |_| {
+                                                let pinned = *spotify_info_open.peek();
+                                                spotify_info_open.set(if pinned == Some(2) { None } else { Some(2) });
+                                            },
+                                            "ⓘ"
+                                        }
+                                        div { id: "spotify-step-2-info", class: spotify_info_panel_class(2), role: "note",
+                                            p { "After you approve access, Spotify sends your browser back to UHC -- but only to an address on your app's \"Redirect URIs\" list, and (except on the exact machine running UHC) only to a secure https address." }
+                                            p { class: "mt-2", "The address UHC opens for you stays up for about 15 minutes and closes itself once you finish connecting. Connecting again later issues a new address, which then needs to be added to your Spotify app too." }
+                                        }
+                                    }
+                                }
+                                div {
+                                    id: "spotify-step-2-body",
+                                    hidden: !spotify_step2_open,
+                                    aria_hidden: !spotify_step2_open,
                                     if spotify_remote_origin() {
                                         // Remote/LAN origin -- the common case (a NAS or any
                                         // machine other than the one running the browser).
-                                        // Spotify only accepts plain HTTP loopback callbacks, so
-                                        // this browser's origin cannot use the loopback URL at
-                                        // all; showing it here as a primary instruction is what
-                                        // used to walk beginners into registering the wrong
-                                        // callback while a contradicting tunnel box sat further
-                                        // down the page. The tunnel button and its result now
-                                        // live inline in this step instead.
-                                        li {
-                                            "Add the callback URL below under \"Redirect URIs\", exactly as written."
-                                            p { class: "mt-1 text-xs text-muted", "UHC is running on a NAS or another machine, so Spotify needs an HTTPS address to send you back to. Nothing to install, no terminal needed -- click the button and UHC gives you the exact URL to register." }
+                                        // Spotify rejects plain-HTTP addresses here, so the
+                                        // tunnel button is THE action (#570/#592).
+                                        div {
+                                            p { class: "mt-2 text-sm text-secondary", "Get a secure address for this server, then paste it into your Spotify app under \"Redirect URIs\"." }
                                             if spotify_tunnel_status.is_active() {
                                                 div { class: "mt-2 rounded-md border border-default bg-hover p-3",
                                                     div { class: "flex flex-col gap-2 sm:flex-row sm:items-stretch",
@@ -1908,7 +2096,7 @@ pub fn Settings() -> Element {
                                                         },
                                                         Some(false) => rsx! {
                                                             p { class: "mt-2 text-xs status-err", role: "alert",
-                                                                "This address did not answer when UHC checked it from the internet. Stop the tunnel and try again before registering it with Spotify."
+                                                                "This address did not answer when UHC checked it from the internet. Stop it and try again before adding it to Spotify."
                                                             }
                                                         },
                                                         None => rsx! {
@@ -1918,7 +2106,7 @@ pub fn Settings() -> Element {
                                                     if spotify_tunnel_mismatch {
                                                         div { class: "mt-2 rounded-md border border-default p-2", role: "alert",
                                                             p { class: "text-xs status-err",
-                                                                "Your HTTPS address changed and no longer matches the Redirect URI field below. Update the redirect URI registered in the Spotify dashboard to this new address, then apply it here and save again before connecting."
+                                                                "Your secure address changed and no longer matches the one saved below. Add this new address to your Spotify app, then apply it here and save again before connecting."
                                                             }
                                                             button {
                                                                 r#type: "button",
@@ -1926,6 +2114,7 @@ pub fn Settings() -> Element {
                                                                 onclick: move |_| {
                                                                     spotify_redirect_uri.set(spotify_tunnel_callback_for_use.clone());
                                                                     spotify_local_setup_saved.set(false);
+                                                                    spotify_resave_needed.set(true);
                                                                 },
                                                                 "Use this address"
                                                             }
@@ -1933,29 +2122,29 @@ pub fn Settings() -> Element {
                                                     }
                                                     if let Some(minutes) = spotify_tunnel_minutes_remaining {
                                                         p { class: "mt-2 text-xs text-muted",
-                                                            "Closes automatically in about {minutes} minute(s), or shortly after authorization completes -- whichever comes first."
+                                                            "Closes by itself in about {minutes} minute(s), or right after you connect."
                                                         }
                                                     }
-                                                    p { class: "mt-2 text-xs text-muted", "Live via {spotify_tunnel_provider_label}. While it's open, this server is briefly reachable from the public internet at that address; only the in-progress Spotify sign-in is accepted through it." }
+                                                    p { class: "mt-2 text-xs text-muted", "Live via {spotify_tunnel_provider_label}. While open, this server is briefly reachable from the internet at that address; only the in-progress Spotify sign-in is accepted through it." }
                                                     button {
                                                         r#type: "button",
                                                         class: "btn btn-ghost btn-sm mt-2",
                                                         disabled: spotify_tunnel_busy(),
                                                         aria_busy: spotify_tunnel_busy(),
                                                         onclick: stop_spotify_tunnel,
-                                                        "Stop tunnel"
+                                                        "Stop this address"
                                                     }
                                                 }
                                             } else {
-                                                div { class: "mt-2",
+                                                div { class: "mt-3",
                                                     button {
                                                         r#type: "button",
-                                                        class: "btn btn-outline min-h-11 w-full sm:w-auto",
+                                                        class: "btn btn-primary min-h-11 w-full sm:w-auto",
                                                         disabled: spotify_tunnel_busy() || spotify_tunnel_status.is_starting(),
                                                         aria_busy: spotify_tunnel_busy() || spotify_tunnel_status.is_starting(),
                                                         onclick: start_spotify_tunnel,
                                                         if spotify_tunnel_status.is_starting() {
-                                                            "Opening a tunnel via {spotify_tunnel_provider_label}…"
+                                                            "Opening an address via {spotify_tunnel_provider_label}…"
                                                         } else {
                                                             "Get an HTTPS address"
                                                         }
@@ -1969,8 +2158,8 @@ pub fn Settings() -> Element {
                                     } else {
                                         // Loopback origin -- this browser and UHC are the same
                                         // machine, so the plain HTTP loopback callback just works.
-                                        li {
-                                            "Add the callback URL shown below under \"Redirect URIs\", exactly as written."
+                                        div {
+                                            p { class: "mt-2 text-sm text-secondary", "Paste this address into your Spotify app under \"Redirect URIs\", exactly as written." }
                                             div { class: "mt-2 flex flex-col gap-2 sm:flex-row sm:items-stretch",
                                                 code {
                                                     id: "spotify-callback-url-display",
@@ -1985,96 +2174,229 @@ pub fn Settings() -> Element {
                                                     span { aria_live: "polite", "{spotify_callback_copy_state().label(\"Copy URL\")}" }
                                                 }
                                             }
-                                            p { class: "mt-2 text-xs text-muted", "This works because your browser is on the same machine as UHC. Opening this page from another device or a NAS switches this step to a temporary HTTPS tunnel automatically." }
                                         }
                                     }
-                                    li { "Copy that app's Client ID into the field below. Most setups don't need the Client Secret -- see \"Advanced\" if you specifically set one up." }
-                                    li { "Save client settings, then click Connect Spotify and approve access on Spotify's consent page." }
-                                    li { "If something goes wrong, the message below the Connect button explains what to fix — most often a callback URL that doesn't match exactly." }
-                                }
-                                details { class: "mt-4",
-                                    summary { class: "cursor-pointer text-sm text-secondary select-none", "Advanced: bring your own HTTPS" }
-                                    div { class: "mt-2 space-y-2",
-                                        if spotify_remote_origin() {
-                                            div {
-                                                p { class: "text-sm text-secondary", "UHC's default loopback callback only works when your browser runs on the exact same machine as UHC:" }
-                                                code {
-                                                    class: "mt-2 block min-w-0 overflow-x-auto break-all rounded-md bg-hover px-3 py-3 text-xs select-all",
-                                                    "{DEFAULT_SPOTIFY_REDIRECT_URI}"
+                                    button {
+                                        id: "spotify-callback-registered",
+                                        r#type: "button",
+                                        class: "btn btn-outline mt-3 min-h-11",
+                                        onclick: move |_| {
+                                            spotify_step_callback_done.set(true);
+                                            spotify_reopen_step.set(None);
+                                        },
+                                        "I've added it to Spotify"
+                                    }
+                                    details { class: "mt-3",
+                                        summary { class: "cursor-pointer text-sm text-secondary select-none", "Advanced: use your own address" }
+                                        div { class: "mt-2 space-y-2",
+                                            if spotify_remote_origin() {
+                                                div {
+                                                    p { class: "text-sm text-secondary", "UHC's built-in address below only works when your browser runs on the exact same machine as UHC:" }
+                                                    code {
+                                                        class: "mt-2 block min-w-0 overflow-x-auto break-all rounded-md bg-hover px-3 py-3 text-xs select-all",
+                                                        "{DEFAULT_SPOTIFY_REDIRECT_URI}"
+                                                    }
                                                 }
                                             }
+                                            p { class: "text-sm text-secondary", "Already have your own secure route to this server (for example ", code { "cloudflared tunnel --url http://127.0.0.1:8088" }, " or Tailscale Funnel)? Put its callback address here and register that with Spotify instead." }
+                                            label { class: "block text-sm font-medium", r#for: "spotify-redirect-uri", "Redirect URI" }
+                                            input {
+                                                id: "spotify-redirect-uri",
+                                                class: "input mt-1 min-h-11 w-full",
+                                                value: spotify_redirect_uri(),
+                                                placeholder: "https://your-uhc-host.example/api/providers/spotify/oauth/callback",
+                                                autocomplete: "url",
+                                                oninput: move |event| {
+                                                    spotify_local_setup_saved.set(false);
+                                                    spotify_resave_needed.set(true);
+                                                    spotify_redirect_uri.set(event.value());
+                                                },
+                                            }
+                                            p { class: "text-xs text-muted", "Saved together with the Client ID in the next step. Plain http is accepted only on 127.0.0.1 or [::1]." }
                                         }
-                                        p { class: "text-sm text-secondary", "Prefer your own tunnel? Start one to this UHC server (for example ", code { "cloudflared tunnel --url http://127.0.0.1:8088" }, " or Tailscale Funnel), open its HTTPS URL in this browser, then set the Redirect URI field below to that tunnel's callback address before registering it above." }
-                                        p { class: "text-sm text-secondary", "Stop the tunnel after authorization; reauthorizing later needs a new tunnel (built-in or your own) and a newly registered callback URL." }
                                     }
                                 }
-                                label { class: "mt-4 block text-sm font-medium", r#for: "spotify-client-id", "Client ID" }
-                                input {
-                                    id: "spotify-client-id",
-                                    class: "input mt-1 min-h-11 w-full",
-                                    value: spotify_client_id(),
-                                    autocomplete: "off",
-                                    oninput: move |event| {
-                                        spotify_local_setup_saved.set(false);
-                                        spotify_client_id.set(event.value());
-                                    },
-                                }
-                                details { class: "mt-3",
-                                    summary { class: "cursor-pointer text-sm font-medium select-none", "Advanced: client secret" }
-                                    div { class: "mt-2",
-                                        label { class: "block text-sm font-medium", r#for: "spotify-client-secret", "Client secret" }
-                                        input {
-                                            id: "spotify-client-secret",
-                                            class: "input mt-1 min-h-11 w-full",
-                                            r#type: "password",
-                                            value: spotify_client_secret(),
-                                            autocomplete: "new-password",
-                                            oninput: move |event| {
-                                                spotify_local_setup_saved.set(false);
-                                                spotify_client_secret.set(event.value());
-                                            },
-                                        }
-                                        p { class: "mt-1 text-xs text-muted", "Most setups can leave this blank -- UHC signs in securely without it. Only fill this in if you specifically created your Spotify app to require one." }
-                                    }
-                                }
-                                label { class: "mt-3 block text-sm font-medium", r#for: "spotify-redirect-uri", "Redirect URI" }
-                                input {
-                                    id: "spotify-redirect-uri",
-                                    class: "input mt-1 min-h-11 w-full",
-                                    value: spotify_redirect_uri(),
-                                    placeholder: "https://your-uhc-host.example/api/providers/spotify/oauth/callback",
-                                    autocomplete: "url",
-                                    oninput: move |event| {
-                                        spotify_local_setup_saved.set(false);
-                                        spotify_redirect_uri.set(event.value());
-                                    },
-                                }
-                                p { class: "mt-2 text-xs text-muted", "Spotify requires HTTPS when UHC is accessed remotely. Plain HTTP is accepted only on 127.0.0.1 or [::1]. Changing this updates the callback URL shown in step 2 above." }
-                                button {
-                                    id: "spotify-save-client-settings",
-                                    r#type: "button",
-                                    class: "btn btn-outline mt-4 min-h-11 w-full sm:w-auto",
-                                    disabled: spotify_action() == ProviderActionState::Loading,
-                                    aria_busy: spotify_action() == ProviderActionState::Loading,
-                                    aria_describedby: "spotify-client-settings-status",
-                                    onclick: save_spotify_local,
-                                    if spotify_action() == ProviderActionState::Loading { "Saving…" } else { "Save client settings" }
-                                }
-                                p { class: "mt-2 text-xs text-muted", "Secrets are never returned to this page. Use Connect after saving to authorize the account." }
                             }
-                            }
-                        }
 
-                        // Status panes stay mounted while their state changes so the
-                        // Refresh handler cannot move during hydration or polling.
-                        div {
-                            class: "rounded-md border border-default bg-elevated p-4",
-                            hidden: spotify_configured,
-                            aria_hidden: spotify_configured,
-                            role: "status",
-                            aria_live: "polite",
-                                p { class: "font-medium", "Spotify setup required" }
-                                p { class: "mt-1 text-sm text-secondary", "Save your Spotify client settings, then connect your account to discover Connect devices." }
+                            // Step 3 -- Client ID (server state: configured). The
+                            // secret stays behind Advanced; errors render here.
+                            li { class: spotify_step_class(3, spotify_step3_complete),
+                                div { class: "flex items-start gap-3",
+                                    span {
+                                        class: if spotify_step3_complete { "flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-default text-xs status-ok" } else { "flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-default text-xs text-muted" },
+                                        aria_hidden: true,
+                                        if spotify_step3_complete { "✓" } else { "3" }
+                                    }
+                                    button {
+                                        r#type: "button",
+                                        class: "flex min-w-0 flex-1 cursor-pointer flex-col items-start text-left disabled:cursor-default",
+                                        disabled: !spotify_step3_complete,
+                                        aria_expanded: spotify_step3_open,
+                                        aria_controls: "spotify-step-3-body",
+                                        onclick: move |_| {
+                                            let reopened = *spotify_reopen_step.peek();
+                                            spotify_reopen_step.set(if reopened == Some(3) { None } else { Some(3) });
+                                        },
+                                        span { class: "font-medium", "Enter your Client ID" }
+                                        span {
+                                            class: "text-xs text-muted",
+                                            hidden: !spotify_step3_complete || spotify_step3_open,
+                                            "Done -- saved on this UHC server"
+                                        }
+                                    }
+                                    span { class: "group relative shrink-0",
+                                        button {
+                                            r#type: "button",
+                                            class: "flex h-8 w-8 items-center justify-center rounded-full text-muted",
+                                            aria_expanded: spotify_info_pinned == Some(3),
+                                            aria_controls: "spotify-step-3-info",
+                                            aria_label: "More about the Client ID",
+                                            onclick: move |_| {
+                                                let pinned = *spotify_info_open.peek();
+                                                spotify_info_open.set(if pinned == Some(3) { None } else { Some(3) });
+                                            },
+                                            "ⓘ"
+                                        }
+                                        div { id: "spotify-step-3-info", class: spotify_info_panel_class(3), role: "note",
+                                            p { "The Client ID is the long code on your app's page in the Spotify dashboard. It identifies your app; it is not a password, and it is stored on this UHC server -- never in the browser." }
+                                            p { class: "mt-2", "Most setups can leave the Client Secret blank -- UHC signs in securely without it. Only fill it in if you specifically created your app to require one." }
+                                        }
+                                    }
+                                }
+                                div {
+                                    id: "spotify-step-3-body",
+                                    hidden: !spotify_step3_open,
+                                    aria_hidden: !spotify_step3_open,
+                                    p { class: "mt-2 text-sm text-secondary", "Copy the Client ID from your app's page in the Spotify dashboard and save it here." }
+                                    label { class: "mt-3 block text-sm font-medium", r#for: "spotify-client-id", "Client ID" }
+                                    input {
+                                        id: "spotify-client-id",
+                                        class: "input mt-1 min-h-11 w-full",
+                                        value: spotify_client_id(),
+                                        autocomplete: "off",
+                                        oninput: move |event| {
+                                            spotify_local_setup_saved.set(false);
+                                            spotify_resave_needed.set(true);
+                                            spotify_client_id.set(event.value());
+                                        },
+                                    }
+                                    details { class: "mt-3",
+                                        summary { class: "cursor-pointer text-sm font-medium select-none", "Advanced: client secret" }
+                                        div { class: "mt-2",
+                                            label { class: "block text-sm font-medium", r#for: "spotify-client-secret", "Client secret" }
+                                            input {
+                                                id: "spotify-client-secret",
+                                                class: "input mt-1 min-h-11 w-full",
+                                                r#type: "password",
+                                                value: spotify_client_secret(),
+                                                autocomplete: "new-password",
+                                                oninput: move |event| {
+                                                    spotify_local_setup_saved.set(false);
+                                                    spotify_resave_needed.set(true);
+                                                    spotify_client_secret.set(event.value());
+                                                },
+                                            }
+                                            p { class: "mt-1 text-xs text-muted", "Usually blank. Never shown back to this page once saved." }
+                                        }
+                                    }
+                                    button {
+                                        id: "spotify-save-client-settings",
+                                        r#type: "button",
+                                        class: "btn btn-primary mt-4 min-h-11 w-full sm:w-auto",
+                                        disabled: spotify_action() == ProviderActionState::Loading,
+                                        aria_busy: spotify_action() == ProviderActionState::Loading,
+                                        aria_describedby: "spotify-client-settings-status",
+                                        onclick: save_spotify_local,
+                                        if spotify_action() == ProviderActionState::Loading { "Saving…" } else { "Save" }
+                                    }
+                                    p {
+                                        id: "spotify-client-settings-status",
+                                        class: if spotify_status_is_error { "mt-2 status-err" } else { "mt-2 text-sm text-secondary" },
+                                        hidden: spotify_scope != 3 || spotify_status_message.is_none(),
+                                        role: if spotify_status_is_error { "alert" } else { "status" },
+                                        aria_live: "polite",
+                                        "{spotify_status_message.as_deref().unwrap_or_default()}"
+                                    }
+                                }
+                            }
+
+                            // Step 4 -- connect the account (server state: connected).
+                            li { class: spotify_step_class(4, spotify_step4_complete),
+                                div { class: "flex items-start gap-3",
+                                    span {
+                                        class: if spotify_step4_complete { "flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-default text-xs status-ok" } else { "flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-default text-xs text-muted" },
+                                        aria_hidden: true,
+                                        if spotify_step4_complete { "✓" } else { "4" }
+                                    }
+                                    button {
+                                        r#type: "button",
+                                        class: "flex min-w-0 flex-1 cursor-pointer flex-col items-start text-left disabled:cursor-default",
+                                        disabled: !spotify_step4_complete,
+                                        aria_expanded: spotify_step4_open,
+                                        aria_controls: "spotify-step-4-body",
+                                        onclick: move |_| {
+                                            let reopened = *spotify_reopen_step.peek();
+                                            spotify_reopen_step.set(if reopened == Some(4) { None } else { Some(4) });
+                                        },
+                                        span { class: "font-medium", "Connect your account" }
+                                        span {
+                                            class: "text-xs status-ok",
+                                            hidden: !spotify_step4_complete || spotify_step4_open,
+                                            "Connected as {spotify_account_display}"
+                                        }
+                                    }
+                                    span { class: "group relative shrink-0",
+                                        button {
+                                            r#type: "button",
+                                            class: "flex h-8 w-8 items-center justify-center rounded-full text-muted",
+                                            aria_expanded: spotify_info_pinned == Some(4),
+                                            aria_controls: "spotify-step-4-info",
+                                            aria_label: "More about connecting",
+                                            onclick: move |_| {
+                                                let pinned = *spotify_info_open.peek();
+                                                spotify_info_open.set(if pinned == Some(4) { None } else { Some(4) });
+                                            },
+                                            "ⓘ"
+                                        }
+                                        div { id: "spotify-step-4-info", class: spotify_info_panel_class(4), role: "note",
+                                            p { "Connect opens Spotify's approval page for the app you created. Once you approve, Spotify sends you straight back here and UHC starts discovering your players." }
+                                            p { class: "mt-2", "Your sign-in lives on this UHC server and renews itself automatically; the browser never sees it. Reconnecting later repeats this step -- and needs a fresh address from step 2 first." }
+                                        }
+                                    }
+                                }
+                                div {
+                                    id: "spotify-step-4-body",
+                                    hidden: !spotify_step4_open,
+                                    aria_hidden: !spotify_step4_open,
+                                    p { class: "mt-2 text-sm text-secondary", "Approve access on Spotify's page -- you'll land right back here." }
+                                    p {
+                                        class: "mt-2 status-err",
+                                        hidden: !callback_message.as_ref().is_some_and(|feedback| feedback.is_error),
+                                        aria_hidden: !callback_message.as_ref().is_some_and(|feedback| feedback.is_error),
+                                        role: "alert",
+                                        aria_live: "polite",
+                                        "{callback_message.as_ref().filter(|feedback| feedback.is_error).map(|feedback| feedback.message.as_str()).unwrap_or_default()}"
+                                    }
+                                    button {
+                                        id: "spotify-connect-button",
+                                        r#type: "button",
+                                        class: "btn btn-primary mt-3 min-h-11 w-full sm:w-auto",
+                                        disabled: spotify_action() == ProviderActionState::Loading || !spotify_step3_complete,
+                                        aria_busy: spotify_action() == ProviderActionState::Loading,
+                                        aria_describedby: "spotify-connect-status",
+                                        onclick: start_spotify_oauth,
+                                        if spotify_action() == ProviderActionState::Loading { "Opening Spotify…" } else if spotify_connected { "Reconnect Spotify" } else if spotify_step3_complete { "Connect Spotify" } else { "Finish the steps above first" }
+                                    }
+                                    p {
+                                        id: "spotify-connect-status",
+                                        class: if spotify_status_is_error { "mt-2 status-err" } else { "mt-2 text-sm text-secondary" },
+                                        hidden: spotify_scope != 4 || spotify_status_message.is_none(),
+                                        role: if spotify_status_is_error { "alert" } else { "status" },
+                                        aria_live: "polite",
+                                        "{spotify_status_message.as_deref().unwrap_or_default()}"
+                                    }
+                                }
+                            }
                         }
                         div {
                             class: "flex justify-end",
@@ -2146,25 +2468,25 @@ pub fn Settings() -> Element {
                             "Unable to load Spotify devices. Refresh and try again."
                         }
 
-                        p {
-                            id: "spotify-client-settings-status",
-                            class: if spotify_status_is_error { "mt-4 status-err" } else { "mt-4 text-sm text-secondary" },
-                            hidden: spotify_status_message.is_none(),
-                            role: if spotify_status_is_error { "alert" } else { "status" },
-                            aria_live: "polite",
-                            "{spotify_status_message.as_deref().unwrap_or_default()}"
-                        }
-
                         div {
-                            class: "mt-5 flex flex-wrap gap-3 border-t border-default pt-4",
+                            class: "mt-5 flex flex-wrap items-center gap-3 border-t border-default pt-4",
                             hidden: !(spotify_configured || spotify_connected),
                             aria_hidden: !(spotify_configured || spotify_connected),
                                 button {
                                     r#type: "button",
                                     class: "btn btn-outline min-h-11",
                                     disabled: spotify_action() == ProviderActionState::Loading,
+                                    aria_describedby: "spotify-disconnect-status",
                                     onclick: disconnect_spotify,
                                     "Disconnect Spotify"
+                                }
+                                p {
+                                    id: "spotify-disconnect-status",
+                                    class: if spotify_status_is_error { "status-err" } else { "text-sm text-secondary" },
+                                    hidden: spotify_scope != 5 || spotify_status_message.is_none(),
+                                    role: if spotify_status_is_error { "alert" } else { "status" },
+                                    aria_live: "polite",
+                                    "{spotify_status_message.as_deref().unwrap_or_default()}"
                                 }
                             }
                         }
@@ -3019,7 +3341,7 @@ mod tests {
         let mismatch =
             spotify_callback_feedback("?spotify=error&reason=token_exchange_failed").unwrap();
         assert!(mismatch.is_error);
-        assert!(mismatch.message.contains("callback URL"));
+        assert!(mismatch.message.contains("does not exactly match"));
 
         let unknown_reason = spotify_callback_feedback("?spotify=error&reason=made_up").unwrap();
         assert!(unknown_reason.is_error);
