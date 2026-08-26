@@ -316,6 +316,26 @@ pub fn playlist_live(title: &str, tracks: &[(&str, &str)]) -> FakeItem {
     FakeItem::list(title).with_children(children)
 }
 
+/// A live-radio station row, shaped exactly as the operator's real Core
+/// served one under "My Live Radio" (issue #587, recorded 2026-08 via the
+/// raw `/roon/browse` endpoint against the production install):
+///
+/// ```json
+/// {"title":"WOSU-HD2 WOSU Public Media: Classical 101",
+///  "subtitle":"Columbus, Ohio, USA FM 89.7 HD2 English",
+///  "item_key":"1646:0","hint":"action","image_key":"afd6..."}
+/// ```
+///
+/// The load-bearing part is `hint: action` -- browsing a station **plays it
+/// immediately** (no Play Now menu below it), which is why it has no
+/// children here. #587 was exactly this row being mistaken for a play-verb
+/// row and filtered out of `hifi_collections` listings.
+pub fn radio_station(title: &str, subtitle: &str) -> FakeItem {
+    FakeItem::action(title)
+        .with_subtitle(subtitle)
+        .with_image_key(&format!("img_{}", title.to_lowercase().replace(' ', "_")))
+}
+
 /// The fake Core's library: a browse root plus a flat set of searchable items.
 #[derive(Debug, Clone)]
 pub struct FakeLibrary {
@@ -805,6 +825,31 @@ impl FakeRoonCore {
 
     pub async fn set_item_key_scope(&self, scope: ItemKeyScope) {
         self.state.write().await.item_key_scope = scope;
+    }
+
+    /// Replace the children of the node titled `parent_title`, mid-run.
+    ///
+    /// This is how a test models the library changing under a live Core --
+    /// e.g. the operator adding a radio station in Roon's own app while UHC
+    /// is connected (#587). A real Core serves whatever the level contains
+    /// *at browse time* (this fake likewise snapshots a level's children
+    /// when the level is entered, in `handle_browse`), so the change is
+    /// visible to any browse that happens after the mutation and invisible
+    /// to loads of a level that was entered before it.
+    ///
+    /// Panics when no node carries that title, so a typo fails the test
+    /// loudly instead of mutating nothing.
+    pub async fn set_children_by_title(&self, parent_title: &str, children: Vec<FakeItem>) {
+        let mut state = self.state.write().await;
+        let parent = state
+            .arena
+            .find_by_title(parent_title)
+            .unwrap_or_else(|| panic!("no node titled {parent_title:?} in the fake library"));
+        let indices: Vec<usize> = children
+            .iter()
+            .map(|child| arena_insert(&mut state.arena.nodes, child))
+            .collect();
+        state.arena.nodes[parent].children = indices;
     }
 
     pub async fn set_zones(&self, zones: Vec<Value>) {
