@@ -1,3 +1,4 @@
+#include "Version.xcconfig"
 // Shared.xcconfig
 // Minimal shared configuration for scaffold tool customization
 // All other settings use Xcode project defaults
@@ -10,8 +11,6 @@ PRODUCT_NAME = AppleMusicIOSCompanionHost
 PRODUCT_DISPLAY_NAME = Hi-Fi Control
 PRODUCT_BUNDLE_IDENTIFIER = com.openhorizonlabs.uhc.companion
 DEVELOPMENT_TEAM = B69HKNTV5Q
-MARKETING_VERSION = 0.1.0
-CURRENT_PROJECT_VERSION = 1
 
 // ==========================================
 // Platform Configuration
