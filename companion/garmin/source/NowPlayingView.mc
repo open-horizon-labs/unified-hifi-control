@@ -25,6 +25,8 @@ class NowPlayingView extends WatchUi.View {
     private var _artist as String = "";
     private var _error as String?;
     private var _loaded as Boolean = false;
+    private var _art as WatchUi.BitmapResource?;
+    private var _artKey as String = "";
 
     public function initialize(zone as Zone) {
         View.initialize();
@@ -60,6 +62,18 @@ class NowPlayingView extends WatchUi.View {
         }
         _title = text(data["line1"]);
         _artist = text(data["line2"]);
+
+        // Only re-request art when the image actually changed: the request
+        // is a round trip through Garmin's servers, so refetching the same
+        // album on every command would be slow and pointless.
+        var key = text(data["image_key"]);
+        if (key.length() > 0 && !key.equals(_artKey)) {
+            _artKey = key;
+            new ArtRequest(method(:onArt)).start(_zone.id, key);
+        } else if (key.length() == 0) {
+            _artKey = "";
+            _art = null;
+        }
         var playing = data["is_playing"];
         if (playing instanceof Boolean) {
             _zone.state = playing ? "playing" : "paused";
@@ -72,6 +86,15 @@ class NowPlayingView extends WatchUi.View {
         }
         _loaded = true;
         WatchUi.requestUpdate();
+    }
+
+    public function onArt(error as Number?, bitmap) as Void {
+        // Art is decoration. A failure leaves the previous image or none at
+        // all, and never surfaces an error — the controls still work.
+        if (error == null && bitmap != null) {
+            _art = bitmap;
+            WatchUi.requestUpdate();
+        }
     }
 
     private function text(value) as String {
@@ -118,6 +141,25 @@ class NowPlayingView extends WatchUi.View {
             Graphics.TEXT_JUSTIFY_CENTER | Graphics.TEXT_JUSTIFY_VCENTER
         );
 
+        // Album art, large. On a 454px AMOLED the art is the best thing on
+        // the screen, so it gets the middle of it; the text sits underneath.
+        // Art gets the top half; the text keeps a fixed band beneath it, so
+        // a larger cover can never squeeze the title out of existence — an
+        // earlier version computed the text height as a subtraction and
+        // silently produced a negative box.
+        var textTop = 0.30;
+        var textBottom = 0.82;
+        if (_art != null) {
+            var art = _art as WatchUi.BitmapResource;
+            var side = art.getWidth();
+            var artTop = (h * 0.125).toNumber();
+            dc.drawBitmap((w / 2) - (side / 2), artTop, art);
+            textTop = ((artTop + side).toFloat() / h) + 0.015;
+        }
+        if (textTop > textBottom - 0.10) {
+            textTop = textBottom - 0.10;   // always room for one line
+        }
+
         // Track and artist: the headline, wrapped inside the bezel.
         var body = new WatchUi.TextArea({
             :text => _loaded ? bodyText() : (WatchUi.loadResource(Rez.Strings.Loading) as String),
@@ -125,9 +167,9 @@ class NowPlayingView extends WatchUi.View {
             :font => [Graphics.FONT_MEDIUM, Graphics.FONT_SMALL, Graphics.FONT_TINY, Graphics.FONT_XTINY],
             :justification => Graphics.TEXT_JUSTIFY_CENTER | Graphics.TEXT_JUSTIFY_VCENTER,
             :locX => inset,
-            :locY => (h * 0.29).toNumber(),
+            :locY => (h * textTop).toNumber(),
             :width => w - inset * 2,
-            :height => (h * 0.34).toNumber()
+            :height => (h * (textBottom - textTop)).toNumber()
         });
         body.draw(dc);
 

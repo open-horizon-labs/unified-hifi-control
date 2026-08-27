@@ -1,6 +1,8 @@
 import Toybox.Application;
 import Toybox.Communications;
 import Toybox.Lang;
+import Toybox.Graphics;
+import Toybox.WatchUi;
 
 //! The whole server contract, in one place.
 //!
@@ -211,6 +213,60 @@ class NowPlayingRequest {
         var failure = UhcApi.classify(responseCode);
         if (failure != null || data == null || !(data instanceof Dictionary)) {
             _callback.invoke(failure == null ? UhcApi.ERR_UNREACHABLE : failure, null);
+            return;
+        }
+        _callback.invoke(null, data);
+    }
+}
+
+
+//! Album art.
+//!
+//! `makeImageRequest` is NOT fetched by the watch or the phone — the URL is
+//! handed to GARMIN'S SERVERS, which fetch and transcode it for the device.
+//! That is why the art endpoint must be reachable from the public internet:
+//! a valid certificate on a private address is not enough, because Garmin's
+//! infrastructure cannot resolve it. It is also why no Authorization header
+//! is sent here: the request is not ours to sign.
+class ArtRequest {
+    private var _callback as Method;
+
+    public function initialize(callback as Method) {
+        _callback = callback;
+    }
+
+    //! `cacheKey` is the provider's image key, passed through so a track
+    //! change produces a different URL. Without it Garmin's proxy would
+    //! happily serve the previous album forever.
+    public function start(zoneId as String, cacheKey as String) as Void {
+        var base = UhcApi.baseUrl();
+        if (base == null) {
+            _callback.invoke(UhcApi.ERR_NO_SERVER, null);
+            return;
+        }
+        Communications.makeImageRequest(
+            base + "/now_playing/image",
+            { "zone_id" => zoneId, "k" => cacheKey },
+            {
+                // Big: this is a 454px AMOLED and album art is the best
+                // thing on the screen. The cost is real — every pixel
+                // crosses Bluetooth on a watch — but it is paid once per
+                // track, not per command, because the fetch is keyed on the
+                // provider's image key.
+                :maxWidth => 176,
+                :maxHeight => 176,
+                :dithering => Communications.IMAGE_DITHERING_NONE
+            },
+            method(:onResponse)
+        );
+    }
+
+    public function onResponse(
+        responseCode as Number,
+        data as WatchUi.BitmapResource or Graphics.BitmapReference or Null
+    ) as Void {
+        if (responseCode != 200 || data == null) {
+            _callback.invoke(UhcApi.ERR_UNREACHABLE, null);
             return;
         }
         _callback.invoke(null, data);
