@@ -174,10 +174,9 @@ pub fn install_report_from_lookup(
             .filter(|value| !value.is_empty())
     };
     Some(InstallReport {
-        outcome: non_empty(STATUS_ENV)
-            .map_or(InstallOutcome::Unknown, |value| {
-                InstallOutcome::parse(&value)
-            }),
+        outcome: non_empty(STATUS_ENV).map_or(InstallOutcome::Unknown, |value| {
+            InstallOutcome::parse(&value)
+        }),
         version: non_empty(VERSION_ENV),
         detail: non_empty(DETAIL_ENV),
     })
@@ -430,11 +429,10 @@ mod tests {
 
     #[test]
     fn no_report_outside_the_addon() {
-        assert!(install_report_from_lookup(lookup(&[(
-            "UHC_HA_INTEGRATION_STATUS",
-            "installed"
-        )]))
-        .is_none());
+        assert!(
+            install_report_from_lookup(lookup(&[("UHC_HA_INTEGRATION_STATUS", "installed")]))
+                .is_none()
+        );
     }
 
     #[test]

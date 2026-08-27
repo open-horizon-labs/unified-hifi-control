@@ -215,6 +215,7 @@ mod tests {
             has_username: true,
             has_password: true,
             source: Some("user".to_string()),
+            user_opted_in: true,
             home_assistant: "consuming".to_string(),
             home_assistant_detail: None,
         }
@@ -253,6 +254,7 @@ mod tests {
             has_username: false,
             has_password: false,
             source: Some(MqttConfigSource::Environment),
+            enable_source: MqttEnableSource::Automatic,
             home_assistant: HomeAssistantState::Unknown,
             home_assistant_detail: None,
         };
@@ -293,6 +295,7 @@ mod tests {
             has_username: false,
             has_password: false,
             source: None,
+            enable_source: MqttEnableSource::Automatic,
             home_assistant: HomeAssistantState::default(),
             home_assistant_detail: None,
         });
@@ -319,6 +322,7 @@ mod tests {
             has_username: true,
             has_password: true,
             source: Some(MqttConfigSource::Environment),
+            enable_source: MqttEnableSource::Automatic,
             home_assistant: HomeAssistantState::NotConfigured,
             home_assistant_detail: None,
         });
@@ -345,6 +349,7 @@ mod tests {
             has_username: false,
             has_password: false,
             source: Some(MqttConfigSource::User),
+            enable_source: MqttEnableSource::Automatic,
             home_assistant: HomeAssistantState::Unknown,
             home_assistant_detail: Some("not running as a Home Assistant add-on".to_string()),
         }))
