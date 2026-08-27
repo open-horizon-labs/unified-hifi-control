@@ -13,6 +13,10 @@ class Zone {
     public var volume as Float;
     public var volumeMin as Float;
     public var volumeMax as Float;
+    public var volumeStep as Float;
+    //! "percentage" or "db". A dB zone runs NEGATIVE (e.g. -80.0 to 0.0),
+    //! which is why nothing here assumes a floor of zero.
+    public var volumeScale as String;
 
     public function initialize(raw as Dictionary) {
         id = asString(raw["zone_id"], "");
@@ -31,11 +35,18 @@ class Zone {
             // zone may run 0-98 with a half-step rather than 0-100.
             volumeMin = asFloat(vc["min"], 0.0);
             volumeMax = asFloat(vc["max"], 100.0);
+            // Zones disagree: 1.0 on some, 0.5 on others. Using the zone's
+            // own step means one press moves exactly one detent.
+            volumeStep = asFloat(vc["step"], 1.0);
+            if (volumeStep <= 0.0) { volumeStep = 1.0; }
+            volumeScale = asString(vc["scale"], "percentage");
         } else {
             hasVolume = false;
             volume = 0.0;
             volumeMin = 0.0;
             volumeMax = 100.0;
+            volumeStep = 1.0;
+            volumeScale = "percentage";
         }
     }
 

@@ -32,6 +32,8 @@ module UhcApi {
     const ACTION_PREVIOUS = "previous";
     const ACTION_VOLUME_UP = "volume_up";
     const ACTION_VOLUME_DOWN = "volume_down";
+    //! Absolute level; takes a `value`. Both spellings work server-side.
+    const ACTION_VOLUME_ABS = "volume";
 
     // Distinguishable failures. Each earns different advice: a bad address is
     // a settings problem, a rejected token is a server problem, and anything
@@ -158,14 +160,31 @@ class ControlRequest {
     }
 
     public function start(zoneId as String, action as String) as Void {
+        send(zoneId, action, null);
+    }
+
+    //! Absolute form: `{zone_id, action:"volume", value}`. Used by the volume
+    //! screen so a sweep becomes ONE request for the level the user landed
+    //! on, rather than a burst of relative bumps.
+    public function startWithValue(
+        zoneId as String, action as String, value as Float
+    ) as Void {
+        send(zoneId, action, value);
+    }
+
+    private function send(zoneId as String, action as String, value as Float?) as Void {
         var base = UhcApi.baseUrl();
         if (base == null) {
             _callback.invoke(UhcApi.ERR_NO_SERVER);
             return;
         }
+        var params = { "zone_id" => zoneId, "action" => action } as Dictionary;
+        if (value != null) {
+            params["value"] = value;
+        }
         Communications.makeWebRequest(
             base + "/control",
-            { "zone_id" => zoneId, "action" => action },
+            params,
             {
                 :method => Communications.HTTP_REQUEST_METHOD_POST,
                 :headers => UhcApi.headers(Communications.REQUEST_CONTENT_TYPE_JSON),
