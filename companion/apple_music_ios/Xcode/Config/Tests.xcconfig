@@ -7,7 +7,7 @@
 // ==========================================
 // Test Target Settings (Customizable by scaffold tool)
 // ==========================================
-PRODUCT_BUNDLE_IDENTIFIER = com.openhorizonlabs.uhc.applemusiccompanion
+PRODUCT_BUNDLE_IDENTIFIER = com.openhorizonlabs.uhc.companion
 TEST_TARGET_NAME = AppleMusicIOSCompanionHost
 
 // Fix duplicate module name issue

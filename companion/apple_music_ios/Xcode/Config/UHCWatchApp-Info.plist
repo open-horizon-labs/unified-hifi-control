@@ -28,7 +28,7 @@
 	<key>WKApplication</key>
 	<true/>
 	<key>WKCompanionAppBundleIdentifier</key>
-	<string>com.openhorizonlabs.uhc.applemusiccompanion</string>
+	<string>com.openhorizonlabs.uhc.companion</string>
 	<key>WKRunsIndependentlyOfCompanionApp</key>
 	<true/>
 	<!--
