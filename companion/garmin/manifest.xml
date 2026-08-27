@@ -20,8 +20,19 @@
           Widening it is a per-device layout question, not a checkbox — a
           non-touch or lower-resolution device needs its own layout pass.
         -->
+        <!--
+          The fēnix 8 family. Each id covers several physical models: 47mm
+          also covers 51mm and the tactix/quatix variants, and the Pro id
+          covers MicroLED. The Solar models are MIP at 260-280px rather than
+          AMOLED at 454, which is why the layout works in fractions of the
+          screen and the album art is requested at a size derived from it.
+        -->
         <iq:products>
+            <iq:product id="fenix843mm"/>
+            <iq:product id="fenix847mm"/>
             <iq:product id="fenix8pro47mm"/>
+            <iq:product id="fenix8solar47mm"/>
+            <iq:product id="fenix8solar51mm"/>
         </iq:products>
 
         <iq:permissions>

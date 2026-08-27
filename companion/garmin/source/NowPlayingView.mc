@@ -27,6 +27,9 @@ class NowPlayingView extends WatchUi.View {
     private var _loaded as Boolean = false;
     private var _art as WatchUi.BitmapResource?;
     private var _artKey as String = "";
+    //! Screen width, learned at layout time. Art is requested as a fraction
+    //! of it so the same code suits a 454px AMOLED and a 260px MIP.
+    private var _screenW as Number = 260;
 
     public function initialize(zone as Zone) {
         View.initialize();
@@ -34,6 +37,7 @@ class NowPlayingView extends WatchUi.View {
     }
 
     public function onLayout(dc as Graphics.Dc) as Void {
+        _screenW = dc.getWidth();
         setLayout(Rez.Layouts.NowPlayingHints(dc));
     }
 
@@ -69,7 +73,7 @@ class NowPlayingView extends WatchUi.View {
         var key = text(data["image_key"]);
         if (key.length() > 0 && !key.equals(_artKey)) {
             _artKey = key;
-            new ArtRequest(method(:onArt)).start(_zone.id, key);
+            new ArtRequest(method(:onArt)).start(_zone.id, key, (_screenW * 0.39).toNumber());
         } else if (key.length() == 0) {
             _artKey = "";
             _art = null;

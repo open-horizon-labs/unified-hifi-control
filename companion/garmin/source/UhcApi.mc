@@ -238,7 +238,7 @@ class ArtRequest {
     //! `cacheKey` is the provider's image key, passed through so a track
     //! change produces a different URL. Without it Garmin's proxy would
     //! happily serve the previous album forever.
-    public function start(zoneId as String, cacheKey as String) as Void {
+    public function start(zoneId as String, cacheKey as String, side as Number) as Void {
         var base = UhcApi.baseUrl();
         if (base == null) {
             _callback.invoke(UhcApi.ERR_NO_SERVER, null);
@@ -248,13 +248,13 @@ class ArtRequest {
             base + "/now_playing/image",
             { "zone_id" => zoneId, "k" => cacheKey },
             {
-                // Big: this is a 454px AMOLED and album art is the best
-                // thing on the screen. The cost is real — every pixel
-                // crosses Bluetooth on a watch — but it is paid once per
-                // track, not per command, because the fetch is keyed on the
-                // provider's image key.
-                :maxWidth => 176,
-                :maxHeight => 176,
+                // Sized by the caller from the actual screen: this family
+                // spans a 454px AMOLED and a 260px MIP, and a fixed size
+                // would either waste bytes or swallow the small screens.
+                // The cost is paid once per track, not per command, because
+                // the fetch is keyed on the provider's image key.
+                :maxWidth => side,
+                :maxHeight => side,
                 :dithering => Communications.IMAGE_DITHERING_NONE
             },
             method(:onResponse)
