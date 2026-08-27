@@ -80,18 +80,26 @@ class ZoneControlView extends WatchUi.View {
         dc.setColor(Graphics.COLOR_WHITE, Graphics.COLOR_BLACK);
         dc.clear();
 
-        // Zone name: the answer to "what am I about to change".
+        // Zone name, wrapped rather than truncated or scrolled.
         //
-        // Truncated, not drawn raw: "Front Family Room" ran off both edges of
-        // the round face in the simulator. drawText neither wraps nor clips
-        // gracefully, so the width has to be enforced here. The usable width
-        // is narrower than the screen because this sits high on a circle.
-        dc.drawText(
-            _cx, (_cy * 0.42).toNumber(),
-            Graphics.FONT_MEDIUM,
-            fit(dc, _zone.name, Graphics.FONT_MEDIUM, (dc.getWidth() * 0.66).toNumber()),
-            Graphics.TEXT_JUSTIFY_CENTER | Graphics.TEXT_JUSTIFY_VCENTER
-        );
+        // Truncation was ambiguous ("Bathroom …" could be two different
+        // rooms). A marquee is what Garmin does for TRACK titles — long,
+        // changing text — but this is a static label on a screen you are
+        // holding open, and a marquee means a repeating timer redrawing the
+        // screen for as long as you look at it. Two lines costs nothing and
+        // is readable at a glance, which is the whole job.
+        var nameInset = (dc.getWidth() * 0.17).toNumber();
+        var name = new WatchUi.TextArea({
+            :text => _zone.name,
+            :color => Graphics.COLOR_WHITE,
+            :font => [Graphics.FONT_MEDIUM, Graphics.FONT_SMALL, Graphics.FONT_TINY],
+            :justification => Graphics.TEXT_JUSTIFY_CENTER | Graphics.TEXT_JUSTIFY_VCENTER,
+            :locX => nameInset,
+            :locY => (_cy * 0.18).toNumber(),
+            :width => dc.getWidth() - nameInset * 2,
+            :height => (_cy * 0.62).toNumber()
+        });
+        name.draw(dc);
 
         // Status line: an error outranks state, because it is the thing the
         // user has to act on.
@@ -102,8 +110,10 @@ class ZoneControlView extends WatchUi.View {
             _error != null ? Graphics.COLOR_RED : Graphics.COLOR_LT_GRAY,
             Graphics.COLOR_TRANSPARENT
         );
+        // Below the name block (which reaches 0.80 * _cy) and above the
+        // transport row — a two-line zone name used to collide with this.
         dc.drawText(
-            _cx, (_cy * 0.72).toNumber(),
+            _cx, (_cy * 0.90).toNumber(),
             Graphics.FONT_TINY,
             status,
             Graphics.TEXT_JUSTIFY_CENTER | Graphics.TEXT_JUSTIFY_VCENTER
@@ -111,28 +121,6 @@ class ZoneControlView extends WatchUi.View {
 
         drawTransport(dc);
         drawVolume(dc);
-    }
-
-    //! Shorten `text` until it fits `maxWidth`, ending in an ellipsis.
-    //! Character-wise rather than word-wise: zone names are short labels
-    //! where losing the tail is clearer than dropping a whole word.
-    private function fit(
-        dc as Graphics.Dc,
-        text as String,
-        font as Graphics.FontType,
-        maxWidth as Number
-    ) as String {
-        if (dc.getTextWidthInPixels(text, font) <= maxWidth) {
-            return text;
-        }
-        var trimmed = text;
-        while (trimmed.length() > 1) {
-            trimmed = trimmed.substring(0, trimmed.length() - 1);
-            if (dc.getTextWidthInPixels(trimmed + "…", font) <= maxWidth) {
-                return trimmed + "…";
-            }
-        }
-        return trimmed;
     }
 
     //! Previous / play-pause / next, in Garmin's order.
