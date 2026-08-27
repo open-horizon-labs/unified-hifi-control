@@ -452,40 +452,31 @@ public struct ContentView: View {
 private struct ControlsTab: View {
     @ObservedObject var model: CompanionModel
     @Binding var reloadToken: Int
+    @State private var chromeColor = Color.black
 
     var body: some View {
-        NavigationStack {
-            Group {
-                if let url = model.serverURL {
-                    // No ignoresSafeArea here: UHC's own zones strip is
-                    // pinned to the bottom of its viewport, and letting the
-                    // web view run under the tab bar buries exactly the
-                    // control the user reaches for most.
-                    UHCWebView(url: url, reloadToken: $reloadToken)
-                } else {
-                    ContentUnavailableView {
-                        Label("No UHC server yet", systemImage: "antenna.radiowaves.left.and.right.slash")
-                    } description: {
-                        Text("Find your Unified Hi-Fi Control server on this network to control your zones from here.")
-                    } actions: {
-                        Button(model.isFindingServer ? "Searching…" : "Find UHC") {
-                            model.findServerForControls()
-                        }
-                        .disabled(model.isFindingServer)
+        // Deliberately no NavigationStack: UHC's web UI brings its own header
+        // and its own bottom zones strip. Wrapping it in a native title bar
+        // stacks two sets of chrome doing the same job, which is what makes a
+        // hosted web app read as a web page rather than an app. Reload lives
+        // in pull-to-refresh instead of a toolbar button.
+        Group {
+            if let url = model.serverURL {
+                UHCWebView(url: url, reloadToken: $reloadToken, chromeColor: $chromeColor)
+                    // Paint the status-bar strip to match the page's own top
+                    // bar; a white sliver above a dark app is the tell that
+                    // you are looking at a web page in a frame.
+                    .background(chromeColor.ignoresSafeArea(edges: .top))
+            } else {
+                ContentUnavailableView {
+                    Label("No UHC server yet", systemImage: "antenna.radiowaves.left.and.right.slash")
+                } description: {
+                    Text("Find your Unified Hi-Fi Control server on this network to control your zones from here.")
+                } actions: {
+                    Button(model.isFindingServer ? "Searching…" : "Find UHC") {
+                        model.findServerForControls()
                     }
-                }
-            }
-            .navigationTitle("Controls")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                if model.serverURL != nil {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button {
-                            reloadToken += 1
-                        } label: {
-                            Label("Reload", systemImage: "arrow.clockwise")
-                        }
-                    }
+                    .disabled(model.isFindingServer)
                 }
             }
         }

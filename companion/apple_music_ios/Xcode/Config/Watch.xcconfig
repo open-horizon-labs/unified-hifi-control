@@ -30,3 +30,6 @@ CODE_SIGNING_ALLOWED[sdk=watchsimulator*] = NO
 
 SKIP_INSTALL = NO
 ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = NO
+
+// TestFlight/App Store require an app icon on every submitted target.
+ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon
