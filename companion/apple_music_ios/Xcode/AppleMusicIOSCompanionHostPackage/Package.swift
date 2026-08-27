@@ -14,7 +14,11 @@ let package = Package(
         ),
     ],
     dependencies: [
-        .package(path: "../../")
+        .package(path: "../../"),
+        // The shared UHC control client (#619). Discovery lives here now, so
+        // the iOS companion and the watchOS controller browse for _uhc._tcp
+        // through exactly one implementation.
+        .package(path: "../../../uhckit"),
     ],
     targets: [
         // Targets are the basic building blocks of a package, defining a module or a test suite.
@@ -22,7 +26,8 @@ let package = Package(
         .target(
             name: "AppleMusicIOSCompanionHostFeature",
             dependencies: [
-                .product(name: "AppleMusicIOSCompanion", package: "apple_music_ios")
+                .product(name: "AppleMusicIOSCompanion", package: "apple_music_ios"),
+                .product(name: "UHCKit", package: "uhckit"),
             ]
         ),
         .testTarget(
