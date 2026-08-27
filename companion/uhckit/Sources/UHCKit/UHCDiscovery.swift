@@ -116,6 +116,34 @@ public final class UHCDiscovery: NSObject, @unchecked Sendable {
         }
     }
 
+    /// The first usable numeric host in a Bonjour address list, IPv4 first.
+    /// Link-local IPv6 is skipped: it needs a scope id that does not survive
+    /// being written into a URL string.
+    static func numericHost(from addresses: [Data]) -> String? {
+        var fallbackV6: String?
+        for data in addresses {
+            let host: String? = data.withUnsafeBytes { raw -> String? in
+                guard let base = raw.baseAddress, raw.count >= MemoryLayout<sockaddr>.size else {
+                    return nil
+                }
+                let sa = base.assumingMemoryBound(to: sockaddr.self)
+                var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                guard getnameinfo(sa, socklen_t(raw.count), &buffer, socklen_t(buffer.count),
+                                  nil, 0, NI_NUMERICHOST) == 0 else { return nil }
+                let text = String(cString: buffer)
+                if sa.pointee.sa_family == sa_family_t(AF_INET) { return text }
+                if sa.pointee.sa_family == sa_family_t(AF_INET6) {
+                    if text.hasPrefix("fe80") || text.contains("%") { return nil }
+                    return "[\(text)]"
+                }
+                return nil
+            }
+            guard let host else { continue }
+            if host.hasPrefix("[") { fallbackV6 = fallbackV6 ?? host } else { return host }
+        }
+        return fallbackV6
+    }
+
     /// Reads a usable base URL out of a Bonjour TXT record. Shared by both
     /// implementations so the fallback rule cannot drift between platforms.
     static func baseURL(fromTXT txt: [String: String]) -> URL? {
@@ -215,9 +243,25 @@ extension UHCDiscovery: NetServiceBrowserDelegate, NetServiceDelegate {
 
     public func netServiceDidResolveAddress(_ sender: NetService) {
         guard !finished else { return }
-        // Prefer the resolved hostname: a server may advertise a loopback or
-        // container hostname in its TXT base URL, while Bonjour has already
-        // resolved a name reachable from *this* device.
+        // Prefer the numeric address Bonjour has ALREADY resolved. Using the
+        // `.local` hostname instead makes every subsequent request re-run an
+        // mDNS lookup, and those lose the race often enough to matter -- on
+        // the owner's network that surfaced as sporadic `-1001` timeouts and
+        // a `did not receive all answers in time for nas2.local:8088` in the
+        // device log, on a server that was up the whole time.
+        //
+        // Trade-off, deliberate: an address can go stale if DHCP moves the
+        // server, where a hostname would have followed it. Re-running
+        // discovery fixes that, and a lookup that intermittently fails is
+        // worse than one that fails predictably and can be retried.
+        if let address = UHCDiscovery.numericHost(from: sender.addresses ?? []),
+           sender.port > 0,
+           let url = URL(string: "http://\(address):\(sender.port)") {
+            finish(url)
+            return
+        }
+
+        // No usable address: fall back to the resolved hostname.
         if let host = sender.hostName?.trimmingCharacters(in: CharacterSet(charactersIn: ".")),
            !host.isEmpty, sender.port > 0,
            let url = URL(string: "http://\(host):\(sender.port)") {
