@@ -1,0 +1,5 @@
+# Build output and the developer signing key never belong in the repo.
+bin/
+*.prg
+*.prg.debug.xml
+developer_key*
