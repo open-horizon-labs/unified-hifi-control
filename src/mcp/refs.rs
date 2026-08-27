@@ -105,10 +105,29 @@ const TOKEN_PREFIX: &str = "ref_";
 /// private session per call and the item keys it returns are scoped to that
 /// session (see `src/adapters/roon.rs::search_with_session`); resolution must
 /// re-enter that exact session (`RoonAdapter::play_ref`), never a fresh one.
+/// # Why the pair alone is not enough (#616)
+///
+/// An `(item_key, multi_session_key)` pair is only meaningful while the Core
+/// still holds that session. When it does not -- the extension reconnected,
+/// the Core restarted, or the session aged out -- the pair is unrecoverable
+/// on its own: nothing in it says *what* the key pointed at, so the only
+/// answer left is to tell the human to browse again. That is the error
+/// reported in #616, and asking the user to redo a walk we could redo
+/// ourselves is the part they feel.
+///
+/// [`Self::trail`] is what makes recovery possible: the titles from the
+/// browse root down to this item, accumulated as the user descends. Given
+/// the trail, `RoonAdapter::resolve_trail` can re-walk it in a fresh session
+/// and mint an equivalent key, so a rejected ref becomes a retry rather than
+/// an apology. It is best-effort: an empty trail simply means no recovery is
+/// possible for that ref, exactly as before.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoonRefTarget {
     pub item_key: String,
     pub multi_session_key: String,
+    /// Titles from the browse root down to and including this item. Empty
+    /// when the minting surface could not supply one.
+    pub trail: Vec<String>,
 }
 
 /// What a ref resolves to, independent of the opaque token a client holds.
@@ -469,6 +488,7 @@ mod tests {
             target: RoonRefTarget {
                 item_key: item_key.to_string(),
                 multi_session_key: session.to_string(),
+                trail: vec![title.to_string()],
             },
             title: title.to_string(),
         }

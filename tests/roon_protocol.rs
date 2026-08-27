@@ -1698,6 +1698,7 @@ async fn roon_play_ref_matches_playlist_verb_and_reports_no_error() {
             "roon:zone_fake_1",
             PlayAction::Play,
             "An Introduction to Qobuz",
+            &[],
         )
         .await
         .expect("playing a playlist ref must succeed, not report a false error");
@@ -1746,6 +1747,7 @@ async fn roon_play_ref_does_not_silently_substitute_queue_for_an_unavailable_act
             "roon:zone_fake_1",
             PlayAction::Queue,
             "Solo Playlist",
+            &[],
         )
         .await
         .expect_err("Queue is not offered by this playlist");
@@ -2499,6 +2501,7 @@ async fn roon_collections_artist_level_albums_are_dual_under_session_scoped_keys
             "roon:zone_fake_1",
             PlayAction::Play,
             "Flight of the Crow",
+            &[],
         )
         .await
         .expect("playing an artist-level album ref must succeed");

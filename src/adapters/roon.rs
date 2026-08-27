@@ -50,6 +50,17 @@ const BROWSE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default search result limit
 const DEFAULT_SEARCH_LIMIT: usize = 50;
 
+/// Page size used when re-walking a browse trail (#616). Larger than a UI
+/// page because nothing is rendered from it -- it is scanned for one title.
+const TRAIL_PAGE_SIZE: usize = 100;
+
+/// How deep into a single level a trail re-walk will scan before giving up.
+/// Roon offers no "find the row named X" verb, so a level is paged through;
+/// this bounds that against a level with hundreds of thousands of rows. A
+/// container that lives past this cap fails recovery and the caller reports
+/// the Core's original rejection.
+const TRAIL_SCAN_LIMIT: usize = 5_000;
+
 /// Category names returned by Roon search - these are containers, not playable items
 const CATEGORY_NAMES: &[&str] = &[
     "Albums",
@@ -3025,6 +3036,21 @@ impl RoonAdapter {
     /// that plays a top-level item whose own action fires immediately (see
     /// [`Self::resolve_item_key`]'s docs) still gets a human-readable
     /// message instead of the raw `item_key`.
+    /// # Recovering a key the Core no longer honours (#616)
+    ///
+    /// Re-entering the minting session is right whenever that session still
+    /// exists. When it does not, the Core answers `InvalidItemKey` and the
+    /// old behaviour was to hand the human that rejection verbatim --
+    /// "search or browse again to get a fresh key" -- which asks them to
+    /// perform, by hand, a walk this adapter can perform itself.
+    ///
+    /// So a rejection is now a retry, not a verdict: given `trail` (the
+    /// titles from the browse root down to this item, carried on the ref
+    /// since #616), [`Self::resolve_trail`] re-walks it in a fresh session,
+    /// mints an equivalent key, and the play is attempted once more. The
+    /// caller only sees an error when recovery itself fails -- and then it
+    /// is the *original* rejection that surfaces, because that is the one
+    /// that describes what actually went wrong.
     pub async fn play_ref(
         &self,
         item_key: &str,
@@ -3032,6 +3058,7 @@ impl RoonAdapter {
         zone_id: &str,
         action: PlayAction,
         fallback_title: &str,
+        trail: &[String],
     ) -> Result<String> {
         if item_key.is_empty() {
             return Err(anyhow::anyhow!("item_key cannot be empty"));
@@ -3041,14 +3068,152 @@ impl RoonAdapter {
         }
 
         let bare_zone_id = strip_roon_prefix(zone_id);
+        let first = self
+            .resolve_item_key(
+                multi_session_key,
+                item_key,
+                bare_zone_id,
+                action,
+                Some(fallback_title),
+            )
+            .await;
+
+        let Err(error) = first else {
+            return first;
+        };
+
+        // Only a key the Core actively rejected is worth re-walking. A
+        // timeout, a lost Core, or a zone that does not exist are not fixed
+        // by minting a fresh key, and retrying them would double the wait.
+        if !matches!(
+            RoonBrowseError::from_error(&error).map(|rejection| rejection.kind),
+            Some(RoonBrowseErrorKind::InvalidItemKey)
+        ) {
+            return Err(error);
+        }
+        if trail.is_empty() {
+            return Err(error);
+        }
+
+        tracing::info!(
+            session_key = %multi_session_key,
+            trail = ?trail,
+            "roon: item key rejected; re-walking its trail in a fresh session"
+        );
+
+        let Ok((recovered_session, recovered_key)) = self.resolve_trail(zone_id, trail).await
+        else {
+            return Err(error);
+        };
         self.resolve_item_key(
-            multi_session_key,
-            item_key,
+            &recovered_session,
+            &recovered_key,
             bare_zone_id,
             action,
             Some(fallback_title),
         )
         .await
+        .map_err(|_| error)
+    }
+
+    /// Re-walk `trail` -- titles from the browse root down to and including
+    /// the wanted item -- in a session minted for this walk, and report
+    /// `(session_key, item_key)` for the item it lands on.
+    ///
+    /// This is the recovery half of #616. It deliberately starts from the
+    /// root with `pop_all` in a *fresh* session rather than reusing the
+    /// caller's: the caller's session is, by the time this runs, the one the
+    /// Core just rejected a key from.
+    ///
+    /// Titles are matched exactly. Roon has no "find the row named X" browse
+    /// verb, so each level is paged through until the title turns up or the
+    /// level is exhausted; [`TRAIL_SCAN_LIMIT`] caps that so a walk down a
+    /// hundred-thousand-track list cannot run away. A title that has since
+    /// been renamed, or moved past the cap, simply fails the walk -- the
+    /// caller then reports the original rejection, which is the honest
+    /// answer.
+    pub(crate) async fn resolve_trail(
+        &self,
+        zone_id: &str,
+        trail: &[String],
+    ) -> Result<(String, String)> {
+        if trail.is_empty() {
+            return Err(anyhow::anyhow!("cannot re-walk an empty trail"));
+        }
+        let bare_zone_id = strip_roon_prefix(zone_id);
+        let session_key = format!(
+            "recover_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+
+        // Land on the browse root. Safe to `pop_all` here precisely because
+        // the session is new: no key anyone holds was minted in it.
+        self.browse(BrowseOpts {
+            multi_session_key: Some(session_key.clone()),
+            zone_or_output_id: Some(bare_zone_id.to_string()),
+            pop_all: true,
+            ..Default::default()
+        })
+        .await?;
+
+        let mut found_key: Option<String> = None;
+        for (depth, title) in trail.iter().enumerate() {
+            // Descend into the previous match before looking for this one.
+            if let Some(parent_key) = found_key.take() {
+                self.browse(BrowseOpts {
+                    multi_session_key: Some(session_key.clone()),
+                    item_key: Some(parent_key),
+                    zone_or_output_id: Some(bare_zone_id.to_string()),
+                    ..Default::default()
+                })
+                .await?;
+            }
+            let matched = self
+                .find_titled_row(&session_key, title)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "re-walking the browse trail lost the row {title:?} at depth {depth}"
+                    )
+                })?;
+            found_key = Some(matched);
+        }
+
+        let item_key = found_key
+            .ok_or_else(|| anyhow::anyhow!("re-walking the browse trail found no item key"))?;
+        Ok((session_key, item_key))
+    }
+
+    /// Page through the level `session_key` is currently on, looking for a
+    /// row whose title matches `title` exactly. `Ok(None)` means the level
+    /// was read to its end (or to [`TRAIL_SCAN_LIMIT`]) without a match.
+    async fn find_titled_row(&self, session_key: &str, title: &str) -> Result<Option<String>> {
+        let mut offset = 0usize;
+        loop {
+            let page = self
+                .load(LoadOpts {
+                    multi_session_key: Some(session_key.to_string()),
+                    offset,
+                    count: Some(TRAIL_PAGE_SIZE),
+                    ..Default::default()
+                })
+                .await?;
+            let fetched = page.items.len();
+            for item in page.items {
+                if item.title == title {
+                    if let Some(key) = item.item_key {
+                        return Ok(Some(key));
+                    }
+                }
+            }
+            offset += fetched;
+            if fetched == 0 || offset >= page.list.count.min(TRAIL_SCAN_LIMIT) {
+                return Ok(None);
+            }
+        }
     }
 
     /// Browse `item_key` within `session_key` and report what came back:

@@ -557,11 +557,19 @@ async fn handle_roon(
     if let Some(RoonRefTarget {
         item_key,
         multi_session_key,
+        ..
     }) = &resume
     {
         params["item_key"] = json!(item_key);
         params["session_key"] = json!(multi_session_key);
     }
+    // #616: the trail this page hangs off. Children extend it by their own
+    // title, so every ref minted below carries the full root-to-item walk
+    // and can be re-resolved after its session is gone.
+    let parent_trail: Vec<String> = resume
+        .as_ref()
+        .map(|target| target.trail.clone())
+        .unwrap_or_default();
     // Roon has no separate playlists/favorites protocol feature: both arrive
     // as named nodes in the same browse hierarchy (see the capability
     // table's note on this). `favorites` never reaches here -- `support()`
@@ -626,9 +634,12 @@ async fn handle_roon(
         let (path, r#ref) = match item_key {
             None => (None, None),
             Some(item_key) => {
+                let mut trail = parent_trail.clone();
+                trail.push(title.clone());
                 let target = RoonRefTarget {
                     item_key: item_key.to_string(),
                     multi_session_key: session_key.to_string(),
+                    trail,
                 };
                 let path = if navigable {
                     Some(
