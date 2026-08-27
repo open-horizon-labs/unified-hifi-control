@@ -24,6 +24,16 @@ import Toybox.WatchUi;
 //! here, not ceremony.
 module UhcApi {
 
+    //! Shown on the loading and error screens.
+    //!
+    //! Garmin's manifest carries no app version -- the store tracks it
+    //! separately -- so there is otherwise NO way to tell from the watch
+    //! which build is installed. That ambiguity cost a debugging round:
+    //! a fix was uploaded, the watch never offered an update, and the old
+    //! behaviour looked like the fix not working. Bump this with every
+    //! upload.
+    const VERSION = "0.1.3";
+
     // Actions, matching the server's vocabulary exactly. Constants so a typo
     // is a compile error rather than a 400 the user experiences as "nothing
     // happened".

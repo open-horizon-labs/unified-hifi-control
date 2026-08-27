@@ -87,6 +87,17 @@ class LoadingView extends WatchUi.View {
             :height => (dc.getHeight() * 0.4).toNumber()
         });
         area.draw(dc);
+
+        // Build marker, small and always present: the only way to know from
+        // the wrist which version is actually installed.
+        dc.setColor(Graphics.COLOR_DK_GRAY, Graphics.COLOR_TRANSPARENT);
+        dc.drawText(
+            dc.getWidth() / 2,
+            (dc.getHeight() * 0.80).toNumber(),
+            Graphics.FONT_XTINY,
+            "v" + UhcApi.VERSION,
+            Graphics.TEXT_JUSTIFY_CENTER | Graphics.TEXT_JUSTIFY_VCENTER
+        );
     }
 }
 
