@@ -241,6 +241,29 @@ private final class CompanionModel: ObservableObject {
         isLive = false
         outputLabel = nil
     }
+    /// Clear this device's pairing without contacting UHC. Deliberately does
+    /// not run automatically when `revoke()` fails: a reachable server that
+    /// merely timed out would still list this companion, and silently
+    /// dropping our side would leave that stale entry with nothing pointing
+    /// at it. The user is told, and chooses.
+    func resetThisDevice() {
+        stopPolling()
+        Task { @MainActor in
+            // Best-effort: the store write is what matters, and it must happen
+            // even if the host is in a bad state.
+            try? await host.forgetAuthorization()
+            let fresh = newAppleMusicCompanionInstallation()
+            try? installationStore.save(fresh)
+            host = AppleMusicCompanionHost(installation: fresh, store: installationStore)
+            isPaired = false
+            isLive = false
+            outputLabel = nil
+            pairingCode = ""
+            stage = .findUHC
+            message = "This iPhone was reset. If UHC still lists it, remove it there too."
+        }
+    }
+
     func revoke() {
         Task { @MainActor in
             do {
@@ -251,7 +274,7 @@ private final class CompanionModel: ObservableObject {
                 stage = .findUHC
                 message = "Pairing was removed. Find UHC to connect again."
             } catch {
-                message = "Pairing could not be removed. Try again."
+                message = "Couldn't reach UHC to remove the pairing. You can reset this iPhone instead."
             }
         }
     }
@@ -338,6 +361,13 @@ public struct ContentView: View {
                     }
                     Section {
                         Button("Disconnect from UHC", role: .destructive, action: model.revoke)
+                    } footer: {
+                        Text("Tells UHC to forget this iPhone.")
+                    }
+                    Section {
+                        Button("Reset this iPhone", role: .destructive, action: model.resetThisDevice)
+                    } footer: {
+                        Text("Clears pairing on this iPhone only, without contacting UHC. Use this if UHC is unreachable or has already forgotten this device.")
                     }
                 }
             }
