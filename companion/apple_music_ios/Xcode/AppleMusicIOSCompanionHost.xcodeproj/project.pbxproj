@@ -7,11 +7,20 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		8BA61900000000000000000B /* UHCKit in Frameworks */ = {isa = PBXBuildFile; productRef = 8BA61900000000000000000A /* UHCKit */; };
+		8BA61900000000000000000D /* UHCWatchApp.app in Embed Watch Content */ = {isa = PBXBuildFile; fileRef = 8BA619000000000000000001 /* UHCWatchApp.app */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		8B41F6832DEDD23B001A66F9 /* AppleMusicIOSCompanionHostFeature in Frameworks */ = {isa = PBXBuildFile; productRef = 8B41F6822DEDD23B001A66F9 /* AppleMusicIOSCompanionHostFeature */; };
 		8B41F6852DEDD25C001A66F9 /* AppleMusicIOSCompanionHostFeature in Frameworks */ = {isa = PBXBuildFile; productRef = 8B41F6842DEDD25C001A66F9 /* AppleMusicIOSCompanionHostFeature */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
+		8BA61900000000000000000F /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 8B41F63D2DEDD0D5001A66F9 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 8BA619000000000000000000;
+			remoteInfo = UHCWatchApp;
+		};
 		8B41F65D2DEDD0D6001A66F9 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = 8B41F63D2DEDD0D5001A66F9 /* Project object */;
@@ -21,12 +30,41 @@
 		};
 /* End PBXContainerItemProxy section */
 
+/* Begin PBXCopyFilesBuildPhase section */
+		8BA61900000000000000000C /* Embed Watch Content */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "$(CONTENTS_FOLDER_PATH)/Watch";
+			dstSubfolderSpec = 16;
+			files = (
+				8BA61900000000000000000D /* UHCWatchApp.app in Embed Watch Content */,
+			);
+			name = "Embed Watch Content";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
+		8BA619000000000000000001 /* UHCWatchApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = UHCWatchApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		8B41F6452DEDD0D5001A66F9 /* AppleMusicIOSCompanionHost.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AppleMusicIOSCompanionHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		8B41F65C2DEDD0D6001A66F9 /* AppleMusicIOSCompanionHost.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AppleMusicIOSCompanionHost.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		8BA619000000000000000010 /* Exceptions for "Config" folder in "UHCWatchApp" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				AppleMusicIOSCompanionHost-Info.plist,
+				AppleMusicIOSCompanionHost.entitlements,
+				Debug.xcconfig,
+				Release.xcconfig,
+				Shared.xcconfig,
+				Tests.xcconfig,
+				UHCWatchApp-Info.plist,
+				Watch.xcconfig,
+			);
+			target = 8BA619000000000000000000 /* UHCWatchApp */;
+		};
 		8BD71C0A2DEE41E000CEDD92 /* Exceptions for "Config" folder in "AppleMusicIOSCompanionHost" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
@@ -34,12 +72,19 @@
 				Release.xcconfig,
 				Shared.xcconfig,
 				Tests.xcconfig,
+				UHCWatchApp-Info.plist,
+				Watch.xcconfig,
 			);
 			target = 8B41F6442DEDD0D5001A66F9 /* AppleMusicIOSCompanionHost */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
+		8BA619000000000000000002 /* UHCWatchApp */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = UHCWatchApp;
+			sourceTree = "<group>";
+		};
 		8B41F6472DEDD0D5001A66F9 /* AppleMusicIOSCompanionHost */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = AppleMusicIOSCompanionHost;
@@ -54,6 +99,7 @@
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
 				8BD71C0A2DEE41E000CEDD92 /* Exceptions for "Config" folder in "AppleMusicIOSCompanionHost" target */,
+				8BA619000000000000000010 /* Exceptions for "Config" folder in "UHCWatchApp" target */,
 			);
 			path = Config;
 			sourceTree = "<group>";
@@ -61,6 +107,14 @@
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		8BA619000000000000000004 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				8BA61900000000000000000B /* UHCKit in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		8B41F6422DEDD0D5001A66F9 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -85,6 +139,7 @@
 			children = (
 				8BD71C052DEE41D800CEDD92 /* Config */,
 				8B41F6472DEDD0D5001A66F9 /* AppleMusicIOSCompanionHost */,
+				8BA619000000000000000002 /* UHCWatchApp */,
 				8B41F65F2DEDD0D6001A66F9 /* AppleMusicIOSCompanionHostUITests */,
 				8B41F6812DEDD23B001A66F9 /* Frameworks */,
 				8B41F6462DEDD0D5001A66F9 /* Products */,
@@ -96,6 +151,7 @@
 			children = (
 				8B41F6452DEDD0D5001A66F9 /* AppleMusicIOSCompanionHost.app */,
 				8B41F65C2DEDD0D6001A66F9 /* AppleMusicIOSCompanionHost.xctest */,
+				8BA619000000000000000001 /* UHCWatchApp.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -110,6 +166,30 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		8BA619000000000000000000 /* UHCWatchApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 8BA619000000000000000006 /* Build configuration list for PBXNativeTarget "UHCWatchApp" */;
+			buildPhases = (
+				8BA619000000000000000003 /* Sources */,
+				8BA619000000000000000004 /* Frameworks */,
+				8BA619000000000000000005 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				8BA619000000000000000002 /* UHCWatchApp */,
+				8BD71C052DEE41D800CEDD92 /* Config */,
+			);
+			name = UHCWatchApp;
+			packageProductDependencies = (
+				8BA61900000000000000000A /* UHCKit */,
+			);
+			productName = UHCWatchApp;
+			productReference = 8BA619000000000000000001 /* UHCWatchApp.app */;
+			productType = "com.apple.product-type.application";
+		};
 		8B41F6442DEDD0D5001A66F9 /* AppleMusicIOSCompanionHost */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 8B41F6662DEDD0D6001A66F9 /* Build configuration list for PBXNativeTarget "AppleMusicIOSCompanionHost" */;
@@ -117,10 +197,12 @@
 				8B41F6412DEDD0D5001A66F9 /* Sources */,
 				8B41F6422DEDD0D5001A66F9 /* Frameworks */,
 				8B41F6432DEDD0D5001A66F9 /* Resources */,
+				8BA61900000000000000000C /* Embed Watch Content */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				8BA61900000000000000000E /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				8B41F6472DEDD0D5001A66F9 /* AppleMusicIOSCompanionHost */,
@@ -175,6 +257,9 @@
 						CreatedOnToolsVersion = 16.3;
 						TestTargetID = 8B41F6442DEDD0D5001A66F9;
 					};
+					8BA619000000000000000000 = {
+						CreatedOnToolsVersion = 26.6;
+					};
 				};
 			};
 			buildConfigurationList = 8B41F6402DEDD0D5001A66F9 /* Build configuration list for PBXProject "AppleMusicIOSCompanionHost" */;
@@ -188,6 +273,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				8BD71C0B2DEE41E000CEDD92 /* XCLocalSwiftPackageReference */,
+				8BA619000000000000000009 /* XCLocalSwiftPackageReference "../../uhckit" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 8B41F6462DEDD0D5001A66F9 /* Products */;
@@ -195,12 +281,20 @@
 			projectRoot = "";
 			targets = (
 				8B41F6442DEDD0D5001A66F9 /* AppleMusicIOSCompanionHost */,
+				8BA619000000000000000000 /* UHCWatchApp */,
 				8B41F65B2DEDD0D6001A66F9 /* AppleMusicIOSCompanionHostUITests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		8BA619000000000000000005 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		8B41F6432DEDD0D5001A66F9 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -218,6 +312,13 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		8BA619000000000000000003 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		8B41F6412DEDD0D5001A66F9 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -235,6 +336,11 @@
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
+		8BA61900000000000000000E /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 8BA619000000000000000000 /* UHCWatchApp */;
+			targetProxy = 8BA61900000000000000000F /* PBXContainerItemProxy */;
+		};
 		8B41F65E2DEDD0D6001A66F9 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			target = 8B41F6442DEDD0D5001A66F9 /* AppleMusicIOSCompanionHost */;
@@ -243,6 +349,29 @@
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
+		8BA619000000000000000007 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReferenceAnchor = 8BD71C052DEE41D800CEDD92 /* Config */;
+			baseConfigurationReferenceRelativePath = Watch.xcconfig;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ENABLE_PREVIEWS = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		8BA619000000000000000008 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReferenceAnchor = 8BD71C052DEE41D800CEDD92 /* Config */;
+			baseConfigurationReferenceRelativePath = Watch.xcconfig;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ENABLE_PREVIEWS = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
+			};
+			name = Release;
+		};
 		8B41F6642DEDD0D6001A66F9 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -441,6 +570,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		8BA619000000000000000006 /* Build configuration list for PBXNativeTarget "UHCWatchApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				8BA619000000000000000007 /* Debug */,
+				8BA619000000000000000008 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		8B41F6402DEDD0D5001A66F9 /* Build configuration list for PBXProject "AppleMusicIOSCompanionHost" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -471,6 +609,10 @@
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
+		8BA619000000000000000009 /* XCLocalSwiftPackageReference "../../uhckit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../../uhckit;
+		};
 		8BD71C0B2DEE41E000CEDD92 /* XCLocalSwiftPackageReference */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = AppleMusicIOSCompanionHostPackage;
@@ -478,6 +620,11 @@
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		8BA61900000000000000000A /* UHCKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 8BA619000000000000000009 /* XCLocalSwiftPackageReference "../../uhckit" */;
+			productName = UHCKit;
+		};
 		8B41F6822DEDD23B001A66F9 /* AppleMusicIOSCompanionHostFeature */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = 8BD71C0B2DEE41E000CEDD92 /* XCLocalSwiftPackageReference */;

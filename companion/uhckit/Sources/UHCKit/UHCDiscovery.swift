@@ -1,40 +1,53 @@
 import Foundation
 
+#if os(watchOS)
+import Network
+#endif
+
 /// Finds UHC servers advertising `_uhc._tcp.` on the local network.
 ///
 /// Moved here from the iOS feature package (#619) because the Watch needs the
-/// identical behaviour and a second copy is exactly the duplication this issue
-/// exists to prevent. The iOS app now reaches it through this package; its
-/// observable behaviour is unchanged.
+/// same capability and a second copy is exactly the duplication this issue
+/// exists to prevent.
 ///
-/// The resolved service hostname is preferred over the TXT record's `base`: a
-/// server may advertise a loopback or container hostname in its base URL, while
-/// Bonjour has already resolved a name that is reachable from *this* device.
-/// TXT is the fallback for proxies and tunnels whose service hostname is not
-/// usable as an HTTP host.
+/// ## Why there are two implementations
 ///
-/// On watchOS this is subject to the same unresolved local-network question as
-/// `DirectHTTPTransport` — and more sharply, since Bonjour browsing is gated
-/// separately from plain LAN sockets. A Watch build must therefore also accept
-/// a manually typed address, which is why `UHCClient` takes a `URL` and never
-/// requires discovery to have succeeded. See `Transport.md`.
-/// `@unchecked Sendable`: every mutating entry point (`start`, `stop`, the
-/// Bonjour delegate callbacks and the timeout) runs on the main queue, and the
-/// async wrapper below hops to it explicitly. The compiler cannot see that from
-/// an `NSObject` subclass, hence the manual conformance.
-public final class UHCDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDelegate, @unchecked Sendable {
+/// **`NetService` and `NetServiceBrowser` do not exist on watchOS.** They are
+/// marked unavailable, so this is a compile error rather than a runtime
+/// failure — one of the few hard facts available about watchOS networking
+/// without a device in hand (see `Transport.md`). The iOS path therefore keeps
+/// the exact `NetService` code that ships today, byte for byte, and watchOS
+/// gets an `NWBrowser` implementation.
+///
+/// The two differ in how they arrive at a URL, and it is worth knowing which
+/// you are relying on:
+///
+/// - **iOS/macOS** resolves the service and prefers the *resolved hostname*,
+///   falling back to the TXT record's `base` key.
+/// - **watchOS** can only read the TXT record: `NWBrowser` reports services and
+///   their metadata but resolving one to a host requires opening an
+///   `NWConnection`, and the TXT `base` key the server already publishes
+///   (`base=http://NAS2:8088`) makes that round trip unnecessary. A server that
+///   advertises no `base` key is therefore undiscoverable from the Watch, which
+///   is why the Watch UI always offers manual address entry too.
+public final class UHCDiscovery: NSObject, @unchecked Sendable {
     /// Called on the main queue with the first usable server found.
     public var onBaseURL: ((URL) -> Void)?
     /// Called on the main queue when the search times out or cannot start.
     public var onFailure: ((String) -> Void)?
 
-    private let browser = NetServiceBrowser()
     private let serviceType: String
     private let domain: String
     private let timeoutInterval: TimeInterval
-    private var services: [NetService] = []
     private var finished = false
     private var timeoutWork: DispatchWorkItem?
+
+    #if os(watchOS)
+    private var browser: NWBrowser?
+    #else
+    private let browser = NetServiceBrowser()
+    private var services: [NetService] = []
+    #endif
 
     public init(
         serviceType: String = "_uhc._tcp.",
@@ -49,9 +62,6 @@ public final class UHCDiscovery: NSObject, NetServiceBrowserDelegate, NetService
 
     public func start() {
         finished = false
-        services.removeAll()
-        browser.delegate = self
-        browser.searchForServices(ofType: serviceType, inDomain: domain)
         let timeout = DispatchWorkItem { [weak self] in
             guard let self, !self.finished else { return }
             self.finished = true
@@ -60,14 +70,20 @@ public final class UHCDiscovery: NSObject, NetServiceBrowserDelegate, NetService
         }
         timeoutWork = timeout
         DispatchQueue.main.asyncAfter(deadline: .now() + timeoutInterval, execute: timeout)
+        startBrowsing()
     }
 
     public func stop() {
         timeoutWork?.cancel()
         timeoutWork = nil
-        browser.stop()
-        services.forEach { $0.stop() }
-        services.removeAll()
+        stopBrowsing()
+    }
+
+    private func finish(_ url: URL) {
+        guard !finished else { return }
+        finished = true
+        stop()
+        onBaseURL?(url)
     }
 
     /// One-shot async wrapper, for call sites that would rather await than wire
@@ -100,7 +116,84 @@ public final class UHCDiscovery: NSObject, NetServiceBrowserDelegate, NetService
         }
     }
 
-    // MARK: - NetServiceBrowserDelegate
+    /// Reads a usable base URL out of a Bonjour TXT record. Shared by both
+    /// implementations so the fallback rule cannot drift between platforms.
+    static func baseURL(fromTXT txt: [String: String]) -> URL? {
+        guard let raw = txt["base"], let url = URL(string: raw), url.host != nil else {
+            return nil
+        }
+        return url
+    }
+}
+
+// MARK: - watchOS: NWBrowser
+
+#if os(watchOS)
+extension UHCDiscovery {
+    private func startBrowsing() {
+        let parameters = NWParameters()
+        parameters.includePeerToPeer = false
+
+        // NWBrowser wants the type without the trailing dot NetService uses.
+        let type = serviceType.hasSuffix(".") ? String(serviceType.dropLast()) : serviceType
+        let trimmedDomain = domain.hasSuffix(".") ? String(domain.dropLast()) : domain
+
+        let browser = NWBrowser(
+            for: .bonjourWithTXTRecord(type: type, domain: trimmedDomain),
+            using: parameters
+        )
+        self.browser = browser
+
+        browser.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            if case .failed(let error) = state {
+                DispatchQueue.main.async {
+                    guard !self.finished else { return }
+                    // On watchOS this is the signal that matters: a denial here
+                    // means local-network access is refused, not that the
+                    // server is absent.
+                    self.onFailure?("Bonjour browsing failed: \(error.localizedDescription)")
+                }
+            }
+        }
+
+        browser.browseResultsChangedHandler = { [weak self] results, _ in
+            guard let self else { return }
+            for result in results {
+                guard case .bonjour(let record) = result.metadata else { continue }
+                guard let url = UHCDiscovery.baseURL(fromTXT: record.dictionary) else { continue }
+                DispatchQueue.main.async { self.finish(url) }
+                return
+            }
+        }
+
+        browser.start(queue: .main)
+    }
+
+    private func stopBrowsing() {
+        browser?.cancel()
+        browser = nil
+    }
+}
+#endif
+
+// MARK: - iOS/macOS: NetService
+//
+// Unchanged from the implementation that ships in the iOS companion today.
+
+#if !os(watchOS)
+extension UHCDiscovery: NetServiceBrowserDelegate, NetServiceDelegate {
+    private func startBrowsing() {
+        services.removeAll()
+        browser.delegate = self
+        browser.searchForServices(ofType: serviceType, inDomain: domain)
+    }
+
+    private func stopBrowsing() {
+        browser.stop()
+        services.forEach { $0.stop() }
+        services.removeAll()
+    }
 
     public func netServiceBrowser(
         _ browser: NetServiceBrowser,
@@ -120,10 +213,11 @@ public final class UHCDiscovery: NSObject, NetServiceBrowserDelegate, NetService
         onFailure?("Could not search for UHC on the local network.")
     }
 
-    // MARK: - NetServiceDelegate
-
     public func netServiceDidResolveAddress(_ sender: NetService) {
         guard !finished else { return }
+        // Prefer the resolved hostname: a server may advertise a loopback or
+        // container hostname in its TXT base URL, while Bonjour has already
+        // resolved a name reachable from *this* device.
         if let host = sender.hostName?.trimmingCharacters(in: CharacterSet(charactersIn: ".")),
            !host.isEmpty, sender.port > 0,
            let url = URL(string: "http://\(host):\(sender.port)") {
@@ -131,24 +225,24 @@ public final class UHCDiscovery: NSObject, NetServiceBrowserDelegate, NetService
             return
         }
 
-        let txt = sender.txtRecordData().map(NetService.dictionary(fromTXTRecord:)) ?? [:]
-        if let raw = txt["base"].flatMap({ String(data: $0, encoding: .utf8) }),
-           let url = URL(string: raw), url.host != nil {
+        // Fall back to the explicit base URL for proxies/tunnels whose service
+        // hostname is not usable as an HTTP host.
+        let raw = sender.txtRecordData().map(NetService.dictionary(fromTXTRecord:)) ?? [:]
+        let txt = raw.compactMapValues { String(data: $0, encoding: .utf8) }
+        if let url = UHCDiscovery.baseURL(fromTXT: txt) {
             finish(url)
         }
     }
 
     public func netService(_ sender: NetService, didNotResolve errorDict: [String: NSNumber]) {
+        // Only give up once every other candidate has also failed: the live
+        // network advertises a stale second instance that never resolves, and
+        // failing on it would abandon a browse that is about to succeed.
         guard !finished, services.allSatisfy({ $0 === sender || $0.port > 0 }) else { return }
         onFailure?("Could not resolve UHC on the local network.")
     }
-
-    private func finish(_ url: URL) {
-        finished = true
-        stop()
-        onBaseURL?(url)
-    }
 }
+#endif
 
 /// Single-claim latch, so a continuation is resumed exactly once.
 private final class ResumeGuard: @unchecked Sendable {
