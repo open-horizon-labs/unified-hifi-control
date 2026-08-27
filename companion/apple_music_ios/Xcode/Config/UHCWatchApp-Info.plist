@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Spelled out rather than left to Xcode: with GENERATE_INFOPLIST_FILE = NO
+	  the watchOS build does not synthesise these the way the iOS build does,
+	  and a bundle without CFBundleIdentifier fails to install with only
+	  "Missing bundle ID" to go on.
+	-->
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>CFBundleDisplayName</key>
+	<string>UHC</string>
+	<!-- Modern single-target watchOS app (no legacy WatchKit extension). -->
+	<key>WKApplication</key>
+	<true/>
+	<key>WKCompanionAppBundleIdentifier</key>
+	<string>com.openhorizonlabs.uhc.applemusiccompanion</string>
+	<key>WKRunsIndependentlyOfCompanionApp</key>
+	<true/>
+	<!--
+	  #619: the open question is whether watchOS honours these at all. The
+	  iOS companion in the same bundle already declares the identical pair,
+	  which is the configuration the Apple forum thread claims is what makes
+	  a Watch app's LAN access work. Declaring them here too costs nothing
+	  and removes one variable from the on-device test.
+	-->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>UHC uses your local network to reach your music server.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_uhc._tcp</string>
+	</array>
+</dict>
+</plist>

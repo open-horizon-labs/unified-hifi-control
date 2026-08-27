@@ -536,6 +536,19 @@ public actor AppleMusicCompanionHost {
         try installationStore.clear()
     }
 
+    /// Forget a credential only after the server explicitly rejects it. This
+    /// is deliberately separate from transport recovery: a timeout, DNS
+    /// failure, or 5xx must never destroy a valid Keychain pairing.
+    ///
+    /// Mirrors `AppleMusicCompanionHost.forgetAuthorization()` in the macOS
+    /// bridge. `ContentView` has always called this on an authorization
+    /// failure; the iOS host simply never grew the method, so the iOS target
+    /// did not compile. Unlike `revoke()`, this does not tell the server
+    /// anything -- the server is the party that just rejected us.
+    public func forgetAuthorization() throws {
+        try installationStore.clear()
+    }
+
     public func pollAndHandleContent(
         _ handler: @Sendable (MusicKitContentCommand) async throws -> MusicKitContentResult
     ) async throws {
