@@ -12,8 +12,8 @@ class UhcApp extends Application.AppBase {
     }
 
     public function getInitialView() as [WatchUi.Views] or [WatchUi.Views, WatchUi.InputDelegates] {
-        var view = new ZoneListView();
-        return [view, new ZoneListDelegate(view)];
+        var view = new LoadingView();
+        return [view, new LoadingDelegate(view)];
     }
 
     //! Settings changed in Garmin Connect (or on-device). The base URL may

@@ -25,6 +25,25 @@ Connect is a declarative form, not code. So the base URL is typed once. Give
 the server a stable name (a DHCP reservation, or a public hostname) so the
 setting does not rot.
 
+## HTTPS is mandatory — measured, not assumed
+
+The Connect IQ runtime refuses plain HTTP. Verified in the simulator against
+this app: every request returns
+
+```
+responseCode = -1001
+```
+
+which the SDK documents as `SECURE_CONNECTION_REQUIRED` — *"Indicates an https
+connection is required for the request."* This held for a LAN address **and
+for `127.0.0.1`**; there is no localhost exemption in SDK 9.2.0.
+
+**The dangerous part:** the request still reaches the server. A local fixture
+server logged the `POST /control` bodies arriving and answering `200`, while
+the app reported failure. So over HTTP a command *executes* and the watch
+tells you it did not — the worst possible split. This is a reason to fail
+closed on a bad configuration rather than retry.
+
 ## Networking constraints that shaped this
 
 - Requests are made **by the phone**, not the watch; the watch has no
