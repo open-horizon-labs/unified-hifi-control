@@ -1,3 +1,14 @@
+> **STATUS: DO NOT MERGE.** Working prototype, verified on real hardware
+> (fēnix 8 51mm AMOLED) driving a live Unified Hi-Fi Control server. It is
+> parked on its own branch deliberately:
+>
+> - The Connect IQ Store upload **burns its appID** — publishing needs a
+>   fresh UUID in `manifest.xml` (see below).
+> - It depends on a **publicly reachable HTTPS endpoint**. Connect IQ refuses
+>   plain HTTP, so there is no LAN fallback, and remote access is an open
+>   product question rather than a settled one.
+> - Nothing in the main repo depends on it, and it adds no server code.
+
 # Unified Hi-Fi Control — Garmin Connect IQ remote
 
 A wrist remote for UHC zones: pick a zone, play/pause, skip, change volume.
