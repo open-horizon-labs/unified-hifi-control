@@ -47,6 +47,12 @@ private final class CompanionModel: ObservableObject {
     @Published private(set) var isPaired = false
     @Published private(set) var isLive = false
     @Published private(set) var outputLabel: String?
+    /// The UHC web UI's address, once we know one. Nil until discovery or a
+    /// pairing has given us a real server -- the fresh-install placeholder is
+    /// a loopback address that would only render an error page.
+    @Published private(set) var serverURL: URL?
+    @Published private(set) var isFindingServer = false
+    private var controlsDiscovery: UHCBonjourDiscovery?
     private let installationStore: KeychainAppleMusicCompanionInstallationStore
     private let companionID: String
     private var host: AppleMusicCompanionHost
@@ -72,11 +78,54 @@ private final class CompanionModel: ObservableObject {
         companionID = installation.companionID
         host = AppleMusicCompanionHost(installation: installation, store: store)
         bridgeID = installation.bridgeID ?? companionID
+        serverURL = Self.usableServerURL(installation.baseURL)
         let alreadyPaired = installation.accessToken != nil
         isPaired = alreadyPaired
         stage = alreadyPaired ? .connected : .authorize
         message = alreadyPaired ? "Paired. Open this companion to connect to UHC." : nil
         if alreadyPaired { reconnect() }
+    }
+
+    /// The placeholder a fresh install carries is loopback on a port nothing
+    /// serves; treating it as a real address would show the user a failed page
+    /// instead of "find your server".
+    private static func usableServerURL(_ url: URL) -> URL? {
+        guard let host = url.host else { return nil }
+        if host == "127.0.0.1" || host == "localhost" || host == "::1" { return nil }
+        return url
+    }
+
+    /// Find UHC for the Controls tab without starting the Apple Music pairing
+    /// flow -- viewing the web UI needs an address, not a bridge credential.
+    func findServerForControls() {
+        guard !isFindingServer else { return }
+        isFindingServer = true
+        let browser = UHCBonjourDiscovery()
+        controlsDiscovery = browser
+        browser.onBaseURL = { [weak self] baseURL in
+            Task { @MainActor in
+                guard let self else { return }
+                self.isFindingServer = false
+                self.serverURL = Self.usableServerURL(baseURL)
+                // Persist it, or every launch starts at "No UHC server yet"
+                // even though we already know where the server is. Only the
+                // address is stored; this path never touches credentials.
+                if var installation = self.installationStore.load() {
+                    installation.baseURL = baseURL
+                    try? self.installationStore.save(installation)
+                }
+                self.controlsDiscovery = nil
+            }
+        }
+        browser.onFailure = { [weak self] text in
+            Task { @MainActor in
+                guard let self else { return }
+                self.isFindingServer = false
+                self.message = text
+                self.controlsDiscovery = nil
+            }
+        }
+        browser.start()
     }
 
     func authorize() {
@@ -140,6 +189,7 @@ private final class CompanionModel: ObservableObject {
         discovery?.stop(); discovery = nil
         guard var installation = installationStore.load(), installation.accessToken != nil else { return }
         installation.baseURL = baseURL
+        serverURL = Self.usableServerURL(baseURL)
         try? installationStore.save(installation)
         host = AppleMusicCompanionHost(installation: installation, store: installationStore)
         startPolling()
@@ -283,8 +333,19 @@ private final class CompanionModel: ObservableObject {
 public struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model = CompanionModel()
+    @State private var reloadToken = 0
     public init() {}
+
     public var body: some View {
+        TabView {
+            ControlsTab(model: model, reloadToken: $reloadToken)
+                .tabItem { Label("Controls", systemImage: "hifispeaker.2") }
+            appleMusicTab
+                .tabItem { Label("Apple Music", systemImage: "music.note") }
+        }
+    }
+
+    private var appleMusicTab: some View {
         NavigationStack {
             Form {
                 Section {
@@ -381,6 +442,53 @@ public struct ContentView: View {
             }
         }
         .task { model.startPolling() }
+    }
+}
+
+/// UHC's controls, which are the web UI. This tab needs only the server's
+/// address; it deliberately does not require the Apple Music pairing, because
+/// controlling your system and lending this phone's Apple Music account are
+/// unrelated things a user may want independently.
+private struct ControlsTab: View {
+    @ObservedObject var model: CompanionModel
+    @Binding var reloadToken: Int
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if let url = model.serverURL {
+                    // No ignoresSafeArea here: UHC's own zones strip is
+                    // pinned to the bottom of its viewport, and letting the
+                    // web view run under the tab bar buries exactly the
+                    // control the user reaches for most.
+                    UHCWebView(url: url, reloadToken: $reloadToken)
+                } else {
+                    ContentUnavailableView {
+                        Label("No UHC server yet", systemImage: "antenna.radiowaves.left.and.right.slash")
+                    } description: {
+                        Text("Find your Unified Hi-Fi Control server on this network to control your zones from here.")
+                    } actions: {
+                        Button(model.isFindingServer ? "Searching…" : "Find UHC") {
+                            model.findServerForControls()
+                        }
+                        .disabled(model.isFindingServer)
+                    }
+                }
+            }
+            .navigationTitle("Controls")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                if model.serverURL != nil {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            reloadToken += 1
+                        } label: {
+                            Label("Reload", systemImage: "arrow.clockwise")
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
