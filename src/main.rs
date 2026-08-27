@@ -688,13 +688,39 @@ mod server {
                                         // so switching MQTT on as well would
                                         // publish to a broker nobody asked to
                                         // publish to.
+                                        //
+                                        // "Do not turn it on" is not "turn it
+                                        // off". Someone already publishing
+                                        // whose Supervisor rotated the broker
+                                        // password arrives here with a changed
+                                        // record and `mqtt: true` on disk;
+                                        // dropping them to silent would be
+                                        // this change breaking the very setup
+                                        // it promises not to touch.
+                                        let already_on = app_settings.adapters.mqtt;
+                                        if already_on {
+                                            state.mqtt.set_enabled(true).await;
+                                        }
                                         tracing::info!(
                                             broker = %format!("{host}:{port}"),
+                                            enabled = already_on,
                                             "MQTT broker details from the Home Assistant add-on saved; \
-                                             publishing stays off until you turn it on in Settings"
+                                             publishing is left exactly as it was"
                                         );
-                                    } else if api::enable_mqtt_in_settings() {
+                                    } else if api::enable_mqtt_in_settings(
+                                        api::credentials::MqttEnableSource::User,
+                                    ) {
                                         state.mqtt.set_enabled(true).await;
+                                        // Standalone: whoever set UHC_MQTT_*
+                                        // chose this, so the #610 warning
+                                        // about Home Assistant not consuming
+                                        // it still belongs to them (#613).
+                                        state
+                                            .mqtt
+                                            .set_enable_source(
+                                                api::credentials::MqttEnableSource::User,
+                                            )
+                                            .await;
                                         tracing::info!(
                                             broker = %format!("{host}:{port}"),
                                             "MQTT configured from environment; publisher enabled"

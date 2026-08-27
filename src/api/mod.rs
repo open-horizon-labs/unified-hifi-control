@@ -3254,13 +3254,17 @@ fn mutate_app_settings(mutate: impl FnOnce(&mut AppSettings)) -> bool {
 /// leave `app-settings.json` saying `mqtt: false`, so the *next* boot could
 /// not tell "the add-on switched this on for you" from "you switched it off",
 /// and the user's later decision to turn it off would not survive a restart.
-pub fn enable_mqtt_in_settings() -> bool {
+pub fn enable_mqtt_in_settings(source: credentials::MqttEnableSource) -> bool {
     mutate_app_settings(|settings| {
         settings.adapters.mqtt = true;
-        // Nobody chose this; the environment did (#613). Recording that is
-        // what keeps the "Home Assistant isn't receiving this" warning off a
-        // publisher the user never asked for.
-        settings.mqtt_enabled_by = credentials::MqttEnableSource::Automatic;
+        // Who gets the blame, and therefore the warning (#613). Outside the
+        // add-on, `UHC_MQTT_*` is the operator's own docker-compose or
+        // systemd unit - a deliberate choice, so
+        // [`credentials::MqttEnableSource::User`]. Under the add-on nothing
+        // reaches here at all any more; the only records left carrying
+        // `Automatic` are the ones an older add-on wrote before this
+        // distinction existed, which is exactly whose warning must stay off.
+        settings.mqtt_enabled_by = source;
     })
 }
 
