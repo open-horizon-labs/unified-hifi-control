@@ -130,6 +130,7 @@ final class WatchController {
     func refreshNowPlaying() async {
         guard let client, let zoneID = selectedZoneID else { return }
         guard Date() >= suppressPollUntil else { return }
+        defer { confirmedVolume = nowPlaying?.volume }
         do {
             let np = try await client.nowPlaying(zoneID: zoneID)
             nowPlaying = np
@@ -209,16 +210,61 @@ final class WatchController {
         await send { try await $0.previous(zoneID: zoneID) }
     }
 
+    /// Where the crown is pointing right now, before the server has agreed.
+    /// While the user is turning, THIS is the truth the readout shows: asking
+    /// the server mid-turn returns a value from before the write landed, and
+    /// rendering that is what made the number jump backwards.
+    private(set) var pendingVolume: Double?
+    /// The last value the server confirmed, used to skip writes that would ask
+    /// a zone for the volume it already has.
+    private var confirmedVolume: Double?
+
     /// Absolute volume from the Digital Crown, snapped to the zone's own step.
-    func setVolume(_ value: Double) async {
-        guard let zoneID = selectedZoneID else { return }
+    ///
+    /// The crown is a continuous input, so the server is told the destination,
+    /// not the journey: the caller debounces, this commits once, and no read
+    /// is issued afterwards. The poller reconciles in its own time.
+    ///
+    /// Returns whether the value actually reached the server, so the view can
+    /// confirm it to the wrist.
+    @discardableResult
+    func commitVolume(_ value: Double) async -> Bool {
+        guard let zoneID = selectedZoneID, let client else { return false }
         let control = nowPlaying?.volumeControl
             ?? zones.first(where: { $0.id == zoneID })?.volumeControl
+        let target = control?.normalized(value) ?? value
+
+        // Writing the value a zone already holds produces no readback, so the
+        // server waits for a change event that never comes and eventually
+        // 500s (#621). At the crown that is not an edge case -- a hand that
+        // stops on the current value is ordinary -- so never send it.
+        if let confirmed = confirmedVolume, confirmed == target {
+            pendingVolume = nil
+            return true
+        }
+
+        pendingVolume = target
         if var np = nowPlaying {
-            np.volume = control?.normalized(value) ?? value
+            np.volume = target
             nowPlaying = np
         }
-        await send { try await $0.setVolume(zoneID: zoneID, to: value, within: control) }
+        // Long enough for the write and its readback, which the poller must
+        // not overwrite in the meantime.
+        suppressPollUntil = Date().addingTimeInterval(1.5)
+        do {
+            try await client.setVolume(zoneID: zoneID, to: target, within: control)
+            confirmedVolume = target
+            pendingVolume = nil
+            errorMessage = nil
+            return true
+        } catch {
+            pendingVolume = nil
+            recordFailure(error)
+            // Only now is a read worth making: the local value is wrong and
+            // the user needs to see where the zone actually sits.
+            await refreshNowPlaying()
+            return false
+        }
     }
 
     private func send(_ body: @escaping (UHCClient) async throws -> Void) async {
