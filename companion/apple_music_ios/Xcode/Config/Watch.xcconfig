@@ -9,7 +9,7 @@ PRODUCT_NAME = UHCWatchApp
 PRODUCT_DISPLAY_NAME = UHC
 // Must be the iOS app's identifier plus a suffix for the two to ship as one
 // bundle; the Watch app is embedded in the iOS app's Watch container.
-PRODUCT_BUNDLE_IDENTIFIER = com.openhorizonlabs.uhc.applemusiccompanion.watchkitapp
+PRODUCT_BUNDLE_IDENTIFIER = com.openhorizonlabs.uhc.companion.watchkitapp
 DEVELOPMENT_TEAM = B69HKNTV5Q
 MARKETING_VERSION = 0.1.0
 CURRENT_PROJECT_VERSION = 1
