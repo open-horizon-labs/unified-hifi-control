@@ -1,3 +1,4 @@
+#include "Version.xcconfig"
 // Watch.xcconfig
 // Build settings for the UHC watchOS controller app (#619).
 //
@@ -11,8 +12,6 @@ PRODUCT_DISPLAY_NAME = UHC
 // bundle; the Watch app is embedded in the iOS app's Watch container.
 PRODUCT_BUNDLE_IDENTIFIER = com.openhorizonlabs.uhc.companion.watchkitapp
 DEVELOPMENT_TEAM = B69HKNTV5Q
-MARKETING_VERSION = 0.1.0
-CURRENT_PROJECT_VERSION = 1
 
 SDKROOT = watchos
 WATCHOS_DEPLOYMENT_TARGET = 10.0
