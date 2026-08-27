@@ -24,10 +24,9 @@ let package = Package(
     ],
     targets: [
         .target(name: "UHCKit"),
-        .testTarget(
-            name: "UHCKitTests",
-            dependencies: ["UHCKit"],
-            resources: [.copy("Fixtures")]
-        ),
+        // The contract suite reads tests/fixtures/uhckit_contract.json from the
+        // repository root — the same file tests/uhckit_contract.rs guards — so
+        // there is deliberately no bundled resource copy to drift from it.
+        .testTarget(name: "UHCKitTests", dependencies: ["UHCKit"]),
     ]
 )
