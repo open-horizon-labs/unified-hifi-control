@@ -1,3 +1,4 @@
+import Toybox.Application;
 import Toybox.Lang;
 import Toybox.WatchUi;
 
@@ -58,7 +59,12 @@ class ZoneMenuDelegate extends WatchUi.Menu2InputDelegate {
             return;
         }
         var zone = _zones[index];
-        var view = new ZoneControlView(zone);
-        WatchUi.pushView(view, new ZoneControlDelegate(view), WatchUi.SLIDE_LEFT);
+        // Remember the room so the next launch lands on it: the aim is one
+        // press to pause, and re-picking the same zone every time is the
+        // tax that would prevent it.
+        Application.Storage.setValue("lastZoneId", zone.id);
+
+        var menu = new ZoneActionMenu(zone);
+        WatchUi.pushView(menu, new ZoneActionMenuDelegate(menu), WatchUi.SLIDE_LEFT);
     }
 }

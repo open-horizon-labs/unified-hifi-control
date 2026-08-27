@@ -25,6 +25,35 @@ Connect is a declarative form, not code. So the base URL is typed once. Give
 the server a stable name (a DHCP reservation, or a public hostname) so the
 setting does not rot.
 
+## Why there is no custom-drawn control screen
+
+Garmin's music playback screen — icons down the right edge, the highlighted
+one named on the left — cannot be had by an app like this, and three
+attempts to imitate it all looked wrong for the same reason.
+
+That screen belongs to the **native media player**. An app reaches it by
+being an `audio-content-provider-app`, which means the app supplies songs
+for the WATCH to play. Garmin's own sample for it,
+`garmin/connectiq-apps/audio-provider/monkeymusic`, draws no playback
+controls at all — the system player renders them. A remote for a hi-fi in
+another room has no audio on the watch, so it cannot be one.
+
+Two further checks point the same way: the personality library's icon set is
+about / check / cancel / discard / question / revert / save / search /
+warning — **no transport icons** — and `WatchUi.ActionMenu`, the nearest
+system widget, explicitly does not support iconography.
+
+So the interface is built from system widgets instead: `Menu2` for the zone
+list and for the per-zone actions. Garmin draws them, which means the
+device's own typography, spacing, highlight, scrolling and back behaviour,
+and full operation from UP / DOWN / START / BACK with no touchscreen
+required. That is what "native" can actually mean here.
+
+Volume is two ordinary rows rather than a picker or a mode: resting on
+"Volume up" and pressing START repeatedly changes the level without the
+selection moving and without needing to read the screen, which is the
+eyes-free gesture the app exists for.
+
 ## HTTPS is mandatory — measured, not assumed
 
 The Connect IQ runtime refuses plain HTTP. Verified in the simulator against
