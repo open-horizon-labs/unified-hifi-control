@@ -683,6 +683,27 @@ struct CoreState {
     rejected_keys: HashSet<String>,
     /// Per-key override of the rejection's message *name*.
     rejection_names: HashMap<String, String>,
+    /// Session keys the Core has forgotten (#616).
+    ///
+    /// A browse session is Core-side state, so it does not outlive the Core's
+    /// view of the extension: reconnecting the extension, restarting the
+    /// Core, or ageing a session out all leave the client holding an
+    /// `(item_key, multi_session_key)` pair that no longer names anything.
+    /// The Core's answer then is `InvalidItemKey` -- the rejection the
+    /// operator reported in #616, naming the very `collections_<nanos>`
+    /// session the key was minted in.
+    ///
+    /// Measured (read-only, against the operator's production Core, Roon 2.x,
+    /// 2026-08): eviction is **not** driven by session count -- 400 further
+    /// sessions minted back-to-back left an untouched earlier key resolving
+    /// normally -- nor by navigating that session elsewhere. So this models
+    /// session loss as the discrete event it is, driven by a test knob,
+    /// rather than inventing a count or timeout rule the Core does not have.
+    ///
+    /// A `pop_all` browse naming a forgotten session revives it at the root,
+    /// as a real Core does for any session key it has not seen before; only
+    /// keys minted before the loss stay rejected.
+    dropped_sessions: HashSet<String>,
     /// One-shot: the next browse, whatever it is, is rejected.
     reject_next_browse: bool,
     /// One-shot: the next browse carrying `pop_levels` is rejected with
@@ -755,6 +776,7 @@ impl FakeRoonCore {
             item_key_scope: ItemKeyScope::Global,
             rejected_keys: HashSet::new(),
             rejection_names: HashMap::new(),
+            dropped_sessions: HashSet::new(),
             reject_next_browse: false,
             reject_next_pop_levels: false,
             delay: Duration::ZERO,
@@ -891,6 +913,29 @@ impl FakeRoonCore {
 
     pub async fn set_item_key_scope(&self, scope: ItemKeyScope) {
         self.state.write().await.item_key_scope = scope;
+    }
+
+    /// Forget every browse session the Core is currently holding (#616).
+    ///
+    /// Models the discrete event behind the operator's report: the extension
+    /// reconnects, or the Core restarts, and every `multi_session_key` a
+    /// client still holds a key for stops naming anything. Afterwards, a
+    /// browse carrying an `item_key` in one of those sessions is answered
+    /// `InvalidItemKey`; a `pop_all` browse revives the session name at the
+    /// root, exactly as a never-before-seen session key would behave.
+    ///
+    /// See [`CoreState::dropped_sessions`] for why this is a knob rather
+    /// than a modelled count or timeout rule.
+    pub async fn drop_all_sessions(&self) {
+        let mut state = self.state.write().await;
+        let keys: Vec<String> = state.sessions.keys().cloned().collect();
+        for key in &keys {
+            state.sessions.remove(key);
+            for servers in state.minted.values_mut() {
+                servers.remove(key);
+            }
+        }
+        state.dropped_sessions.extend(keys);
     }
 
     /// One-shot: refuse the next browse that carries `pop_levels` (with
@@ -1581,6 +1626,21 @@ async fn handle_browse(
         drop(state);
         refuse(core, writer, "InvalidItemKey", req_id, &session_key).await;
         return;
+    }
+
+    // --- a session the Core has forgotten (#616) ----------------------------
+    // A `pop_all` request revives the name at the root (a real Core treats an
+    // unknown session key as a new session); anything that leans on state the
+    // lost session held -- an `item_key` minted there, a `pop_levels` step
+    // out of a peek -- is `InvalidItemKey`.
+    if state.dropped_sessions.contains(&session_key) {
+        if pop_all {
+            state.dropped_sessions.remove(&session_key);
+        } else {
+            drop(state);
+            refuse(core, writer, "InvalidItemKey", req_id, &session_key).await;
+            return;
+        }
     }
 
     // --- targeted pop_levels rejection (#593 review follow-up) --------------

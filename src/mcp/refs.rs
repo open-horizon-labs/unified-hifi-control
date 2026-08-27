@@ -94,6 +94,26 @@ pub const DEFAULT_CAPACITY: usize = 512;
 /// How long a ref remains resolvable after it is minted. Uniform across every
 /// provider and target kind -- see the module docs for why that is a
 /// deliberate choice, not an oversight.
+///
+/// # Measured against a real Roon Core (#616)
+///
+/// #616 asked whether this should instead track the lifetime of the Roon
+/// browse session a ref depends on. Measured read-only against the
+/// operator's production Core (Roon 2.x, 2026-08), by minting eleven
+/// independent deep browse refs at once and probing one per interval
+/// without touching the others:
+///
+/// | idle | result |
+/// |------|--------|
+/// | 30s, 90s, 180s, 300s, 480s, 660s, **840s** | resolves normally |
+/// | 1020s | gone -- **this TTL**, at 900s, not the Core |
+///
+/// So a Roon browse session outlives this TTL rather than the other way
+/// round: shortening it to "match Roon" would discard refs the Core is
+/// still perfectly willing to honour, and lengthening it is what
+/// [`RoonRefTarget::trail`] now makes safe rather than necessary. Left
+/// uniform and unchanged; the recovery path, not the clock, is what makes a
+/// stale key survivable.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(15 * 60);
 
 const TOKEN_PREFIX: &str = "ref_";

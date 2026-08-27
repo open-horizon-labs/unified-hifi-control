@@ -3101,9 +3101,15 @@ impl RoonAdapter {
             "roon: item key rejected; re-walking its trail in a fresh session"
         );
 
-        let Ok((recovered_session, recovered_key)) = self.resolve_trail(zone_id, trail).await
-        else {
-            return Err(error);
+        let (recovered_session, recovered_key) = match self.resolve_trail(zone_id, trail).await {
+            Ok(pair) => pair,
+            Err(recovery_error) => {
+                tracing::info!(
+                    error = %recovery_error,
+                    "roon: could not re-walk the trail; reporting the Core's original rejection"
+                );
+                return Err(error);
+            }
         };
         self.resolve_item_key(
             &recovered_session,
@@ -3172,7 +3178,7 @@ impl RoonAdapter {
                 .await?;
             }
             let matched = self
-                .find_titled_row(&session_key, title)
+                .find_titled_row(&session_key, title, depth == 0)
                 .await?
                 .ok_or_else(|| {
                     anyhow::anyhow!(
@@ -3188,9 +3194,23 @@ impl RoonAdapter {
     }
 
     /// Page through the level `session_key` is currently on, looking for a
-    /// row whose title matches `title` exactly. `Ok(None)` means the level
-    /// was read to its end (or to [`TRAIL_SCAN_LIMIT`]) without a match.
-    async fn find_titled_row(&self, session_key: &str, title: &str) -> Result<Option<String>> {
+    /// row whose title matches `title`. `Ok(None)` means the level was read
+    /// to its end (or to [`TRAIL_SCAN_LIMIT`]) without a match.
+    ///
+    /// Trails are recorded from what the *client* was shown, and
+    /// `map_collection_page` does not show rows verbatim: it renames the
+    /// root's "Library" row to "Local Library" (#573 defect 4) and strips
+    /// `[[id|Name]]` link markup from every other title (#573 defect 5). So
+    /// matching has to compare against the same rendering, or a trail can
+    /// never find the row it names -- which is how the first cut of this
+    /// walk failed at depth 0. `at_root` selects the rename, exactly as the
+    /// mapping's own `at_collection_root` does.
+    async fn find_titled_row(
+        &self,
+        session_key: &str,
+        title: &str,
+        at_root: bool,
+    ) -> Result<Option<String>> {
         let mut offset = 0usize;
         loop {
             let page = self
@@ -3203,7 +3223,12 @@ impl RoonAdapter {
                 .await?;
             let fetched = page.items.len();
             for item in page.items {
-                if item.title == title {
+                let shown = if at_root && item.title == "Library" {
+                    "Local Library".to_string()
+                } else {
+                    strip_roon_link_markup(&item.title)
+                };
+                if shown == title {
                     if let Some(key) = item.item_key {
                         return Ok(Some(key));
                     }
