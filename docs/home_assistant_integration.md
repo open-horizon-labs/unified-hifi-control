@@ -154,12 +154,50 @@ subdirectory. Rationale:
   session, or leave the flag unset for the interface this integration
   is pointed at.
 
+## Delivery: the add-on installs this (#613)
+
+The image this integration ships in is the one the Home Assistant add-on
+runs. `Dockerfile.release` (and `Dockerfile`/`Dockerfile.ci`, kept
+identical) copy `custom_components/unified_hifi_control` to
+`/app/custom_components/unified_hifi_control`, minus `tests/` — Home
+Assistant loads that directory as a Python package and the test suite is
+not part of it.
+
+Baking it into the base image rather than having the add-on's own
+Dockerfile fetch it from GitHub is deliberate: the add-on pins a UHC image
+tag, so the integration it installs is exactly the one built alongside
+that UHC release. A build-time fetch would introduce a second version to
+keep in sync, and a ref that can drift from the server it talks to.
+
+The add-on's `run.sh` copies it into `/homeassistant/custom_components` on
+start (install when absent, update when the bundled `manifest.json`
+`version` is newer, never over a newer copy, a copy the add-on did not
+install, or one the user has edited), then exports what it did as
+`UHC_HA_INTEGRATION_STATUS`/`_VERSION`/`_DETAIL` plus `UHC_ADDON=1`.
+`src/api/ha_integration.rs` reads those and asks Home Assistant's core API
+whether our domain is in its `components` list, which is how Settings can
+say "restart Home Assistant once" — the one step that is otherwise
+invisible, since HA only loads custom integrations at startup.
+
+Bumping `manifest.json`'s `version` is what makes an upgrade land on an
+existing add-on install. Without a bump, `run.sh` sees equal versions and
+does nothing.
+
+HACS installs are unaffected: a copy the add-on did not place carries no
+`.installed_by_uhc_addon` stamp, and the add-on leaves it alone.
+
 ## Choosing MQTT vs. this integration
 
+- **Under the add-on, this integration is the default and MQTT is off**
+  (#613). The add-on installs this for you and fills in the Supervisor's
+  broker details without switching publishing on, so MQTT is a one-click
+  opt-in for people who want it rather than something that happens to
+  them.
 - Use the MQTT path (PR #518 / issue #508) for lightweight dashboards
   and automations without installing a custom component, or when HA and
   UHC can't reach each other over plain HTTP but already share an MQTT
-  broker.
+  broker. For a **standalone** (non-add-on) UHC this remains the primary
+  route and its behaviour is unchanged.
 - Use this integration for real `media_player` entities: Assist voice
   control, media-player dashboard cards, and `media_player.*` service
   calls (play/pause/volume/seek/grouping) — none of which HA's MQTT
