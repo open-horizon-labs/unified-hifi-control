@@ -451,7 +451,7 @@ private struct ConnectedHeroView: View {
             }
             Label(
                 outputs.isEmpty ? "No AirPlay outputs detected" : "AirPlay outputs available: \(outputs.count)",
-                systemImage: outputs.isEmpty ? "hifispeaker.slash" : "hifispeaker"
+                systemImage: outputs.isEmpty ? "speaker.slash" : "hifispeaker"
             )
             .foregroundStyle(outputs.isEmpty ? .secondary : .primary)
             if let lastConnectedAt {
@@ -557,7 +557,7 @@ public struct MenuBarContentView: View {
             if model.stage.isConnected {
                 Label(
                     model.outputs.isEmpty ? "AirPlay: no outputs found" : "AirPlay: route managed by macOS",
-                    systemImage: model.outputs.isEmpty ? "hifispeaker.slash" : "hifispeaker"
+                    systemImage: model.outputs.isEmpty ? "speaker.slash" : "hifispeaker"
                 )
                     .font(.caption2)
                     .foregroundStyle(.secondary)

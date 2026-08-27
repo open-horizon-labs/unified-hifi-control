@@ -326,7 +326,7 @@ public struct ContentView: View {
                         if let outputLabel = model.outputLabel {
                             Label("Output: \(outputLabel)", systemImage: "hifispeaker.fill")
                         } else {
-                            Label("Output: unavailable", systemImage: "hifispeaker.slash")
+                            Label("Output: unavailable", systemImage: "speaker.slash")
                                 .foregroundStyle(.secondary)
                         }
                     }
