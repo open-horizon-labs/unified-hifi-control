@@ -11,6 +11,8 @@ class Zone {
     public var state as String;          // "playing" | "paused" | "stopped" | ...
     public var hasVolume as Boolean;
     public var volume as Float;
+    public var volumeMin as Float;
+    public var volumeMax as Float;
 
     public function initialize(raw as Dictionary) {
         id = asString(raw["zone_id"], "");
@@ -25,9 +27,15 @@ class Zone {
         if (vc != null && vc instanceof Dictionary && vc["value"] != null) {
             hasVolume = true;
             volume = asFloat(vc["value"], 0.0);
+            // Real range, so a gauge cannot misrepresent the level: a Roon
+            // zone may run 0-98 with a half-step rather than 0-100.
+            volumeMin = asFloat(vc["min"], 0.0);
+            volumeMax = asFloat(vc["max"], 100.0);
         } else {
             hasVolume = false;
             volume = 0.0;
+            volumeMin = 0.0;
+            volumeMax = 100.0;
         }
     }
 

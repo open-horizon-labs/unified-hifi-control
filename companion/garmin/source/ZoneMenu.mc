@@ -64,7 +64,7 @@ class ZoneMenuDelegate extends WatchUi.Menu2InputDelegate {
         // tax that would prevent it.
         Application.Storage.setValue("lastZoneId", zone.id);
 
-        var menu = new ZoneActionMenu(zone);
-        WatchUi.pushView(menu, new ZoneActionMenuDelegate(menu), WatchUi.SLIDE_LEFT);
+        var view = new NowPlayingView(zone);
+        WatchUi.pushView(view, new NowPlayingDelegate(view), WatchUi.SLIDE_LEFT);
     }
 }

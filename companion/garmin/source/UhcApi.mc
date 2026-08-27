@@ -177,3 +177,42 @@ class ControlRequest {
         _callback.invoke(UhcApi.classify(responseCode));
     }
 }
+
+//! GET /now_playing?zone_id=... — what a zone is actually playing.
+//! Separate from /zones because the zone list only needs names and state;
+//! fetching track text for ten zones to show one would be wasteful over
+//! Bluetooth.
+class NowPlayingRequest {
+    private var _callback as Method;
+
+    public function initialize(callback as Method) {
+        _callback = callback;
+    }
+
+    public function start(zoneId as String) as Void {
+        var base = UhcApi.baseUrl();
+        if (base == null) {
+            _callback.invoke(UhcApi.ERR_NO_SERVER, null);
+            return;
+        }
+        Communications.makeWebRequest(
+            base + "/now_playing",
+            { "zone_id" => zoneId },
+            {
+                :method => Communications.HTTP_REQUEST_METHOD_GET,
+                :headers => UhcApi.headers(null),
+                :responseType => Communications.HTTP_RESPONSE_CONTENT_TYPE_JSON
+            },
+            method(:onResponse)
+        );
+    }
+
+    public function onResponse(responseCode as Number, data as Dictionary?) as Void {
+        var failure = UhcApi.classify(responseCode);
+        if (failure != null || data == null || !(data instanceof Dictionary)) {
+            _callback.invoke(failure == null ? UhcApi.ERR_UNREACHABLE : failure, null);
+            return;
+        }
+        _callback.invoke(null, data);
+    }
+}

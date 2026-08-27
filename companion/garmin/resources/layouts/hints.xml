@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Garmin's own button-hint markers. The `personality` selectors carry the
+  icon, the screen position AND the size for each physical button, so these
+  land next to the real button on whatever product they are built for —
+  and are dropped automatically on products that lack that button.
+
+  Hints are how a button-driven screen tells you what the buttons do without
+  a legend. Three are active here: play/pause, next, volume.
+-->
+<layout id="NowPlayingHints">
+    <bitmap id="hintPlay" personality="
+        system_icon_dark__hint_button_right_top
+        system_loc__hint_button_right_top
+        system_size__hint_button_right_top" />
+    <bitmap id="hintVolume" personality="
+        system_icon_dark__hint_button_left_middle
+        system_loc__hint_button_left_middle
+        system_size__hint_button_left_middle" />
+    <bitmap id="hintNext" personality="
+        system_icon_dark__hint_button_left_bottom
+        system_loc__hint_button_left_bottom
+        system_size__hint_button_left_bottom" />
+</layout>
