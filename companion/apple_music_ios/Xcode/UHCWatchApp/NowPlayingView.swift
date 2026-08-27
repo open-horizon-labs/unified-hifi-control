@@ -1,4 +1,5 @@
 import SwiftUI
+import WatchKit
 import UHCKit
 
 /// Artwork, three lines of text, transport, and the Digital Crown bound to
@@ -12,6 +13,7 @@ struct NowPlayingView: View {
     @State private var crownVolume: Double = 0
     @State private var crownPrimed = false
     @State private var volumeCommit: Task<Void, Never>?
+    @State private var wasAtLimit = false
 
     var body: some View {
         ScrollView {
@@ -40,6 +42,7 @@ struct NowPlayingView: View {
             // zone's real volume is known, and acting on it would yank the
             // volume to zero the moment the screen appears.
             guard crownPrimed else { return }
+            reportLimit(newValue)
             scheduleVolumeCommit(newValue)
         }
         .onChange(of: controller.nowPlaying?.volume) { _, newValue in
@@ -137,15 +140,30 @@ struct NowPlayingView: View {
     @ViewBuilder
     private var volumeReadout: some View {
         if let control = controller.volumeControl {
+            // While the crown is moving, show where it points -- not what the
+            // server last said. The server's answer lags the turn, and
+            // rendering it mid-gesture is what made the number walk backwards
+            // under the user's finger.
+            let pending = controller.pendingVolume
+            let shown = pending ?? control.value
             HStack(spacing: 4) {
                 Image(systemName: "speaker.wave.2.fill")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                Text(formatted(control.value))
+                Text(formatted(shown))
                     .font(.caption2)
                     .monospacedDigit()
+                    // Dimmed until the zone confirms it: the number is a
+                    // request, and it says so, rather than claiming a change
+                    // that has not happened.
+                    .foregroundStyle(pending == nil ? .primary : .secondary)
+                    .animation(.easeOut(duration: 0.18), value: pending == nil)
             }
-            .accessibilityLabel("Volume \(formatted(control.value))")
+            .accessibilityLabel(
+                pending == nil
+                    ? "Volume \(formatted(shown))"
+                    : "Volume \(formatted(shown)), setting"
+            )
         }
         if let message = controller.errorMessage {
             Text(message)
@@ -163,12 +181,31 @@ struct NowPlayingView: View {
 
     /// Coalesce crown motion into one request per quiet period. Without this a
     /// single flick of the crown becomes dozens of `vol_abs` commands.
+    /// Commit once the crown has been still for a beat. 250ms fired partway
+    /// through an ordinary turn, so a single adjustment became several writes
+    /// racing each other; a hand comes to rest well inside 600ms.
+    private static let crownQuietPeriod = Duration.milliseconds(600)
+
     private func scheduleVolumeCommit(_ value: Double) {
         volumeCommit?.cancel()
         volumeCommit = Task {
-            try? await Task.sleep(for: .milliseconds(250))
+            try? await Task.sleep(for: Self.crownQuietPeriod)
             guard !Task.isCancelled else { return }
-            await controller.setVolume(value)
+            let landed = await controller.commitVolume(value)
+            guard !Task.isCancelled else { return }
+            // Confirm on the wrist. The crown already ticks while turning;
+            // this is the distinct beat that says the zone actually took it,
+            // which is the whole difference between guessing and knowing.
+            WKInterfaceDevice.current().play(landed ? .click : .failure)
         }
+    }
+
+    /// The ends of the range deserve to be felt, not discovered by watching a
+    /// number stop moving.
+    private func reportLimit(_ value: Double) {
+        guard let control = controller.volumeControl else { return }
+        let atLimit = value <= control.min || value >= control.max
+        if atLimit, !wasAtLimit { WKInterfaceDevice.current().play(.retry) }
+        wasAtLimit = atLimit
     }
 }
