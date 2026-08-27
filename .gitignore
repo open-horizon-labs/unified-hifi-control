@@ -32,3 +32,7 @@ __pycache__/
 .venv*/
 .pytest_cache/
 .ruff_cache/
+
+# Swift package build products (companion/*)
+companion/**/.build/
+companion/**/.swiftpm/
