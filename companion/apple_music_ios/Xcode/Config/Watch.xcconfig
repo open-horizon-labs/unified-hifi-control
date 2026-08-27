@@ -33,3 +33,10 @@ ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = NO
 
 // TestFlight/App Store require an app icon on every submitted target.
 ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon
+
+// The Watch app is embedded inside the iOS app, not shipped beside it.
+// Without this it is ALSO copied to the archive root, leaving two .app
+// bundles there; Xcode then cannot identify the primary app, writes no
+// ApplicationProperties, and Organizer offers "Distribute Content"
+// instead of "Distribute App" -- i.e. no TestFlight upload.
+SKIP_INSTALL = YES
