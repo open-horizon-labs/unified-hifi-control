@@ -6,7 +6,7 @@ FROM ghcr.io/linuxcontainers/alpine:3.20
 WORKDIR /app
 
 # Install runtime dependencies
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates openssh-client
 
 # Copy pre-built binary (web assets are embedded)
 ARG TARGETARCH

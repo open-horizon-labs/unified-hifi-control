@@ -61,6 +61,7 @@ WORKDIR /app
 # Install runtime dependencies (minimal - using rustls, no OpenSSL needed)
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binary with embedded web assets (ADR 002 - no public/ directory)
