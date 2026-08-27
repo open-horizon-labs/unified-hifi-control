@@ -16,23 +16,47 @@
         minApiLevel="3.2.0">
 
         <!--
-          Device list is deliberately narrow for v1: the owner's Fenix 8 Pro.
-          Widening it is a per-device layout question, not a checkbox — a
-          non-touch or lower-resolution device needs its own layout pass.
-        -->
-        <!--
-          The fēnix 8 family. Each id covers several physical models: 47mm
-          also covers 51mm and the tactix/quatix variants, and the Pro id
-          covers MicroLED. The Solar models are MIP at 260-280px rather than
-          AMOLED at 454, which is why the layout works in fractions of the
-          screen and the album art is requested at a size derived from it.
+          Every device that actually builds, verified one at a time rather
+          than listed hopefully.
+
+          The excluded models (fenix 3/5, vivoactive 1-4, chronos) fail on
+          one thing: they predate the personality library, so Garmin's
+          button-hint assets do not exist for them. That is a useful signal
+          rather than an obstacle to route around. Those watches are
+          touch-first with different button counts, so the button-driven
+          design here would not suit them without its own layout pass.
         -->
         <iq:products>
+            <iq:product id="epix2pro47mm"/>
+            <iq:product id="epix2pro51mm"/>
+            <iq:product id="fenix6"/>
+            <iq:product id="fenix6pro"/>
+            <iq:product id="fenix6s"/>
+            <iq:product id="fenix6spro"/>
+            <iq:product id="fenix6xpro"/>
+            <iq:product id="fenix7"/>
+            <iq:product id="fenix7pro"/>
+            <iq:product id="fenix7pronowifi"/>
+            <iq:product id="fenix7s"/>
+            <iq:product id="fenix7spro"/>
+            <iq:product id="fenix7x"/>
+            <iq:product id="fenix7xpro"/>
+            <iq:product id="fenix7xpronowifi"/>
             <iq:product id="fenix843mm"/>
             <iq:product id="fenix847mm"/>
             <iq:product id="fenix8pro47mm"/>
             <iq:product id="fenix8solar47mm"/>
             <iq:product id="fenix8solar51mm"/>
+            <iq:product id="fenix943mm"/>
+            <iq:product id="fenix947mm"/>
+            <iq:product id="fenix9pro43mm"/>
+            <iq:product id="fenix9pro47mm"/>
+            <iq:product id="fenix9pro51mm"/>
+            <iq:product id="fenix9prosolar47mm"/>
+            <iq:product id="fenix9prosolar51mm"/>
+            <iq:product id="fenixe"/>
+            <iq:product id="vivoactive5"/>
+            <iq:product id="vivoactive6"/>
         </iq:products>
 
         <iq:permissions>
