@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<!--
+  Unified Hi-Fi Control — Garmin Connect IQ remote.
+
+  A watch-app (not a widget) because the interaction is deliberate: the user
+  opens it to drive a zone, then leaves. Widgets and glances are for passive
+  glanceable state, which this is not — see README.md.
+-->
+<iq:manifest xmlns:iq="http://www.garmin.com/xml/connectiq" version="3">
+    <iq:application
+        id="a1b2c3d4e5f6470891234567890abcde"
+        type="watch-app"
+        name="@Strings.AppName"
+        entry="UhcApp"
+        launcherIcon="@Drawables.LauncherIcon"
+        minApiLevel="3.2.0">
+
+        <!--
+          Device list is deliberately narrow for v1: the owner's Fenix 8 Pro.
+          Widening it is a per-device layout question, not a checkbox — a
+          non-touch or lower-resolution device needs its own layout pass.
+        -->
+        <iq:products>
+            <iq:product id="fenix8pro47mm"/>
+            <iq:product id="fenix8pro51mm"/>
+        </iq:products>
+
+        <iq:permissions>
+            <!-- Talking to the UHC server. Nothing else is required: no
+                 position, no sensors, no background. -->
+            <iq:uses-permission id="Communications"/>
+        </iq:permissions>
+
+        <iq:languages>
+            <iq:language>eng</iq:language>
+        </iq:languages>
+    </iq:application>
+</iq:manifest>

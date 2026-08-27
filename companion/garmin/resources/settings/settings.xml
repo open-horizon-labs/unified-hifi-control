@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  A declarative form only — Garmin Connect renders these fields; no code of
+  ours runs on the phone. Discovery is therefore impossible here, so the
+  address is typed once (see README.md).
+-->
+<settings>
+    <setting propertyKey="@Properties.baseUrl" title="@Strings.SettingBaseUrl" prompt="@Strings.SettingBaseUrlPrompt">
+        <settingConfig type="alphaNumeric" maxLength="128"/>
+    </setting>
+    <setting propertyKey="@Properties.token" title="@Strings.SettingToken" prompt="@Strings.SettingTokenPrompt">
+        <settingConfig type="alphaNumeric" maxLength="128"/>
+    </setting>
+</settings>

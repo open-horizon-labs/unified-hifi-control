@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<strings>
+    <string id="AppName">Hi-Fi Control</string>
+
+    <!-- Settings, shown in Garmin Connect and in on-device settings. -->
+    <string id="SettingBaseUrl">Server address</string>
+    <string id="SettingBaseUrlPrompt">The address of your Unified Hi-Fi Control server, e.g. https://uhc.example.com</string>
+    <string id="SettingToken">Access token</string>
+    <string id="SettingTokenPrompt">Leave blank unless your server requires a controller token.</string>
+
+    <!-- User-facing states. Kept plain: a watch is a bad place to read. -->
+    <string id="Loading">Loading…</string>
+    <string id="NoServer">Set the server address in the app settings</string>
+    <string id="NoZones">No zones</string>
+    <string id="Unreachable">Can't reach the server</string>
+    <string id="Unauthorized">Server rejected the token</string>
+    <string id="ZonesTitle">Zones</string>
+</strings>
