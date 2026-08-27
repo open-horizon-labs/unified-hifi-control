@@ -14,6 +14,17 @@ COPY dist/unified-hifi-control /app/
 # Make binary executable
 RUN chmod +x /app/unified-hifi-control
 
+# Home Assistant custom integration (#613). The add-on image is built FROM
+# this one, and its run.sh copies this directory into Home Assistant's
+# config directory on start. Shipping it here rather than fetching it in the
+# add-on's Dockerfile is what locks the integration to the exact UHC release
+# it was built alongside: same tag, same API contract, no second version to
+# keep in sync. The test suite is stripped because Home Assistant loads this
+# directory as a Python package and the tests are not part of it.
+COPY custom_components/unified_hifi_control /app/custom_components/unified_hifi_control
+RUN rm -rf /app/custom_components/unified_hifi_control/tests \
+    /app/custom_components/unified_hifi_control/requirements_test.txt
+
 # Create data directory for config persistence
 RUN mkdir -p /data
 

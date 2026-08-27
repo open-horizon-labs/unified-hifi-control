@@ -66,6 +66,11 @@ RUN apt-get update && apt-get install -y \
 # Copy binary with embedded web assets (ADR 002 - no public/ directory)
 COPY --from=builder /app/unified-hifi-control-bin /app/unified-hifi-control
 
+# Home Assistant custom integration (#613) - see Dockerfile.release.
+COPY custom_components/unified_hifi_control /app/custom_components/unified_hifi_control
+RUN rm -rf /app/custom_components/unified_hifi_control/tests \
+    /app/custom_components/unified_hifi_control/requirements_test.txt
+
 # Create data directory for config persistence
 RUN mkdir -p /data
 
