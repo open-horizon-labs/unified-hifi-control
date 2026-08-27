@@ -378,9 +378,15 @@ pub async fn handle_search(
                             });
                             continue;
                         };
+                        // #616: a search hit's trail is its own title. A
+                        // search is not a walk from the browse root, so
+                        // re-resolution for these goes through the search
+                        // itself rather than a root descent -- recorded
+                        // here so the ref is self-describing either way.
                         let target = RoonRefTarget {
                             item_key,
                             multi_session_key: session_key.clone(),
+                            trail: vec![title.clone()],
                         };
                         // #396 (found live, ship-gate re-review): a real
                         // Core's search results mix the actual hit with
@@ -1148,6 +1154,7 @@ async fn play_ref_roon(
             &args.zone_id,
             action,
             &title,
+            &target.trail,
         )
         .await
     {

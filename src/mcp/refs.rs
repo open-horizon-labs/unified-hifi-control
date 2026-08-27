@@ -94,6 +94,26 @@ pub const DEFAULT_CAPACITY: usize = 512;
 /// How long a ref remains resolvable after it is minted. Uniform across every
 /// provider and target kind -- see the module docs for why that is a
 /// deliberate choice, not an oversight.
+///
+/// # Measured against a real Roon Core (#616)
+///
+/// #616 asked whether this should instead track the lifetime of the Roon
+/// browse session a ref depends on. Measured read-only against the
+/// operator's production Core (Roon 2.x, 2026-08), by minting eleven
+/// independent deep browse refs at once and probing one per interval
+/// without touching the others:
+///
+/// | idle | result |
+/// |------|--------|
+/// | 30s, 90s, 180s, 300s, 480s, 660s, **840s** | resolves normally |
+/// | 1020s | gone -- **this TTL**, at 900s, not the Core |
+///
+/// So a Roon browse session outlives this TTL rather than the other way
+/// round: shortening it to "match Roon" would discard refs the Core is
+/// still perfectly willing to honour, and lengthening it is what
+/// [`RoonRefTarget::trail`] now makes safe rather than necessary. Left
+/// uniform and unchanged; the recovery path, not the clock, is what makes a
+/// stale key survivable.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(15 * 60);
 
 const TOKEN_PREFIX: &str = "ref_";
@@ -105,10 +125,29 @@ const TOKEN_PREFIX: &str = "ref_";
 /// private session per call and the item keys it returns are scoped to that
 /// session (see `src/adapters/roon.rs::search_with_session`); resolution must
 /// re-enter that exact session (`RoonAdapter::play_ref`), never a fresh one.
+/// # Why the pair alone is not enough (#616)
+///
+/// An `(item_key, multi_session_key)` pair is only meaningful while the Core
+/// still holds that session. When it does not -- the extension reconnected,
+/// the Core restarted, or the session aged out -- the pair is unrecoverable
+/// on its own: nothing in it says *what* the key pointed at, so the only
+/// answer left is to tell the human to browse again. That is the error
+/// reported in #616, and asking the user to redo a walk we could redo
+/// ourselves is the part they feel.
+///
+/// [`Self::trail`] is what makes recovery possible: the titles from the
+/// browse root down to this item, accumulated as the user descends. Given
+/// the trail, `RoonAdapter::resolve_trail` can re-walk it in a fresh session
+/// and mint an equivalent key, so a rejected ref becomes a retry rather than
+/// an apology. It is best-effort: an empty trail simply means no recovery is
+/// possible for that ref, exactly as before.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoonRefTarget {
     pub item_key: String,
     pub multi_session_key: String,
+    /// Titles from the browse root down to and including this item. Empty
+    /// when the minting surface could not supply one.
+    pub trail: Vec<String>,
 }
 
 /// What a ref resolves to, independent of the opaque token a client holds.
@@ -469,6 +508,7 @@ mod tests {
             target: RoonRefTarget {
                 item_key: item_key.to_string(),
                 multi_session_key: session.to_string(),
+                trail: vec![title.to_string()],
             },
             title: title.to_string(),
         }

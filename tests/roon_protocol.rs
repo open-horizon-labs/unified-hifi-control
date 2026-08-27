@@ -35,7 +35,9 @@ use mock_servers::roon_core::{
     FakeItem, FakeLibrary, FakeRoonCore, Hint, ItemKeyScope,
 };
 use roon_api::browse::{BrowseOpts, LoadOpts};
-use unified_hifi_control::adapters::roon::{PlayAction, RoonAdapter, SearchSource};
+use unified_hifi_control::adapters::roon::{
+    PlayAction, RoonAdapter, RoonBrowseError, RoonBrowseErrorKind, SearchSource,
+};
 use unified_hifi_control::bus::create_bus;
 use unified_hifi_control::knobs::KnobStore;
 
@@ -1698,6 +1700,7 @@ async fn roon_play_ref_matches_playlist_verb_and_reports_no_error() {
             "roon:zone_fake_1",
             PlayAction::Play,
             "An Introduction to Qobuz",
+            &[],
         )
         .await
         .expect("playing a playlist ref must succeed, not report a false error");
@@ -1746,6 +1749,7 @@ async fn roon_play_ref_does_not_silently_substitute_queue_for_an_unavailable_act
             "roon:zone_fake_1",
             PlayAction::Queue,
             "Solo Playlist",
+            &[],
         )
         .await
         .expect_err("Queue is not offered by this playlist");
@@ -2499,12 +2503,115 @@ async fn roon_collections_artist_level_albums_are_dual_under_session_scoped_keys
             "roon:zone_fake_1",
             PlayAction::Play,
             "Flight of the Crow",
+            &[],
         )
         .await
         .expect("playing an artist-level album ref must succeed");
     assert!(
         message.contains("Play Now") || message.contains("Play Album"),
         "the album's Play Album menu resolves to a real invocation: {message}"
+    );
+
+    core.stop().await;
+}
+
+/// **#616's regression test.** The Core forgets the browse session a held key
+/// was minted in, and playing that key must still work.
+///
+/// This is the operator's report reproduced end to end: browse the Library
+/// down to an album, hold its ref, and have the Core lose the session
+/// underneath it (`FakeRoonCore::drop_all_sessions` -- an extension
+/// reconnect or a Core restart; see that method's docs for why session loss
+/// is modelled as an event rather than a count or timeout rule, and the
+/// read-only production measurements behind that choice).
+///
+/// Before #616 this surfaced the Core's rejection verbatim -- *"Roon Core
+/// rejected the item key: it is no longer valid in this browse session -
+/// search or browse again to get a fresh key"* -- which asks the human to
+/// redo, by hand, the exact walk the adapter is holding the breadcrumbs
+/// for. Now the ref carries its trail, `RoonAdapter::resolve_trail` re-walks
+/// it in a fresh session, and the play goes through.
+///
+/// Delete the recovery branch in `play_ref` and this fails with that
+/// message, which is the whole point of it.
+#[tokio::test]
+async fn a_held_key_still_plays_after_the_core_forgets_its_session() {
+    let core = FakeRoonCore::start_with(artists_library()).await;
+    core.set_item_key_scope(ItemKeyScope::PerSessionSilentRootReset)
+        .await;
+    let adapter = connected(&core).await;
+
+    // Walk the Library page down to an album, recording the trail exactly as
+    // `hifi_collections` accumulates it onto every ref it mints.
+    let mut level = adapter
+        .content(
+            "collections_browse",
+            &json!({ "zone_id": "roon:zone_1", "limit": 20, "offset": 0 }),
+        )
+        .await
+        .unwrap();
+    let mut session = level["session_key"].as_str().unwrap().to_string();
+    let mut trail: Vec<String> = Vec::new();
+    for title in ["Local Library", "Artists", "/Passenger."] {
+        let key = level["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["title"] == title)
+            .unwrap_or_else(|| panic!("row {title} missing: {level:?}"))["item_key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        trail.push(title.to_string());
+        level = adapter
+            .content(
+                "collections_browse",
+                &json!({
+                    "zone_id": "roon:zone_1",
+                    "item_key": key,
+                    "session_key": session,
+                    "limit": 20,
+                    "offset": 0,
+                }),
+            )
+            .await
+            .unwrap();
+        session = level["session_key"].as_str().unwrap().to_string();
+    }
+    let album = &level["items"][0];
+    let album_title = album["title"].as_str().unwrap().to_string();
+    let album_key = album["item_key"].as_str().unwrap().to_string();
+    trail.push(album_title.clone());
+
+    // The Core loses every browse session it is holding.
+    core.drop_all_sessions().await;
+
+    // Sanity: the held key really is dead now, so the recovery below is
+    // doing real work rather than passing on a session that still exists.
+    let direct = adapter
+        .browse_collection("zone_1", Some(&album_key), Some(&session), 0, 20)
+        .await;
+    let rejection = direct.expect_err("the dropped session must reject the held key");
+    assert_eq!(
+        RoonBrowseError::from_error(&rejection).map(|error| error.kind),
+        Some(RoonBrowseErrorKind::InvalidItemKey),
+        "expected the Core's stale-key rejection, got: {rejection}"
+    );
+
+    let message = adapter
+        .play_ref(
+            &album_key,
+            &session,
+            "roon:zone_fake_1",
+            PlayAction::Play,
+            &album_title,
+            &trail,
+        )
+        .await
+        .expect("a ref whose session the Core forgot must recover by re-walking its trail");
+    assert!(
+        message.contains("Play Now") || message.contains("Play Album"),
+        "recovery must end in a real invocation, not a half-walk: {message}"
     );
 
     core.stop().await;
