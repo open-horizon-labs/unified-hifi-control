@@ -92,6 +92,37 @@ buttons, Connect IQ 6.0.2, 768 KB watch-app memory.
 Widening to other devices is a layout pass per device family, not a line in
 the manifest: a non-touch or lower-resolution watch needs its own design.
 
+## Distribution, and the appID trap
+
+Sideloading over USB is a dead end on macOS for this watch: the fēnix 8 Pro
+presents as MTP (091e:51b8), macOS will not mount it, and libmtp cannot open
+a session. Switching the watch to "Garmin" USB mode makes it worse — it
+enumerates as 091e:0003, Garmin's proprietary protocol, which is not mass
+storage either.
+
+The working route is the Connect IQ Store's test upload: publish the `.iq`
+as a test app and install it to your OWN watch over Bluetooth through
+Garmin Connect. Only the developer can install a test build, which is
+exactly the case here.
+
+**The trap**, in Garmin's own words on the upload page:
+
+> Only you will be able to download and test the app. If you want to publish
+> your app after testing, you will need to upload it again and use another
+> appID in the app's manifest.xml.
+
+So a test upload BURNS its appID. The id currently in `manifest.xml` is a
+hand-written placeholder and is fine to spend on testing. Before any public
+release, mint a fresh UUID for `<iq:application id="...">` — and keep the
+signing key (`developer_key.der`), because a published app can only be
+updated by the key that first signed it.
+
+Build the test package with:
+
+```
+monkeyc -f monkey.jungle -o uhc-hifi-control.iq -y <developer_key.der> -e -r
+```
+
 ## Building
 
 Requires the Connect IQ SDK (via the SDK Manager) and a JRE.
