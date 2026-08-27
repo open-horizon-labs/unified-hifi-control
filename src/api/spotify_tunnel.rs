@@ -579,9 +579,15 @@ impl SpotifyTunnelManager {
                     self.set_status_if_current(
                         generation,
                         TunnelStatus::Error {
-                            message: "ssh was not found on this system. Install the OpenSSH \
-                                      client (most Linux, macOS, and NAS systems already have \
-                                      it) or use \"Advanced: bring your own HTTPS\" below."
+                            // "Install the OpenSSH client" is useless advice
+                            // inside a container, which is where this is most
+                            // likely to be hit -- the images now ship it, so
+                            // point at the update first.
+                            message: "ssh was not found on this system. If you run Unified \
+                                      Hi-Fi Control as a Home Assistant add-on or a Docker \
+                                      container, update to the latest version -- it includes \
+                                      ssh. Otherwise install the OpenSSH client, or use \
+                                      \"Advanced: bring your own HTTPS\" below."
                                 .to_string(),
                         },
                     )
