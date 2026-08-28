@@ -438,6 +438,8 @@ pub struct ImageQuery {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub format: Option<String>,
+    pub scale: Option<String>,
+    pub crop_limit: Option<u8>,
 }
 
 // Image conversion is now handled by state.get_image()
@@ -453,11 +455,45 @@ pub async fn knob_image_handler(
     let target_width = params.width.unwrap_or(240);
     let target_height = params.height.unwrap_or(240);
     let format = params.format.as_deref();
+    let rgb565_requested = matches!(format, Some("rgb565" | "rgb565-smart"));
+    let eink_requested = format == Some("eink_acep6");
+    if eink_requested
+        && (target_width == 0
+            || target_height == 0
+            || u64::from(target_width) * u64::from(target_height) > 1_536_000)
+    {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("invalid e-ink artwork dimensions"))
+            .unwrap();
+    }
+    let resize_policy = match (format, params.scale.as_deref()) {
+        (Some("rgb565-smart" | "eink_acep6"), _) | (_, Some("smart")) => {
+            Some(crate::knobs::image::Rgb565ResizePolicy::SmartCover {
+                max_crop_percent: params.crop_limit.unwrap_or(10).min(25),
+            })
+        }
+        (_, Some("fit")) => Some(crate::knobs::image::Rgb565ResizePolicy::Fit),
+        _ => None,
+    };
 
     // Helper to return placeholder image in appropriate format
     let placeholder_response = || -> Response {
         let svg = placeholder_svg(target_width, target_height);
-        if format == Some("rgb565") {
+        if eink_requested {
+            let bytes_per_row = target_width.div_ceil(2) as usize;
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header("X-Image-Format", "eink_acep6")
+                .header("X-Image-Width", target_width.to_string())
+                .header("X-Image-Height", target_height.to_string())
+                .body(Body::from(vec![
+                    0x11;
+                    bytes_per_row * target_height as usize
+                ]))
+                .unwrap()
+        } else if rgb565_requested {
             // Convert SVG placeholder to RGB565
             match svg_to_rgb565(svg.as_bytes(), target_width, target_height) {
                 Ok(rgb565) => Response::builder()
@@ -510,13 +546,16 @@ pub async fn knob_image_handler(
             Some(target_width),
             Some(target_height),
             format,
+            resize_policy,
         )
         .await
     {
         Ok(image_data) => {
             // If RGB565 was requested but conversion failed (content_type != octet-stream),
             // return the placeholder instead of misleading headers
-            if format == Some("rgb565") && image_data.content_type != "application/octet-stream" {
+            if (rgb565_requested || eink_requested)
+                && image_data.content_type != "application/octet-stream"
+            {
                 return placeholder_response();
             }
 
@@ -525,7 +564,12 @@ pub async fn knob_image_handler(
                 .header(header::CONTENT_TYPE, &image_data.content_type);
 
             // Add RGB565 metadata headers for ESP32 clients
-            if format == Some("rgb565") {
+            if eink_requested {
+                response = response
+                    .header("X-Image-Format", "eink_acep6")
+                    .header("X-Image-Width", target_width.to_string())
+                    .header("X-Image-Height", target_height.to_string());
+            } else if rgb565_requested {
                 response = response
                     .header("X-Image-Format", "rgb565")
                     .header("X-Image-Width", target_width.to_string())
