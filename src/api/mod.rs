@@ -302,6 +302,8 @@ pub struct AppState {
     /// provider-native image handle behind it. Deliberately a separate table
     /// from `mcp_refs` -- see `crate::mcp::refs::ImageRef`'s docs for why.
     pub image_refs: crate::mcp::refs::ImageRefTable,
+    /// Bounded cache of fully composed, dithered, and packed Frame artwork.
+    pub eink_artwork_cache: crate::knobs::image::EinkArtworkCache,
     /// UHC-owned requested listening sequences, separate from provider queue
     /// observations (#483).
     pub listening_plans: crate::mcp::listening_plan::ListeningPlanStore,
@@ -375,6 +377,7 @@ impl AppState {
             sse_connections: Arc::new(AtomicUsize::new(0)),
             mcp_refs: crate::mcp::refs::RefTable::new(),
             image_refs: crate::mcp::refs::ImageRefTable::new(),
+            eink_artwork_cache: crate::knobs::image::EinkArtworkCache::default(),
             listening_plans: crate::mcp::listening_plan::ListeningPlanStore::from_config(),
             apple_feedback: crate::mcp::feedback::FeedbackStore::from_config(),
             reliable_commands: None,
@@ -412,13 +415,54 @@ impl AppState {
         width: Option<u32>,
         height: Option<u32>,
         format: Option<&str>,
+        resize_policy: Option<crate::knobs::image::Rgb565ResizePolicy>,
     ) -> anyhow::Result<crate::bus::ImageData> {
         use crate::bus::ImageData;
-        use crate::knobs::image::jpeg_to_rgb565;
+        use crate::knobs::image::{
+            image_to_eink_acep6_with_policy, jpeg_to_rgb565_with_policy, EinkCacheKey,
+            Rgb565ResizePolicy,
+        };
+
+        let dimensions = match (width, height) {
+            (Some(w), Some(h)) => (w, h),
+            (Some(w), None) => (w, w),
+            (None, Some(h)) => (h, h),
+            (None, None) if format == Some("eink_acep6") => (800, 450),
+            (None, None) => (240, 240),
+        };
+        let resize_policy = resize_policy.unwrap_or(Rgb565ResizePolicy::Exact);
+        let eink_cache_key = (format == Some("eink_acep6")).then(|| EinkCacheKey {
+            zone_id: zone_id.to_string(),
+            image_key: image_key.to_string(),
+            width: dimensions.0,
+            height: dimensions.1,
+            resize_policy,
+            converter_version: 1,
+        });
+        if let Some(key) = eink_cache_key.as_ref() {
+            if let Some(data) = self.eink_artwork_cache.get(key) {
+                return Ok(ImageData {
+                    content_type: "application/octet-stream".to_string(),
+                    data: data.as_ref().clone(),
+                });
+            }
+        }
+
+        // Smart composition needs the source aspect ratio. Asking a provider
+        // for the final rectangle first can irreversibly stretch or crop it
+        // before UHC gets a chance to apply the crop budget/gallery mat.
+        let provider_dimensions = if resize_policy == Rgb565ResizePolicy::Exact {
+            (width, height)
+        } else {
+            (None, None)
+        };
 
         // Fetch raw image from appropriate adapter
         let raw_image = if zone_id.starts_with("lms:") {
-            let (content_type, data) = self.lms.get_artwork(image_key, width, height).await?;
+            let (content_type, data) = self
+                .lms
+                .get_artwork(image_key, provider_dimensions.0, provider_dimensions.1)
+                .await?;
             ImageData { content_type, data }
         } else if zone_id.starts_with("openhome:") {
             let img = self.openhome.get_image(image_key).await?;
@@ -447,7 +491,10 @@ impl AppState {
         } else if let Some(instance) = zone_id.strip_prefix("hqplayer:") {
             self.hqp_images.get_current_cover(instance).await?
         } else if zone_id.starts_with("roon:") || !zone_id.contains(':') {
-            let img = self.roon.get_image(image_key, width, height).await?;
+            let img = self
+                .roon
+                .get_image(image_key, provider_dimensions.0, provider_dimensions.1)
+                .await?;
             ImageData {
                 content_type: img.content_type,
                 data: img.data,
@@ -456,23 +503,45 @@ impl AppState {
             anyhow::bail!("Unknown zone type for image: {}", zone_id)
         };
 
-        // Convert to RGB565 if requested (for ESP32 LCD displays)
-        if format == Some("rgb565") {
+        // Convert to RGB565 if requested (for ESP32 LCD/e-ink displays).
+        // The smart variant is a capability handshake: older servers return
+        // the source image, allowing firmware to detect and use its fallback.
+        if matches!(format, Some("rgb565" | "rgb565-smart")) {
             // Use square dimensions when only one side specified (matches adapter behavior)
-            let (target_w, target_h) = match (width, height) {
-                (Some(w), Some(h)) => (w, h),
-                (Some(w), None) => (w, w),
-                (None, Some(h)) => (h, h),
-                (None, None) => (240, 240),
-            };
+            let (target_w, target_h) = dimensions;
 
-            match jpeg_to_rgb565(&raw_image.data, target_w, target_h) {
+            match jpeg_to_rgb565_with_policy(&raw_image.data, target_w, target_h, resize_policy) {
                 Ok(rgb565) => Ok(ImageData {
                     content_type: "application/octet-stream".to_string(),
                     data: rgb565.data,
                 }),
                 Err(_) => {
                     // Fall back to original on conversion error
+                    Ok(raw_image)
+                }
+            }
+        } else if format == Some("eink_acep6") {
+            let (target_w, target_h) = dimensions;
+            match image_to_eink_acep6_with_policy(
+                &raw_image.data,
+                target_w,
+                target_h,
+                resize_policy,
+            ) {
+                Ok(eink) => {
+                    let Some(cache_key) = eink_cache_key else {
+                        return Ok(raw_image);
+                    };
+                    let data = self.eink_artwork_cache.insert(cache_key, eink.data);
+                    Ok(ImageData {
+                        content_type: "application/octet-stream".to_string(),
+                        data: data.as_ref().clone(),
+                    })
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Frame artwork conversion failed for {zone_id} at {target_w}x{target_h}: {error}"
+                    );
                     Ok(raw_image)
                 }
             }
@@ -1067,6 +1136,7 @@ pub async fn collections_image_handler(
             params.width,
             params.height,
             params.format.as_deref(),
+            None,
         )
         .await
     {
