@@ -25,6 +25,7 @@ mod command {
 
     const INSTALLATION_ENROLLMENT_AUDIENCE: &str = "uhc-connector";
     const MAX_ENROLLMENT_TTL_MS: i64 = 10 * 60 * 1_000;
+    const MAX_PAIRING_TTL_MS: i64 = 10 * 60 * 1_000;
     const MAX_HANDOFF_BYTES: u64 = 4 * 1_024;
     const MAX_JSON_RESPONSE_BYTES: usize = 16 * 1_024;
 
@@ -36,7 +37,7 @@ mod command {
         expires_at: i64,
     }
 
-    #[derive(Deserialize)]
+    #[derive(Clone, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct InitiationResponse {
         pairing_id: Uuid,
@@ -158,15 +159,7 @@ mod command {
             }),
         )
         .await?;
-        if response.fingerprint != identity.fingerprint() {
-            anyhow::bail!("cloud returned a fingerprint that does not match the local key");
-        }
-        if response.secret.len() < 32
-            || response.expires_at <= unix_ms()
-            || response.expires_at > handoff.expires_at
-        {
-            anyhow::bail!("cloud returned an invalid or expired pairing ceremony");
-        }
+        validate_initiation(&response, &identity.fingerprint(), unix_ms())?;
         let pending = PendingPairing {
             cloud_origin: origin.to_string(),
             pairing_id: response.pairing_id,
@@ -393,6 +386,28 @@ mod command {
         Ok(())
     }
 
+    fn validate_initiation(
+        response: &InitiationResponse,
+        expected_fingerprint: &str,
+        now: i64,
+    ) -> anyhow::Result<()> {
+        if response.fingerprint != expected_fingerprint {
+            anyhow::bail!("cloud returned a fingerprint that does not match the local key");
+        }
+        let secret = URL_SAFE_NO_PAD
+            .decode(&response.secret)
+            .context("cloud returned a noncanonical pairing secret")?;
+        if secret.len() != 32 || URL_SAFE_NO_PAD.encode(&secret) != response.secret {
+            anyhow::bail!("cloud returned an invalid pairing secret");
+        }
+        if response.expires_at <= now
+            || response.expires_at.saturating_sub(now) > MAX_PAIRING_TTL_MS
+        {
+            anyhow::bail!("cloud returned an expired or unreasonably long pairing ceremony");
+        }
+        Ok(())
+    }
+
     fn unix_ms() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -529,6 +544,36 @@ mod command {
                 serde_json::json!({"ok": true, "authority": "extra"})
             )
             .is_err());
+        }
+
+        #[test]
+        fn pairing_ceremony_has_its_own_short_bounded_expiry_window() {
+            let now = 1_000_000_i64;
+            let response = InitiationResponse {
+                pairing_id: Uuid::from_u128(1),
+                installation_id: Uuid::from_u128(2),
+                secret: URL_SAFE_NO_PAD.encode([9_u8; 32]),
+                fingerprint: "AAAA-BBBB".to_owned(),
+                expires_at: now + 5 * 60 * 1_000,
+            };
+            assert!(validate_initiation(&response, "AAAA-BBBB", now).is_ok());
+
+            for invalid in [
+                InitiationResponse {
+                    fingerprint: "CCCC-DDDD".to_owned(),
+                    ..response.clone()
+                },
+                InitiationResponse {
+                    expires_at: now,
+                    ..response.clone()
+                },
+                InitiationResponse {
+                    expires_at: now + MAX_PAIRING_TTL_MS + 1,
+                    ..response
+                },
+            ] {
+                assert!(validate_initiation(&invalid, "AAAA-BBBB", now).is_err());
+            }
         }
     }
 }
