@@ -1,0 +1,43 @@
+name: Swift packages
+
+on:
+  pull_request:
+    branches:
+      - v3
+      - integration/streaming-ha-alpha
+    paths:
+      - Package.swift
+      - companion/uhckit/**
+      - tests/fixtures/uhckit_contract.json
+      - .github/workflows/swift.yml
+
+permissions:
+  contents: read
+
+jobs:
+  uhckit:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build and test repository-root package
+        run: |
+          swift package dump-package
+          swift build
+          swift test
+
+      - name: Build and test nested development package
+        run: |
+          swift package --package-path companion/uhckit dump-package
+          swift build --package-path companion/uhckit
+          swift test --package-path companion/uhckit
+
+      - name: Verify a fresh Git checkout resolves the root product
+        run: |
+          git clone --no-local "$GITHUB_WORKSPACE" "$RUNNER_TEMP/uhc-remote"
+          git -C "$RUNNER_TEMP/uhc-remote" checkout --detach "$GITHUB_SHA"
+          swift package --package-path "$RUNNER_TEMP/uhc-remote" describe --type json \
+            | grep '"name" : "UHCKit"'
+          swift build --package-path "$RUNNER_TEMP/uhc-remote"
