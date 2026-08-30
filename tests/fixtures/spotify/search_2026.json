@@ -1,0 +1,35 @@
+{
+  "tracks": {
+    "items": [
+      {
+        "id": "track-1",
+        "name": "Song",
+        "uri": "spotify:track:track-1",
+        "artists": [{"name": "Artist"}],
+        "album": {"name": "Album", "images": []},
+        "duration_ms": 180000
+      }
+    ]
+  },
+  "albums": {
+    "items": [
+      {
+        "id": "album-1",
+        "name": "Album",
+        "uri": "spotify:album:album-1",
+        "artists": [{"name": "Artist"}],
+        "images": []
+      }
+    ]
+  },
+  "artists": {
+    "items": [
+      {
+        "id": "artist-1",
+        "name": "Artist",
+        "uri": "spotify:artist:artist-1",
+        "images": []
+      }
+    ]
+  }
+}

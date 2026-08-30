@@ -1,0 +1,17 @@
+{
+  "sources": {
+    "february_2026_changes": "https://developer.spotify.com/documentation/web-api/references/changes/february-2026",
+    "february_2026_migration": "https://developer.spotify.com/documentation/web-api/tutorials/february-2026-migration-guide",
+    "july_2026_quota_update": "https://developer.spotify.com/blog/2026-07-23-web-api-quota-updates",
+    "transfer_playback": "https://developer.spotify.com/documentation/web-api/reference/transfer-a-users-playback"
+  },
+  "playlist_create_path": "/me/playlists",
+  "playlist_items_field": "items",
+  "search_limit_max": 10,
+  "removed_development_mode_browse_actions": [
+    "browse_categories",
+    "browse_category_playlists",
+    "browse_featured_playlists",
+    "browse_new_releases"
+  ]
+}

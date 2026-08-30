@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use axum::{
     body::Bytes,
     extract::State,
-    http::{Method, StatusCode, Uri},
+    http::{header::CONTENT_TYPE, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::any,
     Json, Router,
@@ -14,9 +14,26 @@ use tokio::net::TcpListener;
 use unified_hifi_control::adapters::spotify::{
     SpotifyAdapter, SpotifyDevice, SpotifyToken, SpotifyTokenRefresher,
 };
-use unified_hifi_control::adapters::{AdapterCommand, AdapterLogic, Startable};
+use unified_hifi_control::adapters::{AdapterCommand, AdapterLogic, LibraryAdapter, Startable};
 use unified_hifi_control::bus::RepeatMode;
 use unified_hifi_control::bus::{create_bus, BusEvent};
+use unified_hifi_control::mcp::capabilities::{support, Capability, Support};
+use unified_hifi_control::mcp::routing::ZoneTarget;
+
+const SPOTIFY_2026_CONTRACT: &str = include_str!("fixtures/spotify/web_api_2026_contract.json");
+const SPOTIFY_2026_DEVICES: &str = include_str!("fixtures/spotify/devices_2026.json");
+const SPOTIFY_2026_PLAYLIST: &str = include_str!("fixtures/spotify/playlist_2026.json");
+const SPOTIFY_2026_SEARCH: &str = include_str!("fixtures/spotify/search_2026.json");
+const SPOTIFY_2026_QUOTA: &str = include_str!("fixtures/spotify/quota_exceeded_2026.json");
+const SPOTIFY_2026_RATE_LIMIT: &str = include_str!("fixtures/spotify/rate_limited_2026.json");
+
+fn spotify_token() -> SpotifyToken {
+    SpotifyToken {
+        access_token: "access".to_string(),
+        refresh_token: None,
+        expires_at: Some(u64::MAX),
+    }
+}
 
 struct RefreshingToken;
 
@@ -35,6 +52,12 @@ impl SpotifyTokenRefresher for RefreshingToken {
 struct MockSpotifyState {
     requests: Arc<Mutex<Vec<String>>>,
     bodies: Arc<Mutex<Vec<String>>>,
+    devices_response: Arc<Mutex<Option<(StatusCode, String)>>>,
+    search_response: Arc<Mutex<Option<(StatusCode, String)>>>,
+}
+
+fn json_response(status: StatusCode, body: String) -> Response {
+    (status, [(CONTENT_TYPE, "application/json")], body).into_response()
 }
 
 async fn spotify_mock(
@@ -56,6 +79,27 @@ async fn spotify_mock(
             .push(String::from_utf8_lossy(&body).into_owned());
     }
 
+    if method == Method::GET && uri.path() == "/me/player/devices" {
+        if let Some((status, body)) = state
+            .devices_response
+            .lock()
+            .expect("devices response lock")
+            .clone()
+        {
+            return json_response(status, body);
+        }
+    }
+    if method == Method::GET && uri.path() == "/search" {
+        if let Some((status, body)) = state
+            .search_response
+            .lock()
+            .expect("search response lock")
+            .clone()
+        {
+            return json_response(status, body);
+        }
+    }
+
     match (method, uri.path()) {
         (Method::GET, "/me/player/devices") => Json(serde_json::json!({
             "devices": [{
@@ -64,6 +108,7 @@ async fn spotify_mock(
                 "type": "Speaker",
                 "is_active": true,
                 "is_restricted": false,
+                "supports_volume": true,
                 "volume_percent": 42
             }]
         }))
@@ -104,107 +149,11 @@ async fn spotify_mock(
             }]
         }))
         .into_response(),
-        (Method::GET, "/search") => Json(serde_json::json!({
-            "tracks": {
-                "items": [{
-                    "id": "track-1",
-                    "name": "Song",
-                    "uri": "spotify:track:track-1",
-                    "artists": [{"name": "Artist"}],
-                    "album": {"name": "Album", "images": []},
-                    "duration_ms": 180000
-                }]
-            },
-            "albums": {
-                "items": [{
-                    "id": "album-1",
-                    "name": "Album",
-                    "uri": "spotify:album:album-1",
-                    "artists": [{"name": "Artist"}],
-                    "images": []
-                }]
-            },
-            "artists": {
-                "items": [{
-                    "id": "artist-1",
-                    "name": "Artist",
-                    "uri": "spotify:artist:artist-1",
-                    "images": []
-                }]
-            }
-        }))
-        .into_response(),
+        (Method::GET, "/search") => json_response(StatusCode::OK, SPOTIFY_2026_SEARCH.to_string()),
         (Method::GET, "/me") => Json(serde_json::json!({
             "id": "account-1",
             "display_name": "Muness Castle",
             "email": "muness@example.test"
-        }))
-        .into_response(),
-        (Method::GET, "/browse/categories") => Json(serde_json::json!({
-            "href": "https://api.spotify.test/browse/categories",
-            "limit": 2,
-            "next": null,
-            "offset": 0,
-            "previous": null,
-            "total": 1,
-            "items": [{"id": "workout", "name": "Workout", "icons": []}]
-        }))
-        .into_response(),
-        (Method::GET, "/browse/categories/workout/playlists") => Json(serde_json::json!({
-            "href": "https://api.spotify.test/browse/categories/workout/playlists",
-            "limit": 2,
-            "next": null,
-            "offset": 0,
-            "previous": null,
-            "total": 1,
-            "items": [{
-                "id": "playlist-1",
-                "name": "Workout",
-                "uri": "spotify:playlist:playlist-1",
-                "description": "Keep moving",
-                "public": true,
-                "collaborative": false,
-                "images": []
-            }]
-        }))
-        .into_response(),
-        (Method::GET, "/browse/featured-playlists") => Json(serde_json::json!({
-            "message": "Featured",
-            "playlists": {
-                "href": "https://api.spotify.test/browse/featured-playlists",
-                "limit": 2,
-                "next": null,
-                "offset": 0,
-                "previous": null,
-                "total": 1,
-                "items": [{
-                    "id": "playlist-1",
-                    "name": "Workout",
-                    "uri": "spotify:playlist:playlist-1",
-                    "description": "Keep moving",
-                    "public": true,
-                    "collaborative": false,
-                    "images": []
-                }]
-            }
-        }))
-        .into_response(),
-        (Method::GET, "/browse/new-releases") => Json(serde_json::json!({
-            "albums": {
-                "href": "https://api.spotify.test/browse/new-releases",
-                "limit": 2,
-                "next": null,
-                "offset": 0,
-                "previous": null,
-                "total": 1,
-                "items": [{
-                    "id": "album-1",
-                    "name": "Album",
-                    "uri": "spotify:album:album-1",
-                    "artists": [{"name": "Artist"}],
-                    "images": []
-                }]
-            }
         }))
         .into_response(),
         (Method::GET, "/me/playlists") => Json(serde_json::json!({
@@ -266,17 +215,9 @@ async fn spotify_mock(
         (Method::GET, "/me/library/contains") => {
             Json(serde_json::json!([true, false])).into_response()
         }
-        (Method::POST, "/me/playlists") => Json(serde_json::json!({
-            "id": "playlist-2",
-            "name": "New Playlist",
-            "uri": "spotify:playlist:playlist-2",
-            "description": "Made by UHC",
-            "public": false,
-            "collaborative": false,
-            "images": [],
-            "tracks": {"total": 0}
-        }))
-        .into_response(),
+        (Method::POST, "/me/playlists") => {
+            json_response(StatusCode::OK, SPOTIFY_2026_PLAYLIST.to_string())
+        }
         (Method::PUT, "/playlists/playlist-1") => StatusCode::NO_CONTENT.into_response(),
         (Method::POST, "/playlists/playlist-1/items") => Json(serde_json::json!({
             "snapshot_id": "snapshot-add"
@@ -325,6 +266,7 @@ fn spotify_device_maps_to_prefixed_zone() {
         device_type: "Speaker".to_string(),
         is_active: true,
         is_restricted: false,
+        supports_volume: true,
         volume_percent: Some(42),
     };
 
@@ -344,6 +286,7 @@ fn restricted_spotify_device_is_not_controllable() {
         device_type: "Speaker".to_string(),
         is_active: false,
         is_restricted: true,
+        supports_volume: false,
         volume_percent: None,
     };
     let zone = device.to_zone(None);
@@ -616,7 +559,251 @@ async fn search_returns_track_album_and_artist_uri_targets() {
 }
 
 #[tokio::test]
-async fn catalog_playlists_saved_tracks_and_playlist_edits_use_spotify_endpoints() {
+async fn official_2026_device_shape_skips_null_ids_and_honors_supports_volume() {
+    let (base_url, mock, server) = mock_server().await;
+    *mock.devices_response.lock().expect("devices response lock") =
+        Some((StatusCode::OK, SPOTIFY_2026_DEVICES.to_string()));
+    let adapter = SpotifyAdapter::with_base_url(create_bus(), base_url);
+    adapter.set_token(spotify_token()).await;
+
+    adapter
+        .update()
+        .await
+        .expect("the current Spotify device response must be accepted");
+    let devices = adapter.get_devices().await;
+    assert_eq!(devices.len(), 2);
+    let fixed = devices
+        .iter()
+        .find(|device| device.id == "fixed-device")
+        .expect("fixed-volume device");
+    let controllable = devices
+        .iter()
+        .find(|device| device.id == "controllable-device")
+        .expect("volume-capable device");
+    assert!(fixed.to_zone(None).volume_control.is_none());
+    assert_eq!(
+        controllable
+            .to_zone(None)
+            .volume_control
+            .as_ref()
+            .map(|volume| volume.value),
+        Some(42.0)
+    );
+    let response = adapter
+        .handle_command("spotify:fixed-device", AdapterCommand::VolumeAbsolute(20))
+        .await
+        .expect("fixed device refusal");
+    assert!(!response.success);
+    assert!(response.error.expect("error").contains("does not support"));
+    assert!(!mock
+        .requests
+        .lock()
+        .expect("mock lock")
+        .iter()
+        .any(|request| request.contains("device_id=fixed-device")));
+    server.abort();
+}
+
+#[tokio::test]
+async fn search_clamps_every_request_to_the_official_2026_maximum() {
+    let contract: serde_json::Value =
+        serde_json::from_str(SPOTIFY_2026_CONTRACT).expect("Spotify contract fixture");
+    let maximum = contract["search_limit_max"]
+        .as_u64()
+        .expect("search maximum");
+    let (base_url, mock, server) = mock_server().await;
+    let adapter = SpotifyAdapter::with_base_url(create_bus(), base_url);
+    adapter.set_token(spotify_token()).await;
+
+    adapter
+        .search("Song", 50)
+        .await
+        .expect("Spotify search response");
+    let requests = mock.requests.lock().expect("mock lock").clone();
+    let search_request = requests
+        .iter()
+        .find(|request| request.starts_with("GET /search?"))
+        .expect("search request");
+    assert!(search_request.contains(&format!("limit={maximum}")));
+    assert!(!search_request.contains("limit=50"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn current_playlist_shape_and_content_creation_use_me_endpoint() {
+    let contract: serde_json::Value =
+        serde_json::from_str(SPOTIFY_2026_CONTRACT).expect("Spotify contract fixture");
+    let create_path = contract["playlist_create_path"]
+        .as_str()
+        .expect("playlist create path");
+    let items_field = contract["playlist_items_field"]
+        .as_str()
+        .expect("playlist items field");
+    let (base_url, mock, server) = mock_server().await;
+    let adapter = SpotifyAdapter::with_base_url(create_bus(), base_url);
+    adapter.set_token(spotify_token()).await;
+
+    let created = LibraryAdapter::content(
+        &adapter,
+        "create_playlist",
+        &serde_json::json!({"name": "Official Current"}),
+    )
+    .await
+    .expect("content playlist creation");
+    assert_eq!(created[items_field]["total"], 0);
+    let requests = mock.requests.lock().expect("mock lock").clone();
+    assert!(requests
+        .iter()
+        .any(|request| request == &format!("POST {create_path}")));
+    assert!(!requests.iter().any(|request| request.contains("/users/")));
+    server.abort();
+}
+
+#[tokio::test]
+async fn removed_development_mode_browse_actions_refuse_without_provider_calls() {
+    let contract: serde_json::Value =
+        serde_json::from_str(SPOTIFY_2026_CONTRACT).expect("Spotify contract fixture");
+    let removed = contract["removed_development_mode_browse_actions"]
+        .as_array()
+        .expect("removed browse actions");
+    let (base_url, mock, server) = mock_server().await;
+    let adapter = SpotifyAdapter::with_base_url(create_bus(), base_url);
+    adapter.set_token(spotify_token()).await;
+
+    for action in removed {
+        let action = action.as_str().expect("action name");
+        let error = LibraryAdapter::content(
+            &adapter,
+            action,
+            &serde_json::json!({"category_id": "workout"}),
+        )
+        .await
+        .expect_err("removed Development Mode browse action must be refused");
+        let message = error.to_string();
+        assert!(message.contains("Development Mode"), "{action}: {message}");
+    }
+    assert!(adapter
+        .browse_categories(10, 0, None, None)
+        .await
+        .expect_err("removed category browse must be refused")
+        .to_string()
+        .contains("Development Mode"));
+    assert!(adapter
+        .browse_category_playlists("workout", 10, 0, None)
+        .await
+        .expect_err("removed category-playlist browse must be refused")
+        .to_string()
+        .contains("Development Mode"));
+    assert!(adapter
+        .browse_featured_playlists(10, 0, None, None, None)
+        .await
+        .expect_err("removed featured browse must be refused")
+        .to_string()
+        .contains("Development Mode"));
+    assert!(adapter
+        .browse_new_releases(10, 0, None)
+        .await
+        .expect_err("removed new-releases browse must be refused")
+        .to_string()
+        .contains("Development Mode"));
+    let requests = mock.requests.lock().expect("mock lock").clone();
+    assert!(!requests.iter().any(|request| request.contains("/browse/")));
+    server.abort();
+}
+
+#[tokio::test]
+async fn quota_exceeded_is_classified_without_exposing_the_provider_body() {
+    let (base_url, mock, server) = mock_server().await;
+    *mock.search_response.lock().expect("search response lock") = Some((
+        StatusCode::TOO_MANY_REQUESTS,
+        SPOTIFY_2026_QUOTA.to_string(),
+    ));
+    let adapter = SpotifyAdapter::with_base_url(create_bus(), base_url);
+    adapter.set_token(spotify_token()).await;
+
+    let message = adapter
+        .search("Song", 10)
+        .await
+        .expect_err("quota exhaustion must fail")
+        .to_string();
+    assert!(message.contains("QUOTA_EXCEEDED"), "{message}");
+    assert!(message.to_ascii_lowercase().contains("quota"), "{message}");
+    assert!(
+        !message.contains("provider-secret-diagnostic-marker"),
+        "{message}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn ordinary_rate_limit_is_distinct_and_does_not_expose_the_provider_body() {
+    let (base_url, mock, server) = mock_server().await;
+    *mock.search_response.lock().expect("search response lock") = Some((
+        StatusCode::TOO_MANY_REQUESTS,
+        SPOTIFY_2026_RATE_LIMIT.to_string(),
+    ));
+    let adapter = SpotifyAdapter::with_base_url(create_bus(), base_url);
+    adapter.set_token(spotify_token()).await;
+
+    let message = adapter
+        .search("Song", 10)
+        .await
+        .expect_err("rate limiting must fail")
+        .to_string();
+    assert!(
+        message.to_ascii_lowercase().contains("rate limit"),
+        "{message}"
+    );
+    assert!(!message.contains("QUOTA_EXCEEDED"), "{message}");
+    assert!(
+        !message.contains("provider-rate-limit-diagnostic"),
+        "{message}"
+    );
+    server.abort();
+}
+
+#[test]
+fn spotify_capability_truth_distinguishes_removed_and_unsupported_operations() {
+    assert!(matches!(
+        support(ZoneTarget::Spotify, Capability::Browse),
+        Support::NotImplemented { .. }
+    ));
+    for capability in [
+        Capability::QueueJump,
+        Capability::QueueReorder,
+        Capability::QueueRemove,
+        Capability::QueueClear,
+        Capability::QueueTransfer,
+        Capability::MultiroomSync,
+    ] {
+        assert!(
+            matches!(
+                support(ZoneTarget::Spotify, capability),
+                Support::Unsupported { .. }
+            ),
+            "{} must be a provider limitation, not an implementation promise",
+            capability.name()
+        );
+    }
+}
+
+#[test]
+fn spotify_tool_source_does_not_advertise_removed_development_mode_actions() {
+    let contract: serde_json::Value =
+        serde_json::from_str(SPOTIFY_2026_CONTRACT).expect("Spotify contract fixture");
+    let source = include_str!("../src/mcp/tools/spotify.rs");
+    for action in contract["removed_development_mode_browse_actions"]
+        .as_array()
+        .expect("removed browse actions")
+    {
+        let action = action.as_str().expect("action name");
+        assert!(!source.contains(&format!("\"{action}\"")), "{action}");
+    }
+    assert!(source.contains("Development Mode"));
+}
+
+#[tokio::test]
+async fn playlists_saved_tracks_and_playlist_edits_use_current_spotify_endpoints() {
     let (base_url, mock, server) = mock_server().await;
     let adapter = SpotifyAdapter::with_base_url(create_bus(), base_url);
     adapter
@@ -626,27 +813,6 @@ async fn catalog_playlists_saved_tracks_and_playlist_edits_use_spotify_endpoints
             expires_at: Some(u64::MAX),
         })
         .await;
-
-    let categories = adapter
-        .browse_categories(2, 0, None, None)
-        .await
-        .expect("Spotify categories");
-    assert_eq!(categories.items[0].id, "workout");
-    let category_playlists = adapter
-        .browse_category_playlists("workout", 2, 0, None)
-        .await
-        .expect("Spotify category playlists");
-    assert_eq!(category_playlists.items[0].id, "playlist-1");
-    let featured = adapter
-        .browse_featured_playlists(2, 0, None, None, None)
-        .await
-        .expect("Spotify featured playlists");
-    assert_eq!(featured.items[0].id, "playlist-1");
-    let releases = adapter
-        .browse_new_releases(2, 0, None)
-        .await
-        .expect("Spotify new releases");
-    assert_eq!(releases.items[0].id, "album-1");
 
     let playlists = adapter
         .get_playlists(2, 0)
@@ -679,6 +845,7 @@ async fn catalog_playlists_saved_tracks_and_playlist_edits_use_spotify_endpoints
         .await
         .expect("Spotify create playlist");
     assert_eq!(created.id, "playlist-2");
+    assert_eq!(created.items.as_ref().map(|items| items.total), Some(0));
     adapter
         .update_playlist("playlist-1", Some("Renamed"), Some(false), None, None)
         .await
@@ -708,18 +875,7 @@ async fn catalog_playlists_saved_tracks_and_playlist_edits_use_spotify_endpoints
         .expect("Spotify remove saved track");
 
     let requests = mock.requests.lock().expect("mock lock").clone();
-    assert!(requests
-        .iter()
-        .any(|request| request.starts_with("GET /browse/categories?")));
-    assert!(requests
-        .iter()
-        .any(|request| request.starts_with("GET /browse/categories/workout/playlists?")));
-    assert!(requests
-        .iter()
-        .any(|request| request.starts_with("GET /browse/featured-playlists?")));
-    assert!(requests
-        .iter()
-        .any(|request| request.starts_with("GET /browse/new-releases?")));
+    assert!(!requests.iter().any(|request| request.contains("/browse/")));
     assert!(requests
         .iter()
         .any(|request| request.starts_with("GET /me/playlists?")));
