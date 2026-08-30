@@ -31,11 +31,15 @@ credentials, raw adapter IDs, or executable payloads. The local aggregator
 maintains the reverse handle map.
 
 Every command is independently authorized by a compact Ed25519 JWS grant. UHC
-pins issuer keys by `key_id` and verifies issuer, audience, installation, node,
-request, epoch, scope, exact canonical payload hash, expiry, and grant
-generation before dispatch. A bounded result ledger makes `request_id` the
-idempotency key: a retry returns the recorded terminal result, while a lost
-terminal result is `unknown_outcome` and is never silently replayed.
+pins issuer keys by `key_id` and verifies issuer, audience, installation,
+control node, request, epoch, scope, exact canonical payload hash, expiry, and
+grant generation before dispatch. The control-node identity is carried in the
+signed grant and the command envelope, allowing one installation to serve
+multiple paired control nodes without a process-wide node allowlist. A bounded
+result ledger binds the signed `idempotency_key` to the canonical payload hash:
+a retry with a new request ID returns the recorded terminal result, while key
+reuse with a different payload is rejected. A lost terminal result is
+`unknown_outcome` and is never silently replayed.
 
 Artwork is a bounded, low-priority request/response lane. Capabilities are
 opaque, short-lived, installation-scoped, and single-use (except an identical

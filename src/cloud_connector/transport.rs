@@ -1,5 +1,13 @@
 use std::time::Duration;
 
+/// The relay must prove liveness periodically after authentication.  These
+/// bounds are deliberately conservative; a missed heartbeat cannot make a
+/// command execute, but it must eventually release a black-holed session.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+pub const PEER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
+pub const PEER_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelayEndpoint(String);
 
@@ -78,6 +86,33 @@ pub struct ConnectorRunLoop {
     backoff: Backoff,
     outbound: Vec<RunLoopEvent>,
     last_heartbeat_ms: Option<u64>,
+}
+
+/// Small deterministic liveness primitive used by the real socket loop.  It
+/// stores milliseconds rather than an `Instant` so tests can exercise expiry
+/// without sleeping. Saturating arithmetic prevents clock rollback from
+/// underflowing; command grants independently fail their wall-clock checks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerWatchdog {
+    last_seen_ms: u64,
+    timeout_ms: u64,
+}
+
+impl PeerWatchdog {
+    pub fn new(now_ms: u64, timeout: Duration) -> Self {
+        Self {
+            last_seen_ms: now_ms,
+            timeout_ms: timeout.as_millis().try_into().unwrap_or(u64::MAX),
+        }
+    }
+
+    pub fn observe(&mut self, now_ms: u64) {
+        self.last_seen_ms = now_ms;
+    }
+
+    pub fn expired(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.last_seen_ms) >= self.timeout_ms
+    }
 }
 impl Default for ConnectorRunLoop {
     fn default() -> Self {

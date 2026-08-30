@@ -1,13 +1,16 @@
 #[path = "../src/cloud_connector/mod.rs"]
 mod cloud_connector;
 
-use cloud_connector::commands::{GrantClaims, GrantError};
-use cloud_connector::protocol::{canonical_json, parse_envelope, sha256_canonical};
+use cloud_connector::commands::{GrantClaims, GrantError, MAX_REPLAY_REQUESTS};
+use cloud_connector::protocol::{
+    canonical_json, parse_envelope, parse_relay_message, sha256_canonical,
+};
 use cloud_connector::protocol::{FieldPatch, ZoneDelta};
 use cloud_connector::*;
 use ed25519_dalek::{Signer, SigningKey, Verifier};
 use rand::rngs::OsRng;
 use serde_json::json;
+use std::time::Duration;
 
 fn id(prefix: &str) -> String {
     format!("{prefix}_01234567890")
@@ -40,6 +43,47 @@ fn sanitized_protocol_fixtures_parse_and_adversarial_major_version_rejects() {
 fn legacy_parser_rejects_duplicate_security_fields() {
     let duplicate = br#"{"protocol_version":1,"type":"hello","installation_id":"install_01234567890","epoch":1,"message_id":"message_01234567890","protocol_version":1}"#;
     assert_eq!(parse_envelope(duplicate), Err("duplicate_object_key"));
+}
+
+#[test]
+fn relay_parser_rejects_unknown_security_fields_and_duplicate_or_nonfinite_values() {
+    let base = json!({
+        "type": "command",
+        "body": {
+            "protocol_version": 1,
+            "installation_id": "11111111-1111-4111-8111-111111111111",
+            "control_node_id": "66666666-6666-4666-8666-666666666666",
+            "epoch": 7,
+            "message_id": "message_demo_command",
+            "request_id": "22222222-2222-4222-8222-222222222222",
+            "idempotency_key": "33333333-3333-4333-8333-333333333333",
+            "created_at": 1788060000000_i64,
+            "expires_at": 1788060015000_i64,
+            "payload": {"zone_handle": "zone_demo_lounge", "action": "transport.next"},
+            "grant": "fake-v1-grant-not-a-credential-000000000000000000000000"
+        }
+    });
+    let mut arbitrary_http = base.clone();
+    arbitrary_http["body"]["payload"]["url"] = json!("http://127.0.0.1/admin");
+    assert_eq!(
+        parse_relay_message(&serde_json::to_vec(&arbitrary_http).unwrap()),
+        Err("invalid_relay_message")
+    );
+
+    let mut missing_grant = base.clone();
+    missing_grant["body"]
+        .as_object_mut()
+        .unwrap()
+        .remove("grant");
+    assert_eq!(
+        parse_relay_message(&serde_json::to_vec(&missing_grant).unwrap()),
+        Err("invalid_relay_message")
+    );
+
+    let nonfinite = br#"{"type":"command","body":{"payload":{"zone_handle":"zone_demo_lounge","action":"volume.absolute","value":1e999}}}"#;
+    assert_eq!(parse_relay_message(nonfinite), Err("invalid_relay_message"));
+    let duplicate = br#"{"type":"command","body":{"payload":{"zone_handle":"zone_demo_lounge","action":"transport.next","action":"transport.previous"}}}"#;
+    assert_eq!(parse_relay_message(duplicate), Err("duplicate_object_key"));
 }
 
 #[test]
@@ -117,6 +161,27 @@ fn artwork_lane_rejects_source_output_over_bound() {
 }
 
 #[test]
+fn artwork_lane_rejects_work_beyond_pending_bound() {
+    let mut lane = ArtLane::default();
+    for index in 0..cloud_connector::artwork::MAX_PENDING {
+        lane.enqueue(ArtRequest {
+            request_id: format!("request_{index:016}"),
+            zone_handle: id("zone"),
+            art_capability: format!("capability_{index:032}"),
+        })
+        .unwrap();
+    }
+    assert_eq!(
+        lane.enqueue(ArtRequest {
+            request_id: id("request_overflow"),
+            zone_handle: id("zone"),
+            art_capability: id("capability_overflow_012345678901234567890"),
+        }),
+        Err(cloud_connector::artwork::ArtError::Busy)
+    );
+}
+
+#[test]
 fn state_delta_field_patches_preserve_unchanged_set_and_clear() {
     let unchanged: ZoneDelta =
         serde_json::from_value(json!({"zone_handle":"zone_demo_lounge","state":"playing"}))
@@ -138,20 +203,22 @@ fn canonical_payload_hash_is_key_order_independent() {
 #[test]
 fn opaque_handles_round_trip_locally_without_provider_id_in_projection() {
     let mut store = StateStore::default();
-    let projection = store.snapshot(SemanticStateInput {
-        installation_id: id("install"),
-        epoch: 1,
-        revision: 1,
-        observed_at: 10,
-        expires_at: 20,
-        zones: vec![cloud_connector::state::SemanticZoneInput {
-            provider_id: "roon:secret-provider-id".into(),
-            name: "Lounge".into(),
-            state: "playing".into(),
-            volume: None,
-            now_playing: None,
-        }],
-    });
+    let projection = store
+        .snapshot(SemanticStateInput {
+            installation_id: "11111111-1111-4111-8111-111111111111".into(),
+            epoch: 1,
+            revision: 1,
+            observed_at: 10,
+            expires_at: 20,
+            zones: vec![cloud_connector::state::SemanticZoneInput {
+                provider_id: "roon:secret-provider-id".into(),
+                name: "Lounge".into(),
+                state: "playing".into(),
+                volume: None,
+                now_playing: None,
+            }],
+        })
+        .unwrap();
     let encoded = serde_json::to_string(&projection.zones).unwrap();
     assert!(!encoded.contains("roon:secret-provider-id"));
     assert!(store
@@ -162,31 +229,85 @@ fn opaque_handles_round_trip_locally_without_provider_id_in_projection() {
     assert!(!store.is_fresh(1, 20));
 
     let removed_handle = projection.zones[0].zone_handle.clone();
-    store.snapshot(SemanticStateInput {
-        installation_id: id("install"),
-        epoch: 1,
-        revision: 2,
-        observed_at: 21,
-        expires_at: 30,
-        zones: vec![],
-    });
+    store
+        .snapshot(SemanticStateInput {
+            installation_id: "11111111-1111-4111-8111-111111111111".into(),
+            epoch: 1,
+            revision: 2,
+            observed_at: 21,
+            expires_at: 30,
+            zones: vec![],
+        })
+        .unwrap();
     assert!(store.provider_id(&removed_handle).is_none());
 }
 
 #[test]
 fn stale_state_is_not_command_eligible() {
     let mut store = StateStore::default();
-    let projection = store.snapshot(SemanticStateInput {
-        installation_id: id("install"),
-        epoch: 9,
-        revision: 4,
-        observed_at: 100,
-        expires_at: 200,
-        zones: vec![],
-    });
+    let projection = store
+        .snapshot(SemanticStateInput {
+            installation_id: "11111111-1111-4111-8111-111111111111".into(),
+            epoch: 9,
+            revision: 4,
+            observed_at: 100,
+            expires_at: 200,
+            zones: vec![],
+        })
+        .unwrap();
     assert!(store.is_fresh(projection.epoch, 199));
     assert!(!store.is_fresh(projection.epoch, 200));
     assert!(!store.is_fresh(projection.epoch + 1, 150));
+}
+
+#[test]
+fn outbound_projection_rejects_oversized_duplicate_and_nonfinite_state() {
+    use cloud_connector::state::{NowPlayingInput, SemanticZoneInput, VolumeInput};
+
+    let zone = |provider_id: &str| SemanticZoneInput {
+        provider_id: provider_id.into(),
+        name: "Lounge".into(),
+        state: "playing".into(),
+        volume: None,
+        now_playing: None,
+    };
+    let input = |zones| SemanticStateInput {
+        installation_id: "11111111-1111-4111-8111-111111111111".into(),
+        epoch: 1,
+        revision: 1,
+        observed_at: 10,
+        expires_at: 20,
+        zones,
+    };
+
+    let mut store = StateStore::default();
+    assert!(store
+        .snapshot(input(vec![zone("roon:one"), zone("roon:one")]))
+        .is_err());
+
+    let oversized = (0..129)
+        .map(|index| zone(&format!("roon:{index}")))
+        .collect();
+    assert!(store.snapshot(input(oversized)).is_err());
+
+    let mut bad_volume = zone("roon:volume");
+    bad_volume.volume = Some(VolumeInput {
+        value: f64::NAN,
+        min: 0.0,
+        max: 100.0,
+        step: 1.0,
+        scale: "percent".into(),
+    });
+    assert!(store.snapshot(input(vec![bad_volume])).is_err());
+
+    let mut bad_art = zone("roon:art");
+    bad_art.now_playing = Some(NowPlayingInput {
+        title: "Track".into(),
+        artist: "Artist".into(),
+        art_revision: Some("not valid because it has spaces".into()),
+        image_key: Some("provider-secret".into()),
+    });
+    assert!(store.snapshot(input(vec![bad_art])).is_err());
 }
 
 #[test]
@@ -242,7 +363,7 @@ fn command_with_claims(
         issuer: "hiphi-command-authorization".into(),
         audience: "uhc-connector".into(),
         installation_id: id("install"),
-        control_node_id: id("node"),
+        control_node_id: uuid(3),
         request_id,
         idempotency_key,
         epoch: 7,
@@ -257,6 +378,7 @@ fn command_with_claims(
     CommandEnvelope {
         protocol_version: 1,
         installation_id: claims.installation_id.clone(),
+        control_node_id: uuid(3),
         epoch: 7,
         message_id: id("message"),
         request_id: claims.request_id,
@@ -275,7 +397,6 @@ fn grant_binds_key_audience_expiry_generation_and_replay() {
         "hiphi-command-authorization",
         "uhc-connector",
         id("install"),
-        id("node"),
         7,
         3,
     );
@@ -301,7 +422,6 @@ fn grant_rejects_each_security_binding_dimension() {
         "hiphi-command-authorization",
         "uhc-connector",
         id("install"),
-        id("node"),
         7,
         3,
     );
@@ -335,13 +455,12 @@ fn grant_rejects_each_security_binding_dimension() {
     );
 
     let wrong_node = command_with_claims(1_000, &key, 3, |claims| {
-        claims.control_node_id = id("other_node");
+        claims.control_node_id = uuid(4);
     });
     let mut node_verifier = CommandGrantVerifier::new(
         "hiphi-command-authorization",
         "uhc-connector",
         id("install"),
-        id("node"),
         7,
         3,
     );
@@ -390,10 +509,172 @@ fn grant_rejects_each_security_binding_dimension() {
 }
 
 #[test]
+fn command_ledger_expires_terminal_results_before_reuse() {
+    let mut ledger = cloud_connector::commands::CommandLedger::default();
+    ledger.record_at("request", CommandOutcome::Executed, 1_000);
+    assert_eq!(ledger.get_at("request", 61_001), None);
+    assert!(ledger.is_empty());
+}
+
+#[test]
+fn command_ledger_refuses_new_entry_at_capacity_without_evicting_live_results() {
+    let mut ledger = cloud_connector::commands::CommandLedger::default();
+    for index in 0..257 {
+        ledger.record_at(format!("request_{index}"), CommandOutcome::Executed, index);
+    }
+    assert_eq!(ledger.len(), 256);
+    assert_eq!(
+        ledger.get_at("request_0", 257),
+        Some(CommandOutcome::Executed)
+    );
+    assert_eq!(ledger.get_at("request_256", 257), None);
+}
+
+#[test]
+fn valid_new_request_retry_uses_the_signed_idempotency_result_without_reexecution() {
+    let key = SigningKey::generate(&mut OsRng);
+    let mut verifier = CommandGrantVerifier::new(
+        "hiphi-command-authorization",
+        "uhc-connector",
+        id("install"),
+        7,
+        3,
+    );
+    verifier.pin_key("issuer-1", key.verifying_key());
+    let first = command_and_grant(1_000, &key, 3);
+    let first_verified = verifier.verify(&first, 1_000).unwrap();
+    let hash = first_verified.payload.canonical_hash().unwrap();
+    let mut ledger = cloud_connector::commands::CommandLedger::default();
+    ledger
+        .record_command_at(
+            first.idempotency_key.to_string(),
+            &hash,
+            CommandOutcome::Executed,
+            1_000,
+        )
+        .unwrap();
+
+    let retry = command_with_claims(1_001, &key, 3, |claims| {
+        claims.request_id = uuid(88);
+    });
+    let retry_verified = verifier.verify(&retry, 1_001).unwrap();
+    assert_eq!(retry.idempotency_key, first.idempotency_key);
+    assert_eq!(retry_verified.payload.canonical_hash().unwrap(), hash);
+    assert_eq!(
+        ledger
+            .lookup_command_at(&retry.idempotency_key.to_string(), &hash, 1_001)
+            .unwrap(),
+        Some(CommandOutcome::Executed)
+    );
+}
+
+#[test]
+fn invalid_grant_cannot_poison_the_idempotency_ledger() {
+    let key = SigningKey::generate(&mut OsRng);
+    let mut verifier = CommandGrantVerifier::new(
+        "hiphi-command-authorization",
+        "uhc-connector",
+        id("install"),
+        7,
+        3,
+    );
+    verifier.pin_key("issuer-1", key.verifying_key());
+    let invalid = command_with_claims(1_000, &key, 3, |claims| {
+        claims.audience = "attacker".into();
+    });
+    let ledger = cloud_connector::commands::CommandLedger::default();
+    assert_eq!(
+        verifier.verify(&invalid, 1_000),
+        Err(GrantError::WrongAudience)
+    );
+    assert!(ledger.is_empty());
+}
+
+#[test]
+fn command_ledger_binds_idempotency_to_payload_hash() {
+    let mut ledger = cloud_connector::commands::CommandLedger::default();
+    ledger
+        .record_command_at("idempotency", "hash_a", CommandOutcome::Executed, 1_000)
+        .unwrap();
+    assert_eq!(
+        ledger
+            .lookup_command_at("idempotency", "hash_a", 1_001)
+            .unwrap(),
+        Some(CommandOutcome::Executed)
+    );
+    assert_eq!(
+        ledger.lookup_command_at("idempotency", "hash_b", 1_001),
+        Err(cloud_connector::commands::LedgerError::Conflict)
+    );
+    assert_eq!(ledger.len(), 1);
+}
+
+#[test]
+fn command_replay_cache_remains_bounded_under_unique_grants() {
+    let key = SigningKey::generate(&mut OsRng);
+    let mut verifier = CommandGrantVerifier::new(
+        "hiphi-command-authorization",
+        "uhc-connector",
+        id("install"),
+        7,
+        3,
+    );
+    verifier.pin_key("issuer-1", key.verifying_key());
+    for request in 0..MAX_REPLAY_REQUESTS {
+        let command = command_with_claims(1_000, &key, 3, |claims| {
+            claims.request_id = uuid((request + 100) as u128);
+        });
+        assert!(verifier.verify(&command, 1_000).is_ok());
+    }
+    assert_eq!(verifier.seen_requests_len(), MAX_REPLAY_REQUESTS);
+    let full = command_with_claims(1_000, &key, 3, |claims| {
+        claims.request_id = uuid(10_000);
+    });
+    assert_eq!(verifier.verify(&full, 1_000), Err(GrantError::AtCapacity));
+}
+
+#[test]
+fn command_verifier_binds_the_signed_node_to_each_envelope() {
+    let key = SigningKey::generate(&mut OsRng);
+    let mut verifier = CommandGrantVerifier::new(
+        "hiphi-command-authorization",
+        "uhc-connector",
+        id("install"),
+        7,
+        3,
+    );
+    verifier.pin_key("issuer-1", key.verifying_key());
+    let wrong_node = command_with_claims(1_000, &key, 3, |claims| {
+        claims.control_node_id = uuid(4);
+    });
+    assert_eq!(
+        verifier.verify(&wrong_node, 1_000),
+        Err(GrantError::BindingMismatch)
+    );
+
+    let mut node_a = command_with_claims(1_000, &key, 3, |claims| {
+        claims.request_id = uuid(10);
+        claims.control_node_id = uuid(10);
+    });
+    node_a.control_node_id = uuid(10);
+    assert!(verifier.verify(&node_a, 1_000).is_ok());
+
+    let mut node_b = command_with_claims(1_000, &key, 3, |claims| {
+        claims.request_id = uuid(11);
+        claims.control_node_id = uuid(11);
+    });
+    node_b.control_node_id = uuid(11);
+    assert!(verifier.verify(&node_b, 1_000).is_ok());
+}
+
+#[test]
 fn dropped_result_is_idempotent_and_art_lane_has_no_url_surface() {
     let mut ledger = cloud_connector::commands::CommandLedger::default();
     ledger.record(id("request"), CommandOutcome::Executed);
-    assert_eq!(ledger.get(&id("request")), Some(CommandOutcome::Executed));
+    assert_eq!(
+        ledger.get_at(&id("request"), 1_000),
+        Some(CommandOutcome::Executed)
+    );
     let mut lane = ArtLane::default();
     let request = ArtRequest {
         request_id: id("request"),
@@ -425,6 +706,39 @@ fn run_loop_increments_epoch_sends_snapshot_first_and_drops_offline_work() {
     assert_eq!(loop_state.state(), ConnectionState::Offline);
     assert!(loop_state.drain_events().is_empty());
     assert!(loop_state.reconnect_delay() <= std::time::Duration::from_secs(30));
+}
+
+#[test]
+fn revocation_is_terminal_for_the_run_loop() {
+    let mut loop_state = ConnectorRunLoop::default();
+    loop_state.connect();
+    loop_state.revoke();
+    loop_state.connect();
+    assert_eq!(loop_state.state(), ConnectionState::Revoked);
+    assert!(loop_state.drain_events().is_empty());
+}
+
+#[test]
+fn backoff_progresses_until_authenticated_session_then_resets() {
+    let mut backoff = cloud_connector::transport::Backoff::default();
+    assert_eq!(backoff.next_delay(), Duration::from_millis(250));
+    assert_eq!(backoff.next_delay(), Duration::from_millis(500));
+    assert_eq!(backoff.next_delay(), Duration::from_millis(1_000));
+    // The runtime calls reset only after challenge/proof/session establishment.
+    backoff.reset();
+    assert_eq!(backoff.next_delay(), Duration::from_millis(250));
+}
+
+#[test]
+fn peer_watchdog_expires_only_after_bounded_silence() {
+    let mut watchdog = cloud_connector::transport::PeerWatchdog::new(
+        10_000,
+        cloud_connector::transport::PEER_HEARTBEAT_TIMEOUT,
+    );
+    assert!(!watchdog.expired(10_000 + 89_999));
+    watchdog.observe(100_000);
+    assert!(!watchdog.expired(100_000 + 89_999));
+    assert!(watchdog.expired(100_000 + 90_000));
 }
 
 #[test]

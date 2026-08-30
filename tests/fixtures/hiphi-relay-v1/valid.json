@@ -11,7 +11,7 @@
     {"type":"challenge","body":{"protocol_version":1,"challenge_id":"55555555-5555-4555-8555-555555555555","endpoint":"wss://cloud.invalid/v1/relay/connect","nonce":"fake_nonce_not_a_credential_000000000000","expires_at":1788060060000}},
     {"type":"session_established","body":{"epoch":7}},
     {"type":"heartbeat","body":{"epoch":7,"sent_at":1788060000000}},
-    {"type":"command","body":{"protocol_version":1,"installation_id":"11111111-1111-4111-8111-111111111111","epoch":7,"message_id":"message_demo_command","request_id":"22222222-2222-4222-8222-222222222222","idempotency_key":"33333333-3333-4333-8333-333333333333","created_at":1788060000000,"expires_at":1788060015000,"payload":{"zone_handle":"zone_demo_lounge","action":"volume.absolute","value":-23.5},"grant":"fake-v1-grant-not-a-credential-000000000000000000000000"}},
+    {"type":"command","body":{"protocol_version":1,"installation_id":"11111111-1111-4111-8111-111111111111","control_node_id":"66666666-6666-4666-8666-666666666666","epoch":7,"message_id":"message_demo_command","request_id":"22222222-2222-4222-8222-222222222222","idempotency_key":"33333333-3333-4333-8333-333333333333","created_at":1788060000000,"expires_at":1788060015000,"payload":{"zone_handle":"zone_demo_lounge","action":"volume.absolute","value":-23.5},"grant":"fake-v1-grant-not-a-credential-000000000000000000000000"}},
     {"type":"artwork_request","body":{"protocol_version":1,"message_id":"message_demo_art_req","installation_id":"11111111-1111-4111-8111-111111111111","epoch":7,"request_id":"44444444-4444-4444-8444-444444444444","zone_handle":"zone_demo_lounge","artwork_revision":"art_demo_004","max_source_bytes":2097152}},
     {"type":"revoke","body":{"reason_code":"owner_revoked"}}
   ],

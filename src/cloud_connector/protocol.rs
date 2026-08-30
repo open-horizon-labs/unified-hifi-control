@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
@@ -16,7 +16,7 @@ pub const MAX_ARTWORK_CHUNK_BYTES: usize = 48 * 1024;
 pub type Epoch = u64;
 pub type TimestampMs = i64;
 pub type InstallationId = String;
-pub type ControlNodeId = String;
+pub type ControlNodeId = Uuid;
 
 // Historical fixture parser only. Runtime traffic uses the typed messages below.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -68,6 +68,7 @@ pub struct ConnectorHello {
     pub capabilities: Vec<String>,
 }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionChallengeMessage {
     pub protocol_version: u16,
     pub challenge_id: Uuid,
@@ -98,13 +99,66 @@ impl CommandAction {
     }
 }
 pub type AllowedAction = CommandAction;
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CommandPayload {
     pub zone_handle: String,
     #[serde(flatten)]
     pub action: CommandAction,
 }
+
+#[derive(Deserialize)]
+#[serde(tag = "action", deny_unknown_fields)]
+enum CommandPayloadWire {
+    #[serde(rename = "transport.play_pause")]
+    PlayPause { zone_handle: String },
+    #[serde(rename = "transport.next")]
+    Next { zone_handle: String },
+    #[serde(rename = "transport.previous")]
+    Previous { zone_handle: String },
+    #[serde(rename = "volume.up")]
+    VolumeUp { zone_handle: String },
+    #[serde(rename = "volume.down")]
+    VolumeDown { zone_handle: String },
+    #[serde(rename = "volume.absolute")]
+    VolumeAbsolute { zone_handle: String, value: f64 },
+}
+
+impl<'de> Deserialize<'de> for CommandPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = CommandPayloadWire::deserialize(deserializer)?;
+        Ok(match wire {
+            CommandPayloadWire::PlayPause { zone_handle } => Self {
+                zone_handle,
+                action: CommandAction::PlayPause,
+            },
+            CommandPayloadWire::Next { zone_handle } => Self {
+                zone_handle,
+                action: CommandAction::Next,
+            },
+            CommandPayloadWire::Previous { zone_handle } => Self {
+                zone_handle,
+                action: CommandAction::Previous,
+            },
+            CommandPayloadWire::VolumeUp { zone_handle } => Self {
+                zone_handle,
+                action: CommandAction::VolumeUp,
+            },
+            CommandPayloadWire::VolumeDown { zone_handle } => Self {
+                zone_handle,
+                action: CommandAction::VolumeDown,
+            },
+            CommandPayloadWire::VolumeAbsolute { zone_handle, value } => Self {
+                zone_handle,
+                action: CommandAction::VolumeAbsolute { value },
+            },
+        })
+    }
+}
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandGrantClaims {
     pub protocol_version: u16,
     pub issuer: String,
@@ -121,9 +175,15 @@ pub struct CommandGrantClaims {
     pub grant_generation: u64,
 }
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+/// A command is addressed to one control node, but the installation can serve
+/// many nodes over its authenticated relay session. The node binding is
+/// repeated in the signed grant claims and this envelope so UHC can verify it
+/// without a process-wide node allowlist.
 pub struct CommandEnvelope {
     pub protocol_version: u16,
     pub installation_id: InstallationId,
+    pub control_node_id: ControlNodeId,
     pub epoch: Epoch,
     pub message_id: String,
     pub request_id: Uuid,
@@ -233,6 +293,7 @@ pub struct StateDelta {
     pub zones: Vec<ZoneDelta>,
 }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtworkRelayRequest {
     pub protocol_version: u16,
     pub message_id: String,
@@ -315,6 +376,16 @@ pub enum RelayMessage {
     Command(CommandEnvelope),
     ArtworkRequest(ArtworkRelayRequest),
     Revoke { reason_code: String },
+}
+
+/// Parse relay traffic with duplicate-key rejection before serde can collapse
+/// a repeated security field to its last value.
+pub fn parse_relay_message(bytes: &[u8]) -> Result<RelayMessage, &'static str> {
+    validate_message_bytes(bytes)?;
+    if contains_duplicate_object_keys(bytes) {
+        return Err("duplicate_object_key");
+    }
+    serde_json::from_slice(bytes).map_err(|_| "invalid_relay_message")
 }
 
 pub fn validate_id(id: &str) -> bool {

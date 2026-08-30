@@ -7,6 +7,7 @@
 
 use futures::{SinkExt, StreamExt};
 use sha2::{Digest as _, Sha256};
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{
     connect_async_with_config,
@@ -15,7 +16,7 @@ use tokio_tungstenite::{
 use uuid::Uuid;
 
 use super::{
-    commands::{CommandGrantVerifier, CommandLedger, CommandOutcome},
+    commands::{CommandGrantVerifier, CommandLedger, CommandOutcome, GrantError, LedgerError},
     config::CloudConnectorConfig,
     identity::InstallationIdentity,
     protocol::{
@@ -25,8 +26,21 @@ use super::{
     },
     session::sign_installation_session_proof,
     state::{snapshot_from_aggregator, StateStore},
-    transport::RelayEndpoint,
+    transport::{
+        PeerWatchdog, RelayEndpoint, CONNECT_TIMEOUT, PEER_HEARTBEAT_CHECK_INTERVAL,
+        PEER_HEARTBEAT_TIMEOUT, SOCKET_WRITE_TIMEOUT,
+    },
 };
+
+const ARTWORK_QUEUE_CAPACITY: usize = super::artwork::MAX_PENDING;
+const ARTWORK_CONCURRENCY: usize = super::artwork::MAX_CONCURRENT;
+const ARTWORK_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionExit {
+    Disconnected,
+    Revoked,
+}
 
 pub fn spawn_from_env(
     state: crate::api::AppState,
@@ -71,18 +85,24 @@ async fn run(
             max_frame_size: Some(super::protocol::MAX_MESSAGE_BYTES),
             ..WebSocketConfig::default()
         };
-        match connect_async_with_config(config.endpoint.as_str(), Some(websocket_limits), false)
-            .await
+        match tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            connect_async_with_config(config.endpoint.as_str(), Some(websocket_limits), false),
+        )
+        .await
         {
-            Ok((socket, _)) => {
-                backoff.reset();
-                if let Err(error) =
-                    run_connection(&state, &config, &identity, &grant, &mut store, socket).await
-                {
-                    tracing::warn!("HiPhi Cloud relay disconnected: {error}");
+            Ok(Ok((socket, _))) => {
+                match run_connection(&state, &config, &identity, &grant, &mut store, socket).await {
+                    // Reset only after the authenticated session completed its
+                    // challenge/proof ceremony.  A socket that accepts TCP
+                    // and then rejects the protocol must still back off.
+                    Ok(ConnectionExit::Disconnected) => backoff.reset(),
+                    Ok(ConnectionExit::Revoked) => break,
+                    Err(error) => tracing::warn!("HiPhi Cloud relay disconnected: {error}"),
                 }
             }
-            Err(error) => tracing::debug!("HiPhi Cloud relay unavailable: {error}"),
+            Ok(Err(error)) => tracing::debug!("HiPhi Cloud relay unavailable: {error}"),
+            Err(_) => tracing::debug!("HiPhi Cloud relay connect timed out"),
         }
     }
 }
@@ -133,10 +153,10 @@ async fn run_connection(
     grant: &str,
     store: &mut StateStore,
     mut socket: Socket,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ConnectionExit> {
     let challenge = match tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        next_json::<RelayMessage>(&mut socket),
+        next_relay_message(&mut socket),
     )
     .await
     .map_err(|_| anyhow::anyhow!("relay challenge timed out"))??
@@ -151,12 +171,10 @@ async fn run_connection(
     validate_challenge(&challenge, config.endpoint.as_str(), now_ms())?;
     // Private relay API expects the proof object itself, not a tagged envelope.
     let proof = sign_installation_session_proof(identity, grant.to_owned(), &challenge, now_ms());
-    socket
-        .send(Message::Text(serde_json::to_string(&proof)?))
-        .await?;
+    send_message(&mut socket, Message::Text(serde_json::to_string(&proof)?)).await?;
     let epoch = match tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        next_json::<RelayMessage>(&mut socket),
+        next_relay_message(&mut socket),
     )
     .await
     .map_err(|_| anyhow::anyhow!("relay proof response timed out"))??
@@ -173,7 +191,7 @@ async fn run_connection(
         1,
         now_ms() as u64,
     )
-    .await;
+    .await?;
     let hello = ConnectorMessage::Hello(ConnectorHello {
         protocol_version: PROTOCOL_VERSION,
         message_id: message_id(),
@@ -213,7 +231,7 @@ async fn run_connection(
             .try_into()
             .map_err(|_| anyhow::anyhow!("issuer key must be 32 bytes"))?,
     )?;
-    let mut verifier = CommandGrantVerifier::new_without_node(
+    let mut verifier = CommandGrantVerifier::new(
         "hiphi-command-authorization",
         UHC_AUDIENCE,
         config.installation_id.clone(),
@@ -222,13 +240,34 @@ async fn run_connection(
     );
     verifier.pin_key(config.issuer_key_id.clone(), issuer_key);
     let mut ledger = CommandLedger::default();
+    let (artwork_tx, mut artwork_rx) = mpsc::channel(ARTWORK_QUEUE_CAPACITY);
+    let artwork_slots =
+        std::sync::Arc::new(Semaphore::new(ARTWORK_QUEUE_CAPACITY + ARTWORK_CONCURRENCY));
+    let artwork_active = std::sync::Arc::new(Semaphore::new(ARTWORK_CONCURRENCY));
     let mut refresh = tokio::time::interval(std::time::Duration::from_secs(20));
+    let mut heartbeat_check = tokio::time::interval(PEER_HEARTBEAT_CHECK_INTERVAL);
+    let mut peer_watchdog = PeerWatchdog::new(now_ms() as u64, PEER_HEARTBEAT_TIMEOUT);
     refresh.tick().await;
     loop {
         let message = tokio::select! {
             _ = refresh.tick() => {
-                let projection = snapshot_from_aggregator(&state.aggregator, store, config.installation_id.clone(), epoch, store.latest().map_or(1, |p| p.revision.saturating_add(1)), now_ms() as u64).await;
+                let projection = snapshot_from_aggregator(&state.aggregator, store, config.installation_id.clone(), epoch, store.latest().map_or(1, |p| p.revision.saturating_add(1)), now_ms() as u64).await?;
                 send_json(&mut socket, &ConnectorMessage::Snapshot(StateSnapshot { protocol_version: PROTOCOL_VERSION, message_id: message_id(), installation_id: projection.installation_id, epoch: projection.epoch, revision: projection.revision, observed_at: projection.observed_at as i64, expires_at: projection.expires_at as i64, zones: projection.zones, now_playing: projection.now_playing })).await?;
+                continue;
+            }
+            _ = heartbeat_check.tick() => {
+                if peer_watchdog.expired(now_ms() as u64) {
+                    anyhow::bail!("relay heartbeat timed out");
+                }
+                send_json(&mut socket, &ConnectorMessage::Heartbeat { epoch, sent_at: now_ms() }).await?;
+                continue;
+            }
+            artwork = artwork_rx.recv() => {
+                if let Some(artwork) = artwork {
+                    send_message(&mut socket, artwork).await?;
+                    continue;
+                }
+                // All artwork workers have gone away; keep servicing the relay.
                 continue;
             }
             message = socket.next() => {
@@ -237,11 +276,14 @@ async fn run_connection(
             }
         };
         match message {
-            Message::Text(text) => match serde_json::from_str::<RelayMessage>(&text)? {
+            Message::Text(text) => match super::protocol::parse_relay_message(text.as_bytes())
+                .map_err(|error| anyhow::anyhow!(error))?
+            {
                 RelayMessage::Heartbeat {
                     epoch: message_epoch,
                     ..
                 } if message_epoch == epoch => {
+                    peer_watchdog.observe(now_ms() as u64);
                     send_json(
                         &mut socket,
                         &ConnectorMessage::Heartbeat {
@@ -253,23 +295,61 @@ async fn run_connection(
                 }
                 RelayMessage::Command(command) => {
                     let request_id = command.request_id;
-                    // The idempotency key is part of the signed command
-                    // binding.  Include it in the local response ledger so a
-                    // compromised relay cannot replay a request id with a
-                    // different key and bypass grant verification.
-                    let ledger_key = format!("{request_id}:{}", command.idempotency_key);
-                    let outcome = if let Some(previous) = ledger.get(&ledger_key) {
-                        previous
-                    } else {
-                        let outcome = match verifier.verify(&command, now_ms()) {
-                            Ok(verified) => dispatch(state, store, &verified.payload).await,
-                            Err(error) => {
-                                tracing::debug!("rejecting relay command: {error}");
-                                CommandOutcome::Forbidden
+                    let now = now_ms();
+                    let payload_hash = command.payload.canonical_hash().ok();
+                    let outcome = match verifier.verify(&command, now) {
+                        Ok(verified) => {
+                            let Some(payload_hash) = payload_hash.as_deref() else {
+                                return Err(anyhow::anyhow!("command payload hash failed"));
+                            };
+                            match ledger.lookup_command_at(
+                                &command.idempotency_key.to_string(),
+                                payload_hash,
+                                now as u64,
+                            ) {
+                                Ok(Some(previous)) => previous,
+                                Err(LedgerError::Conflict) => CommandOutcome::Forbidden,
+                                Ok(None) if ledger.is_full() => CommandOutcome::Busy,
+                                Ok(None) => {
+                                    let outcome = dispatch(state, store, &verified.payload).await;
+                                    if ledger
+                                        .record_command_at(
+                                            command.idempotency_key.to_string(),
+                                            payload_hash,
+                                            outcome,
+                                            now as u64,
+                                        )
+                                        .is_err()
+                                    {
+                                        CommandOutcome::Busy
+                                    } else {
+                                        outcome
+                                    }
+                                }
+                                Err(LedgerError::AtCapacity) => CommandOutcome::Busy,
                             }
-                        };
-                        ledger.record_at(ledger_key, outcome, now_ms() as u64);
-                        outcome
+                        }
+                        Err(GrantError::Replayed) => {
+                            match payload_hash.as_deref().and_then(|payload_hash| {
+                                ledger
+                                    .lookup_command_at(
+                                        &command.idempotency_key.to_string(),
+                                        payload_hash,
+                                        now as u64,
+                                    )
+                                    .ok()
+                                    .flatten()
+                            }) {
+                                Some(previous) => previous,
+                                None => CommandOutcome::Forbidden,
+                            }
+                        }
+                        Err(GrantError::AtCapacity) => CommandOutcome::Busy,
+                        Err(GrantError::Expired) => CommandOutcome::Expired,
+                        Err(error) => {
+                            tracing::debug!("rejecting relay command: {error}");
+                            CommandOutcome::Forbidden
+                        }
                     };
                     send_command_result(
                         &mut socket,
@@ -282,21 +362,31 @@ async fn run_connection(
                     .await?;
                 }
                 RelayMessage::ArtworkRequest(request) => {
-                    respond_artwork(state, store, config, epoch, &mut socket, request).await?;
+                    schedule_artwork(
+                        state,
+                        store,
+                        config,
+                        epoch,
+                        request,
+                        artwork_tx.clone(),
+                        artwork_slots.clone(),
+                        artwork_active.clone(),
+                    );
                 }
                 RelayMessage::Revoke { reason_code } => {
-                    anyhow::bail!("relay revoked connector: {reason_code}")
+                    tracing::warn!("relay revoked connector: {reason_code}");
+                    return Ok(ConnectionExit::Revoked);
                 }
                 _ => {}
             },
             Message::Ping(bytes) => {
-                socket.send(Message::Pong(bytes)).await?;
+                send_message(&mut socket, Message::Pong(bytes)).await?;
             }
             Message::Close(_) => break,
             Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
         }
     }
-    Ok(())
+    Ok(ConnectionExit::Disconnected)
 }
 
 /// A challenge is untrusted relay input.  Do not sign a nonce or endpoint
@@ -325,14 +415,17 @@ fn validate_challenge(
     Ok(())
 }
 
-async fn next_json<T: serde::de::DeserializeOwned>(
-    socket: &mut Socket,
-) -> anyhow::Result<Option<T>> {
+async fn next_relay_message(socket: &mut Socket) -> anyhow::Result<Option<RelayMessage>> {
     while let Some(message) = socket.next().await {
         match message? {
-            Message::Text(text) => return Ok(Some(serde_json::from_str(&text)?)),
+            Message::Text(text) => {
+                return Ok(Some(
+                    super::protocol::parse_relay_message(text.as_bytes())
+                        .map_err(|error| anyhow::anyhow!(error))?,
+                ))
+            }
             Message::Ping(bytes) => {
-                socket.send(Message::Pong(bytes)).await?;
+                send_message(socket, Message::Pong(bytes)).await?;
             }
             Message::Close(_) => return Ok(None),
             _ => {}
@@ -340,11 +433,14 @@ async fn next_json<T: serde::de::DeserializeOwned>(
     }
     Ok(None)
 }
-async fn send_json<T: serde::Serialize>(socket: &mut Socket, value: &T) -> anyhow::Result<()> {
-    socket
-        .send(Message::Text(serde_json::to_string(value)?))
-        .await?;
+async fn send_message(socket: &mut Socket, message: Message) -> anyhow::Result<()> {
+    tokio::time::timeout(SOCKET_WRITE_TIMEOUT, socket.send(message))
+        .await
+        .map_err(|_| anyhow::anyhow!("relay write timed out"))??;
     Ok(())
+}
+async fn send_json<T: serde::Serialize>(socket: &mut Socket, value: &T) -> anyhow::Result<()> {
+    send_message(socket, Message::Text(serde_json::to_string(value)?)).await
 }
 
 async fn dispatch(
@@ -435,54 +531,79 @@ fn map_outcome(outcome: CommandOutcome) -> CommandStatus {
     }
 }
 
-async fn respond_artwork(
+/// Schedule artwork away from the socket event loop. A relay can request
+/// artwork frequently, but it must never make a slow provider image fetch
+/// delay command verification or heartbeat processing. Ten bounded permits
+/// represent two active fetches plus eight queued jobs; excess work is
+/// intentionally dropped because artwork is decoration, not control state.
+fn schedule_artwork(
     state: &crate::api::AppState,
     store: &StateStore,
     config: &CloudConnectorConfig,
     epoch: u64,
-    socket: &mut Socket,
     request: ArtworkRelayRequest,
-) -> anyhow::Result<()> {
+    artwork_tx: mpsc::Sender<Message>,
+    artwork_slots: std::sync::Arc<Semaphore>,
+    artwork_active: std::sync::Arc<Semaphore>,
+) {
     if request.protocol_version != PROTOCOL_VERSION
         || request.installation_id != config.installation_id
         || request.epoch != epoch
         || request.max_source_bytes == 0
     {
-        return Ok(());
+        return;
     }
-    let Some(provider_id) = store.provider_id(&request.zone_handle) else {
-        return Ok(());
+    let Some(provider_id) = store.provider_id(&request.zone_handle).map(str::to_owned) else {
+        return;
     };
-    let Some(image_key) = store.artwork_key(&request.zone_handle, &request.artwork_revision) else {
-        return Ok(());
+    let Some(image_key) = store
+        .artwork_key(&request.zone_handle, &request.artwork_revision)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let Ok(slot) = artwork_slots.try_acquire_owned() else {
+        return;
     };
     let limit = request.max_source_bytes.min(MAX_ARTWORK_SOURCE_BYTES);
-    let image = state
-        .get_image(provider_id, image_key, None, None, None, None)
-        .await?;
-    // The connector bounds the source transfer. The private cloud artwork
-    // service performs hostile-image validation and emits the smaller Garmin
-    // representation; applying its output cap here would reject legitimate
-    // source images before that validation/re-encode boundary.
-    if image.data.len() > limit {
-        return Ok(());
-    }
-    let count = image
-        .data
-        .len()
-        .div_ceil(MAX_ARTWORK_CHUNK_BYTES)
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("artwork has too many chunks"))?;
-    let count: u16 = if image.data.is_empty() { 0 } else { count };
-    if count == 0 {
-        return Ok(());
-    }
-    send_json(
-        socket,
-        &ConnectorMessage::ArtworkResponse(ArtworkRelayResponse {
+    let state = state.clone();
+    let installation_id = config.installation_id.clone();
+    tokio::spawn(async move {
+        let _slot = slot;
+        let Ok(Ok(active)) =
+            tokio::time::timeout(ARTWORK_FETCH_TIMEOUT, artwork_active.acquire_owned()).await
+        else {
+            return;
+        };
+        let Ok(Ok(image)) = tokio::time::timeout(
+            ARTWORK_FETCH_TIMEOUT,
+            state.get_image(&provider_id, &image_key, None, None, None, None),
+        )
+        .await
+        else {
+            return;
+        };
+        // The connector bounds the source transfer. The private cloud artwork
+        // service performs hostile-image validation and emits the smaller
+        // Garmin representation, so the source cap is the relevant bound at
+        // this side of the relay.
+        if image.data.is_empty() || image.data.len() > limit {
+            return;
+        }
+        drop(active);
+        let Ok(count) = image
+            .data
+            .len()
+            .div_ceil(MAX_ARTWORK_CHUNK_BYTES)
+            .try_into()
+        else {
+            return;
+        };
+        let count: u16 = count;
+        let response = ConnectorMessage::ArtworkResponse(ArtworkRelayResponse {
             protocol_version: PROTOCOL_VERSION,
             message_id: message_id(),
-            installation_id: config.installation_id.clone(),
+            installation_id,
             epoch,
             request_id: request.request_id,
             artwork_revision: request.artwork_revision,
@@ -490,24 +611,28 @@ async fn respond_artwork(
             total_bytes: image.data.len(),
             chunk_count: count,
             sha256: hex::encode(Sha256::digest(&image.data)),
-        }),
-    )
-    .await?;
-    for (index, bytes) in image.data.chunks(MAX_ARTWORK_CHUNK_BYTES).enumerate() {
-        socket
-            .send(Message::Binary(
-                ArtworkChunk {
-                    request_id: request.request_id,
-                    index: index.try_into().unwrap_or(u16::MAX),
-                    count,
-                    bytes: bytes.to_vec(),
-                }
-                .encode()
-                .map_err(|error| anyhow::anyhow!(error))?,
-            ))
-            .await?;
-    }
-    Ok(())
+        });
+        let Ok(text) = serde_json::to_string(&response) else {
+            return;
+        };
+        if artwork_tx.send(Message::Text(text)).await.is_err() {
+            return;
+        }
+        for (index, bytes) in image.data.chunks(MAX_ARTWORK_CHUNK_BYTES).enumerate() {
+            let Ok(frame) = (ArtworkChunk {
+                request_id: request.request_id,
+                index: index.try_into().unwrap_or(u16::MAX),
+                count,
+                bytes: bytes.to_vec(),
+            })
+            .encode() else {
+                return;
+            };
+            if artwork_tx.send(Message::Binary(frame)).await.is_err() {
+                return;
+            }
+        }
+    });
 }
 fn message_id() -> String {
     format!("msg_{}", Uuid::new_v4().simple())

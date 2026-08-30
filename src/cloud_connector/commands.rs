@@ -2,6 +2,12 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::Deserialize;
 use std::collections::HashMap;
 
+/// A connector process is intentionally bounded even when the relay is
+/// hostile.  The terminal ledger and replay cache use the same envelope
+/// budget, but remain separate so a command cannot bypass signature replay
+/// protection by evicting only a ledger row.
+pub const MAX_REPLAY_REQUESTS: usize = 256;
+
 use super::protocol::{
     payload_hash, CommandAction, CommandEnvelope, CommandGrantClaims, CommandPayload,
 };
@@ -53,13 +59,14 @@ pub enum GrantError {
     Expired,
     #[error("request has already been seen")]
     Replayed,
+    #[error("command replay cache is full")]
+    AtCapacity,
 }
 
 pub struct CommandGrantVerifier {
     issuer: String,
     audience: String,
     installation_id: String,
-    node_id: String,
     epoch: u64,
     generation: u64,
     keys: HashMap<String, VerifyingKey>,
@@ -71,7 +78,6 @@ impl CommandGrantVerifier {
         issuer: impl Into<String>,
         audience: impl Into<String>,
         installation_id: impl Into<String>,
-        node_id: impl Into<String>,
         epoch: u64,
         generation: u64,
     ) -> Self {
@@ -79,28 +85,11 @@ impl CommandGrantVerifier {
             issuer: issuer.into(),
             audience: audience.into(),
             installation_id: installation_id.into(),
-            node_id: node_id.into(),
             epoch,
             generation,
             keys: HashMap::new(),
             seen_requests: Default::default(),
         }
-    }
-    pub fn new_without_node(
-        issuer: impl Into<String>,
-        audience: impl Into<String>,
-        installation_id: impl Into<String>,
-        epoch: u64,
-        generation: u64,
-    ) -> Self {
-        Self::new(
-            issuer,
-            audience,
-            installation_id,
-            String::new(),
-            epoch,
-            generation,
-        )
     }
     pub fn pin_key(&mut self, key_id: impl Into<String>, key: VerifyingKey) {
         self.keys.insert(key_id.into(), key);
@@ -108,6 +97,10 @@ impl CommandGrantVerifier {
     pub fn revoke_generation(&mut self, generation: u64) {
         self.generation = generation;
         self.seen_requests.clear();
+    }
+
+    pub fn seen_requests_len(&self) -> usize {
+        self.seen_requests.len()
     }
     pub fn verify(
         &mut self,
@@ -153,7 +146,7 @@ impl CommandGrantVerifier {
             || envelope.epoch != self.epoch
             || claims.issuer != self.issuer
             || claims.installation_id != self.installation_id
-            || (!self.node_id.is_empty() && claims.control_node_id != self.node_id)
+            || claims.control_node_id != envelope.control_node_id
             || claims.epoch != self.epoch
             || claims.grant_generation != self.generation
             || claims.request_id != envelope.request_id
@@ -171,6 +164,9 @@ impl CommandGrantVerifier {
             .contains_key(&envelope.request_id.to_string())
         {
             return Err(GrantError::Replayed);
+        }
+        if self.seen_requests.len() >= MAX_REPLAY_REQUESTS {
+            return Err(GrantError::AtCapacity);
         }
         self.seen_requests
             .insert(envelope.request_id.to_string(), now_ms);
@@ -195,7 +191,22 @@ pub enum CommandOutcome {
 
 #[derive(Default)]
 pub struct CommandLedger {
-    terminal: HashMap<String, (CommandOutcome, u64)>,
+    terminal: HashMap<String, LedgerEntry>,
+}
+
+#[derive(Clone, Debug)]
+struct LedgerEntry {
+    outcome: CommandOutcome,
+    recorded_at: u64,
+    payload_hash: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum LedgerError {
+    #[error("command result ledger is full")]
+    AtCapacity,
+    #[error("idempotency key was reused for a different command payload")]
+    Conflict,
 }
 impl CommandLedger {
     pub fn record(&mut self, request_id: impl Into<String>, outcome: CommandOutcome) {
@@ -208,34 +219,84 @@ impl CommandLedger {
         now_ms: u64,
     ) {
         self.expire(now_ms);
-        if self.terminal.len() >= 256 {
-            if let Some(oldest) = self
-                .terminal
-                .iter()
-                .min_by_key(|(_, (_, at))| *at)
-                .map(|(id, _)| id.clone())
-            {
-                self.terminal.remove(&oldest);
-            }
+        let request_id = request_id.into();
+        if self.terminal.len() < 256 || self.terminal.contains_key(&request_id) {
+            self.terminal.insert(
+                request_id,
+                LedgerEntry {
+                    outcome,
+                    recorded_at: now_ms,
+                    payload_hash: None,
+                },
+            );
         }
-        self.terminal.insert(request_id.into(), (outcome, now_ms));
     }
-    pub fn get(&self, request_id: &str) -> Option<CommandOutcome> {
-        self.terminal.get(request_id).map(|(outcome, _)| *outcome)
+    fn get(&self, request_id: &str) -> Option<CommandOutcome> {
+        self.terminal.get(request_id).map(|entry| entry.outcome)
     }
     pub fn get_at(&mut self, request_id: &str, now_ms: u64) -> Option<CommandOutcome> {
         self.expire(now_ms);
         self.get(request_id)
     }
-    fn expire(&mut self, now_ms: u64) {
-        self.terminal
-            .retain(|_, (_, at)| *at == 0 || now_ms.saturating_sub(*at) <= 60_000);
-    }
+
     pub fn len(&self) -> usize {
         self.terminal.len()
     }
+
     pub fn is_empty(&self) -> bool {
         self.terminal.is_empty()
+    }
+    pub fn is_full(&self) -> bool {
+        self.terminal.len() >= 256
+    }
+    pub fn lookup_command_at(
+        &mut self,
+        idempotency_key: &str,
+        payload_hash: &str,
+        now_ms: u64,
+    ) -> Result<Option<CommandOutcome>, LedgerError> {
+        self.expire(now_ms);
+        match self.terminal.get(idempotency_key) {
+            Some(entry) if entry.payload_hash.as_deref() == Some(payload_hash) => {
+                Ok(Some(entry.outcome))
+            }
+            Some(_) => Err(LedgerError::Conflict),
+            None => Ok(None),
+        }
+    }
+    pub fn record_command_at(
+        &mut self,
+        idempotency_key: impl Into<String>,
+        payload_hash: &str,
+        outcome: CommandOutcome,
+        now_ms: u64,
+    ) -> Result<(), LedgerError> {
+        self.expire(now_ms);
+        let idempotency_key = idempotency_key.into();
+        if let Some(entry) = self.terminal.get(&idempotency_key) {
+            return if entry.payload_hash.as_deref() == Some(payload_hash) {
+                Ok(())
+            } else {
+                Err(LedgerError::Conflict)
+            };
+        }
+        if self.is_full() {
+            return Err(LedgerError::AtCapacity);
+        }
+        self.terminal.insert(
+            idempotency_key,
+            LedgerEntry {
+                outcome,
+                recorded_at: now_ms,
+                payload_hash: Some(payload_hash.to_owned()),
+            },
+        );
+        Ok(())
+    }
+    fn expire(&mut self, now_ms: u64) {
+        self.terminal.retain(|_, entry| {
+            entry.recorded_at == 0 || now_ms.saturating_sub(entry.recorded_at) <= 60_000
+        });
     }
 }
 

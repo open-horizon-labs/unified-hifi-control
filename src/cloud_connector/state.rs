@@ -1,9 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{
     identity::ZoneHandleMap,
-    protocol::{NowPlayingProjection, VolumeControl, ZoneProjection},
+    protocol::{NowPlayingProjection, VolumeControl, ZoneProjection, MAX_STRING_BYTES, MAX_ZONES},
 };
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum StateError {
+    #[error("state projection exceeds a protocol bound: {0}")]
+    Invalid(&'static str),
+}
 
 /// Build the cloud projection from the aggregator's authoritative zones. The
 /// provider image key is reduced to a revision digest; the key itself never
@@ -16,7 +22,7 @@ pub async fn snapshot_from_aggregator(
     epoch: u64,
     revision: u64,
     now_ms: u64,
-) -> StateProjection {
+) -> Result<StateProjection, StateError> {
     let zones = aggregator.get_zones().await;
     let input = SemanticStateInput {
         installation_id,
@@ -114,12 +120,17 @@ pub struct StateStore {
 }
 
 impl StateStore {
-    pub fn snapshot(&mut self, input: SemanticStateInput) -> StateProjection {
+    pub fn snapshot(&mut self, input: SemanticStateInput) -> Result<StateProjection, StateError> {
+        validate_input(&input)?;
         self.artwork_keys.clear();
         let mut zones = Vec::new();
         let mut now_playing = Vec::new();
+        let mut handles = HashSet::new();
         for zone in input.zones {
             let handle = self.handles.handle_for(&zone.provider_id);
+            if !handles.insert(handle.clone()) {
+                return Err(StateError::Invalid("duplicate zone handle"));
+            }
             if let Some(now_playing) = zone.now_playing.as_ref() {
                 if let (Some(revision), Some(key)) =
                     (&now_playing.art_revision, &now_playing.image_key)
@@ -163,7 +174,7 @@ impl StateStore {
         };
         self.delta_revision = Some(projection.revision);
         self.latest = Some(projection.clone());
-        projection
+        Ok(projection)
     }
     pub fn accepts_delta(&self, revision: u64) -> bool {
         self.delta_revision
@@ -212,4 +223,58 @@ pub fn public_zone_handles(projection: &StateProjection) -> HashMap<String, ()> 
         .iter()
         .map(|z| (z.zone_handle.clone(), ()))
         .collect()
+}
+
+fn validate_input(input: &SemanticStateInput) -> Result<(), StateError> {
+    if input.epoch == 0 || input.expires_at <= input.observed_at {
+        return Err(StateError::Invalid("epoch or expiry"));
+    }
+    if input.installation_id.len() > MAX_STRING_BYTES
+        || input.zones.len() > MAX_ZONES
+        || uuid::Uuid::parse_str(&input.installation_id).is_err()
+    {
+        return Err(StateError::Invalid("installation, zone count, or id"));
+    }
+    let mut providers = HashSet::new();
+    for zone in &input.zones {
+        if zone.provider_id.is_empty()
+            || zone.provider_id.len() > MAX_STRING_BYTES
+            || !providers.insert(&zone.provider_id)
+            || zone.name.len() > MAX_STRING_BYTES
+            || zone.state.len() > MAX_STRING_BYTES
+        {
+            return Err(StateError::Invalid("zone identity or string bound"));
+        }
+        if let Some(volume) = &zone.volume {
+            if !volume.value.is_finite()
+                || !volume.min.is_finite()
+                || !volume.max.is_finite()
+                || !volume.step.is_finite()
+                || volume.min > volume.max
+                || volume.value < volume.min
+                || volume.value > volume.max
+                || volume.step <= 0.0
+                || volume.scale.is_empty()
+                || volume.scale.len() > MAX_STRING_BYTES
+            {
+                return Err(StateError::Invalid("volume values"));
+            }
+        }
+        if let Some(playing) = &zone.now_playing {
+            if playing.title.len() > MAX_STRING_BYTES
+                || playing.artist.len() > MAX_STRING_BYTES
+                || playing
+                    .art_revision
+                    .as_ref()
+                    .is_some_and(|revision| !super::protocol::validate_id(revision))
+                || playing
+                    .image_key
+                    .as_ref()
+                    .is_some_and(|key| key.is_empty() || key.len() > MAX_STRING_BYTES)
+            {
+                return Err(StateError::Invalid("now-playing string bound"));
+            }
+        }
+    }
+    Ok(())
 }

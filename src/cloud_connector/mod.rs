@@ -20,13 +20,14 @@ pub use commands::{CommandGrantVerifier, CommandLedger, CommandOutcome, Verified
 pub use config::{CloudConnectorConfig, ConfigError};
 pub use identity::{InstallationIdentity, ZoneHandleMap};
 pub use protocol::{
-    AllowedAction, ArtworkChunk, ArtworkRelayRequest, ArtworkRelayResponse, CommandEnvelope,
-    CommandPayload, ConnectorMessage, RelayMessage, StateSnapshot, WireEnvelope, WireType,
+    parse_relay_message, AllowedAction, ArtworkChunk, ArtworkRelayRequest, ArtworkRelayResponse,
+    CommandEnvelope, CommandPayload, ConnectorMessage, RelayMessage, StateSnapshot, WireEnvelope,
+    WireType,
 };
 pub use session::{
     InstallationGrantRequest, InstallationSessionProof, SessionError, SessionProof, SessionVerifier,
 };
-pub use state::{SemanticStateInput, StateProjection, StateStore};
+pub use state::{SemanticStateInput, StateError, StateProjection, StateStore};
 pub use transport::{
     Backoff, ConnectionState, ConnectorRunLoop, EndpointError, RelayEndpoint, RunLoopEvent,
 };
