@@ -45,6 +45,7 @@
 //! again rather than failing generically. This module is also the target for
 //! #399 (hierarchical browse), which will mint refs the same way.
 
+use super::spotify::refusal_for_spotify_error;
 use crate::api::AppState;
 use crate::mcp::capabilities::{support, Capability};
 use crate::mcp::envelope::{Envelope, Observed, Provider, Refusal, Scope};
@@ -256,7 +257,10 @@ pub async fn handle_search(
                     }
                     Ok(env.json_result(&mcp_results))
                 }
-                Err(e) => env.failed(format!("Search error: {}", e)),
+                Err(e) => env.refused(
+                    format!("Search error: {}", e),
+                    refusal_for_spotify_error(&e),
+                ),
             }
         }
         LibraryRoute::MusicAssistant => {
@@ -664,14 +668,20 @@ pub async fn handle_play(
                         };
                         match result {
                             Ok(message) => Ok(play_success(state, env, message).await),
-                            Err(e) => env.failed(format!("Play error: {}", e)),
+                            Err(e) => env.refused(
+                                format!("Play error: {}", e),
+                                refusal_for_spotify_error(&e),
+                            ),
                         }
                     }
                     None => {
                         env.failed("Play error: Spotify search returned no results".to_string())
                     }
                 },
-                Err(e) => env.failed(format!("Search error: {}", e)),
+                Err(e) => env.refused(
+                    format!("Search error: {}", e),
+                    refusal_for_spotify_error(&e),
+                ),
             }
         }
         LibraryRoute::MusicAssistant => {
@@ -1246,7 +1256,10 @@ async fn play_ref_spotify(
     };
     match result {
         Ok(message) => Ok(play_success(state, env, message).await),
-        Err(error) => env.failed(format!("Play error for {title}: {}", error)),
+        Err(error) => env.refused(
+            format!("Play error for {title}: {}", error),
+            refusal_for_spotify_error(&error),
+        ),
     }
 }
 

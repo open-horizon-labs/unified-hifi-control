@@ -4,20 +4,19 @@ name: Home Assistant integration
 # package. This job is intentionally independent of the Rust crate's
 # build/CI (build.yml) since it has its own toolchain and dependencies.
 #
-# Note: feature-branch PRs in this repo do not currently run CI checks
-# (see AGENTS.md / stacked-PR workflow notes); this workflow becomes
-# active once merged to v3.
+# The streaming/companion alpha branch is also an active integration target;
+# changes there need the same package-level evidence before review.
 
 on:
   push:
-    branches: [v3]
+    branches: [v3, 'integration/streaming-ha-alpha']
     paths:
       - "custom_components/unified_hifi_control/**"
       - "hacs.json"
       - "pyproject.toml"
       - ".github/workflows/ha-integration.yml"
   pull_request:
-    branches: [v3]
+    branches: [v3, 'integration/streaming-ha-alpha']
     paths:
       - "custom_components/unified_hifi_control/**"
       - "hacs.json"

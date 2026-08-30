@@ -567,6 +567,13 @@ pub enum BusEvent {
         is_muted: bool,
     },
 
+    /// Whether a zone can accept volume commands independently of whether a
+    /// current numeric volume was available in the latest observation.
+    VolumeCapabilityChanged {
+        zone_id: PrefixedZoneId,
+        supported: bool,
+    },
+
     // =========================================================================
     // Command Events
     // =========================================================================
@@ -700,6 +707,7 @@ impl BusEvent {
             Self::PlaybackModesChanged { .. } => "playback_modes_changed",
             Self::SeekPositionChanged { .. } => "seek_position_changed",
             Self::VolumeChanged { .. } => "volume_changed",
+            Self::VolumeCapabilityChanged { .. } => "volume_capability_changed",
             Self::CommandReceived { .. } => "command_received",
             Self::CommandResult { .. } => "command_result",
             Self::AdapterStopping { .. } => "adapter_stopping",
@@ -730,6 +738,7 @@ impl BusEvent {
                 | Self::ZoneUpdated { .. }
                 | Self::ZoneRemoved { .. }
                 | Self::ZonesFlushed { .. }
+                | Self::VolumeCapabilityChanged { .. }
         )
     }
 
