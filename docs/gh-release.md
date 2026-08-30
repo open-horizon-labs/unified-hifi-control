@@ -449,3 +449,32 @@ both are supported paths, pick whichever the owner buys.
 
 None of these are committed anywhere; the workflow only ever imports them
 from GitHub Actions secrets at build time.
+
+## Home Assistant Add-on Version Bumps
+
+The [Home Assistant add-on](https://github.com/open-horizon-labs/uhc-home-assistant-addon)
+lives in its own repository — it isn't built by this repo's CI. It's a thin
+wrapper: `unified-hifi-control/build.yaml` pins a specific `muness/unified-hifi-control`
+Docker Hub tag as `build_from`, and the Home Assistant Supervisor builds the
+add-on image locally on the user's box from that base at install/update time.
+
+After cutting a release here that you want the add-on to track:
+
+1. In the `uhc-home-assistant-addon` repo, edit `unified-hifi-control/build.yaml`:
+   bump both `build_from.amd64` and `build_from.aarch64` to the new version tag
+   (e.g. `docker.io/muness/unified-hifi-control:3.7.0`). Both arches use the
+   same tag — the published image is already a multi-arch manifest, so Docker
+   resolves the right platform layer.
+2. Bump `version` in `unified-hifi-control/config.yaml` to match (Home
+   Assistant's add-on store uses this field to show/offer the update — it
+   must change or users won't see an update available).
+3. Commit and push directly to `main` (that repo has no release process of
+   its own; the add-on version *is* the tracked UHC version).
+4. The repo's `Lint` GitHub Actions workflow (`frenck/action-addon-linter`)
+   validates the config schema on push — confirm it's green before telling
+   anyone to update.
+
+There's no automation wiring this to this repo's own release workflow yet;
+it's a manual two-field bump after you're satisfied a release is stable
+enough to push to Home Assistant users (skip beta/rc tags — point the add-on
+at stable releases only).

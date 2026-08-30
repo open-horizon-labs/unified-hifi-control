@@ -55,6 +55,24 @@ https://raw.githubusercontent.com/open-horizon-labs/unified-hifi-control/v3/lms-
 ```
 Betas are less soaked than releases. Use one channel or the other, not both at once — LMS would see two entries for the same plugin.
 
+### Home Assistant Add-on
+
+Runs the bridge as a Supervisor-managed container on your Home Assistant box —
+no separate server, no Docker Compose, no terminal. In Home Assistant, go to
+**Settings → Add-ons → Add-on Store → ⋮ → Repositories** and add:
+
+```text
+https://github.com/open-horizon-labs/uhc-home-assistant-addon
+```
+
+Then install **Unified Hi-Fi Control** from the store. This is the Tier 1
+add-on: the UI opens in its own browser tab at `http://<your-ha-host>:8088`,
+not embedded in the HA dashboard (that's a separate, later "ingress" add-on).
+It runs with host networking, same as the Docker install above, for Roon/mDNS
+discovery. Full walkthrough, including where to find the one-time controller
+bootstrap token on first start, is in the
+[add-on repo's DOCS.md](https://github.com/open-horizon-labs/uhc-home-assistant-addon/blob/main/unified-hifi-control/DOCS.md).
+
 ### Binary Downloads
 
 Pre-built binaries available for Linux (x64, arm64, armv7), macOS (x64, arm64), and Windows from [Releases](https://github.com/open-horizon-labs/unified-hifi-control/releases).
