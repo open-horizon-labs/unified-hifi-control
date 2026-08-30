@@ -44,6 +44,15 @@ const ARTWORK_QUEUE_CAPACITY: usize = super::artwork::MAX_PENDING;
 const ARTWORK_CONCURRENCY: usize = super::artwork::MAX_CONCURRENT;
 const ARTWORK_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const ARTWORK_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+const MAX_SESSION_GRANT_RESPONSE_BYTES: usize = 16 * 1024;
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantResponse {
+    grant: String,
+    endpoint: String,
+    expires_at: i64,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConnectionExit {
@@ -168,10 +177,6 @@ async fn request_session_grant(
     config: &CloudConnectorConfig,
     identity: &InstallationIdentity,
 ) -> anyhow::Result<String> {
-    #[derive(serde::Deserialize)]
-    struct GrantResponse {
-        grant: String,
-    }
     let mut url = url::Url::parse(config.endpoint.as_str())?;
     url.set_scheme("https")
         .map_err(|_| anyhow::anyhow!("relay endpoint cannot use HTTPS"))?;
@@ -182,22 +187,67 @@ async fn request_session_grant(
         config.endpoint.as_str().to_owned(),
         now_ms(),
     );
-    let response = reqwest::Client::builder()
+    let client = session_grant_client()?;
+    request_session_grant_at(&client, url, &request, config.endpoint.as_str()).await
+}
+
+fn session_grant_client() -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(10))
-        .build()?
-        .post(url)
-        .json(&request)
-        .send()
-        .await?;
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
+async fn request_session_grant_at(
+    client: &reqwest::Client,
+    url: url::Url,
+    request: &super::session::InstallationGrantRequest,
+    expected_relay_endpoint: &str,
+) -> anyhow::Result<String> {
+    let expected_response_url = url.clone();
+    let response = client.post(url).json(&request).send().await?;
+    if response.url().scheme() != "https" && !cfg!(test) {
+        anyhow::bail!("session grant response used a non-HTTPS endpoint");
+    }
+    if response.url() != &expected_response_url {
+        anyhow::bail!("session grant response came from an unexpected endpoint");
+    }
     if !response.status().is_success() {
         anyhow::bail!("session grant request returned {}", response.status());
     }
-    let grant = response.json::<GrantResponse>().await?.grant;
-    if !(32..=4096).contains(&grant.len()) {
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if !matches!(content_type, Some(value) if value.eq_ignore_ascii_case("application/json")) {
+        anyhow::bail!("session grant response was not JSON");
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_SESSION_GRANT_RESPONSE_BYTES as u64)
+    {
+        anyhow::bail!("session grant response exceeded its byte limit");
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_SESSION_GRANT_RESPONSE_BYTES {
+            anyhow::bail!("session grant response exceeded its byte limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let response: GrantResponse = serde_json::from_slice(&bytes)?;
+    if response.endpoint != expected_relay_endpoint || response.expires_at <= 0 {
+        anyhow::bail!("session grant response did not match the requested relay");
+    }
+    if !(32..=4096).contains(&response.grant.len()) {
         anyhow::bail!("relay returned an invalid session grant");
     }
-    Ok(grant)
+    Ok(response.grant)
 }
 
 async fn run_connection<S>(
@@ -754,8 +804,9 @@ fn websocket_upgrade_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        run_connection, validate_challenge, websocket_upgrade_request, CommandLedger,
-        ConnectionExit, RelayMessage, StateStore,
+        request_session_grant_at, run_connection, session_grant_client, validate_challenge,
+        websocket_upgrade_request, CommandLedger, ConnectionExit, RelayMessage, StateStore,
+        MAX_SESSION_GRANT_RESPONSE_BYTES,
     };
     use crate::{
         adapters::{
@@ -773,7 +824,7 @@ mod tests {
             identity::InstallationIdentity,
             protocol::{ConnectorMessage, SessionChallengeMessage, PROTOCOL_VERSION},
             transport::{RelayEndpoint, SessionEpochGuard},
-            InstallationSessionProof,
+            InstallationGrantRequest, InstallationSessionProof,
         },
         coordinator::AdapterCoordinator,
         knobs::KnobStore,
@@ -787,6 +838,24 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    async fn serve_grant_app(app: axum::Router) -> url::Url {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url::Url::parse(&format!("http://{address}/v1/relay/session-grant")).unwrap()
+    }
+
+    fn grant_request() -> InstallationGrantRequest {
+        InstallationGrantRequest {
+            installation_id: Uuid::from_u128(1).to_string(),
+            request_id: Uuid::from_u128(2),
+            endpoint: "wss://cloud.invalid/v1/relay/connect".into(),
+            connector_version: env!("UHC_VERSION").into(),
+            issued_at: 1_800_000_000_000,
+            signature: "proof_012345678901234567890123456789".into(),
+        }
+    }
 
     async fn empty_app_state() -> AppState {
         let bus = create_bus();
@@ -845,6 +914,129 @@ mod tests {
             "invalid\r\ngrant"
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn session_grant_http_boundary_accepts_only_bounded_exact_json() {
+        use axum::{response::Redirect, routing::post, Json, Router};
+
+        let relay_endpoint = "wss://cloud.invalid/v1/relay/connect";
+        let grant = "g".repeat(64);
+        let success_grant = grant.clone();
+        let success_endpoint = relay_endpoint.to_owned();
+        let success_url = serve_grant_app(Router::new().route(
+            "/v1/relay/session-grant",
+            post(move || {
+                let grant = success_grant.clone();
+                let endpoint = success_endpoint.clone();
+                async move {
+                    Json(serde_json::json!({
+                        "grant": grant,
+                        "endpoint": endpoint,
+                        "expires_at": 1_800_000_060_000_i64,
+                    }))
+                }
+            }),
+        ))
+        .await;
+        let accepted = request_session_grant_at(
+            &session_grant_client().unwrap(),
+            success_url,
+            &grant_request(),
+            relay_endpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(accepted, grant);
+
+        let redirect_url = serve_grant_app(
+            Router::new()
+                .route(
+                    "/v1/relay/session-grant",
+                    post(|| async { Redirect::temporary("/redirected") }),
+                )
+                .route(
+                    "/redirected",
+                    post(|| async { Json(serde_json::json!({"grant":"should-not-be-read"})) }),
+                ),
+        )
+        .await;
+        let redirect_error = request_session_grant_at(
+            &session_grant_client().unwrap(),
+            redirect_url.clone(),
+            &grant_request(),
+            relay_endpoint,
+        )
+        .await
+        .unwrap_err();
+        assert!(redirect_error.to_string().contains("307"));
+        let followed_redirect_error = request_session_grant_at(
+            &reqwest::Client::new(),
+            redirect_url,
+            &grant_request(),
+            relay_endpoint,
+        )
+        .await
+        .unwrap_err();
+        assert!(followed_redirect_error
+            .to_string()
+            .contains("unexpected endpoint"));
+
+        let wrong_type_url = serve_grant_app(Router::new().route(
+            "/v1/relay/session-grant",
+            post(|| async { ([("content-type", "text/plain")], "{}") }),
+        ))
+        .await;
+        let wrong_type_error = request_session_grant_at(
+            &session_grant_client().unwrap(),
+            wrong_type_url,
+            &grant_request(),
+            relay_endpoint,
+        )
+        .await
+        .unwrap_err();
+        assert!(wrong_type_error.to_string().contains("not JSON"));
+
+        let oversized = "x".repeat(MAX_SESSION_GRANT_RESPONSE_BYTES + 1);
+        let oversized_url = serve_grant_app(Router::new().route(
+            "/v1/relay/session-grant",
+            post(move || {
+                let oversized = oversized.clone();
+                async move { ([("content-type", "application/json")], oversized) }
+            }),
+        ))
+        .await;
+        let oversized_error = request_session_grant_at(
+            &session_grant_client().unwrap(),
+            oversized_url,
+            &grant_request(),
+            relay_endpoint,
+        )
+        .await
+        .unwrap_err();
+        assert!(oversized_error.to_string().contains("byte limit"));
+
+        let unexpected_url = serve_grant_app(Router::new().route(
+            "/v1/relay/session-grant",
+            post(|| async {
+                Json(serde_json::json!({
+                    "grant": "g".repeat(64),
+                    "endpoint": "wss://cloud.invalid/v1/relay/connect",
+                    "expires_at": 1_800_000_060_000_i64,
+                    "extra": true,
+                }))
+            }),
+        ))
+        .await;
+        let unexpected_error = request_session_grant_at(
+            &session_grant_client().unwrap(),
+            unexpected_url,
+            &grant_request(),
+            relay_endpoint,
+        )
+        .await
+        .unwrap_err();
+        assert!(unexpected_error.to_string().contains("unknown field"));
     }
 
     #[test]
