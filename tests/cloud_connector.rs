@@ -44,6 +44,7 @@ fn session_grant_is_verified_before_it_can_authenticate_the_websocket_upgrade() 
     let now = 1_800_000_000_000_i64;
     let claims = cloud_connector::protocol::InstallationSessionGrantClaims {
         protocol_version: 1,
+        connector_version: env!("UHC_VERSION").into(),
         issuer: "hiphi-installation-authorization".into(),
         audience: "hiphi-relay".into(),
         installation_id,
@@ -65,6 +66,21 @@ fn session_grant_is_verified_before_it_can_authenticate_the_websocket_upgrade() 
     )
     .unwrap();
     assert_eq!(verified.grant_generation, 7);
+
+    let mut wrong_version_claims = claims.clone();
+    wrong_version_claims.connector_version = "0.9.9".into();
+    let wrong_version_grant = signed_session_grant(&issuer, &wrong_version_claims);
+    assert_eq!(
+        verify_installation_session_grant(
+            &wrong_version_grant,
+            "issuer-1",
+            &issuer.verifying_key(),
+            &identity,
+            "wss://cloud.example/v1/relay/connect",
+            now,
+        ),
+        Err(SessionGrantError::WrongBinding)
+    );
 
     let mut forged_claims = claims;
     forged_claims.grant_generation = 8;
@@ -943,6 +959,7 @@ fn installation_grant_request_is_signed_and_contains_no_bearer_header() {
     let encoded = serde_json::to_string(&request).unwrap();
     assert!(!encoded.contains("Authorization"));
     assert!(!encoded.contains("token"));
+    assert_eq!(request.connector_version, env!("UHC_VERSION"));
     assert!(!request.signature.is_empty());
 }
 

@@ -8,6 +8,7 @@
 
 use futures::{SinkExt, StreamExt};
 use sha2::{Digest as _, Sha256};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{
@@ -163,9 +164,6 @@ async fn run(
     }
 }
 
-type Socket =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
 async fn request_session_grant(
     config: &CloudConnectorConfig,
     identity: &InstallationIdentity,
@@ -202,7 +200,7 @@ async fn request_session_grant(
     Ok(grant)
 }
 
-async fn run_connection(
+async fn run_connection<S>(
     state: &crate::api::AppState,
     config: &CloudConnectorConfig,
     identity: &InstallationIdentity,
@@ -211,8 +209,11 @@ async fn run_connection(
     store: &mut StateStore,
     epoch_guard: &mut SessionEpochGuard,
     ledger: &mut CommandLedger,
-    mut socket: Socket,
-) -> anyhow::Result<ConnectionExit> {
+    mut socket: tokio_tungstenite::WebSocketStream<S>,
+) -> anyhow::Result<ConnectionExit>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let challenge = match tokio::time::timeout(
         std::time::Duration::from_secs(10),
         next_relay_message(&mut socket),
@@ -255,7 +256,7 @@ async fn run_connection(
     let hello = ConnectorMessage::Hello(ConnectorHello {
         protocol_version: PROTOCOL_VERSION,
         message_id: message_id(),
-        connector_version: env!("CARGO_PKG_VERSION").to_owned(),
+        connector_version: env!("UHC_VERSION").to_owned(),
         installation_id: config.installation_id.clone(),
         epoch,
         capabilities: vec![
@@ -474,7 +475,12 @@ fn validate_challenge(
     Ok(())
 }
 
-async fn next_relay_message(socket: &mut Socket) -> anyhow::Result<Option<RelayMessage>> {
+async fn next_relay_message<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+) -> anyhow::Result<Option<RelayMessage>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     while let Some(message) = socket.next().await {
         match message? {
             Message::Text(text) => {
@@ -492,13 +498,25 @@ async fn next_relay_message(socket: &mut Socket) -> anyhow::Result<Option<RelayM
     }
     Ok(None)
 }
-async fn send_message(socket: &mut Socket, message: Message) -> anyhow::Result<()> {
+async fn send_message<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    message: Message,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     tokio::time::timeout(SOCKET_WRITE_TIMEOUT, socket.send(message))
         .await
         .map_err(|_| anyhow::anyhow!("relay write timed out"))??;
     Ok(())
 }
-async fn send_json<T: serde::Serialize>(socket: &mut Socket, value: &T) -> anyhow::Result<()> {
+async fn send_json<S, T: serde::Serialize>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    value: &T,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     send_message(socket, Message::Text(serde_json::to_string(value)?)).await
 }
 
@@ -556,14 +574,17 @@ async fn dispatch(
     }
 }
 
-async fn send_command_result(
-    socket: &mut Socket,
+async fn send_command_result<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
     config: &CloudConnectorConfig,
     epoch: u64,
     request_id: Uuid,
     idempotency_key: Uuid,
     outcome: CommandOutcome,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     send_json(
         socket,
         &ConnectorMessage::CommandResult(CommandResult {
@@ -639,7 +660,7 @@ fn schedule_artwork(
         };
         let Ok(Ok(image)) = tokio::time::timeout(
             ARTWORK_FETCH_TIMEOUT,
-            state.get_image(&provider_id, &image_key, None, None, None, None),
+            state.get_image_bounded(&provider_id, &image_key, limit),
         )
         .await
         else {
@@ -732,10 +753,69 @@ fn websocket_upgrade_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_challenge, websocket_upgrade_request, RelayMessage};
-    use crate::cloud_connector::protocol::SessionChallengeMessage;
-    use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+    use super::{
+        run_connection, validate_challenge, websocket_upgrade_request, CommandLedger,
+        ConnectionExit, RelayMessage, StateStore,
+    };
+    use crate::{
+        adapters::{
+            hqplayer::{HqpInstanceManager, HqpZoneLinkService},
+            lms::LmsAdapter,
+            openhome::OpenHomeAdapter,
+            roon::RoonAdapter,
+            upnp::UPnPAdapter,
+        },
+        aggregator::ZoneAggregator,
+        api::AppState,
+        bus::create_bus,
+        cloud_connector::{
+            config::CloudConnectorConfig,
+            identity::InstallationIdentity,
+            protocol::{ConnectorMessage, SessionChallengeMessage, PROTOCOL_VERSION},
+            transport::{RelayEndpoint, SessionEpochGuard},
+            InstallationSessionProof,
+        },
+        coordinator::AdapterCoordinator,
+        knobs::KnobStore,
+    };
+    use ed25519_dalek::SigningKey;
+    use futures::{SinkExt as _, StreamExt as _};
+    use std::{sync::Arc, time::Instant};
+    use tokio_tungstenite::{
+        tungstenite::{http::header::AUTHORIZATION, protocol::Role, Message},
+        WebSocketStream,
+    };
+    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    async fn empty_app_state() -> AppState {
+        let bus = create_bus();
+        let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
+        let hqp_instances = Arc::new(HqpInstanceManager::new(bus.clone()));
+        let hqplayer = hqp_instances.get_default().await;
+        let hqp_zone_links = Arc::new(HqpZoneLinkService::new(hqp_instances.clone()));
+        let lms = Arc::new(LmsAdapter::new(bus.clone()));
+        let openhome = Arc::new(OpenHomeAdapter::new(bus.clone()));
+        let upnp = Arc::new(UPnPAdapter::new(bus.clone()));
+        let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+        let coordinator = Arc::new(AdapterCoordinator::new(bus.clone()));
+        AppState::new(
+            roon,
+            hqplayer,
+            hqp_instances,
+            hqp_zone_links,
+            lms,
+            openhome,
+            upnp,
+            KnobStore::new(),
+            bus,
+            aggregator,
+            coordinator,
+            vec![],
+            Instant::now(),
+            CancellationToken::new(),
+        )
+    }
 
     fn challenge(endpoint: &str, expires_at: i64) -> SessionChallengeMessage {
         SessionChallengeMessage {
@@ -791,5 +871,97 @@ mod tests {
     fn runtime_accepts_only_typed_relay_messages() {
         let raw = serde_json::json!({"type":"command","body":{}});
         assert!(serde_json::from_value::<RelayMessage>(raw).is_err());
+    }
+
+    #[tokio::test]
+    async fn production_run_connection_sends_hello_snapshot_then_honors_revocation() {
+        let installation_id = Uuid::new_v4().to_string();
+        let identity = InstallationIdentity::generate(installation_id.clone()).unwrap();
+        let issuer = SigningKey::from_bytes(&[31; 32]);
+        let temp = tempfile::tempdir().unwrap();
+        let endpoint = "wss://cloud.invalid/v1/relay/connect";
+        let config = CloudConnectorConfig {
+            endpoint: RelayEndpoint::parse(endpoint).unwrap(),
+            installation_id: installation_id.clone(),
+            key_path: temp.path().join("installation.key"),
+            epoch_path: temp.path().join("epoch"),
+            issuer_key_id: "issuer-1".into(),
+            issuer_public_key: issuer.verifying_key().to_bytes().to_vec(),
+        };
+        let state = empty_app_state().await;
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let now = super::now_ms();
+        let challenge = RelayMessage::Challenge(SessionChallengeMessage {
+            protocol_version: PROTOCOL_VERSION,
+            challenge_id: Uuid::new_v4(),
+            endpoint: endpoint.into(),
+            nonce: "nonce_012345678901234567890123456789".into(),
+            expires_at: now + 30_000,
+        });
+        let epoch = u64::try_from(now).unwrap();
+        let server_task = tokio::spawn(async move {
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&challenge).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+            let Message::Text(proof) = server.next().await.unwrap().unwrap() else {
+                panic!("expected installation proof")
+            };
+            let proof: InstallationSessionProof = serde_json::from_str(&proof).unwrap();
+            assert_eq!(proof.grant, "test.session.grant");
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&RelayMessage::SessionEstablished { epoch })
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let Message::Text(hello) = server.next().await.unwrap().unwrap() else {
+                panic!("expected connector hello")
+            };
+            let hello: ConnectorMessage = serde_json::from_str(&hello).unwrap();
+            assert!(matches!(hello, ConnectorMessage::Hello(ref value)
+                if value.installation_id == installation_id
+                    && value.connector_version == env!("UHC_VERSION")));
+            let Message::Text(snapshot) = server.next().await.unwrap().unwrap() else {
+                panic!("expected initial snapshot")
+            };
+            let snapshot: ConnectorMessage = serde_json::from_str(&snapshot).unwrap();
+            assert!(matches!(snapshot, ConnectorMessage::Snapshot(ref value)
+                if value.installation_id == installation_id && value.epoch == epoch));
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&RelayMessage::Revoke {
+                        reason_code: "owner_revoked".into(),
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+        let mut store = StateStore::default();
+        let mut epoch_guard = SessionEpochGuard::load(&config.epoch_path).unwrap();
+        let mut ledger = CommandLedger::default();
+        let exit = run_connection(
+            &state,
+            &config,
+            &identity,
+            "test.session.grant",
+            0,
+            &mut store,
+            &mut epoch_guard,
+            &mut ledger,
+            client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(exit, ConnectionExit::Revoked);
+        server_task.await.unwrap();
     }
 }

@@ -43,6 +43,9 @@ jobs:
       - name: Test connector contracts
         run: cargo test --features server --test cloud_connector
 
+      - name: Test the production connector runtime
+        run: cargo test --features server --lib cloud_connector::runtime
+
       - name: Preserve the public HTTP API contract
         run: cargo test --features server --test api_contract
 

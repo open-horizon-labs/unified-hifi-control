@@ -81,6 +81,7 @@ pub struct SessionChallengeMessage {
 #[serde(deny_unknown_fields)]
 pub struct InstallationSessionGrantClaims {
     pub protocol_version: u16,
+    pub connector_version: String,
     pub issuer: String,
     pub audience: String,
     pub installation_id: InstallationId,

@@ -122,6 +122,7 @@ pub fn verify_installation_session_grant(
         RelayEndpoint::parse(&claims.endpoint).map_err(|_| SessionGrantError::WrongBinding)?;
     let public_key_sha256 = hex::encode(Sha256::digest(identity.verifying_key().as_bytes()));
     if claims.protocol_version != PROTOCOL_VERSION
+        || claims.connector_version != env!("UHC_VERSION")
         || claims.issuer != SESSION_GRANT_ISSUER
         || claims.audience != RELAY_AUDIENCE
         || claims.installation_id != identity.installation_id()
@@ -152,6 +153,7 @@ pub struct InstallationGrantRequest {
     pub installation_id: String,
     pub request_id: Uuid,
     pub endpoint: String,
+    pub connector_version: String,
     pub issued_at: i64,
     pub signature: String,
 }
@@ -167,12 +169,14 @@ pub fn sign_installation_grant_request(
         installation_id: identity.installation_id().to_owned(),
         request_id: Uuid::new_v4(),
         endpoint,
+        connector_version: env!("UHC_VERSION").to_owned(),
         issued_at,
         signature: String::new(),
     };
     let message = serde_json::json!({
         "audience": "hiphi-relay",
         "endpoint": request.endpoint,
+        "connector_version": request.connector_version,
         "installation_id": request.installation_id,
         "issued_at": request.issued_at,
         "request_id": request.request_id,
