@@ -247,14 +247,14 @@ Control your hi-fi with natural language. The bridge includes an MCP server so C
 | `hifi_play` | Search and play/queue in one command *(Roon, LMS, Spotify)* |
 | `hifi_play_ref` | Play or queue an exact search result |
 | `hifi_queue` | Read the current provider queue |
-| `hifi_spotify` | Browse Spotify, access playlists/liked tracks, and create/edit playlists |
+| `hifi_spotify` | Access Spotify playlists/liked tracks and create/edit playlists |
 | `hifi_status` | Overall bridge status |
 | `hifi_hqplayer_status` | HQPlayer Embedded status and pipeline |
 | `hifi_hqplayer_profiles` | List saved HQPlayer profiles |
 | `hifi_hqplayer_load_profile` | Switch HQPlayer profile |
 | `hifi_hqplayer_set_pipeline` | Change filter, shaper, dither settings |
 
-*Spotify is a controller for existing Spotify Connect devices, not a receiver. Spotify search, exact play/queue, queue read, catalog browsing, playlists, liked tracks, repeat, and shuffle require the corresponding OAuth scopes; transport controls work with all enabled adapters.*
+*Spotify is a controller for existing Spotify Connect devices, not a receiver. Spotify search, exact play/queue-add, queue read, playlists, liked tracks, repeat, and shuffle require the corresponding OAuth scopes. New Development Mode applications cannot use the removed categories, featured-playlists, or new-releases browse endpoints. Spotify exposes no active-queue jump/reorder/remove/clear/transfer operations, and Transfer Playback selects one device rather than synchronizing a multiroom group. Transport controls work with all enabled adapters.*
 
 The MCP endpoint is unauthenticated like the rest of the bridge — see [Security and Network Exposure](#security-and-network-exposure).
 

@@ -12,7 +12,7 @@ use serde_json::json;
 
 #[mcp_tool(
     name = "hifi_spotify",
-    description = "Spotify catalog and library access. Actions include browse_categories, browse_category_playlists, browse_featured_playlists, browse_new_releases, playlists, playlist_tracks, saved_tracks, saved_tracks_check, saved_tracks_add/remove, create_playlist, update_playlist, playlist_add/replace/remove. Use hifi_search and hifi_play for catalog search and playback. Playlist/library writes require the corresponding Spotify scopes."
+    description = "Spotify personal-library access. Actions: playlists, playlist_tracks, saved_tracks, saved_tracks_check, saved_tracks_add/remove, create_playlist, update_playlist, playlist_add/replace/remove. Use hifi_search and hifi_play for catalog search, playback, and queue-add. Spotify's February 2026 Development Mode API removed categories, category playlists, featured playlists, and new releases, so this tool does not advertise or call them. The Web API can read/add to the active queue but cannot jump, reorder, remove, clear, or transfer queue contents. Transfer Playback selects one device; it is not multiroom synchronization. Playlist/library writes require the corresponding Spotify scopes."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiSpotifyTool {
@@ -21,9 +21,6 @@ pub struct HifiSpotifyTool {
     /// Playlist id for playlist_tracks, update_playlist, or playlist_add.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub playlist_id: Option<String>,
-    /// Spotify browse category id.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub category_id: Option<String>,
     /// Playlist name for create/update.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -49,10 +46,6 @@ pub async fn handle_spotify(
     args: HifiSpotifyTool,
 ) -> Result<CallToolResult, CallToolError> {
     let accepted = [
-        "browse_categories",
-        "browse_category_playlists",
-        "browse_featured_playlists",
-        "browse_new_releases",
         "playlists",
         "playlist_tracks",
         "saved_tracks",
@@ -77,7 +70,6 @@ pub async fn handle_spotify(
     }
     let params = json!({
         "playlist_id": args.playlist_id,
-        "category_id": args.category_id,
         "name": args.name,
         "description": args.description,
         "uri": args.uri,

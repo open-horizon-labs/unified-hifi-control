@@ -832,7 +832,6 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
         &[
             ("action", true),
             ("playlist_id", false),
-            ("category_id", false),
             ("name", false),
             ("description", false),
             ("uri", false),
@@ -6067,8 +6066,8 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
     // stopped being reported as supported, which is the direction that hides a
     // capability rather than inventing one.
     assert_eq!(
-        proved, 53,
-        "{proved} supported cells were proved end to end, expected 53. If a capability was deliberately wired or unwired, change this number in the same commit."
+        proved, 52,
+        "{proved} supported cells were proved end to end, expected 52. If a capability was deliberately wired or unwired, change this number in the same commit."
     );
 }
 

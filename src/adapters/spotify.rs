@@ -96,6 +96,8 @@ pub struct SpotifyDevice {
     #[serde(default)]
     pub is_restricted: bool,
     #[serde(default)]
+    pub supports_volume: bool,
+    #[serde(default)]
     pub volume_percent: Option<u8>,
 }
 
@@ -123,15 +125,20 @@ impl SpotifyDevice {
             zone_id: zone_id.clone(),
             zone_name: self.name.clone(),
             state,
-            volume_control: self.volume_percent.map(|value| VolumeControl {
-                value: f32::from(value),
-                min: 0.0,
-                max: 100.0,
-                step: 1.0,
-                is_muted: false,
-                scale: VolumeScale::Percentage,
-                output_id: Some(zone_id),
-            }),
+            volume_control: self
+                .supports_volume
+                .then(|| {
+                    self.volume_percent.map(|value| VolumeControl {
+                        value: f32::from(value),
+                        min: 0.0,
+                        max: 100.0,
+                        step: 1.0,
+                        is_muted: false,
+                        scale: VolumeScale::Percentage,
+                        output_id: Some(zone_id),
+                    })
+                })
+                .flatten(),
             now_playing,
             source: "spotify".to_string(),
             is_controllable: controllable,
@@ -288,11 +295,11 @@ pub struct SpotifyPlaylist {
     #[serde(default)]
     pub images: Vec<SpotifyImage>,
     #[serde(default)]
-    pub tracks: Option<SpotifyPlaylistTrackSummary>,
+    pub items: Option<SpotifyPlaylistItemSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SpotifyPlaylistTrackSummary {
+pub struct SpotifyPlaylistItemSummary {
     #[serde(default)]
     pub total: usize,
 }
@@ -330,16 +337,6 @@ struct SpotifySnapshot {
     snapshot_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct SpotifyFeaturedPlaylists {
-    playlists: SpotifyPage<SpotifyPlaylist>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct SpotifyNewReleases {
-    albums: SpotifyPage<SpotifyAlbumSummary>,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SpotifyArtist {
     pub name: String,
@@ -360,7 +357,41 @@ pub struct SpotifyImage {
 #[derive(Debug, Clone, Deserialize)]
 struct DevicesResponse {
     #[serde(default)]
-    devices: Vec<SpotifyDevice>,
+    devices: Vec<SpotifyDeviceResponse>,
+}
+
+/// Spotify documents device IDs as nullable. UHC zones require a stable ID, so
+/// the wire shape stays nullable until the inventory boundary and anonymous
+/// devices are skipped without discarding the rest of the poll.
+#[derive(Debug, Clone, Deserialize)]
+struct SpotifyDeviceResponse {
+    id: Option<String>,
+    name: String,
+    #[serde(rename = "type", default)]
+    device_type: String,
+    #[serde(default)]
+    is_active: bool,
+    #[serde(default)]
+    is_restricted: bool,
+    #[serde(default)]
+    supports_volume: bool,
+    #[serde(default)]
+    volume_percent: Option<u8>,
+}
+
+impl SpotifyDeviceResponse {
+    fn into_device(self) -> Option<SpotifyDevice> {
+        let id = self.id.filter(|id| !id.trim().is_empty())?;
+        Some(SpotifyDevice {
+            id,
+            name: self.name,
+            device_type: self.device_type,
+            is_active: self.is_active,
+            is_restricted: self.is_restricted,
+            supports_volume: self.supports_volume,
+            volume_percent: self.volume_percent,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -525,7 +556,7 @@ impl SpotifyAdapter {
         if query.is_empty() {
             return Err(anyhow!("Spotify search query cannot be empty"));
         }
-        let limit = limit.clamp(1, 50);
+        let limit = spotify_search_limit(limit);
         let path = format!(
             "/search?q={}&type=track%2Calbum%2Cartist&limit={limit}",
             urlencoding::encode(query)
@@ -578,99 +609,52 @@ impl SpotifyAdapter {
         Ok(results)
     }
 
-    /// Browse Spotify's top-level catalog categories.
+    /// Spotify removed catalog categories from the Web API surface available
+    /// to new Development Mode applications in February 2026.
     pub async fn browse_categories(
         &self,
-        limit: usize,
-        offset: usize,
-        country: Option<&str>,
-        locale: Option<&str>,
+        _limit: usize,
+        _offset: usize,
+        _country: Option<&str>,
+        _locale: Option<&str>,
     ) -> Result<SpotifyPage<SpotifyCategory>> {
-        let mut query = vec![
-            format!("limit={}", spotify_page_limit(limit)),
-            format!("offset={offset}"),
-        ];
-        if let Some(country) = country.filter(|value| !value.is_empty()) {
-            query.push(format!("country={}", urlencoding::encode(country)));
-        }
-        if let Some(locale) = locale.filter(|value| !value.is_empty()) {
-            query.push(format!("locale={}", urlencoding::encode(locale)));
-        }
-        let path = format!("/browse/categories?{}", query.join("&"));
-        self.request_json(Method::GET, &path).await
+        Err(development_mode_browse_unavailable("catalog categories"))
     }
 
-    /// Browse playlists attached to one Spotify catalog category.
+    /// Spotify removed category playlists from the Web API surface available
+    /// to new Development Mode applications in February 2026.
     pub async fn browse_category_playlists(
         &self,
-        category_id: &str,
-        limit: usize,
-        offset: usize,
-        country: Option<&str>,
+        _category_id: &str,
+        _limit: usize,
+        _offset: usize,
+        _country: Option<&str>,
     ) -> Result<SpotifyPage<SpotifyPlaylist>> {
-        let category_id = category_id.trim();
-        if category_id.is_empty() {
-            return Err(anyhow!("Spotify category id cannot be empty"));
-        }
-        let mut query = vec![
-            format!("limit={}", spotify_page_limit(limit)),
-            format!("offset={offset}"),
-        ];
-        if let Some(country) = country.filter(|value| !value.is_empty()) {
-            query.push(format!("country={}", urlencoding::encode(country)));
-        }
-        let path = format!(
-            "/browse/categories/{}/playlists?{}",
-            urlencoding::encode(category_id),
-            query.join("&")
-        );
-        self.request_json(Method::GET, &path).await
+        Err(development_mode_browse_unavailable("category playlists"))
     }
 
-    /// Browse Spotify's featured editorial playlists.
+    /// Spotify removed featured playlists from the Web API surface available
+    /// to new Development Mode applications in February 2026.
     pub async fn browse_featured_playlists(
         &self,
-        limit: usize,
-        offset: usize,
-        country: Option<&str>,
-        locale: Option<&str>,
-        timestamp: Option<&str>,
+        _limit: usize,
+        _offset: usize,
+        _country: Option<&str>,
+        _locale: Option<&str>,
+        _timestamp: Option<&str>,
     ) -> Result<SpotifyPage<SpotifyPlaylist>> {
-        let mut query = vec![
-            format!("limit={}", spotify_page_limit(limit)),
-            format!("offset={offset}"),
-        ];
-        if let Some(country) = country.filter(|value| !value.is_empty()) {
-            query.push(format!("country={}", urlencoding::encode(country)));
-        }
-        if let Some(locale) = locale.filter(|value| !value.is_empty()) {
-            query.push(format!("locale={}", urlencoding::encode(locale)));
-        }
-        if let Some(timestamp) = timestamp.filter(|value| !value.is_empty()) {
-            query.push(format!("timestamp={}", urlencoding::encode(timestamp)));
-        }
-        let path = format!("/browse/featured-playlists?{}", query.join("&"));
-        let response: SpotifyFeaturedPlaylists = self.request_json(Method::GET, &path).await?;
-        Ok(response.playlists)
+        Err(development_mode_browse_unavailable("featured playlists"))
     }
 
-    /// Browse Spotify's new-release album catalog.
+    /// Spotify removed new releases from the Web API surface available to new
+    /// Development Mode applications in February 2026.
     pub async fn browse_new_releases(
         &self,
-        limit: usize,
-        offset: usize,
-        country: Option<&str>,
+        _limit: usize,
+        _offset: usize,
+        _country: Option<&str>,
     ) -> Result<SpotifyPage<SpotifyAlbumSummary>> {
-        let mut query = vec![
-            format!("limit={}", spotify_page_limit(limit)),
-            format!("offset={offset}"),
-        ];
-        if let Some(country) = country.filter(|value| !value.is_empty()) {
-            query.push(format!("country={}", urlencoding::encode(country)));
-        }
-        let path = format!("/browse/new-releases?{}", query.join("&"));
-        let response: SpotifyNewReleases = self.request_json(Method::GET, &path).await?;
-        Ok(response.albums)
+        Err(development_mode_browse_unavailable("new releases"))
     }
 
     /// List playlists visible to the current Spotify user.
@@ -1072,7 +1056,11 @@ impl SpotifyAdapter {
     async fn fetch_devices(&self) -> Result<Vec<SpotifyDevice>> {
         let response: DevicesResponse =
             self.request_json(Method::GET, "/me/player/devices").await?;
-        Ok(response.devices)
+        Ok(response
+            .devices
+            .into_iter()
+            .filter_map(SpotifyDeviceResponse::into_device)
+            .collect())
     }
 
     async fn fetch_playback(&self) -> Result<Option<SpotifyPlayback>> {
@@ -1188,11 +1176,7 @@ impl SpotifyAdapter {
             .await
             .map_err(|e| anyhow!("failed reading Spotify response: {}", e))?;
         if !status.is_success() {
-            let detail = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|json| json["error"]["message"].as_str().map(str::to_string))
-                .unwrap_or_else(|| body.chars().take(240).collect());
-            return Err(anyhow!("Spotify API returned HTTP {}: {}", status, detail));
+            return Err(spotify_api_error(status, &body, false));
         }
         serde_json::from_str(&body).map_err(|e| anyhow!("invalid Spotify response JSON: {}", e))
     }
@@ -1217,21 +1201,7 @@ impl SpotifyAdapter {
             return Ok(());
         }
         let body = response.text().await.unwrap_or_default();
-        let detail = serde_json::from_str::<Value>(&body)
-            .ok()
-            .and_then(|json| json["error"]["message"].as_str().map(str::to_string))
-            .unwrap_or_else(|| body.chars().take(240).collect());
-        if playback_control && status == StatusCode::FORBIDDEN {
-            return Err(anyhow!(
-                "Spotify playback control requires a Premium account: {detail}"
-            ));
-        }
-        if playback_control && status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(anyhow!(
-                "Spotify playback control is rate limited; try again shortly: {detail}"
-            ));
-        }
-        Err(anyhow!("Spotify API returned HTTP {}: {}", status, detail))
+        Err(spotify_api_error(status, &body, playback_control))
     }
 
     async fn send_json_command<T: Serialize>(
@@ -1254,11 +1224,7 @@ impl SpotifyAdapter {
             return Ok(());
         }
         let body = response.text().await.unwrap_or_default();
-        let detail = serde_json::from_str::<Value>(&body)
-            .ok()
-            .and_then(|json| json["error"]["message"].as_str().map(str::to_string))
-            .unwrap_or_else(|| body.chars().take(240).collect());
-        Err(anyhow!("Spotify API returned HTTP {}: {}", status, detail))
+        Err(spotify_api_error(status, &body, false))
     }
 
     async fn request_json_with_body<T: Serialize, R: for<'de> Deserialize<'de>>(
@@ -1417,6 +1383,9 @@ impl AdapterLogic for SpotifyAdapter {
                     .await
             }
             AdapterCommand::VolumeAbsolute(value) => {
+                if !device.supports_volume {
+                    return Ok(failure("Spotify device does not support volume control"));
+                }
                 let value = value.clamp(0, 100);
                 self.send_command(
                     Method::PUT,
@@ -1428,6 +1397,9 @@ impl AdapterLogic for SpotifyAdapter {
                 .await
             }
             AdapterCommand::VolumeRelative(delta) => {
+                if !device.supports_volume {
+                    return Ok(failure("Spotify device does not support volume control"));
+                }
                 let current = device
                     .volume_percent
                     .ok_or_else(|| anyhow!("Spotify device volume is unavailable"));
@@ -1528,26 +1500,17 @@ impl LibraryAdapter for SpotifyAdapter {
             .unwrap_or(20)
             .clamp(1, 50);
         let result = match operation {
-            "browse_categories" => serde_json::to_value(
-                self.browse_categories(limit as usize, 0, None, None)
-                    .await?,
-            )?,
-            "browse_category_playlists" => {
-                let id = params
-                    .get("category_id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("category_id is required"))?;
-                serde_json::to_value(
-                    self.browse_category_playlists(id, limit as usize, 0, None)
-                        .await?,
-                )?
+            "browse_categories" => {
+                return Err(development_mode_browse_unavailable("catalog categories"))
             }
-            "browse_featured_playlists" => serde_json::to_value(
-                self.browse_featured_playlists(limit as usize, 0, None, None, None)
-                    .await?,
-            )?,
+            "browse_category_playlists" => {
+                return Err(development_mode_browse_unavailable("category playlists"))
+            }
+            "browse_featured_playlists" => {
+                return Err(development_mode_browse_unavailable("featured playlists"))
+            }
             "browse_new_releases" => {
-                serde_json::to_value(self.browse_new_releases(limit as usize, 0, None).await?)?
+                return Err(development_mode_browse_unavailable("new releases"))
             }
             "playlists" => {
                 self.request_json(Method::GET, &format!("/me/playlists?limit={limit}"))
@@ -1573,17 +1536,13 @@ impl LibraryAdapter for SpotifyAdapter {
                     .and_then(Value::as_str)
                     .filter(|s| !s.trim().is_empty())
                     .ok_or_else(|| anyhow!("name is required"))?;
-                let profile = self
-                    .request_json::<SpotifyUserProfile>(Method::GET, "/me")
-                    .await?;
                 let body = serde_json::json!({
                     "name": name,
                     "public": params.get("public").and_then(Value::as_bool).unwrap_or(false),
                     "collaborative": false,
                     "description": params.get("description").and_then(Value::as_str).unwrap_or("")
                 });
-                let path = format!("/users/{}/playlists", profile.id);
-                self.request_json_with_body(Method::POST, &path, &body)
+                self.request_json_with_body(Method::POST, "/me/playlists", &body)
                     .await?
             }
             "update_playlist" => {
@@ -1703,6 +1662,39 @@ fn now_secs() -> u64 {
 
 fn spotify_page_limit(limit: usize) -> usize {
     limit.clamp(1, 50)
+}
+
+fn spotify_search_limit(limit: usize) -> usize {
+    limit.clamp(1, 10)
+}
+
+fn development_mode_browse_unavailable(surface: &str) -> anyhow::Error {
+    anyhow!(
+        "Spotify {surface} are unavailable to new Development Mode applications as of the February 2026 Web API changes; use search or the authenticated user's library instead"
+    )
+}
+
+fn spotify_api_error(status: StatusCode, body: &str, playback_control: bool) -> anyhow::Error {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        let reason = serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|json| json["error"]["reason"].as_str().map(str::to_owned));
+        if reason.as_deref() == Some("QUOTA_EXCEEDED") {
+            return anyhow!(
+                "Spotify API quota exhausted (QUOTA_EXCEEDED); retry after the developer quota resets"
+            );
+        }
+        return anyhow!("Spotify API rate limited the request; retry after Retry-After");
+    }
+
+    let detail = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|json| json["error"]["message"].as_str().map(str::to_string))
+        .unwrap_or_else(|| body.chars().take(240).collect());
+    if playback_control && status == StatusCode::FORBIDDEN {
+        return anyhow!("Spotify playback control requires a Premium account: {detail}");
+    }
+    anyhow!("Spotify API returned HTTP {}: {}", status, detail)
 }
 
 fn spotify_ids(ids: &[String]) -> Result<String> {
