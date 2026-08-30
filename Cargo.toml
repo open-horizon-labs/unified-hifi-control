@@ -52,7 +52,7 @@ md5 = "0.8"
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.8"
-uuid = { version = "1", features = ["serde", "v4"] }
+uuid = { version = "1", features = ["serde", "v4", "js"] }
 
 # Regex (shared)
 regex = "1"

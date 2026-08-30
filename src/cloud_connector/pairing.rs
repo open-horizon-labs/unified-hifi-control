@@ -29,3 +29,29 @@ pub fn possession_message(
     message.extend_from_slice(fingerprint_bytes);
     message
 }
+
+/// Exact proof-of-possession input for an owner-issued, one-use enrollment
+/// capability. The capability authorizes allocation only; the signature proves
+/// the process presenting it also holds the installation private key.
+///
+/// Keep this byte-for-byte aligned with the public cloud contract. Every field
+/// is length-prefixed so no pair of attacker-controlled strings can produce
+/// the same signed message by shifting a delimiter boundary.
+pub fn enrollment_possession_message(
+    capability: &str,
+    audience: &str,
+    public_key_fingerprint: &str,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(256);
+    message.extend_from_slice(b"hiphi.installation-enrollment.v1\0");
+    append_field(&mut message, capability.as_bytes());
+    append_field(&mut message, audience.as_bytes());
+    append_field(&mut message, public_key_fingerprint.as_bytes());
+    message
+}
+
+fn append_field(message: &mut Vec<u8>, field: &[u8]) {
+    let length = u32::try_from(field.len()).unwrap_or(u32::MAX);
+    message.extend_from_slice(&length.to_be_bytes());
+    message.extend_from_slice(field);
+}
