@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use super::{
     identity::ZoneHandleMap,
-    protocol::{NowPlayingProjection, VolumeControl, ZoneProjection, MAX_STRING_BYTES, MAX_ZONES},
+    protocol::{
+        CommandAction, NowPlayingProjection, VolumeControl, ZoneProjection, MAX_STRING_BYTES,
+        MAX_ZONES,
+    },
 };
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -35,6 +38,12 @@ pub async fn snapshot_from_aggregator(
                 provider_id: zone.zone_id,
                 name: zone.zone_name,
                 state: zone.state.to_string(),
+                control: ControlEligibility {
+                    play: zone.is_play_allowed,
+                    pause: zone.is_pause_allowed,
+                    next: zone.is_next_allowed,
+                    previous: zone.is_previous_allowed,
+                },
                 volume: zone.volume_control.map(|volume| VolumeInput {
                     value: volume.value.into(),
                     min: volume.min.into(),
@@ -71,8 +80,30 @@ pub struct SemanticZoneInput {
     pub provider_id: String,
     pub name: String,
     pub state: String,
+    /// Aggregator-owned eligibility is retained locally for command admission;
+    /// it is deliberately not serialized into the cloud state vocabulary.
+    pub control: ControlEligibility,
     pub volume: Option<VolumeInput>,
     pub now_playing: Option<NowPlayingInput>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ControlEligibility {
+    pub play: bool,
+    pub pause: bool,
+    pub next: bool,
+    pub previous: bool,
+}
+
+impl ControlEligibility {
+    pub const fn all() -> Self {
+        Self {
+            play: true,
+            pause: true,
+            next: true,
+            previous: true,
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub struct VolumeInput {
@@ -113,6 +144,7 @@ pub struct SemanticStateInput {
 #[derive(Default)]
 pub struct StateStore {
     handles: ZoneHandleMap,
+    controls: HashMap<String, ControlEligibility>,
     artwork_keys: HashMap<(String, String), String>,
     latest: Option<StateProjection>,
     delta_revision: Option<u64>,
@@ -121,6 +153,7 @@ pub struct StateStore {
 impl StateStore {
     pub fn snapshot(&mut self, input: SemanticStateInput) -> Result<StateProjection, StateError> {
         validate_input(&input)?;
+        self.controls.clear();
         self.artwork_keys.clear();
         let mut zones = Vec::new();
         let mut now_playing = Vec::new();
@@ -130,6 +163,7 @@ impl StateStore {
             if !handles.insert(handle.clone()) {
                 return Err(StateError::Invalid("duplicate zone handle"));
             }
+            self.controls.insert(handle.clone(), zone.control);
             if let Some(now_playing) = zone.now_playing.as_ref() {
                 if let (Some(revision), Some(key)) =
                     (&now_playing.art_revision, &now_playing.image_key)
@@ -217,6 +251,42 @@ impl StateStore {
                 })
                 .and_then(|zone| zone.volume_control.as_ref())
                 .is_some_and(|volume| value >= volume.min && value <= volume.max)
+    }
+    /// Relative volume is only meaningful when the authoritative aggregate
+    /// currently advertises a volume control.  This is intentionally a
+    /// connector-local eligibility check: the cloud learns no provider detail,
+    /// while a stale or volume-disabled device never reaches its adapter.
+    pub fn supports_relative_volume(&self, handle: &str) -> bool {
+        self.latest.as_ref().is_some_and(|projection| {
+            projection
+                .zones
+                .iter()
+                .find(|zone| zone.zone_handle == handle)
+                .and_then(|zone| zone.volume_control.as_ref())
+                .is_some()
+        })
+    }
+    /// The connector admits transport only when its latest authoritative
+    /// aggregate projection allows that exact semantic action. This keeps
+    /// restricted devices out of the provider registry altogether.
+    pub fn accepts_transport_action(&self, handle: &str, action: &CommandAction) -> bool {
+        let Some(control) = self.controls.get(handle) else {
+            return false;
+        };
+        match action {
+            CommandAction::PlayPause => {
+                if self.state(handle) == Some("playing") {
+                    control.pause
+                } else {
+                    control.play
+                }
+            }
+            CommandAction::Next => control.next,
+            CommandAction::Previous => control.previous,
+            CommandAction::VolumeUp
+            | CommandAction::VolumeDown
+            | CommandAction::VolumeAbsolute { .. } => true,
+        }
     }
     pub fn artwork_key(&self, handle: &str, revision: &str) -> Option<&str> {
         self.artwork_keys
