@@ -34,6 +34,7 @@ server = [
     "dep:http-body-util",
     "dep:rust-mcp-sdk",
     "dep:rumqttc",
+    "dep:ed25519-dalek",
 ]
 web = ["dioxus/web"]
 
@@ -51,6 +52,7 @@ md5 = "0.8"
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.8"
+uuid = { version = "1", features = ["serde", "v4"] }
 
 # Regex (shared)
 regex = "1"
@@ -139,6 +141,10 @@ rust-mcp-sdk = { version = "0.8", default-features = false, features = ["server"
 # MQTT publisher for Home Assistant discovery (server only, issue #508)
 rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"], optional = true }
 
+# Public-key-only verification and locally held installation identity for the
+# optional outbound HiPhi Cloud connector. The cloud signing key never enters UHC.
+ed25519-dalek = { version = "2.2", features = ["rand_core"], optional = true }
+
 # ============ WEB-ONLY DEPENDENCIES ============
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
@@ -156,6 +162,11 @@ path = "src/main.rs"
 [[bin]]
 name = "protocol-checker"
 path = "src/bin/protocol_checker.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "uhc-hiphi-pair"
+path = "src/bin/uhc_hiphi_pair.rs"
 required-features = ["server"]
 
 [dev-dependencies]
