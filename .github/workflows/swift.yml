@@ -29,7 +29,10 @@ jobs:
         run: |
           swift package dump-package
           swift build --target UHCKit
-          swift test
+          xcodebuild \
+            -scheme UHCKit \
+            -destination 'platform=macOS' \
+            test
 
       - name: Build and test nested development package
         run: |
