@@ -147,8 +147,9 @@ If the browser is not on the UHC host, Spotify accepts plain HTTP only for
 explicit loopback callbacks (`127.0.0.1` or `::1`); anything else — a remote
 QNAP, a different machine on the LAN — needs HTTPS. The "Using UHC from
 another device or a NAS?" panel below the callback URL has a **Get an HTTPS
-address** button for this: it asks UHC's server to open a temporary tunnel to
-itself and shows the resulting `https://…` callback URL with a copy button,
+address** button for this: it asks UHC to open a temporary tunnel to a
+separate loopback-only callback listener and shows the resulting `https://…`
+callback URL with a copy button,
 so a first-time user never has to install or run anything. After allocation
 UHC probes its own public URL once and shows the result (reachable or not)
 before the user registers it with Spotify. The Redirect URI field is
@@ -161,17 +162,20 @@ authorize request always uses the saved Redirect URI verbatim. Paste the
 shown URL into the Spotify dashboard's Redirect URIs, save client settings,
 then Connect. The tunnel closes itself shortly after authorization
 completes (success or failure; teardown is deferred a minute so the
-callback response and settings redirect still travel through it), after 55
+bounded callback response still travels through it), after 55
 minutes (under pinggy's own 60-minute anonymous-tunnel limit, and long
 enough for a first-time dashboard round trip), or via its own "Stop
 tunnel" button — while it
-is open, this UHC server is briefly reachable from the public internet at
-that address, though the callback endpoint behind it only ever accepts the
-single in-flight OAuth `state` token, so no extra trust is extended to
+is open, the public address terminates at that callback-only listener, not at
+the UHC LAN listener. It permits exactly `GET
+/api/providers/spotify/oauth/callback` and a non-sensitive `GET /healthz`
+probe; every other method and path is denied. The callback still accepts only
+the single in-flight OAuth `state` token, so no extra trust is extended to
 traffic that arrives through it (see `oauth_callback_json` in
 `src/api/provider_auth.rs`).
 
-Under the hood this is a plain `ssh -R` reverse tunnel to
+Under the hood this is a plain `ssh -R` reverse tunnel to that separate
+loopback listener, via
 [pinggy.io](https://pinggy.io)'s free tier — no account and no bundled binary
 beyond the `ssh` client already present on essentially every Linux, macOS, or
 NAS install — falling back automatically to
@@ -185,16 +189,17 @@ tunnel's stdout, though, since a first live-smoke pass found the original
 `pinggy.link`-only pattern never matched pinggy's real anonymous-tier hosts —
 `pinggy-free.link` and `free.pinggy.net`). Pinggy's free tier also caps an
 anonymous tunnel at 60 minutes before it expires on its own; UHC's own
-15-minute cap closes it well before that regardless. If `ssh` is missing,
+55-minute cap closes it first. If `ssh` is missing,
 both providers are unreachable, or outbound `ssh` traffic is blocked, the
 panel reports why in the same beginner-readable style as the rest of
 Settings, and the collapsed **Advanced: bring your own HTTPS** note
-underneath still covers running your own tunnel by hand (for example
-`cloudflared tunnel --url http://127.0.0.1:8088` or Tailscale Funnel) and
-pasting its callback URL into the Redirect URI field yourself. Reauthorizing
-later always needs a new tunnel (built-in or your own) and a newly registered
-callback URL either way. This is the first-run onboarding path tracked in
-#469, #534, and #538.
+underneath covers an operator-managed HTTPS proxy only when it independently
+default-denies every route except the exact Spotify callback. Do **not** point
+a manual tunnel, Funnel, or reverse proxy at UHC's main port; that listener
+has intentional LAN-readable and control surfaces. Reauthorizing later always
+needs a new tunnel (built-in or carefully filtered operator-managed route) and
+a newly registered callback URL either way. This is the first-run onboarding
+path tracked in #469, #534, and #538.
 
 New endpoints backing the built-in tunnel — `POST
 /api/providers/spotify/tunnel/start`, `GET

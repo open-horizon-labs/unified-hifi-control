@@ -48,6 +48,7 @@ pub mod ingress;
 pub mod mqtt_bootstrap;
 pub mod mqtt_settings;
 pub mod provider_auth;
+pub mod spotify_callback_listener;
 pub mod spotify_tunnel;
 
 const MAX_REMOTE_ARTWORK_BYTES: usize = 10 * 1024 * 1024;
