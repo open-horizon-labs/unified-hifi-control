@@ -16,7 +16,7 @@ use tokio_tungstenite::{
     tungstenite::{
         client::IntoClientRequest as _,
         http::{header::AUTHORIZATION, HeaderValue},
-        protocol::WebSocketConfig,
+        protocol::{frame::coding::CloseCode, CloseFrame, WebSocketConfig},
         Message,
     },
 };
@@ -45,6 +45,7 @@ const ARTWORK_CONCURRENCY: usize = super::artwork::MAX_CONCURRENT;
 const ARTWORK_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const ARTWORK_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 const MAX_SESSION_GRANT_RESPONSE_BYTES: usize = 16 * 1024;
+const SHUTDOWN_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,6 +59,7 @@ struct GrantResponse {
 enum ConnectionExit {
     Disconnected,
     Revoked,
+    Shutdown,
 }
 
 pub fn spawn_from_env(
@@ -99,7 +101,11 @@ async fn run(
     loop {
         let delay = backoff.next_delay();
         tokio::select! { _ = shutdown.cancelled() => break, _ = tokio::time::sleep(delay) => {} }
-        let grant = match request_session_grant(&config, &identity).await {
+        let grant = match tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            grant = request_session_grant(&config, &identity) => grant,
+        } {
             Ok(grant) => grant,
             Err(error) => {
                 tracing::debug!("HiPhi Cloud session grant unavailable: {error}");
@@ -139,12 +145,15 @@ async fn run(
                 break;
             }
         };
-        match tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            connect_async_with_config(request, Some(websocket_limits), false),
-        )
-        .await
-        {
+        let connection = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            connection = tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                connect_async_with_config(request, Some(websocket_limits), false),
+            ) => connection,
+        };
+        match connection {
             Ok(Ok((socket, _))) => {
                 match run_connection(
                     &state,
@@ -164,6 +173,7 @@ async fn run(
                     // and then rejects the protocol must still back off.
                     Ok(ConnectionExit::Disconnected) => backoff.reset(),
                     Ok(ConnectionExit::Revoked) => break,
+                    Ok(ConnectionExit::Shutdown) => break,
                     Err(error) => tracing::warn!("HiPhi Cloud relay disconnected: {error}"),
                 }
             }
@@ -264,6 +274,10 @@ async fn run_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    if state.shutdown.is_cancelled() {
+        close_socket_for_shutdown(&mut socket).await;
+        return Ok(ConnectionExit::Shutdown);
+    }
     let challenge = match tokio::time::timeout(
         std::time::Duration::from_secs(10),
         next_relay_message(&mut socket),
@@ -355,6 +369,10 @@ where
     loop {
         let message = tokio::select! {
             biased;
+            _ = state.shutdown.cancelled() => {
+                close_socket_for_shutdown(&mut socket).await;
+                return Ok(ConnectionExit::Shutdown);
+            }
             message = socket.next() => {
                 let Some(message) = message else { break; };
                 message?
@@ -380,6 +398,10 @@ where
                 continue;
             }
         };
+        if state.shutdown.is_cancelled() {
+            close_socket_for_shutdown(&mut socket).await;
+            return Ok(ConnectionExit::Shutdown);
+        }
         match message {
             Message::Text(text) if text.len() > MAX_COMMAND_BYTES => {
                 anyhow::bail!("relay command frame exceeds the command bound");
@@ -557,6 +579,25 @@ where
         .await
         .map_err(|_| anyhow::anyhow!("relay write timed out"))??;
     Ok(())
+}
+
+async fn close_socket_for_shutdown<S>(socket: &mut tokio_tungstenite::WebSocketStream<S>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let close = Message::Close(Some(CloseFrame {
+        code: CloseCode::Away,
+        reason: "connector shutdown".into(),
+    }));
+    let _ = tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, socket.send(close)).await;
+    let _ = tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, async {
+        while let Some(message) = socket.next().await {
+            if matches!(message, Ok(Message::Close(_)) | Err(_)) {
+                break;
+            }
+        }
+    })
+    .await;
 }
 async fn send_artwork_message<S>(
     socket: &mut tokio_tungstenite::WebSocketStream<S>,
@@ -1436,5 +1477,130 @@ mod tests {
         assert_eq!(exit, ConnectionExit::Revoked);
         assert_eq!(ledger.len(), 1, "the command authority grant was accepted");
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_connection_closes_without_executing_or_reconnecting_on_shutdown() {
+        let installation_id = Uuid::new_v4().to_string();
+        let identity = InstallationIdentity::generate(installation_id.clone()).unwrap();
+        let session_issuer = SigningKey::from_bytes(&[50; 32]);
+        let command_issuer = SigningKey::from_bytes(&[51; 32]);
+        let temp = tempfile::tempdir().unwrap();
+        let endpoint = "wss://cloud.invalid/v1/relay/connect";
+        let config = CloudConnectorConfig {
+            endpoint: RelayEndpoint::parse(endpoint).unwrap(),
+            installation_id: installation_id.clone(),
+            key_path: temp.path().join("installation.key"),
+            epoch_path: temp.path().join("epoch"),
+            session_issuer_key_id: "session-issuer-1".into(),
+            session_issuer_public_key: session_issuer.verifying_key().to_bytes().to_vec(),
+            command_issuer_key_id: "command-issuer-1".into(),
+            command_issuer_public_key: command_issuer.verifying_key().to_bytes().to_vec(),
+        };
+        let state = empty_app_state().await;
+        let shutdown = state.shutdown.clone();
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let now = super::now_ms();
+        let challenge = RelayMessage::Challenge(SessionChallengeMessage {
+            protocol_version: PROTOCOL_VERSION,
+            challenge_id: Uuid::new_v4(),
+            endpoint: endpoint.into(),
+            nonce: "nonce_012345678901234567890123456789".into(),
+            expires_at: now + 30_000,
+        });
+        let epoch = u64::try_from(now).unwrap();
+        let command = signed_command(
+            "command-issuer-1",
+            &command_issuer,
+            &installation_id,
+            epoch,
+            0,
+            now,
+        );
+        let (authenticated_tx, authenticated_rx) = tokio::sync::oneshot::channel();
+        let (send_after_shutdown_tx, send_after_shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&challenge).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                server.next().await.unwrap().unwrap(),
+                Message::Text(_)
+            ));
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&RelayMessage::SessionEstablished { epoch })
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                server.next().await.unwrap().unwrap(),
+                Message::Text(_)
+            ));
+            assert!(matches!(
+                server.next().await.unwrap().unwrap(),
+                Message::Text(_)
+            ));
+            authenticated_tx.send(()).unwrap();
+            send_after_shutdown_rx.await.unwrap();
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&RelayMessage::Command(command))
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), server.next())
+                .await
+                .expect("connector must terminate the active socket within the shutdown bound")
+                .expect("connector must send a WebSocket close frame")
+                .expect("close frame must be readable")
+        });
+        let client_task = tokio::spawn(async move {
+            let mut store = StateStore::default();
+            let mut epoch_guard = SessionEpochGuard::load(&config.epoch_path).unwrap();
+            let mut ledger = CommandLedger::default();
+            let exit = run_connection(
+                &state,
+                &config,
+                &identity,
+                "test.session.grant",
+                0,
+                &mut store,
+                &mut epoch_guard,
+                &mut ledger,
+                client,
+            )
+            .await;
+            (exit, ledger)
+        });
+
+        authenticated_rx.await.unwrap();
+        shutdown.cancel();
+        send_after_shutdown_tx.send(()).unwrap();
+        let (exit, ledger) = tokio::time::timeout(std::time::Duration::from_secs(1), client_task)
+            .await
+            .expect("connector shutdown must be bounded")
+            .unwrap();
+        assert_eq!(exit.unwrap(), ConnectionExit::Shutdown);
+        assert_eq!(
+            ledger.len(),
+            0,
+            "shutdown must win before command verification"
+        );
+        let close = server_task.await.unwrap();
+        assert!(matches!(
+            close,
+            Message::Close(Some(frame))
+                if frame.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Away
+        ));
     }
 }
