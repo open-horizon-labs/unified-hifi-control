@@ -14,7 +14,6 @@ pub enum StateError {
 /// Build the cloud projection from the aggregator's authoritative zones. The
 /// provider image key is reduced to a revision digest; the key itself never
 /// enters the semantic snapshot.
-#[cfg(not(test))]
 pub async fn snapshot_from_aggregator(
     aggregator: &crate::aggregator::ZoneAggregator,
     store: &mut StateStore,

@@ -1,5 +1,4 @@
-#[path = "../src/cloud_connector/mod.rs"]
-mod cloud_connector;
+use unified_hifi_control::cloud_connector;
 
 use cloud_connector::commands::{GrantClaims, GrantError, MAX_REPLAY_REQUESTS};
 use cloud_connector::protocol::{

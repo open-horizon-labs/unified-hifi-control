@@ -122,21 +122,13 @@ async fn run(
             max_frame_size: Some(super::protocol::MAX_MESSAGE_BYTES),
             ..WebSocketConfig::default()
         };
-        let mut request = match config.endpoint.as_str().into_client_request() {
+        let request = match websocket_upgrade_request(config.endpoint.as_str(), &grant) {
             Ok(request) => request,
             Err(error) => {
                 tracing::error!("HiPhi Cloud relay request is invalid: {error}");
                 break;
             }
         };
-        let authorization = match HeaderValue::from_str(&format!("Bearer {grant}")) {
-            Ok(value) => value,
-            Err(_) => {
-                tracing::warn!("HiPhi Cloud returned an invalid session grant");
-                continue;
-            }
-        };
-        request.headers_mut().insert(AUTHORIZATION, authorization);
         match tokio::time::timeout(
             CONNECT_TIMEOUT,
             connect_async_with_config(request, Some(websocket_limits), false),
@@ -726,10 +718,23 @@ fn issuer_verifying_key(
     )?)
 }
 
+fn websocket_upgrade_request(
+    endpoint: &str,
+    grant: &str,
+) -> anyhow::Result<tokio_tungstenite::tungstenite::http::Request<()>> {
+    let mut request = endpoint.into_client_request()?;
+    request.headers_mut().insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {grant}"))?,
+    );
+    Ok(request)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{validate_challenge, RelayMessage};
+    use super::{validate_challenge, websocket_upgrade_request, RelayMessage};
     use crate::cloud_connector::protocol::SessionChallengeMessage;
+    use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
     use uuid::Uuid;
 
     fn challenge(endpoint: &str, expires_at: i64) -> SessionChallengeMessage {
@@ -740,6 +745,26 @@ mod tests {
             nonce: "nonce_012345678901234567890123456789".to_owned(),
             expires_at,
         }
+    }
+
+    #[test]
+    fn websocket_upgrade_carries_authority_only_in_the_header() {
+        let request = websocket_upgrade_request(
+            "wss://cloud.example/v1/relay/connect",
+            "signed.session.grant",
+        )
+        .unwrap();
+        assert_eq!(request.uri(), "wss://cloud.example/v1/relay/connect");
+        assert_eq!(
+            request.headers().get(AUTHORIZATION).unwrap(),
+            "Bearer signed.session.grant"
+        );
+        assert!(!request.uri().to_string().contains("grant"));
+        assert!(websocket_upgrade_request(
+            "wss://cloud.example/v1/relay/connect",
+            "invalid\r\ngrant"
+        )
+        .is_err());
     }
 
     #[test]

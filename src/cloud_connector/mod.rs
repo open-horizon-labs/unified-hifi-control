@@ -9,7 +9,6 @@ pub mod config;
 pub mod identity;
 pub mod pairing;
 pub mod protocol;
-#[cfg(not(test))]
 pub mod runtime;
 pub mod session;
 pub mod state;
