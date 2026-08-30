@@ -11,16 +11,16 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use reqwest::{Client, Method, StatusCode};
+use reqwest::{header::RETRY_AFTER, Client, Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use tokio::time::interval;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -36,6 +36,80 @@ use crate::bus::{
 
 const SPOTIFY_API_URL: &str = "https://api.spotify.com/v1";
 const SPOTIFY_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const SPOTIFY_QUOTA_BACKOFF: Duration = Duration::from_secs(15 * 60);
+const SPOTIFY_QUOTA_MODE_ENV: &str = "UHC_SPOTIFY_QUOTA_MODE";
+
+/// Spotify application entitlement used to select the available Web API
+/// surface. New installations are Development Mode unless an operator
+/// explicitly declares an Extended Quota app.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SpotifyQuotaMode {
+    #[default]
+    Development,
+    Extended,
+}
+
+impl SpotifyQuotaMode {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "development" => Ok(Self::Development),
+            "extended" => Ok(Self::Extended),
+            value => Err(anyhow!(
+                "invalid {SPOTIFY_QUOTA_MODE_ENV} value '{value}'; expected 'development' or 'extended'"
+            )),
+        }
+    }
+
+    fn from_environment() -> Self {
+        let Ok(value) = std::env::var(SPOTIFY_QUOTA_MODE_ENV) else {
+            return Self::default();
+        };
+        match Self::parse(&value) {
+            Ok(mode) => mode,
+            Err(error) => {
+                warn!("{error}; using Development Mode");
+                Self::default()
+            }
+        }
+    }
+}
+
+/// Spotify-specific 429 outcomes that callers can classify without parsing
+/// provider text or exposing the provider response body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpotifyApiError {
+    RateLimited { retry_after: Option<Duration> },
+    QuotaExceeded,
+}
+
+impl fmt::Display for SpotifyApiError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RateLimited {
+                retry_after: Some(delay),
+            } => write!(
+                formatter,
+                "Spotify API rate limited the request; retry after {} seconds",
+                delay.as_secs()
+            ),
+            Self::RateLimited { retry_after: None } => {
+                write!(formatter, "Spotify API rate limited the request")
+            }
+            Self::QuotaExceeded => write!(
+                formatter,
+                "Spotify API quota exhausted (QUOTA_EXCEEDED); retry after the developer quota resets"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SpotifyApiError {}
+
+#[derive(Debug, Clone, Copy)]
+enum SpotifyRequestGate {
+    RateLimitedUntil(Instant),
+    QuotaExceededUntil(Instant),
+}
 
 /// OAuth credentials needed to call the Spotify Web API.
 ///
@@ -96,6 +170,8 @@ pub struct SpotifyDevice {
     #[serde(default)]
     pub is_restricted: bool,
     #[serde(default)]
+    pub supports_volume: bool,
+    #[serde(default)]
     pub volume_percent: Option<u8>,
 }
 
@@ -123,15 +199,20 @@ impl SpotifyDevice {
             zone_id: zone_id.clone(),
             zone_name: self.name.clone(),
             state,
-            volume_control: self.volume_percent.map(|value| VolumeControl {
-                value: f32::from(value),
-                min: 0.0,
-                max: 100.0,
-                step: 1.0,
-                is_muted: false,
-                scale: VolumeScale::Percentage,
-                output_id: Some(zone_id),
-            }),
+            volume_control: self
+                .supports_volume
+                .then(|| {
+                    self.volume_percent.map(|value| VolumeControl {
+                        value: f32::from(value),
+                        min: 0.0,
+                        max: 100.0,
+                        step: 1.0,
+                        is_muted: false,
+                        scale: VolumeScale::Percentage,
+                        output_id: Some(zone_id),
+                    })
+                })
+                .flatten(),
             now_playing,
             source: "spotify".to_string(),
             is_controllable: controllable,
@@ -288,11 +369,11 @@ pub struct SpotifyPlaylist {
     #[serde(default)]
     pub images: Vec<SpotifyImage>,
     #[serde(default)]
-    pub tracks: Option<SpotifyPlaylistTrackSummary>,
+    pub items: Option<SpotifyPlaylistItemSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SpotifyPlaylistTrackSummary {
+pub struct SpotifyPlaylistItemSummary {
     #[serde(default)]
     pub total: usize,
 }
@@ -324,12 +405,6 @@ pub struct SpotifyAlbumSummary {
     pub images: Vec<SpotifyImage>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct SpotifySnapshot {
-    #[serde(default)]
-    snapshot_id: Option<String>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct SpotifyFeaturedPlaylists {
     playlists: SpotifyPage<SpotifyPlaylist>,
@@ -338,6 +413,12 @@ struct SpotifyFeaturedPlaylists {
 #[derive(Debug, Clone, Deserialize)]
 struct SpotifyNewReleases {
     albums: SpotifyPage<SpotifyAlbumSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct SpotifySnapshot {
+    #[serde(default)]
+    snapshot_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -360,7 +441,41 @@ pub struct SpotifyImage {
 #[derive(Debug, Clone, Deserialize)]
 struct DevicesResponse {
     #[serde(default)]
-    devices: Vec<SpotifyDevice>,
+    devices: Vec<SpotifyDeviceResponse>,
+}
+
+/// Spotify documents device IDs as nullable. UHC zones require a stable ID, so
+/// the wire shape stays nullable until the inventory boundary and anonymous
+/// devices are skipped without discarding the rest of the poll.
+#[derive(Debug, Clone, Deserialize)]
+struct SpotifyDeviceResponse {
+    id: Option<String>,
+    name: String,
+    #[serde(rename = "type", default)]
+    device_type: String,
+    #[serde(default)]
+    is_active: bool,
+    #[serde(default)]
+    is_restricted: bool,
+    #[serde(default)]
+    supports_volume: bool,
+    #[serde(default)]
+    volume_percent: Option<u8>,
+}
+
+impl SpotifyDeviceResponse {
+    fn into_device(self) -> Option<SpotifyDevice> {
+        let id = self.id.filter(|id| !id.trim().is_empty())?;
+        Some(SpotifyDevice {
+            id,
+            name: self.name,
+            device_type: self.device_type,
+            is_active: self.is_active,
+            is_restricted: self.is_restricted,
+            supports_volume: self.supports_volume,
+            volume_percent: self.volume_percent,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -425,6 +540,7 @@ struct SpotifyState {
     account: Option<ProviderAccount>,
     account_loaded: bool,
     running: bool,
+    request_gate: Option<SpotifyRequestGate>,
 }
 
 /// Direct Spotify Connect controller adapter.
@@ -433,6 +549,7 @@ pub struct SpotifyAdapter {
     state: Arc<RwLock<SpotifyState>>,
     client: Client,
     api_base_url: String,
+    quota_mode: SpotifyQuotaMode,
     bus: SharedBus,
     shutdown: Arc<RwLock<CancellationToken>>,
     refresher: Arc<RwLock<Option<Arc<dyn SpotifyTokenRefresher>>>>,
@@ -441,11 +558,26 @@ pub struct SpotifyAdapter {
 impl SpotifyAdapter {
     /// Create an adapter using Spotify's production Web API.
     pub fn new(bus: SharedBus) -> Self {
-        Self::with_base_url(bus, SPOTIFY_API_URL.to_string())
+        Self::with_base_url_and_quota_mode(
+            bus,
+            SPOTIFY_API_URL.to_string(),
+            SpotifyQuotaMode::from_environment(),
+        )
     }
 
     /// Create an adapter pointed at a custom API URL (used by protocol tests).
     pub fn with_base_url(bus: SharedBus, api_base_url: String) -> Self {
+        Self::with_base_url_and_quota_mode(bus, api_base_url, SpotifyQuotaMode::default())
+    }
+
+    /// Create an adapter with an explicit Spotify application entitlement.
+    /// Tests and Extended Quota deployments use this to make the boundary
+    /// observable instead of inferring it from provider failures.
+    pub fn with_base_url_and_quota_mode(
+        bus: SharedBus,
+        api_base_url: String,
+        quota_mode: SpotifyQuotaMode,
+    ) -> Self {
         #[allow(clippy::expect_used)]
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
@@ -455,6 +587,7 @@ impl SpotifyAdapter {
             state: Arc::new(RwLock::new(SpotifyState::default())),
             client,
             api_base_url: api_base_url.trim_end_matches('/').to_string(),
+            quota_mode,
             bus,
             shutdown: Arc::new(RwLock::new(CancellationToken::new())),
             refresher: Arc::new(RwLock::new(None)),
@@ -467,6 +600,7 @@ impl SpotifyAdapter {
         state.token = Some(token);
         state.account = None;
         state.account_loaded = false;
+        state.request_gate = None;
     }
 
     /// Install the authorization-layer refresh callback.
@@ -492,6 +626,7 @@ impl SpotifyAdapter {
         state.playback = None;
         state.account = None;
         state.account_loaded = false;
+        state.request_gate = None;
     }
 
     /// Return whether an unexpired access token is available.
@@ -525,7 +660,7 @@ impl SpotifyAdapter {
         if query.is_empty() {
             return Err(anyhow!("Spotify search query cannot be empty"));
         }
-        let limit = limit.clamp(1, 50);
+        let limit = spotify_search_limit(limit);
         let path = format!(
             "/search?q={}&type=track%2Calbum%2Cartist&limit={limit}",
             urlencoding::encode(query)
@@ -578,7 +713,8 @@ impl SpotifyAdapter {
         Ok(results)
     }
 
-    /// Browse Spotify's top-level catalog categories.
+    /// Spotify removed catalog categories from the Web API surface available
+    /// to new Development Mode applications in February 2026.
     pub async fn browse_categories(
         &self,
         limit: usize,
@@ -586,6 +722,7 @@ impl SpotifyAdapter {
         country: Option<&str>,
         locale: Option<&str>,
     ) -> Result<SpotifyPage<SpotifyCategory>> {
+        self.require_extended_quota("catalog categories")?;
         let mut query = vec![
             format!("limit={}", spotify_page_limit(limit)),
             format!("offset={offset}"),
@@ -596,11 +733,15 @@ impl SpotifyAdapter {
         if let Some(locale) = locale.filter(|value| !value.is_empty()) {
             query.push(format!("locale={}", urlencoding::encode(locale)));
         }
-        let path = format!("/browse/categories?{}", query.join("&"));
-        self.request_json(Method::GET, &path).await
+        self.request_json(
+            Method::GET,
+            &format!("/browse/categories?{}", query.join("&")),
+        )
+        .await
     }
 
-    /// Browse playlists attached to one Spotify catalog category.
+    /// Spotify removed category playlists from the Web API surface available
+    /// to new Development Mode applications in February 2026.
     pub async fn browse_category_playlists(
         &self,
         category_id: &str,
@@ -608,6 +749,7 @@ impl SpotifyAdapter {
         offset: usize,
         country: Option<&str>,
     ) -> Result<SpotifyPage<SpotifyPlaylist>> {
+        self.require_extended_quota("category playlists")?;
         let category_id = category_id.trim();
         if category_id.is_empty() {
             return Err(anyhow!("Spotify category id cannot be empty"));
@@ -619,15 +761,19 @@ impl SpotifyAdapter {
         if let Some(country) = country.filter(|value| !value.is_empty()) {
             query.push(format!("country={}", urlencoding::encode(country)));
         }
-        let path = format!(
-            "/browse/categories/{}/playlists?{}",
-            urlencoding::encode(category_id),
-            query.join("&")
-        );
-        self.request_json(Method::GET, &path).await
+        self.request_json(
+            Method::GET,
+            &format!(
+                "/browse/categories/{}/playlists?{}",
+                urlencoding::encode(category_id),
+                query.join("&")
+            ),
+        )
+        .await
     }
 
-    /// Browse Spotify's featured editorial playlists.
+    /// Spotify removed featured playlists from the Web API surface available
+    /// to new Development Mode applications in February 2026.
     pub async fn browse_featured_playlists(
         &self,
         limit: usize,
@@ -636,6 +782,7 @@ impl SpotifyAdapter {
         locale: Option<&str>,
         timestamp: Option<&str>,
     ) -> Result<SpotifyPage<SpotifyPlaylist>> {
+        self.require_extended_quota("featured playlists")?;
         let mut query = vec![
             format!("limit={}", spotify_page_limit(limit)),
             format!("offset={offset}"),
@@ -649,18 +796,24 @@ impl SpotifyAdapter {
         if let Some(timestamp) = timestamp.filter(|value| !value.is_empty()) {
             query.push(format!("timestamp={}", urlencoding::encode(timestamp)));
         }
-        let path = format!("/browse/featured-playlists?{}", query.join("&"));
-        let response: SpotifyFeaturedPlaylists = self.request_json(Method::GET, &path).await?;
+        let response: SpotifyFeaturedPlaylists = self
+            .request_json(
+                Method::GET,
+                &format!("/browse/featured-playlists?{}", query.join("&")),
+            )
+            .await?;
         Ok(response.playlists)
     }
 
-    /// Browse Spotify's new-release album catalog.
+    /// Spotify removed new releases from the Web API surface available to new
+    /// Development Mode applications in February 2026.
     pub async fn browse_new_releases(
         &self,
         limit: usize,
         offset: usize,
         country: Option<&str>,
     ) -> Result<SpotifyPage<SpotifyAlbumSummary>> {
+        self.require_extended_quota("new releases")?;
         let mut query = vec![
             format!("limit={}", spotify_page_limit(limit)),
             format!("offset={offset}"),
@@ -668,9 +821,20 @@ impl SpotifyAdapter {
         if let Some(country) = country.filter(|value| !value.is_empty()) {
             query.push(format!("country={}", urlencoding::encode(country)));
         }
-        let path = format!("/browse/new-releases?{}", query.join("&"));
-        let response: SpotifyNewReleases = self.request_json(Method::GET, &path).await?;
+        let response: SpotifyNewReleases = self
+            .request_json(
+                Method::GET,
+                &format!("/browse/new-releases?{}", query.join("&")),
+            )
+            .await?;
         Ok(response.albums)
+    }
+
+    fn require_extended_quota(&self, surface: &str) -> Result<()> {
+        if self.quota_mode == SpotifyQuotaMode::Extended {
+            return Ok(());
+        }
+        Err(development_mode_browse_unavailable(surface))
     }
 
     /// List playlists visible to the current Spotify user.
@@ -998,13 +1162,20 @@ impl SpotifyAdapter {
         for device in &devices {
             let zone_id = PrefixedZoneId::spotify(&device.id);
             let device_playback = playback_for_device(playback.as_ref(), &device.id);
-            if previous_devices.contains_key(&device.id) {
+            if let Some(previous_device) = previous_devices.get(&device.id) {
                 let zone = device.to_zone(device_playback);
-                self.bus.publish(BusEvent::ZoneUpdated {
-                    zone_id: zone_id.clone(),
-                    display_name: device.name.clone(),
-                    state: zone.state.to_string(),
-                });
+                let needs_full_refresh = previous_device.is_restricted != device.is_restricted
+                    || previous_device.supports_volume != device.supports_volume
+                    || previous_device.volume_percent.is_some() != device.volume_percent.is_some();
+                if needs_full_refresh {
+                    self.bus.publish(BusEvent::ZoneDiscovered { zone });
+                } else {
+                    self.bus.publish(BusEvent::ZoneUpdated {
+                        zone_id: zone_id.clone(),
+                        display_name: device.name.clone(),
+                        state: zone.state.to_string(),
+                    });
+                }
 
                 let previous_device_playback =
                     playback_for_device(previous_playback.as_ref(), &device.id);
@@ -1053,8 +1224,13 @@ impl SpotifyAdapter {
                     }
                 }
             } else {
-                self.bus.publish(BusEvent::ZoneDiscovered {
-                    zone: device.to_zone(device_playback),
+                let zone = device.to_zone(device_playback);
+                self.bus.publish(BusEvent::ZoneDiscovered { zone });
+            }
+            if device.supports_volume && device.volume_percent.is_none() {
+                self.bus.publish(BusEvent::VolumeCapabilityChanged {
+                    zone_id,
+                    supported: true,
                 });
             }
         }
@@ -1072,7 +1248,11 @@ impl SpotifyAdapter {
     async fn fetch_devices(&self) -> Result<Vec<SpotifyDevice>> {
         let response: DevicesResponse =
             self.request_json(Method::GET, "/me/player/devices").await?;
-        Ok(response.devices)
+        Ok(response
+            .devices
+            .into_iter()
+            .filter_map(SpotifyDeviceResponse::into_device)
+            .collect())
     }
 
     async fn fetch_playback(&self) -> Result<Option<SpotifyPlayback>> {
@@ -1094,6 +1274,7 @@ impl SpotifyAdapter {
 
     async fn request(&self, method: Method, path: &str) -> Result<reqwest::Response> {
         let access_token = self.ensure_access_token().await?;
+        self.enforce_request_gate().await?;
         let has_command_body = method == Method::POST || method == Method::PUT;
         let request = self
             .client
@@ -1167,6 +1348,7 @@ impl SpotifyAdapter {
         body: &T,
     ) -> Result<R> {
         let access_token = self.ensure_access_token().await?;
+        self.enforce_request_gate().await?;
         let response = self
             .client
             .request(method, format!("{}{}", self.api_base_url, path))
@@ -1183,16 +1365,15 @@ impl SpotifyAdapter {
         response: reqwest::Response,
     ) -> Result<T> {
         let status = response.status();
+        let retry_after = spotify_retry_after(&response);
         let body = response
             .text()
             .await
             .map_err(|e| anyhow!("failed reading Spotify response: {}", e))?;
         if !status.is_success() {
-            let detail = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|json| json["error"]["message"].as_str().map(str::to_string))
-                .unwrap_or_else(|| body.chars().take(240).collect());
-            return Err(anyhow!("Spotify API returned HTTP {}: {}", status, detail));
+            return Err(self
+                .record_api_error(status, retry_after, &body, false)
+                .await);
         }
         serde_json::from_str(&body).map_err(|e| anyhow!("invalid Spotify response JSON: {}", e))
     }
@@ -1216,22 +1397,11 @@ impl SpotifyAdapter {
         if status.is_success() || status == StatusCode::NO_CONTENT {
             return Ok(());
         }
+        let retry_after = spotify_retry_after(&response);
         let body = response.text().await.unwrap_or_default();
-        let detail = serde_json::from_str::<Value>(&body)
-            .ok()
-            .and_then(|json| json["error"]["message"].as_str().map(str::to_string))
-            .unwrap_or_else(|| body.chars().take(240).collect());
-        if playback_control && status == StatusCode::FORBIDDEN {
-            return Err(anyhow!(
-                "Spotify playback control requires a Premium account: {detail}"
-            ));
-        }
-        if playback_control && status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(anyhow!(
-                "Spotify playback control is rate limited; try again shortly: {detail}"
-            ));
-        }
-        Err(anyhow!("Spotify API returned HTTP {}: {}", status, detail))
+        Err(self
+            .record_api_error(status, retry_after, &body, playback_control)
+            .await)
     }
 
     async fn send_json_command<T: Serialize>(
@@ -1241,6 +1411,7 @@ impl SpotifyAdapter {
         body: &T,
     ) -> Result<()> {
         let access_token = self.ensure_access_token().await?;
+        self.enforce_request_gate().await?;
         let response = self
             .client
             .request(method, format!("{}{}", self.api_base_url, path))
@@ -1253,12 +1424,11 @@ impl SpotifyAdapter {
         if status.is_success() || status == StatusCode::NO_CONTENT {
             return Ok(());
         }
+        let retry_after = spotify_retry_after(&response);
         let body = response.text().await.unwrap_or_default();
-        let detail = serde_json::from_str::<Value>(&body)
-            .ok()
-            .and_then(|json| json["error"]["message"].as_str().map(str::to_string))
-            .unwrap_or_else(|| body.chars().take(240).collect());
-        Err(anyhow!("Spotify API returned HTTP {}: {}", status, detail))
+        Err(self
+            .record_api_error(status, retry_after, &body, false)
+            .await)
     }
 
     async fn request_json_with_body<T: Serialize, R: for<'de> Deserialize<'de>>(
@@ -1268,6 +1438,7 @@ impl SpotifyAdapter {
         body: &T,
     ) -> Result<R> {
         let access_token = self.ensure_access_token().await?;
+        self.enforce_request_gate().await?;
         let response = self
             .client
             .request(method, format!("{}{}", self.api_base_url, path))
@@ -1277,6 +1448,54 @@ impl SpotifyAdapter {
             .await
             .map_err(|e| anyhow!("Spotify request {} failed: {}", path, e))?;
         self.decode_response(response).await
+    }
+
+    async fn enforce_request_gate(&self) -> Result<()> {
+        let now = Instant::now();
+        let mut state = self.state.write().await;
+        match state.request_gate {
+            Some(SpotifyRequestGate::RateLimitedUntil(until)) if until > now => {
+                Err(SpotifyApiError::RateLimited {
+                    retry_after: Some(until.duration_since(now)),
+                }
+                .into())
+            }
+            Some(SpotifyRequestGate::QuotaExceededUntil(until)) if until > now => {
+                Err(SpotifyApiError::QuotaExceeded.into())
+            }
+            Some(_) => {
+                state.request_gate = None;
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    async fn record_api_error(
+        &self,
+        status: StatusCode,
+        retry_after: Option<Duration>,
+        body: &str,
+        playback_control: bool,
+    ) -> anyhow::Error {
+        let error = spotify_api_error(status, retry_after, body, playback_control);
+        if let Some(spotify_error) = error.downcast_ref::<SpotifyApiError>() {
+            let gate = match spotify_error {
+                SpotifyApiError::RateLimited {
+                    retry_after: Some(delay),
+                } => Some(SpotifyRequestGate::RateLimitedUntil(
+                    Instant::now() + *delay,
+                )),
+                SpotifyApiError::RateLimited { retry_after: None } => None,
+                SpotifyApiError::QuotaExceeded => Some(SpotifyRequestGate::QuotaExceededUntil(
+                    Instant::now() + SPOTIFY_QUOTA_BACKOFF,
+                )),
+            };
+            if let Some(gate) = gate {
+                self.state.write().await.request_gate = Some(gate);
+            }
+        }
+        error
     }
 
     async fn start_internal(&self) -> Result<()> {
@@ -1337,14 +1556,23 @@ impl AdapterLogic for SpotifyAdapter {
             adapter: "spotify".to_string(),
             details: Some("Spotify Web API".to_string()),
         });
-        let mut ticker = interval(SPOTIFY_POLL_INTERVAL);
+        // Preserve the adapter's immediate first discovery while using
+        // one-shot sleeps afterward so a long provider call cannot make an
+        // interval ticker catch up with a burst of requests.
+        let mut poll_delay = Duration::ZERO;
         loop {
             tokio::select! {
                 _ = ctx.shutdown.cancelled() => break,
-                _ = ticker.tick() => {
-                    if let Err(error) = self.update().await {
-                        self.publish_error(&error);
-                        debug!("Spotify polling failed: {}", error);
+                _ = sleep(poll_delay) => {
+                    match self.update().await {
+                        Ok(()) => poll_delay = SPOTIFY_POLL_INTERVAL,
+                        Err(error) => {
+                            self.publish_error(&error);
+                            debug!("Spotify polling failed: {}", error);
+                            poll_delay = spotify_retry_delay(&error)
+                                .unwrap_or(SPOTIFY_POLL_INTERVAL)
+                                .max(Duration::from_secs(1));
+                        }
                     }
                 }
             }
@@ -1417,6 +1645,9 @@ impl AdapterLogic for SpotifyAdapter {
                     .await
             }
             AdapterCommand::VolumeAbsolute(value) => {
+                if !device.supports_volume {
+                    return Ok(failure("Spotify device does not support volume control"));
+                }
                 let value = value.clamp(0, 100);
                 self.send_command(
                     Method::PUT,
@@ -1428,6 +1659,9 @@ impl AdapterLogic for SpotifyAdapter {
                 .await
             }
             AdapterCommand::VolumeRelative(delta) => {
+                if !device.supports_volume {
+                    return Ok(failure("Spotify device does not support volume control"));
+                }
                 let current = device
                     .volume_percent
                     .ok_or_else(|| anyhow!("Spotify device volume is unavailable"));
@@ -1533,12 +1767,12 @@ impl LibraryAdapter for SpotifyAdapter {
                     .await?,
             )?,
             "browse_category_playlists" => {
-                let id = params
+                let category_id = params
                     .get("category_id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow!("category_id is required"))?;
                 serde_json::to_value(
-                    self.browse_category_playlists(id, limit as usize, 0, None)
+                    self.browse_category_playlists(category_id, limit as usize, 0, None)
                         .await?,
                 )?
             }
@@ -1573,17 +1807,13 @@ impl LibraryAdapter for SpotifyAdapter {
                     .and_then(Value::as_str)
                     .filter(|s| !s.trim().is_empty())
                     .ok_or_else(|| anyhow!("name is required"))?;
-                let profile = self
-                    .request_json::<SpotifyUserProfile>(Method::GET, "/me")
-                    .await?;
                 let body = serde_json::json!({
                     "name": name,
                     "public": params.get("public").and_then(Value::as_bool).unwrap_or(false),
                     "collaborative": false,
                     "description": params.get("description").and_then(Value::as_str).unwrap_or("")
                 });
-                let path = format!("/users/{}/playlists", profile.id);
-                self.request_json_with_body(Method::POST, &path, &body)
+                self.request_json_with_body(Method::POST, "/me/playlists", &body)
                     .await?
             }
             "update_playlist" => {
@@ -1703,6 +1933,59 @@ fn now_secs() -> u64 {
 
 fn spotify_page_limit(limit: usize) -> usize {
     limit.clamp(1, 50)
+}
+
+fn spotify_search_limit(limit: usize) -> usize {
+    limit.clamp(1, 10)
+}
+
+fn development_mode_browse_unavailable(surface: &str) -> anyhow::Error {
+    anyhow!(
+        "Spotify {surface} are unavailable to new Development Mode applications as of the February 2026 Web API changes; use search or the authenticated user's library instead"
+    )
+}
+
+fn spotify_api_error(
+    status: StatusCode,
+    retry_after: Option<Duration>,
+    body: &str,
+    playback_control: bool,
+) -> anyhow::Error {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        let reason = serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|json| json["error"]["reason"].as_str().map(str::to_owned));
+        if reason.as_deref() == Some("QUOTA_EXCEEDED") {
+            return SpotifyApiError::QuotaExceeded.into();
+        }
+        return SpotifyApiError::RateLimited { retry_after }.into();
+    }
+
+    let detail = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|json| json["error"]["message"].as_str().map(str::to_string))
+        .unwrap_or_else(|| body.chars().take(240).collect());
+    if playback_control && status == StatusCode::FORBIDDEN {
+        return anyhow!("Spotify playback control requires a Premium account: {detail}");
+    }
+    anyhow!("Spotify API returned HTTP {}: {}", status, detail)
+}
+
+fn spotify_retry_after(response: &reqwest::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+fn spotify_retry_delay(error: &anyhow::Error) -> Option<Duration> {
+    match error.downcast_ref::<SpotifyApiError>() {
+        Some(SpotifyApiError::RateLimited { retry_after }) => *retry_after,
+        Some(SpotifyApiError::QuotaExceeded) => Some(SPOTIFY_QUOTA_BACKOFF),
+        None => None,
+    }
 }
 
 fn spotify_ids(ids: &[String]) -> Result<String> {

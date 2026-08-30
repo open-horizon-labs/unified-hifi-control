@@ -11,11 +11,10 @@
 //! "Get an HTTPS address", and is torn down when authorization completes
 //! (success or failure), when the user stops it, on a 55-minute safety
 //! timeout, or when the server shuts down. While it is active this UHC
-//! server is briefly reachable from the public internet at the tunnel's
-//! URL; the callback endpoint behind it only ever accepts the single-use,
-//! in-flight OAuth `state` token (see `oauth_callback_json` in
-//! `provider_auth.rs`), so no additional trust is extended to tunnel
-//! traffic.
+//! callback-only listener is briefly reachable from the public internet at
+//! the tunnel's URL. It accepts only the exact callback and a bounded
+//! liveness probe; the callback itself accepts only the single-use, in-flight
+//! OAuth `state` token (see `oauth_callback_json` in `provider_auth.rs`).
 //!
 //! The state machine (`SpotifyTunnelManager`) is decoupled from the actual
 //! `ssh` process through the `TunnelLauncher`/`TunnelProcess` traits so unit
@@ -36,8 +35,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 /// Hard cap on tunnel lifetime, regardless of activity. A beginner should
-/// never end up with a forgotten tunnel silently keeping this server
-/// internet-reachable.
+/// never end up with a forgotten tunnel silently keeping its callback
+/// listener internet-reachable.
 ///
 /// The cap must comfortably outlast a first-time Spotify enrollment: the
 /// user copies the URL, creates an app in Spotify's developer dashboard,
@@ -295,15 +294,18 @@ pub(crate) trait TunnelProbe: Send + Sync {
     async fn probe(&self, url: &str) -> Option<bool>;
 }
 
-/// Probes by fetching this server's own tunnel-status endpoint through the
-/// public URL. Any well-formed HTTP response proves the round trip; the
-/// endpoint itself is a harmless read.
+/// Probes the callback listener's dedicated liveness path through the public
+/// URL. Any successful response proves the round trip without making a
+/// main-UHC route internet reachable.
 pub(crate) struct RealTunnelProbe;
 
 #[async_trait::async_trait]
 impl TunnelProbe for RealTunnelProbe {
     async fn probe(&self, url: &str) -> Option<bool> {
-        let target = format!("{url}/api/providers/spotify/tunnel/status");
+        let target = format!(
+            "{url}{}",
+            crate::api::spotify_callback_listener::LIVENESS_PATH
+        );
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -470,6 +472,18 @@ impl SpotifyTunnelManager {
 
     pub async fn status(&self) -> TunnelStatus {
         self.status.read().await.clone()
+    }
+
+    /// Report a startup precondition failure without ever choosing a fallback
+    /// forward target.  In particular, a missing callback-only listener must
+    /// not cause the tunnel to fall back to UHC's main LAN port.
+    pub async fn fail_closed(&self, message: impl Into<String>) -> TunnelStatus {
+        self.stop_locked().await;
+        let status = TunnelStatus::Error {
+            message: message.into(),
+        };
+        *self.status.write().await = status.clone();
+        status
     }
 
     /// Starts a tunnel to `port` on this host, unless one is already

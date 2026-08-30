@@ -196,9 +196,10 @@ it, and made the table derived so the same error cannot be typed again.
 Two things this table does **not** claim:
 
 - **It is per provider, not per device.** A fixed-volume Roon output reports
-  `volume` as supported. UHC cannot currently distinguish "this output has no
-  volume control" from "no volume has been read yet", so `hifi_capabilities` reports
-  the aggregator's `has_volume_control` observation separately rather than guessing.
+  `volume` as supported. `hifi_capabilities` reports `has_volume_control`
+  separately: an explicit device flag is authoritative when available (Spotify's
+  `supports_volume`, even with a null current value); other providers fall back to
+  whether the aggregator has observed a numeric control.
 - **Every ⛔ for OpenHome and UPnP rests on specification knowledge, not on a call
   to a device.** Each cell says so in its own footnote. LMS's cells come from a live
   Lyrion 9.1.2 inventory (#402/#403) and are the strongest rows here.
@@ -213,19 +214,19 @@ Two things this table does **not** claim:
 | `search` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 | 🚧 #481 | ✅ | ✅ |
 | `play_by_query` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 | 🚧 #481 | ✅ | ✅ |
 | `play_by_ref` | 🚧 #396 | 🚧 #396 | 🚧 #396 | 🚧 #396 | 🚧 #209 | 🚧 #481 | ✅ | ✅ |
-| `browse` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 | 🚧 #482 | ✅ | ✅ |
+| `browse` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 | 🚧 #482 | 🚧 #473 | ✅ |
 | `queue_read` | 🚧 #400 | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | ✅ | ✅ |
-| `queue_jump` | 🚧 #400 | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | 🚧 #462 | ✅ |
-| `queue_reorder` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | 🚧 #462 | ✅ |
-| `queue_remove` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | 🚧 #462 | ✅ |
-| `queue_clear` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | 🚧 #462 | ✅ |
-| `queue_transfer` | ⛔ | 🚧 #400 | ⛔ | ⛔ | 🚧 #209 | 🚧 #462 | 🚧 #462 | ✅ |
-| `play_next` | 🚧 #399 | 🚧 #403 | 🚧 #392 | 🚧 #396 | 🚧 #209 | 🚧 #483 | 🚧 #462 | ✅ |
+| `queue_jump` | 🚧 #400 | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | ⛔ | ✅ |
+| `queue_reorder` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | ⛔ | ✅ |
+| `queue_remove` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | ⛔ | ✅ |
+| `queue_clear` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | ⛔ | ✅ |
+| `queue_transfer` | ⛔ | 🚧 #400 | ⛔ | ⛔ | 🚧 #209 | 🚧 #462 | ⛔ | ✅ |
+| `play_next` | 🚧 #399 | 🚧 #403 | 🚧 #392 | 🚧 #396 | 🚧 #209 | 🚧 #483 | 🚧 #474 | ✅ |
 | `repeat_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | ✅ | 🚧 #462 | ✅ | ✅ |
 | `shuffle_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | ✅ | 🚧 #462 | ✅ | ✅ |
 | `saved_playlists` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 | 🚧 #482 | ✅ | ✅ |
 | `favorites` | 🚧 #531 | ✅ | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #482 | ✅ | ✅ |
-| `multiroom_sync` | ✅ | ✅ | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #462 | 🚧 #462 | ✅ |
+| `multiroom_sync` | ✅ | ✅ | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #462 | ⛔ | ✅ |
 
 ✅ supported · ⛔ the provider's protocol cannot do it · 🚧 the provider can, UHC has not wired it (issue that will)
 
@@ -253,6 +254,7 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - ⛔ **upnp / `browse`** — UHC discovers UPnP zones as urn:schemas-upnp-org:device:MediaRenderer:1 and speaks only AVTransport:1 and RenderingControl:1. Searching or browsing content is a ContentDirectory:1 (MediaServer) capability, which a renderer does not have and UHC does not discover. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `browse`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `browse`** (#482) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
+- 🚧 **spotify / `browse`** (#473) — Spotify removed categories, category playlists, featured playlists, and new releases from the Web API surface available to new Development Mode applications in February 2026. A future browse implementation must use a currently available, quota-aware surface rather than call those retired endpoints.
 - 🚧 **roon / `queue_read`** (#400) — the pinned roon-api fork exposes subscribe_queue(zone, max_items), which nothing in UHC calls.
 - 🚧 **lms / `queue_read`** (#400) — status <player> <start> <n> returns the whole current playlist with playlist_cur_index; verified live.
 - 🚧 **openhome / `queue_read`** (#392) — OpenHome's Playlist:1 service provides Read/ReadList/IdArray, Insert, DeleteId, DeleteAll, SeekId/SeekIndex and SetRepeat/SetShuffle. UHC discovers only Product/Transport/Volume and drives none of it, so this is a UHC gap. Verified from the OpenHome service definitions, not from a device.
@@ -265,42 +267,42 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - ⛔ **upnp / `queue_jump`** — AVTransport:1 holds a single current transport URI plus one SetNextAVTransportURI; it has no playlist to enumerate or mutate. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `queue_jump`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `queue_jump`** (#483) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
-- 🚧 **spotify / `queue_jump`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
+- ⛔ **spotify / `queue_jump`** — Spotify's Web API exposes Get the User's Queue and Add Item to Playback Queue, but no endpoint to jump, reorder, remove, clear, or transfer active queue contents. Verified from the Spotify Web API Player reference, not inferred from a device.
 - ⛔ **roon / `queue_reorder`** — The Roon API's transport service exposes a queue subscription and play_from_here and no mutation at all -- no move, remove or clear. The pinned roon-api fork (ohc/main) exposes subscribe_queue and play_from_here and nothing further.
 - 🚧 **lms / `queue_reorder`** (#400) — playlist move <from> <to> reorders the queue; verified live. Roon cannot do this and LMS can, which is why this capability exists in the vocabulary at all.
 - 🚧 **openhome / `queue_reorder`** (#392) — OpenHome's Playlist:1 has no Move action, but Insert takes an AfterId, so a reorder is DeleteId plus Insert -- composite rather than atomic, and reachable. Verified from the OpenHome service definitions, not from a device.
 - ⛔ **upnp / `queue_reorder`** — AVTransport:1 holds a single current transport URI plus one SetNextAVTransportURI; it has no playlist to enumerate or mutate. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `queue_reorder`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `queue_reorder`** (#483) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
-- 🚧 **spotify / `queue_reorder`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
+- ⛔ **spotify / `queue_reorder`** — Spotify's Web API exposes Get the User's Queue and Add Item to Playback Queue, but no endpoint to jump, reorder, remove, clear, or transfer active queue contents. Verified from the Spotify Web API Player reference, not inferred from a device.
 - ⛔ **roon / `queue_remove`** — The Roon API's transport service exposes a queue subscription and play_from_here and no mutation at all -- no move, remove or clear. The pinned roon-api fork (ohc/main) exposes subscribe_queue and play_from_here and nothing further.
 - 🚧 **lms / `queue_remove`** (#400) — playlist delete <index> removes one queued item; verified live.
 - 🚧 **openhome / `queue_remove`** (#392) — OpenHome's Playlist:1 service provides Read/ReadList/IdArray, Insert, DeleteId, DeleteAll, SeekId/SeekIndex and SetRepeat/SetShuffle. UHC discovers only Product/Transport/Volume and drives none of it, so this is a UHC gap. Verified from the OpenHome service definitions, not from a device.
 - ⛔ **upnp / `queue_remove`** — AVTransport:1 holds a single current transport URI plus one SetNextAVTransportURI; it has no playlist to enumerate or mutate. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `queue_remove`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `queue_remove`** (#483) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
-- 🚧 **spotify / `queue_remove`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
+- ⛔ **spotify / `queue_remove`** — Spotify's Web API exposes Get the User's Queue and Add Item to Playback Queue, but no endpoint to jump, reorder, remove, clear, or transfer active queue contents. Verified from the Spotify Web API Player reference, not inferred from a device.
 - ⛔ **roon / `queue_clear`** — The Roon API's transport service exposes a queue subscription and play_from_here and no mutation at all -- no move, remove or clear. The pinned roon-api fork (ohc/main) exposes subscribe_queue and play_from_here and nothing further.
 - 🚧 **lms / `queue_clear`** (#400) — playlist clear empties the queue; verified live.
 - 🚧 **openhome / `queue_clear`** (#392) — OpenHome's Playlist:1 service provides Read/ReadList/IdArray, Insert, DeleteId, DeleteAll, SeekId/SeekIndex and SetRepeat/SetShuffle. UHC discovers only Product/Transport/Volume and drives none of it, so this is a UHC gap. Verified from the OpenHome service definitions, not from a device.
 - ⛔ **upnp / `queue_clear`** — AVTransport:1 holds a single current transport URI plus one SetNextAVTransportURI; it has no playlist to enumerate or mutate. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `queue_clear`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `queue_clear`** (#483) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
-- 🚧 **spotify / `queue_clear`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
+- ⛔ **spotify / `queue_clear`** — Spotify's Web API exposes Get the User's Queue and Add Item to Playback Queue, but no endpoint to jump, reorder, remove, clear, or transfer active queue contents. Verified from the Spotify Web API Player reference, not inferred from a device.
 - ⛔ **roon / `queue_transfer`** — The Roon API's transport service exposes a queue subscription and play_from_here and no mutation at all -- no move, remove or clear. The pinned roon-api fork (ohc/main) exposes subscribe_queue and play_from_here and nothing further.
 - 🚧 **lms / `queue_transfer`** (#400) — sync <playerid> was verified live (#403) to merge a player into another's sync group by adopting the leader's queue, which destroys the source's queue rather than transferring it; the CLI reference names no dedicated queue-to-queue transfer command. A composite emulation -- read the source's playlist, replay it against the target with playlistcontrol, then playlist clear the source -- is buildable from primitives #400 already verified live, but is not wired.
 - ⛔ **openhome / `queue_transfer`** — OpenHome's Playlist:1 (Read/Insert/DeleteId/DeleteAll) is scoped to one room's renderer; the service set defines no action that moves one room's playlist into another's. Songcast (Sender:1/Receiver:1) relays audio to a group, it does not merge queue state. Verified from the OpenHome service definitions, not from a device.
 - ⛔ **upnp / `queue_transfer`** — AVTransport:1 holds a single current transport URI plus one SetNextAVTransportURI; it has no playlist to enumerate or mutate. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `queue_transfer`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `queue_transfer`** (#462) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
-- 🚧 **spotify / `queue_transfer`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
+- ⛔ **spotify / `queue_transfer`** — Spotify's Web API exposes Get the User's Queue and Add Item to Playback Queue, but no endpoint to jump, reorder, remove, clear, or transfer active queue contents. Verified from the Spotify Web API Player reference, not inferred from a device.
 - 🚧 **roon / `play_next`** (#399) — Roon's browse item actions include Play Next alongside Play Now and Queue; UHC's PlayAction models only Play, Queue and Radio, so this arrives with browse rather than with the queue.
 - 🚧 **lms / `play_next`** (#403) — playlistcontrol cmd:insert places an item immediately after the current one, verified live -- and LmsPlayAction::Insert is already modelled in the adapter and simply unreachable from MCP.
 - 🚧 **openhome / `play_next`** (#392) — OpenHome's Playlist:1 service provides Read/ReadList/IdArray, Insert, DeleteId, DeleteAll, SeekId/SeekIndex and SetRepeat/SetShuffle. UHC discovers only Product/Transport/Volume and drives none of it, so this is a UHC gap. Verified from the OpenHome service definitions, not from a device.
 - 🚧 **upnp / `play_next`** (#396) — the protocol can play a specific item -- UPnP AVTransport:1 takes SetAVTransportURI and SetNextAVTransportURI, OpenHome Playlist:1 takes Insert(AfterId, Uri, Metadata) -- so what is missing is UHC's ability to name one, not the device's ability to play it. Reported as a UHC gap rather than a provider limit, because a reference minted against a media server would work. Verified from the UPnP AV and OpenHome service definitions, not from a device.
 - 🚧 **hqplayer / `play_next`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `play_next`** (#483) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
-- 🚧 **spotify / `play_next`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
+- 🚧 **spotify / `play_next`** (#474) — Spotify exposes Add Item to Playback Queue and UHC routes it through hifi_play action=queue, but UHC does not expose a distinct play-next operation for Spotify.
 - 🚧 **roon / `repeat_mode`** (#360) — the Roon API's transport service takes loop settings (disabled/loop/loop_one); UHC drives none of them from any surface.
 - 🚧 **lms / `repeat_mode`** (#403) — playlist repeat <0|1|2> and playlist repeat ? read and write it; verified live. Note the mode lives on the sync master, so setting it changes every member.
 - 🚧 **openhome / `repeat_mode`** (#392) — OpenHome's Playlist:1 service provides Read/ReadList/IdArray, Insert, DeleteId, DeleteAll, SeekId/SeekIndex and SetRepeat/SetShuffle. UHC discovers only Product/Transport/Volume and drives none of it, so this is a UHC gap. Verified from the OpenHome service definitions, not from a device.
@@ -324,7 +326,7 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - ⛔ **upnp / `multiroom_sync`** — UPnP AV defines no synchronised-playback service; multiroom on UPnP renderers is vendor-specific and outside the two services UHC speaks. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `multiroom_sync`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `multiroom_sync`** (#462) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
-- 🚧 **spotify / `multiroom_sync`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
+- ⛔ **spotify / `multiroom_sync`** — Spotify's Transfer Playback endpoint accepts a single target device and does not synchronize multiple Connect devices; transfer is device selection, not multiroom grouping. Verified from the Spotify Web API Transfer Playback reference, not inferred from a device.
 <!-- END GENERATED CAPABILITY MATRIX (#398) -->
 
 `hqplayer:` is a fifth zone prefix: `PrefixedZoneId` lists it and `HqpAdapter`

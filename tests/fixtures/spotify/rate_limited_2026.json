@@ -1,0 +1,6 @@
+{
+  "error": {
+    "status": 429,
+    "message": "provider-rate-limit-diagnostic-must-not-leak"
+  }
+}

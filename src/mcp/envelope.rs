@@ -269,6 +269,8 @@ impl Observed {
 /// | [`Self::NotImplemented`]     | `unsupported` | retry once `tracked_by` ships |
 /// | [`Self::InvalidParameter`]   | `invalid`     | resend with a value from `accepted` |
 /// | [`Self::UnknownTarget`]      | `invalid`     | enumerate via `discover_with` |
+/// | [`Self::RateLimited`]        | `error`       | retry after the stated delay |
+/// | [`Self::QuotaExceeded`]      | `error`       | wait for provider quota recovery |
 /// | [`Self::BackendError`]       | `error`       | retrying may work |
 ///
 /// The variant determines the [`Outcome`] — see [`Self::outcome`] and
@@ -320,6 +322,15 @@ pub enum Refusal {
         discover_with: &'static str,
         detail: String,
     },
+    /// The provider applied a short-lived rate limit. Clients should not retry
+    /// before `retry_after_seconds` when it is present.
+    RateLimited {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retry_after_seconds: Option<u64>,
+        detail: String,
+    },
+    /// The provider's longer-lived account/application quota is exhausted.
+    QuotaExceeded { code: &'static str, detail: String },
     /// The operation was attempted and the backend failed.
     BackendError { detail: String },
 }
@@ -330,7 +341,9 @@ impl Refusal {
         match self {
             Self::ProviderLimitation { .. } | Self::NotImplemented { .. } => Outcome::Unsupported,
             Self::InvalidParameter { .. } | Self::UnknownTarget { .. } => Outcome::Invalid,
-            Self::BackendError { .. } => Outcome::Error,
+            Self::RateLimited { .. } | Self::QuotaExceeded { .. } | Self::BackendError { .. } => {
+                Outcome::Error
+            }
         }
     }
 

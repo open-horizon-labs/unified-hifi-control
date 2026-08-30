@@ -503,10 +503,15 @@ mod server {
             shutdown_token.clone(),
         )
         .with_reliable_commands(reliable_commands);
-        // The Spotify tunnel forwards to this server over loopback; record
-        // the port the listener actually bound so the tunnel never trusts a
-        // proxy-rewritten Host header for its forward target (#592).
-        state.provider_auth.bind_local_port(config.port);
+        // The SSH reverse tunnel receives a separate, loopback-only callback
+        // listener.  It must never forward to this main UHC listener: the
+        // latter intentionally serves many LAN routes that are not safe to
+        // publish merely because Spotify needs one callback (#641).
+        let spotify_callback_port =
+            api::spotify_callback_listener::spawn(state.clone(), shutdown_token.clone()).await?;
+        state
+            .provider_auth
+            .bind_callback_port(spotify_callback_port);
         if let Some(bootstrap_token) = state.controller_auth.take_bootstrap_secret().await {
             tracing::info!(
                 "UHC controller bootstrap token (display once; do not put it in a tunnel URL): {}. \
