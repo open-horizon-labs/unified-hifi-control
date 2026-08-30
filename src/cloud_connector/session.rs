@@ -2,8 +2,17 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::identity::InstallationIdentity;
+use super::{
+    identity::InstallationIdentity,
+    protocol::{InstallationSessionGrantClaims, PROTOCOL_VERSION, RELAY_AUDIENCE},
+    transport::RelayEndpoint,
+};
 use uuid::Uuid;
+
+const SESSION_GRANT_ISSUER: &str = "hiphi-installation-authorization";
+const SESSION_JWS_TYPE: &str = "hiphi-session+jwt";
+const MAX_SESSION_GRANT_TTL_MS: i64 = 120_000;
+const MAX_CLOCK_SKEW_MS: i64 = 60_000;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionProof {
@@ -15,8 +24,9 @@ pub struct SessionProof {
     pub signature: String,
 }
 
-/// Exact proof message accepted after the relay sends a challenge. The grant
-/// is carried inside this JSON proof, never as a bearer header or URL value.
+/// Exact proof message accepted after the relay sends a challenge. The same
+/// grant that authenticated the HTTP upgrade is carried inside this proof so
+/// the relay can bind it to installation-key possession. It is never a URL.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InstallationSessionProof {
     pub grant: String,
@@ -30,9 +40,113 @@ pub struct InstallationSessionProof {
 
 pub type SessionChallengeMessage = super::protocol::SessionChallengeMessage;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedInstallationSessionGrant {
+    pub installation_id: String,
+    pub grant_generation: u64,
+    pub grant_jti: Uuid,
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum SessionGrantError {
+    #[error("session grant is malformed")]
+    Malformed,
+    #[error("session grant key is not pinned")]
+    UnknownKey,
+    #[error("session grant signature is invalid")]
+    InvalidSignature,
+    #[error("session grant claims do not match this connector")]
+    WrongBinding,
+    #[error("session grant is expired or outside clock tolerance")]
+    Expired,
+}
+
+/// Verify relay session authority locally before sending it in the WebSocket
+/// Authorization header. The relay remains untrusted: only the pinned
+/// authorizer key can produce a grant accepted here.
+pub fn verify_installation_session_grant(
+    grant: &str,
+    expected_key_id: &str,
+    issuer_key: &VerifyingKey,
+    identity: &InstallationIdentity,
+    expected_endpoint: &str,
+    now_ms: i64,
+) -> Result<VerifiedInstallationSessionGrant, SessionGrantError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Header {
+        alg: String,
+        kid: String,
+        typ: String,
+    }
+
+    let mut parts = grant.split('.');
+    let (Some(encoded_header), Some(encoded_claims), Some(encoded_signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(SessionGrantError::Malformed);
+    };
+    let header: Header = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded_header)
+            .map_err(|_| SessionGrantError::Malformed)?,
+    )
+    .map_err(|_| SessionGrantError::Malformed)?;
+    if header.alg != "EdDSA" || header.typ != SESSION_JWS_TYPE {
+        return Err(SessionGrantError::Malformed);
+    }
+    if header.kid != expected_key_id {
+        return Err(SessionGrantError::UnknownKey);
+    }
+    let signature = Signature::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded_signature)
+            .map_err(|_| SessionGrantError::Malformed)?,
+    )
+    .map_err(|_| SessionGrantError::Malformed)?;
+    issuer_key
+        .verify(
+            format!("{encoded_header}.{encoded_claims}").as_bytes(),
+            &signature,
+        )
+        .map_err(|_| SessionGrantError::InvalidSignature)?;
+    let claims: InstallationSessionGrantClaims = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded_claims)
+            .map_err(|_| SessionGrantError::Malformed)?,
+    )
+    .map_err(|_| SessionGrantError::Malformed)?;
+    let expected_endpoint =
+        RelayEndpoint::parse(expected_endpoint).map_err(|_| SessionGrantError::WrongBinding)?;
+    let granted_endpoint =
+        RelayEndpoint::parse(&claims.endpoint).map_err(|_| SessionGrantError::WrongBinding)?;
+    let public_key_sha256 = hex::encode(Sha256::digest(identity.verifying_key().as_bytes()));
+    if claims.protocol_version != PROTOCOL_VERSION
+        || claims.issuer != SESSION_GRANT_ISSUER
+        || claims.audience != RELAY_AUDIENCE
+        || claims.installation_id != identity.installation_id()
+        || granted_endpoint != expected_endpoint
+        || claims.public_key_sha256 != public_key_sha256
+    {
+        return Err(SessionGrantError::WrongBinding);
+    }
+    if claims.issued_at > now_ms.saturating_add(MAX_CLOCK_SKEW_MS)
+        || claims.expires_at <= now_ms
+        || claims.expires_at.saturating_sub(claims.issued_at) > MAX_SESSION_GRANT_TTL_MS
+    {
+        return Err(SessionGrantError::Expired);
+    }
+    Ok(VerifiedInstallationSessionGrant {
+        installation_id: claims.installation_id,
+        grant_generation: claims.grant_generation,
+        grant_jti: claims.grant_jti,
+    })
+}
+
 /// Request body for the relay's authenticated session-grant ceremony.
 /// The installation signs the exact request fields; the resulting grant is
-/// still proof-bound to the WebSocket challenge and is never an HTTP bearer.
+/// still proof-bound to the WebSocket challenge and later authenticates the
+/// WebSocket HTTP upgrade.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InstallationGrantRequest {
     pub installation_id: String,

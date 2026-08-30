@@ -77,6 +77,21 @@ pub struct SessionChallengeMessage {
     pub expires_at: TimestampMs,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallationSessionGrantClaims {
+    pub protocol_version: u16,
+    pub issuer: String,
+    pub audience: String,
+    pub installation_id: InstallationId,
+    pub endpoint: String,
+    pub public_key_sha256: String,
+    pub grant_jti: Uuid,
+    pub issued_at: TimestampMs,
+    pub expires_at: TimestampMs,
+    pub grant_generation: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "action")]
 pub enum CommandAction {

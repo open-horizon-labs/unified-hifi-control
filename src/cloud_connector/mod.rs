@@ -25,9 +25,12 @@ pub use protocol::{
     WireType,
 };
 pub use session::{
-    InstallationGrantRequest, InstallationSessionProof, SessionError, SessionProof, SessionVerifier,
+    verify_installation_session_grant, InstallationGrantRequest, InstallationSessionProof,
+    SessionError, SessionGrantError, SessionProof, SessionVerifier,
+    VerifiedInstallationSessionGrant,
 };
 pub use state::{SemanticStateInput, StateError, StateProjection, StateStore};
 pub use transport::{
-    Backoff, ConnectionState, ConnectorRunLoop, EndpointError, RelayEndpoint, RunLoopEvent,
+    Backoff, ConnectionState, ConnectorRunLoop, EndpointError, EpochGuardError, RelayEndpoint,
+    RunLoopEvent, SessionEpochGuard,
 };

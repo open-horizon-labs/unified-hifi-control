@@ -13,6 +13,8 @@ pub enum IdentityError {
     InvalidKey,
     #[error("installation id is not an opaque protocol id")]
     InvalidInstallationId,
+    #[error("identity file must be a regular owner-only file")]
+    InsecurePermissions,
 }
 
 pub struct InstallationIdentity {
@@ -34,6 +36,18 @@ impl InstallationIdentity {
     pub fn load(path: impl AsRef<Path>, installation_id: String) -> Result<Self, IdentityError> {
         if !validate_id(&installation_id) {
             return Err(IdentityError::InvalidInstallationId);
+        }
+        let path = path.as_ref();
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() {
+            return Err(IdentityError::InsecurePermissions);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(IdentityError::InsecurePermissions);
+            }
         }
         let bytes = fs::read(path)?;
         let raw: [u8; 32] = bytes.try_into().map_err(|_| IdentityError::InvalidKey)?;

@@ -19,6 +19,70 @@ fn uuid(seed: u128) -> uuid::Uuid {
     uuid::Uuid::from_u128(seed)
 }
 
+fn signed_session_grant(
+    key: &SigningKey,
+    claims: &cloud_connector::protocol::InstallationSessionGrantClaims,
+) -> String {
+    use base64::Engine as _;
+    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(r#"{"alg":"EdDSA","kid":"issuer-1","typ":"hiphi-session+jwt"}"#);
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(claims).unwrap());
+    let signature = key.sign(format!("{header}.{payload}").as_bytes());
+    format!(
+        "{header}.{payload}.{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes())
+    )
+}
+
+#[test]
+fn session_grant_is_verified_before_it_can_authenticate_the_websocket_upgrade() {
+    use sha2::{Digest as _, Sha256};
+
+    let issuer = SigningKey::generate(&mut OsRng);
+    let installation_id = "11111111-1111-4111-8111-111111111111".to_owned();
+    let identity = InstallationIdentity::generate(installation_id.clone()).unwrap();
+    let now = 1_800_000_000_000_i64;
+    let claims = cloud_connector::protocol::InstallationSessionGrantClaims {
+        protocol_version: 1,
+        issuer: "hiphi-installation-authorization".into(),
+        audience: "hiphi-relay".into(),
+        installation_id,
+        endpoint: "wss://cloud.example/v1/relay/connect".into(),
+        public_key_sha256: hex::encode(Sha256::digest(identity.verifying_key().as_bytes())),
+        grant_jti: uuid(101),
+        issued_at: now - 1_000,
+        expires_at: now + 60_000,
+        grant_generation: 7,
+    };
+    let grant = signed_session_grant(&issuer, &claims);
+    let verified = verify_installation_session_grant(
+        &grant,
+        "issuer-1",
+        &issuer.verifying_key(),
+        &identity,
+        "wss://cloud.example/v1/relay/connect",
+        now,
+    )
+    .unwrap();
+    assert_eq!(verified.grant_generation, 7);
+
+    let mut forged_claims = claims;
+    forged_claims.grant_generation = 8;
+    let forged_payload = signed_session_grant(&SigningKey::generate(&mut OsRng), &forged_claims);
+    assert_eq!(
+        verify_installation_session_grant(
+            &forged_payload,
+            "issuer-1",
+            &issuer.verifying_key(),
+            &identity,
+            "wss://cloud.example/v1/relay/connect",
+            now,
+        ),
+        Err(SessionGrantError::InvalidSignature)
+    );
+}
+
 #[test]
 fn sanitized_protocol_fixtures_parse_and_adversarial_major_version_rejects() {
     let valid = include_str!("fixtures/hiphi-relay-v1/valid.json");
@@ -311,6 +375,42 @@ fn outbound_projection_rejects_oversized_duplicate_and_nonfinite_state() {
 }
 
 #[test]
+fn absolute_volume_is_bounded_by_the_last_truthful_zone_projection() {
+    use cloud_connector::state::{SemanticZoneInput, VolumeInput};
+
+    let mut store = StateStore::default();
+    let projection = store
+        .snapshot(SemanticStateInput {
+            installation_id: "11111111-1111-4111-8111-111111111111".into(),
+            epoch: 1,
+            revision: 1,
+            observed_at: 10,
+            expires_at: 20,
+            zones: vec![SemanticZoneInput {
+                provider_id: "roon:bounded".into(),
+                name: "Bounded".into(),
+                state: "playing".into(),
+                volume: Some(VolumeInput {
+                    value: -23.5,
+                    min: -80.0,
+                    max: 0.0,
+                    step: 0.5,
+                    scale: "db".into(),
+                }),
+                now_playing: None,
+            }],
+        })
+        .unwrap();
+    let handle = &projection.zones[0].zone_handle;
+    assert!(store.accepts_absolute_volume(handle, -23.5));
+    assert!(store.accepts_absolute_volume(handle, -80.0));
+    assert!(store.accepts_absolute_volume(handle, 0.0));
+    assert!(!store.accepts_absolute_volume(handle, -80.1));
+    assert!(!store.accepts_absolute_volume(handle, 0.1));
+    assert!(!store.accepts_absolute_volume("zone_unknown_opaque", -23.5));
+}
+
+#[test]
 fn installation_key_is_saved_with_restricted_permissions() {
     let identity = InstallationIdentity::generate(id("install")).unwrap();
     let path = tempfile::NamedTempFile::new().unwrap();
@@ -326,6 +426,53 @@ fn installation_key_is_saved_with_restricted_permissions() {
     let loaded =
         InstallationIdentity::load(path.path(), identity.installation_id().to_owned()).unwrap();
     assert_eq!(identity.verifying_key(), loaded.verifying_key());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            InstallationIdentity::load(path.path(), identity.installation_id().to_owned()),
+            Err(cloud_connector::identity::IdentityError::InsecurePermissions)
+        ));
+    }
+}
+
+#[test]
+fn session_epoch_high_water_mark_survives_reconnect_and_process_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("epoch");
+    let mut guard = SessionEpochGuard::load(&path).unwrap();
+    guard
+        .accept_at(1_800_000_000_001, 1_800_000_000_001)
+        .unwrap();
+    assert_eq!(guard.last(), 1_800_000_000_001);
+    assert!(matches!(
+        guard.accept_at(1_800_000_000_001, 1_800_000_000_001),
+        Err(EpochGuardError::StaleEpoch)
+    ));
+
+    let mut restarted = SessionEpochGuard::load(&path).unwrap();
+    assert_eq!(restarted.last(), 1_800_000_000_001);
+    assert!(matches!(
+        restarted.accept_at(1_800_000_000_000, 1_800_000_000_002),
+        Err(EpochGuardError::StaleEpoch)
+    ));
+    assert!(matches!(
+        restarted.accept_at(u64::MAX, 1_800_000_000_002),
+        Err(EpochGuardError::StaleEpoch)
+    ));
+    restarted
+        .accept_at(1_800_000_000_002, 1_800_000_000_002)
+        .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }
 
 fn signed_grant(identity: &SigningKey, claims: &GrantClaims) -> String {

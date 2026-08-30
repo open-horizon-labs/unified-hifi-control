@@ -8,6 +8,7 @@ pub struct CloudConnectorConfig {
     pub endpoint: RelayEndpoint,
     pub installation_id: String,
     pub key_path: PathBuf,
+    pub epoch_path: PathBuf,
     pub issuer_key_id: String,
     pub issuer_public_key: Vec<u8>,
 }
@@ -67,6 +68,7 @@ impl CloudConnectorConfig {
             endpoint: RelayEndpoint::parse(endpoint)?,
             installation_id: installation_id.to_owned(),
             key_path: config_dir.join("hiphi-installation.key"),
+            epoch_path: config_dir.join("hiphi-relay-epoch"),
             issuer_key_id: issuer_key_id.to_owned(),
             issuer_public_key,
         })

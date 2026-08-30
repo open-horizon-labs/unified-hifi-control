@@ -205,6 +205,20 @@ impl StateStore {
             .find(|zone| zone.zone_handle == handle)
             .map(|zone| zone.state.as_str())
     }
+    pub fn accepts_absolute_volume(&self, handle: &str, value: f64) -> bool {
+        value.is_finite()
+            && self
+                .latest
+                .as_ref()
+                .and_then(|projection| {
+                    projection
+                        .zones
+                        .iter()
+                        .find(|zone| zone.zone_handle == handle)
+                })
+                .and_then(|zone| zone.volume_control.as_ref())
+                .is_some_and(|volume| value >= volume.min && value <= volume.max)
+    }
     pub fn artwork_key(&self, handle: &str, revision: &str) -> Option<&str> {
         self.artwork_keys
             .get(&(handle.to_owned(), revision.to_owned()))

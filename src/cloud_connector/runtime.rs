@@ -1,8 +1,9 @@
 //! Opt-in outbound connector for the authenticated HiPhi relay.
 //!
 //! The relay is contacted over WSS only.  It sends a challenge first; the
-//! installation grant is carried in the signed proof body, never a bearer
-//! header or URL.  All control dispatch goes through the existing semantic
+//! installation grant authenticates the HTTP upgrade and is then carried in
+//! the signed proof body so possession of the installation key is still
+//! required. The grant is never placed in a URL. All control dispatch goes through the existing semantic
 //! MQTT command router, which keeps the aggregator/command gateway boundary.
 
 use futures::{SinkExt, StreamExt};
@@ -11,7 +12,12 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{
     connect_async_with_config,
-    tungstenite::{protocol::WebSocketConfig, Message},
+    tungstenite::{
+        client::IntoClientRequest as _,
+        http::{header::AUTHORIZATION, HeaderValue},
+        protocol::WebSocketConfig,
+        Message,
+    },
 };
 use uuid::Uuid;
 
@@ -22,19 +28,21 @@ use super::{
     protocol::{
         ArtworkChunk, ArtworkRelayRequest, ArtworkRelayResponse, CommandResult, CommandStatus,
         ConnectorHello, ConnectorMessage, RelayMessage, StateSnapshot, MAX_ARTWORK_CHUNK_BYTES,
-        MAX_ARTWORK_SOURCE_BYTES, MAX_STRING_BYTES, PROTOCOL_VERSION, UHC_AUDIENCE,
+        MAX_ARTWORK_SOURCE_BYTES, MAX_COMMAND_BYTES, MAX_STRING_BYTES, PROTOCOL_VERSION,
+        UHC_AUDIENCE,
     },
-    session::sign_installation_session_proof,
+    session::{sign_installation_session_proof, verify_installation_session_grant},
     state::{snapshot_from_aggregator, StateStore},
     transport::{
-        PeerWatchdog, RelayEndpoint, CONNECT_TIMEOUT, PEER_HEARTBEAT_CHECK_INTERVAL,
-        PEER_HEARTBEAT_TIMEOUT, SOCKET_WRITE_TIMEOUT,
+        PeerWatchdog, RelayEndpoint, SessionEpochGuard, CONNECT_TIMEOUT,
+        PEER_HEARTBEAT_CHECK_INTERVAL, PEER_HEARTBEAT_TIMEOUT, SOCKET_WRITE_TIMEOUT,
     },
 };
 
 const ARTWORK_QUEUE_CAPACITY: usize = super::artwork::MAX_PENDING;
 const ARTWORK_CONCURRENCY: usize = super::artwork::MAX_CONCURRENT;
 const ARTWORK_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const ARTWORK_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConnectionExit {
@@ -70,6 +78,14 @@ async fn run(
     let mut backoff = super::transport::Backoff::default();
     let shutdown = state.shutdown.clone();
     let mut store = StateStore::default();
+    let mut epoch_guard = match SessionEpochGuard::load(&config.epoch_path) {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::error!("HiPhi Cloud epoch state is unavailable: {error}");
+            return;
+        }
+    };
+    let mut ledger = CommandLedger::default();
     loop {
         let delay = backoff.next_delay();
         tokio::select! { _ = shutdown.cancelled() => break, _ = tokio::time::sleep(delay) => {} }
@@ -80,19 +96,67 @@ async fn run(
                 continue;
             }
         };
+        let issuer_key = match issuer_verifying_key(&config) {
+            Ok(key) => key,
+            Err(error) => {
+                tracing::error!("HiPhi Cloud issuer key is invalid: {error}");
+                break;
+            }
+        };
+        let verified_grant = match verify_installation_session_grant(
+            &grant,
+            &config.issuer_key_id,
+            &issuer_key,
+            &identity,
+            config.endpoint.as_str(),
+            now_ms(),
+        ) {
+            Ok(claims) => claims,
+            Err(error) => {
+                tracing::warn!("HiPhi Cloud returned an invalid session grant: {error}");
+                continue;
+            }
+        };
         let websocket_limits = WebSocketConfig {
             max_message_size: Some(super::protocol::MAX_MESSAGE_BYTES),
             max_frame_size: Some(super::protocol::MAX_MESSAGE_BYTES),
             ..WebSocketConfig::default()
         };
+        let mut request = match config.endpoint.as_str().into_client_request() {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::error!("HiPhi Cloud relay request is invalid: {error}");
+                break;
+            }
+        };
+        let authorization = match HeaderValue::from_str(&format!("Bearer {grant}")) {
+            Ok(value) => value,
+            Err(_) => {
+                tracing::warn!("HiPhi Cloud returned an invalid session grant");
+                continue;
+            }
+        };
+        request.headers_mut().insert(AUTHORIZATION, authorization);
         match tokio::time::timeout(
             CONNECT_TIMEOUT,
-            connect_async_with_config(config.endpoint.as_str(), Some(websocket_limits), false),
+            connect_async_with_config(request, Some(websocket_limits), false),
         )
         .await
         {
             Ok(Ok((socket, _))) => {
-                match run_connection(&state, &config, &identity, &grant, &mut store, socket).await {
+                match run_connection(
+                    &state,
+                    &config,
+                    &identity,
+                    &grant,
+                    verified_grant.grant_generation,
+                    &mut store,
+                    &mut epoch_guard,
+                    &mut ledger,
+                    socket,
+                )
+                .await
+                {
                     // Reset only after the authenticated session completed its
                     // challenge/proof ceremony.  A socket that accepts TCP
                     // and then rejects the protocol must still back off.
@@ -151,7 +215,10 @@ async fn run_connection(
     config: &CloudConnectorConfig,
     identity: &InstallationIdentity,
     grant: &str,
+    grant_generation: u64,
     store: &mut StateStore,
+    epoch_guard: &mut SessionEpochGuard,
+    ledger: &mut CommandLedger,
     mut socket: Socket,
 ) -> anyhow::Result<ConnectionExit> {
     let challenge = match tokio::time::timeout(
@@ -182,6 +249,7 @@ async fn run_connection(
         Some(RelayMessage::SessionEstablished { epoch }) if epoch != 0 => epoch,
         _ => anyhow::bail!("relay rejected installation proof"),
     };
+    epoch_guard.accept_at(epoch, now_ms().try_into().unwrap_or_default())?;
 
     let projection = snapshot_from_aggregator(
         &state.aggregator,
@@ -224,22 +292,15 @@ async fn run_connection(
     });
     send_json(&mut socket, &snapshot).await?;
 
-    let issuer_key = ed25519_dalek::VerifyingKey::from_bytes(
-        config
-            .issuer_public_key
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("issuer key must be 32 bytes"))?,
-    )?;
+    let issuer_key = issuer_verifying_key(config)?;
     let mut verifier = CommandGrantVerifier::new(
         "hiphi-command-authorization",
         UHC_AUDIENCE,
         config.installation_id.clone(),
         epoch,
-        session_grant_generation(grant)?,
+        grant_generation,
     );
     verifier.pin_key(config.issuer_key_id.clone(), issuer_key);
-    let mut ledger = CommandLedger::default();
     let (artwork_tx, mut artwork_rx) = mpsc::channel(ARTWORK_QUEUE_CAPACITY);
     let artwork_slots =
         std::sync::Arc::new(Semaphore::new(ARTWORK_QUEUE_CAPACITY + ARTWORK_CONCURRENCY));
@@ -250,10 +311,10 @@ async fn run_connection(
     refresh.tick().await;
     loop {
         let message = tokio::select! {
-            _ = refresh.tick() => {
-                let projection = snapshot_from_aggregator(&state.aggregator, store, config.installation_id.clone(), epoch, store.latest().map_or(1, |p| p.revision.saturating_add(1)), now_ms() as u64).await?;
-                send_json(&mut socket, &ConnectorMessage::Snapshot(StateSnapshot { protocol_version: PROTOCOL_VERSION, message_id: message_id(), installation_id: projection.installation_id, epoch: projection.epoch, revision: projection.revision, observed_at: projection.observed_at as i64, expires_at: projection.expires_at as i64, zones: projection.zones, now_playing: projection.now_playing })).await?;
-                continue;
+            biased;
+            message = socket.next() => {
+                let Some(message) = message else { break; };
+                message?
             }
             _ = heartbeat_check.tick() => {
                 if peer_watchdog.expired(now_ms() as u64) {
@@ -262,20 +323,26 @@ async fn run_connection(
                 send_json(&mut socket, &ConnectorMessage::Heartbeat { epoch, sent_at: now_ms() }).await?;
                 continue;
             }
+            _ = refresh.tick() => {
+                let projection = snapshot_from_aggregator(&state.aggregator, store, config.installation_id.clone(), epoch, store.latest().map_or(1, |p| p.revision.saturating_add(1)), now_ms() as u64).await?;
+                send_json(&mut socket, &ConnectorMessage::Snapshot(StateSnapshot { protocol_version: PROTOCOL_VERSION, message_id: message_id(), installation_id: projection.installation_id, epoch: projection.epoch, revision: projection.revision, observed_at: projection.observed_at as i64, expires_at: projection.expires_at as i64, zones: projection.zones, now_playing: projection.now_playing })).await?;
+                continue;
+            }
             artwork = artwork_rx.recv() => {
                 if let Some(artwork) = artwork {
-                    send_message(&mut socket, artwork).await?;
+                    tokio::time::timeout(ARTWORK_WRITE_TIMEOUT, socket.send(artwork))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("relay artwork write exceeded the control-priority bound"))??;
                     continue;
                 }
                 // All artwork workers have gone away; keep servicing the relay.
                 continue;
             }
-            message = socket.next() => {
-                let Some(message) = message else { break; };
-                message?
-            }
         };
         match message {
+            Message::Text(text) if text.len() > MAX_COMMAND_BYTES => {
+                anyhow::bail!("relay command frame exceeds the command bound");
+            }
             Message::Text(text) => match super::protocol::parse_relay_message(text.as_bytes())
                 .map_err(|error| anyhow::anyhow!(error))?
             {
@@ -473,6 +540,9 @@ async fn dispatch(
             crate::mqtt::command::ParsedAction::VolumeDown
         }
         super::protocol::CommandAction::VolumeAbsolute { value } => {
+            if !store.accepts_absolute_volume(&payload.zone_handle, value) {
+                return CommandOutcome::Rejected;
+            }
             crate::mqtt::command::ParsedAction::VolumeNative(value)
         }
     };
@@ -644,21 +714,16 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-fn session_grant_generation(grant: &str) -> anyhow::Result<u64> {
-    use base64::Engine as _;
-    let mut parts = grant.split('.');
-    let (Some(_header), Some(encoded_claims), Some(_signature), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        anyhow::bail!("session grant is not a compact JWS");
-    };
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(encoded_claims)
-        .map_err(|_| anyhow::anyhow!("session grant claims are not base64url"))?;
-    serde_json::from_slice::<serde_json::Value>(&bytes)?
-        .get("grant_generation")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| anyhow::anyhow!("session grant has no authorization generation"))
+fn issuer_verifying_key(
+    config: &CloudConnectorConfig,
+) -> anyhow::Result<ed25519_dalek::VerifyingKey> {
+    Ok(ed25519_dalek::VerifyingKey::from_bytes(
+        config
+            .issuer_public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("issuer key must be 32 bytes"))?,
+    )?)
 }
 
 #[cfg(test)]

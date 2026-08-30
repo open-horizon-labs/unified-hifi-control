@@ -1,5 +1,95 @@
 use std::time::Duration;
 
+#[derive(Debug, thiserror::Error)]
+pub enum EpochGuardError {
+    #[error("session epoch state I/O: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("session epoch state is invalid or has unsafe permissions")]
+    InvalidState,
+    #[error("relay attempted to reuse a stale session epoch")]
+    StaleEpoch,
+}
+
+const MAX_EPOCH_CLOCK_SKEW_MS: u64 = 60_000;
+
+/// A tiny owner-only high-water mark prevents a compromised relay from
+/// replaying an old, still-signed command after reconnect or process restart.
+pub struct SessionEpochGuard {
+    path: std::path::PathBuf,
+    last: u64,
+}
+
+impl SessionEpochGuard {
+    pub fn load(path: impl Into<std::path::PathBuf>) -> Result<Self, EpochGuardError> {
+        let path = path.into();
+        let last = if path.exists() {
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if !metadata.file_type().is_file() {
+                return Err(EpochGuardError::InvalidState);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                if metadata.permissions().mode() & 0o077 != 0 {
+                    return Err(EpochGuardError::InvalidState);
+                }
+            }
+            std::fs::read_to_string(&path)?
+                .trim()
+                .parse()
+                .map_err(|_| EpochGuardError::InvalidState)?
+        } else {
+            0
+        };
+        Ok(Self { path, last })
+    }
+
+    pub fn accept_at(&mut self, epoch: u64, now_ms: u64) -> Result<(), EpochGuardError> {
+        if epoch == 0
+            || epoch <= self.last
+            || epoch > now_ms.saturating_add(MAX_EPOCH_CLOCK_SKEW_MS)
+            || epoch.saturating_add(MAX_EPOCH_CLOCK_SKEW_MS) < now_ms
+        {
+            return Err(EpochGuardError::StaleEpoch);
+        }
+        let parent = self.path.parent().ok_or(EpochGuardError::InvalidState)?;
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(EpochGuardError::InvalidState)?;
+        let temporary = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            writeln!(file, "{epoch}")?;
+            file.sync_all()?;
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+        }
+        #[cfg(not(unix))]
+        std::fs::write(&temporary, format!("{epoch}\n"))?;
+        std::fs::rename(&temporary, &self.path)?;
+        if !parent.as_os_str().is_empty() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        self.last = epoch;
+        Ok(())
+    }
+
+    pub fn last(&self) -> u64 {
+        self.last
+    }
+}
+
 /// The relay must prove liveness periodically after authentication.  These
 /// bounds are deliberately conservative; a missed heartbeat cannot make a
 /// command execute, but it must eventually release a black-holed session.
