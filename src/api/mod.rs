@@ -418,6 +418,55 @@ impl AppState {
         format: Option<&str>,
         resize_policy: Option<crate::knobs::image::Rgb565ResizePolicy>,
     ) -> anyhow::Result<crate::bus::ImageData> {
+        self.get_image_with_source_limit(
+            zone_id,
+            image_key,
+            width,
+            height,
+            format,
+            resize_policy,
+            None,
+        )
+        .await
+    }
+
+    /// Connector-only artwork fetch with a hard streaming source ceiling.
+    /// Existing LAN image behavior keeps its provider-native limits; the
+    /// hosted artwork lane must stop reading before its signed request bound
+    /// can be exceeded in memory.
+    pub async fn get_image_bounded(
+        &self,
+        zone_id: &str,
+        image_key: &str,
+        max_source_bytes: usize,
+    ) -> anyhow::Result<crate::bus::ImageData> {
+        anyhow::ensure!(
+            max_source_bytes > 0,
+            "artwork source limit must be positive"
+        );
+        self.get_image_with_source_limit(
+            zone_id,
+            image_key,
+            None,
+            None,
+            None,
+            None,
+            Some(max_source_bytes),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn get_image_with_source_limit(
+        &self,
+        zone_id: &str,
+        image_key: &str,
+        width: Option<u32>,
+        height: Option<u32>,
+        format: Option<&str>,
+        resize_policy: Option<crate::knobs::image::Rgb565ResizePolicy>,
+        source_limit: Option<usize>,
+    ) -> anyhow::Result<crate::bus::ImageData> {
         use crate::bus::ImageData;
         use crate::knobs::image::{
             image_to_eink_acep6_with_policy, jpeg_to_rgb565_with_policy, EinkCacheKey,
@@ -460,13 +509,29 @@ impl AppState {
 
         // Fetch raw image from appropriate adapter
         let raw_image = if zone_id.starts_with("lms:") {
-            let (content_type, data) = self
-                .lms
-                .get_artwork(image_key, provider_dimensions.0, provider_dimensions.1)
-                .await?;
+            let (content_type, data) = match source_limit {
+                Some(limit) => {
+                    self.lms
+                        .get_artwork_bounded(
+                            image_key,
+                            provider_dimensions.0,
+                            provider_dimensions.1,
+                            limit,
+                        )
+                        .await?
+                }
+                None => {
+                    self.lms
+                        .get_artwork(image_key, provider_dimensions.0, provider_dimensions.1)
+                        .await?
+                }
+            };
             ImageData { content_type, data }
         } else if zone_id.starts_with("openhome:") {
-            let img = self.openhome.get_image(image_key).await?;
+            let img = match source_limit {
+                Some(limit) => self.openhome.get_image_bounded(image_key, limit).await?,
+                None => self.openhome.get_image(image_key).await?,
+            };
             ImageData {
                 content_type: img.content_type,
                 data: img.data,
@@ -476,21 +541,26 @@ impl AppState {
                 "UPnP zones don't support image retrieval - the protocol doesn't expose album art URLs"
             )
         } else if zone_id.starts_with("spotify:") {
-            let response = reqwest::get(image_key).await?;
-            let content_type = response
-                .headers()
-                .get(axum::http::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("image/jpeg")
-                .to_string();
-            let data = response.bytes().await?.to_vec();
-            ImageData { content_type, data }
+            fetch_remote_artwork_url_bounded(
+                reqwest::Url::parse(image_key)?,
+                source_limit.unwrap_or(MAX_REMOTE_ARTWORK_BYTES),
+            )
+            .await?
         } else if zone_id.starts_with("applemusic:") {
-            fetch_apple_music_artwork(image_key).await?
+            fetch_apple_music_artwork(image_key, source_limit.unwrap_or(MAX_REMOTE_ARTWORK_BYTES))
+                .await?
         } else if zone_id.starts_with("musicassistant:") {
-            fetch_musicassistant_artwork(image_key).await?
+            fetch_musicassistant_artwork(
+                image_key,
+                source_limit.unwrap_or(MAX_REMOTE_ARTWORK_BYTES),
+            )
+            .await?
         } else if let Some(instance) = zone_id.strip_prefix("hqplayer:") {
-            self.hqp_images.get_current_cover(instance).await?
+            let image = self.hqp_images.get_current_cover(instance).await?;
+            if source_limit.is_some_and(|limit| image.data.len() > limit) {
+                anyhow::bail!("remote artwork is too large");
+            }
+            image
         } else if zone_id.starts_with("roon:") || !zone_id.contains(':') {
             let img = self
                 .roon
@@ -503,6 +573,9 @@ impl AppState {
         } else {
             anyhow::bail!("Unknown zone type for image: {}", zone_id)
         };
+        if source_limit.is_some_and(|limit| raw_image.data.len() > limit) {
+            anyhow::bail!("remote artwork is too large");
+        }
 
         // Convert to RGB565 if requested (for ESP32 LCD/e-ink displays).
         // The smart variant is a capability handshake: older servers return
@@ -552,9 +625,12 @@ impl AppState {
     }
 }
 
-async fn fetch_apple_music_artwork(image_key: &str) -> anyhow::Result<crate::bus::ImageData> {
+async fn fetch_apple_music_artwork(
+    image_key: &str,
+    max_bytes: usize,
+) -> anyhow::Result<crate::bus::ImageData> {
     let url = validate_apple_music_artwork_url(image_key)?;
-    fetch_remote_artwork_url(url).await
+    fetch_remote_artwork_url_bounded(url, max_bytes).await
 }
 
 /// Music Assistant's `image_url` (#549) is already an absolute URL the MA
@@ -565,9 +641,12 @@ async fn fetch_apple_music_artwork(image_key: &str) -> anyhow::Result<crate::bus
 /// worth enforcing here is "this is actually an http(s) URL", so a
 /// malformed or unexpected scheme fails closed rather than being handed to
 /// `reqwest` uninspected.
-async fn fetch_musicassistant_artwork(image_key: &str) -> anyhow::Result<crate::bus::ImageData> {
+async fn fetch_musicassistant_artwork(
+    image_key: &str,
+    max_bytes: usize,
+) -> anyhow::Result<crate::bus::ImageData> {
     let url = validate_musicassistant_artwork_url(image_key)?;
-    fetch_remote_artwork_url(url).await
+    fetch_remote_artwork_url_bounded(url, max_bytes).await
 }
 
 fn validate_musicassistant_artwork_url(image_key: &str) -> anyhow::Result<reqwest::Url> {
@@ -601,11 +680,14 @@ fn validate_apple_music_artwork_url(image_key: &str) -> anyhow::Result<reqwest::
     Ok(url)
 }
 
-async fn fetch_remote_artwork_url(url: reqwest::Url) -> anyhow::Result<crate::bus::ImageData> {
+async fn fetch_remote_artwork_url_bounded(
+    url: reqwest::Url,
+    max_bytes: usize,
+) -> anyhow::Result<crate::bus::ImageData> {
     let response = reqwest::get(url).await?.error_for_status()?;
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_REMOTE_ARTWORK_BYTES as u64)
+        .is_some_and(|length| length > max_bytes as u64)
     {
         anyhow::bail!("remote artwork is too large");
     }
@@ -616,14 +698,20 @@ async fn fetch_remote_artwork_url(url: reqwest::Url) -> anyhow::Result<crate::bu
         .filter(|value| value.starts_with("image/"))
         .ok_or_else(|| anyhow::anyhow!("remote artwork is not an image"))?
         .to_string();
-    let data = response.bytes().await?;
-    if data.len() > MAX_REMOTE_ARTWORK_BYTES {
-        anyhow::bail!("remote artwork is too large");
+    let mut response = response;
+    let mut data = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or_default()
+            .min(max_bytes as u64) as usize,
+    );
+    while let Some(chunk) = response.chunk().await? {
+        if data.len().saturating_add(chunk.len()) > max_bytes {
+            anyhow::bail!("remote artwork is too large");
+        }
+        data.extend_from_slice(&chunk);
     }
-    Ok(crate::bus::ImageData {
-        content_type,
-        data: data.to_vec(),
-    })
+    Ok(crate::bus::ImageData { content_type, data })
 }
 
 /// Send legacy/bookmarked flash-page requests straight to the secure Web Serial origin.
@@ -4120,6 +4208,40 @@ mod tests {
                 "accepted unsafe artwork URL: {url}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn connector_artwork_stops_streaming_at_its_source_byte_limit() {
+        use axum::{
+            body::{Body, Bytes},
+            http::header,
+            routing::get,
+            Router,
+        };
+        use futures::stream;
+
+        let app = Router::new().route(
+            "/art",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "image/png")],
+                    Body::from_stream(stream::iter([
+                        Ok::<_, std::convert::Infallible>(Bytes::from_static(b"123")),
+                        Ok(Bytes::from_static(b"456")),
+                    ])),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = reqwest::Url::parse(&format!("http://{address}/art")).unwrap();
+
+        let error = fetch_remote_artwork_url_bounded(url, 4)
+            .await
+            .expect_err("the second chunk must be rejected before the body can grow past 4 bytes");
+        assert!(error.to_string().contains("too large"));
+        server.abort();
     }
 
     /// Issue #429, proving the wiring itself: calling the real

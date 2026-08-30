@@ -1099,11 +1099,27 @@ impl OpenHomeAdapter {
 
     /// Fetch album art image
     pub async fn get_image(&self, image_url: &str) -> anyhow::Result<ImageData> {
+        self.get_image_with_limit(image_url, None).await
+    }
+
+    pub async fn get_image_bounded(
+        &self,
+        image_url: &str,
+        max_bytes: usize,
+    ) -> anyhow::Result<ImageData> {
+        self.get_image_with_limit(image_url, Some(max_bytes)).await
+    }
+
+    async fn get_image_with_limit(
+        &self,
+        image_url: &str,
+        max_bytes: Option<usize>,
+    ) -> anyhow::Result<ImageData> {
         if !image_url.starts_with("http://") && !image_url.starts_with("https://") {
             anyhow::bail!("Invalid image URL");
         }
 
-        let response = self.http.get(image_url).send().await?;
+        let mut response = self.http.get(image_url).send().await?;
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -1111,11 +1127,24 @@ impl OpenHomeAdapter {
             .unwrap_or("image/jpeg")
             .to_string();
 
-        let body = response.bytes().await?;
+        if max_bytes.is_some_and(|limit| {
+            response
+                .content_length()
+                .is_some_and(|length| length > limit as u64)
+        }) {
+            anyhow::bail!("image exceeds the source byte limit");
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if max_bytes.is_some_and(|limit| body.len().saturating_add(chunk.len()) > limit) {
+                anyhow::bail!("image exceeds the source byte limit");
+            }
+            body.extend_from_slice(&chunk);
+        }
 
         Ok(ImageData {
             content_type,
-            data: body.to_vec(),
+            data: body,
         })
     }
 }

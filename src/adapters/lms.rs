@@ -1652,6 +1652,28 @@ impl LmsAdapter {
         width: Option<u32>,
         height: Option<u32>,
     ) -> Result<(String, Vec<u8>)> {
+        self.get_artwork_with_limit(image_key, width, height, None)
+            .await
+    }
+
+    pub async fn get_artwork_bounded(
+        &self,
+        image_key: &str,
+        width: Option<u32>,
+        height: Option<u32>,
+        max_bytes: usize,
+    ) -> Result<(String, Vec<u8>)> {
+        self.get_artwork_with_limit(image_key, width, height, Some(max_bytes))
+            .await
+    }
+
+    async fn get_artwork_with_limit(
+        &self,
+        image_key: &str,
+        width: Option<u32>,
+        height: Option<u32>,
+        max_bytes: Option<usize>,
+    ) -> Result<(String, Vec<u8>)> {
         let state = self.state.read().await;
         let username = state.username.clone();
         let password = state.password.clone();
@@ -1682,7 +1704,7 @@ impl LmsAdapter {
             req = req.header("Authorization", format!("Basic {}", auth));
         }
 
-        let response = req.send().await?;
+        let mut response = req.send().await?;
         if !response.status().is_success() {
             return Err(anyhow!("Failed to fetch artwork: {}", response.status()));
         }
@@ -1693,8 +1715,20 @@ impl LmsAdapter {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("image/jpeg")
             .to_string();
-
-        let body = response.bytes().await?.to_vec();
+        if max_bytes.is_some_and(|limit| {
+            response
+                .content_length()
+                .is_some_and(|length| length > limit as u64)
+        }) {
+            return Err(anyhow!("Artwork exceeds the source byte limit"));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if max_bytes.is_some_and(|limit| body.len().saturating_add(chunk.len()) > limit) {
+                return Err(anyhow!("Artwork exceeds the source byte limit"));
+            }
+            body.extend_from_slice(&chunk);
+        }
         Ok((content_type, body))
     }
 

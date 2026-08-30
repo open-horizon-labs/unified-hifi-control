@@ -46,6 +46,8 @@ pub mod api;
 #[cfg(feature = "server")]
 pub mod bus;
 #[cfg(feature = "server")]
+pub mod cloud_connector;
+#[cfg(feature = "server")]
 pub mod config;
 #[cfg(feature = "server")]
 pub mod coordinator;

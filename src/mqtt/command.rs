@@ -42,8 +42,12 @@ pub enum ParsedAction {
     Pause,
     Next,
     Previous,
+    VolumeUp,
+    VolumeDown,
     /// Percent volume, already clamped to 0-100.
     Volume(f64),
+    /// Provider-native absolute volume (for example signed dB on HQPlayer).
+    VolumeNative(f64),
     Mute(bool),
 }
 
@@ -90,10 +94,15 @@ impl ParsedAction {
             ParsedAction::Pause => AdapterCommand::Pause,
             ParsedAction::Next => AdapterCommand::Next,
             ParsedAction::Previous => AdapterCommand::Previous,
+            ParsedAction::VolumeUp => AdapterCommand::VolumeRelative(1),
+            ParsedAction::VolumeDown => AdapterCommand::VolumeRelative(-1),
             // The adapter registry's volume scale is each provider's native
             // 0-100 percentage convention (see `AdapterCommand::VolumeAbsolute`
             // call sites in `src/knobs/routes.rs`).
             ParsedAction::Volume(value) => AdapterCommand::VolumeAbsolute(value.round() as i32),
+            ParsedAction::VolumeNative(value) => {
+                AdapterCommand::VolumeAbsolute(value.round() as i32)
+            }
             ParsedAction::Mute(muted) => AdapterCommand::Mute(muted),
         }
     }
@@ -108,7 +117,19 @@ impl ParsedAction {
             ParsedAction::Pause => Command::Pause,
             ParsedAction::Next => Command::Next,
             ParsedAction::Previous => Command::Previous,
+            ParsedAction::VolumeUp => Command::VolumeRelative {
+                delta: 1.0,
+                output_id: None,
+            },
+            ParsedAction::VolumeDown => Command::VolumeRelative {
+                delta: -1.0,
+                output_id: None,
+            },
             ParsedAction::Volume(value) => Command::VolumeAbsolute {
+                value: value as f32,
+                output_id: None,
+            },
+            ParsedAction::VolumeNative(value) => Command::VolumeAbsolute {
                 value: value as f32,
                 output_id: None,
             },
@@ -127,7 +148,9 @@ impl ParsedAction {
             ParsedAction::Pause => Some(("pause", None)),
             ParsedAction::Next => Some(("next", None)),
             ParsedAction::Previous => Some(("previous", None)),
+            ParsedAction::VolumeUp | ParsedAction::VolumeDown => None,
             ParsedAction::Volume(_) | ParsedAction::Mute(_) => None,
+            ParsedAction::VolumeNative(value) => Some(("volume", Some(value))),
         }
     }
 }

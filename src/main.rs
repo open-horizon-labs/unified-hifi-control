@@ -6,8 +6,8 @@
 #[cfg(feature = "server")]
 mod server {
     use unified_hifi_control::{
-        adapters, aggregator, api, app, bus, config, coordinator, embedded, firmware, knobs, mcp,
-        mdns, mqtt,
+        adapters, aggregator, api, app, bus, cloud_connector, config, coordinator, embedded,
+        firmware, knobs, mcp, mdns, mqtt,
     };
 
     // Import load_app_settings for checking adapter enabled state
@@ -603,6 +603,25 @@ mod server {
             .adapter_registry
             .register_library("musicassistant", state.musicassistant.clone())
             .await;
+
+        // HiPhi Cloud is strictly opt-in.  The connector opens an outbound
+        // authenticated WSS socket only when the complete installation and
+        // pinned issuer configuration is present; it requests a fresh,
+        // installation-signed short-lived session grant for every reconnect and
+        // never adds a LAN route or proxies this server's HTTP API.
+        let _hiphi_connector =
+            match cloud_connector::runtime::spawn_from_env(state.clone(), config::get_config_dir())
+            {
+                Ok(Some(_handle)) => {
+                    tracing::info!("HiPhi Cloud connector started (outbound WSS)");
+                    true
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    tracing::warn!("HiPhi Cloud connector disabled: {error}");
+                    false
+                }
+            };
         provider_startables.push(state.musicassistant.clone());
         let mut startable_adapters = (*state.startable_adapters).clone();
         startable_adapters.push(state.musicassistant.clone());
