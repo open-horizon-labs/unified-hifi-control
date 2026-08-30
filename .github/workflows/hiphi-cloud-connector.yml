@@ -34,6 +34,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Build embedded CSS prerequisite
+        run: make css
+
       - name: Check formatting
         run: cargo fmt --all --check
 
