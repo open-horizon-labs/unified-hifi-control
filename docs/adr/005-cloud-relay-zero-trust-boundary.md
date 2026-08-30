@@ -67,7 +67,10 @@ reuse with a different payload is rejected. A lost terminal result is
 Artwork is a bounded, low-priority request/response lane. Capabilities are
 opaque, short-lived, installation-scoped, and single-use (except an identical
 idempotent retry). UHC returns bytes only; the cloud validates and serves the
-image, and capability values are never logged or placed in URLs.
+image. The cloud façade places the opaque capability in the exact
+`/v1/garmin/artwork/<capability>` path because Garmin fetches artwork without
+the watch bearer. Neither UHC nor the cloud logs that path or capability, and
+the relay protocol itself carries no arbitrary URL.
 
 ## Consequences
 
