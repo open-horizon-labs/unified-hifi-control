@@ -21,9 +21,9 @@ src/api/mod.rs|AppState|concrete-adapter-type|RoonAdapter
 src/api/mod.rs|AppState|concrete-adapter-type|Startable
 src/api/mod.rs|AppState|concrete-adapter-type|UPnPAdapter
 src/api/mod.rs|api_settings_post_handler|direct-field-access|startable_adapters
-src/api/mod.rs|get_image|direct-field-access|lms
-src/api/mod.rs|get_image|direct-field-access|openhome
-src/api/mod.rs|get_image|direct-field-access|roon
+src/api/mod.rs|get_image_with_source_limit|direct-field-access|lms
+src/api/mod.rs|get_image_with_source_limit|direct-field-access|openhome
+src/api/mod.rs|get_image_with_source_limit|direct-field-access|roon
 src/api/mod.rs|hqp_add_instance_handler|direct-field-access|hqp_instances
 src/api/mod.rs|hqp_config_handler|direct-field-access|hqplayer
 src/api/mod.rs|hqp_configure_handler|direct-field-access|hqp_instances
