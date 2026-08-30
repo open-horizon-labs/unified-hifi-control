@@ -447,21 +447,6 @@ where
     Ok(ConnectionExit::Disconnected)
 }
 
-async fn send_artwork_message<S>(
-    socket: &mut tokio_tungstenite::WebSocketStream<S>,
-    message: Message,
-) -> anyhow::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    tokio::time::timeout(ARTWORK_WRITE_TIMEOUT, socket.send(message))
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!("relay artwork write exceeded the control-priority bound")
-        })??;
-    Ok(())
-}
-
 /// A challenge is untrusted relay input.  Do not sign a nonce or endpoint
 /// until both are bound to the configured WSS authority and the challenge is
 /// still live.  This prevents a compromised/redirecting relay from turning
@@ -521,6 +506,20 @@ where
     tokio::time::timeout(SOCKET_WRITE_TIMEOUT, socket.send(message))
         .await
         .map_err(|_| anyhow::anyhow!("relay write timed out"))??;
+    Ok(())
+}
+async fn send_artwork_message<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    message: Message,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::time::timeout(ARTWORK_WRITE_TIMEOUT, socket.send(message))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("relay artwork write exceeded the control-priority bound")
+        })??;
     Ok(())
 }
 async fn send_json<S, T: serde::Serialize>(
