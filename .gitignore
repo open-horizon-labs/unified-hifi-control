@@ -34,5 +34,6 @@ __pycache__/
 .ruff_cache/
 
 # Swift package build products (companion/*)
+/.build/
 companion/**/.build/
 companion/**/.swiftpm/
