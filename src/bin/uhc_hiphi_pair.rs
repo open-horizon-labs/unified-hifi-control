@@ -1,10 +1,12 @@
 //! Local half of the HiPhi installation-pairing ceremony.
 //!
-//! `initiate` creates the installation key and asks the cloud for a short-lived
-//! ceremony. The signed-in owner must independently claim the one-time secret
-//! and confirm the displayed fingerprint. `complete` then proves possession of
-//! the local key and consumes the ceremony. No cloud credential is written by
-//! this command.
+//! `prepare` creates the installation key without contacting the cloud. A
+//! signed-in owner uses its public key to mint a one-use enrollment handoff.
+//! `initiate` consumes that owner-only handoff and asks the cloud for a
+//! short-lived ceremony. The signed-in owner must independently claim the
+//! one-time secret and confirm the displayed fingerprint. `complete` then
+//! proves possession of the local key and consumes the ceremony. No owner
+//! bearer or cloud credential is accepted or written by this command.
 
 #[cfg(feature = "server")]
 mod command {
@@ -12,14 +14,30 @@ mod command {
 
     use anyhow::Context as _;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use serde::de::DeserializeOwned;
     use serde::{Deserialize, Serialize};
     use unified_hifi_control::cloud_connector::{
-        pairing::possession_message, InstallationIdentity,
+        pairing::{enrollment_possession_message, possession_message},
+        InstallationIdentity,
     };
     use url::Url;
     use uuid::Uuid;
 
-    #[derive(Deserialize)]
+    const INSTALLATION_ENROLLMENT_AUDIENCE: &str = "uhc-connector";
+    const MAX_ENROLLMENT_TTL_MS: i64 = 10 * 60 * 1_000;
+    const MAX_PAIRING_TTL_MS: i64 = 10 * 60 * 1_000;
+    const MAX_HANDOFF_BYTES: u64 = 4 * 1_024;
+    const MAX_JSON_RESPONSE_BYTES: usize = 16 * 1_024;
+
+    #[derive(Clone, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct EnrollmentHandoff {
+        enrollment_capability: String,
+        installation_audience: String,
+        expires_at: i64,
+    }
+
+    #[derive(Clone, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct InitiationResponse {
         pairing_id: Uuid,
@@ -50,14 +68,23 @@ mod command {
     pub async fn run() -> anyhow::Result<()> {
         let mut arguments = std::env::args().skip(1);
         match arguments.next().as_deref() {
+            Some("prepare") => {
+                if arguments.next().is_some() {
+                    anyhow::bail!("prepare accepts no arguments");
+                }
+                prepare()
+            }
             Some("initiate") => {
                 let origin = arguments
                     .next()
-                    .context("usage: uhc-hiphi-pair initiate https://cloud.example")?;
+                    .context("usage: uhc-hiphi-pair initiate https://cloud.example /owner-only/enrollment.json")?;
+                let handoff_path = arguments
+                    .next()
+                    .context("usage: uhc-hiphi-pair initiate https://cloud.example /owner-only/enrollment.json")?;
                 if arguments.next().is_some() {
-                    anyhow::bail!("initiate accepts exactly one cloud origin");
+                    anyhow::bail!("initiate accepts exactly one cloud origin and enrollment handoff path");
                 }
-                initiate(&origin).await
+                initiate(&origin, Path::new(&handoff_path)).await
             }
             Some("complete") => {
                 let account_id = arguments
@@ -69,12 +96,31 @@ mod command {
                 complete(&account_id).await
             }
             _ => anyhow::bail!(
-                "usage: uhc-hiphi-pair initiate https://cloud.example\n       uhc-hiphi-pair complete <account-uuid>"
+                "usage: uhc-hiphi-pair prepare\n       uhc-hiphi-pair initiate https://cloud.example /owner-only/enrollment.json\n       uhc-hiphi-pair complete <account-uuid>"
             ),
         }
     }
 
-    async fn initiate(origin: &str) -> anyhow::Result<()> {
+    fn prepare() -> anyhow::Result<()> {
+        let config_dir = unified_hifi_control::config::get_config_dir();
+        fs::create_dir_all(&config_dir)?;
+        let key_path = config_dir.join("hiphi-installation.key");
+        if key_path.exists() && std::env::var_os("UHC_HIPHI_INSTALLATION_ID").is_some() {
+            anyhow::bail!("this UHC is already configured with a HiPhi installation identity");
+        }
+        let identity = load_or_create_identity(&key_path)?;
+        println!(
+            "installation_public_key={}",
+            URL_SAFE_NO_PAD.encode(identity.verifying_key().as_bytes())
+        );
+        println!("installation_fingerprint={}", identity.fingerprint());
+        println!("installation_key_path={}", key_path.display());
+        println!("owner_authorized_enrollment_required=true");
+        println!("owner_bearer_must_not_be_copied_to_uhc=true");
+        Ok(())
+    }
+
+    async fn initiate(origin: &str, handoff_path: &Path) -> anyhow::Result<()> {
         let origin = validated_origin(origin)?;
         let config_dir = unified_hifi_control::config::get_config_dir();
         fs::create_dir_all(&config_dir)?;
@@ -89,30 +135,31 @@ mod command {
         if key_path.exists() && std::env::var_os("UHC_HIPHI_INSTALLATION_ID").is_some() {
             anyhow::bail!("this UHC is already configured with a HiPhi installation identity");
         }
-        let placeholder = format!("pending_{}", Uuid::new_v4().simple());
-        let identity = if key_path.exists() {
-            InstallationIdentity::load(&key_path, placeholder)?
-        } else {
-            let identity = InstallationIdentity::generate(placeholder)?;
-            identity.save(&key_path)?;
-            identity
-        };
-        let response = client()?
-            .post(endpoint(&origin, "/v1/pairing/initiate")?)
-            .json(&serde_json::json!({
+        let identity =
+            InstallationIdentity::load(&key_path, format!("pending_{}", Uuid::new_v4().simple()))
+                .context(
+                "no prepared installation key is available; run `uhc-hiphi-pair prepare` first",
+            )?;
+        let handoff = read_enrollment_handoff(handoff_path)?;
+        validate_enrollment(&handoff, unix_ms())?;
+        let proof = identity.sign(&enrollment_possession_message(
+            &handoff.enrollment_capability,
+            &handoff.installation_audience,
+            &identity.fingerprint(),
+        ));
+        let initiate_url = endpoint(&origin, "/v1/pairing/initiate")?;
+        let response: InitiationResponse = send_json(
+            &client()?,
+            &initiate_url,
+            &serde_json::json!({
                 "installation_public_key": URL_SAFE_NO_PAD.encode(identity.verifying_key().as_bytes()),
-            }))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<InitiationResponse>()
-            .await?;
-        if response.fingerprint != identity.fingerprint() {
-            anyhow::bail!("cloud returned a fingerprint that does not match the local key");
-        }
-        if response.secret.len() < 32 || response.expires_at <= unix_ms() {
-            anyhow::bail!("cloud returned an invalid or expired pairing ceremony");
-        }
+                "enrollment_capability": handoff.enrollment_capability,
+                "installation_audience": handoff.installation_audience,
+                "possession_signature": URL_SAFE_NO_PAD.encode(proof.to_bytes()),
+            }),
+        )
+        .await?;
+        validate_initiation(&response, &identity.fingerprint(), unix_ms())?;
         let pending = PendingPairing {
             cloud_origin: origin.to_string(),
             pairing_id: response.pairing_id,
@@ -122,6 +169,9 @@ mod command {
             expires_at: response.expires_at,
         };
         write_owner_only(&pending_path, &serde_json::to_vec_pretty(&pending)?)?;
+        ensure_owner_only_regular(handoff_path)?;
+        fs::remove_file(handoff_path)
+            .context("pairing began, but the consumed enrollment handoff could not be removed")?;
 
         println!("pairing_id={}", pending.pairing_id);
         println!("installation_id={}", pending.installation_id);
@@ -155,30 +205,34 @@ mod command {
             account_id,
             &pending.fingerprint,
         ));
-        client()?
-            .post(endpoint(&cloud_origin, "/v1/pairing/confirm-local")?)
-            .json(&serde_json::json!({
+        let client = client()?;
+        let confirm_url = endpoint(&cloud_origin, "/v1/pairing/confirm-local")?;
+        let confirmation: SemanticSuccess = send_json(
+            &client,
+            &confirm_url,
+            &serde_json::json!({
                 "pairing_id": pending.pairing_id,
                 "secret": pending.secret,
                 "account_id": account_id,
                 "fingerprint": pending.fingerprint,
                 "possession_signature": URL_SAFE_NO_PAD.encode(proof.to_bytes()),
-            }))
-            .send()
-            .await?
-            .error_for_status()?;
-        let response = client()?
-            .post(endpoint(&cloud_origin, "/v1/pairing/complete")?)
-            .json(&serde_json::json!({
+            }),
+        )
+        .await?;
+        if !confirmation.ok {
+            anyhow::bail!("cloud did not confirm local possession");
+        }
+        let completion_url = endpoint(&cloud_origin, "/v1/pairing/complete")?;
+        let response: CompletionResponse = send_json(
+            &client,
+            &completion_url,
+            &serde_json::json!({
                 "pairing_id": pending.pairing_id,
                 "secret": pending.secret,
                 "account_id": account_id,
-            }))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<CompletionResponse>()
-            .await?;
+            }),
+        )
+        .await?;
         if response.installation_id != pending.installation_id {
             anyhow::bail!("cloud completed a different installation");
         }
@@ -194,17 +248,18 @@ mod command {
     }
 
     fn validated_origin(input: &str) -> anyhow::Result<Url> {
-        let mut url = Url::parse(input)?;
+        let url = Url::parse(input)?;
         if url.scheme() != "https"
             || url.host_str().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
+            || url.port_or_known_default() != Some(443)
+            || url.path() != "/"
             || url.query().is_some()
             || url.fragment().is_some()
         {
-            anyhow::bail!("cloud origin must be credential-free HTTPS without query or fragment");
+            anyhow::bail!("cloud origin must be an exact credential-free HTTPS origin on port 443");
         }
-        url.set_path("");
         Ok(url)
     }
 
@@ -216,10 +271,141 @@ mod command {
 
     fn client() -> anyhow::Result<reqwest::Client> {
         reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .context("failed to build pairing HTTP client")
+    }
+
+    async fn send_json<T: Serialize + ?Sized, R: DeserializeOwned>(
+        client: &reqwest::Client,
+        endpoint: &Url,
+        request: &T,
+    ) -> anyhow::Result<R> {
+        let mut response = client.post(endpoint.clone()).json(request).send().await?;
+        if response.url() != endpoint {
+            anyhow::bail!("cloud response origin or route did not match the requested endpoint");
+        }
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let bytes = read_bounded(&mut response, MAX_JSON_RESPONSE_BYTES).await?;
+        if !status.is_success() {
+            anyhow::bail!("cloud request failed with HTTP {}", status.as_u16());
+        }
+        if !content_type
+            .split(';')
+            .next()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+        {
+            anyhow::bail!("cloud returned a non-JSON response");
+        }
+        serde_json::from_slice(&bytes).context("cloud returned an invalid response contract")
+    }
+
+    async fn read_bounded(
+        response: &mut reqwest::Response,
+        limit: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit as u64)
+        {
+            anyhow::bail!("cloud response exceeded the size limit");
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if bytes.len().saturating_add(chunk.len()) > limit {
+                anyhow::bail!("cloud response exceeded the size limit");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    }
+
+    fn load_or_create_identity(key_path: &Path) -> anyhow::Result<InstallationIdentity> {
+        let placeholder = format!("pending_{}", Uuid::new_v4().simple());
+        if key_path.exists() {
+            return InstallationIdentity::load(key_path, placeholder).map_err(Into::into);
+        }
+        let identity = InstallationIdentity::generate(placeholder)?;
+        identity.save(key_path)?;
+        Ok(identity)
+    }
+
+    fn read_enrollment_handoff(path: &Path) -> anyhow::Result<EnrollmentHandoff> {
+        ensure_owner_only_regular(path)?;
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.len() > MAX_HANDOFF_BYTES {
+            anyhow::bail!("enrollment handoff exceeds the size limit");
+        }
+        let bytes = fs::read(path)?;
+        if bytes.len() as u64 > MAX_HANDOFF_BYTES {
+            anyhow::bail!("enrollment handoff exceeds the size limit");
+        }
+        serde_json::from_slice(&bytes).context("enrollment handoff has an invalid contract")
+    }
+
+    fn ensure_owner_only_regular(path: &Path) -> anyhow::Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() {
+            anyhow::bail!("enrollment handoff must be a regular, non-symlink file");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                anyhow::bail!("enrollment handoff must be owner-only");
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_enrollment(handoff: &EnrollmentHandoff, now: i64) -> anyhow::Result<()> {
+        let capability = URL_SAFE_NO_PAD
+            .decode(&handoff.enrollment_capability)
+            .context("enrollment capability is not canonical base64url")?;
+        if capability.len() != 32
+            || URL_SAFE_NO_PAD.encode(&capability) != handoff.enrollment_capability
+        {
+            anyhow::bail!("enrollment capability is not a canonical 32-byte value");
+        }
+        if handoff.installation_audience != INSTALLATION_ENROLLMENT_AUDIENCE {
+            anyhow::bail!("enrollment audience is not the UHC connector audience");
+        }
+        if handoff.expires_at <= now
+            || handoff.expires_at.saturating_sub(now) > MAX_ENROLLMENT_TTL_MS
+        {
+            anyhow::bail!("enrollment handoff is expired or unreasonably long-lived");
+        }
+        Ok(())
+    }
+
+    fn validate_initiation(
+        response: &InitiationResponse,
+        expected_fingerprint: &str,
+        now: i64,
+    ) -> anyhow::Result<()> {
+        if response.fingerprint != expected_fingerprint {
+            anyhow::bail!("cloud returned a fingerprint that does not match the local key");
+        }
+        let secret = URL_SAFE_NO_PAD
+            .decode(&response.secret)
+            .context("cloud returned a noncanonical pairing secret")?;
+        if secret.len() != 32 || URL_SAFE_NO_PAD.encode(&secret) != response.secret {
+            anyhow::bail!("cloud returned an invalid pairing secret");
+        }
+        if response.expires_at <= now
+            || response.expires_at.saturating_sub(now) > MAX_PAIRING_TTL_MS
+        {
+            anyhow::bail!("cloud returned an expired or unreasonably long pairing ceremony");
+        }
+        Ok(())
     }
 
     fn unix_ms() -> i64 {
@@ -227,6 +413,12 @@ mod command {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SemanticSuccess {
+        ok: bool,
     }
 
     fn write_owner_only(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
@@ -240,6 +432,149 @@ mod command {
         file.sync_all()?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn cloud_origin_is_an_exact_default_port_https_origin() {
+            assert!(validated_origin("https://cloud.example").is_ok());
+            for invalid in [
+                "http://cloud.example",
+                "https://cloud.example:8443",
+                "https://user@cloud.example",
+                "https://cloud.example/a/path",
+                "https://cloud.example?query=yes",
+                "https://cloud.example/#fragment",
+            ] {
+                assert!(validated_origin(invalid).is_err(), "accepted {invalid}");
+            }
+        }
+
+        #[test]
+        fn enrollment_handoff_is_canonical_bounded_and_short_lived() {
+            let now = 1_000_000_i64;
+            let capability = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+            let valid = EnrollmentHandoff {
+                enrollment_capability: capability.clone(),
+                installation_audience: INSTALLATION_ENROLLMENT_AUDIENCE.to_owned(),
+                expires_at: now + 60_000,
+            };
+            assert!(validate_enrollment(&valid, now).is_ok());
+
+            for invalid in [
+                EnrollmentHandoff {
+                    enrollment_capability: format!("{capability}="),
+                    ..valid.clone()
+                },
+                EnrollmentHandoff {
+                    installation_audience: "owner-api".to_owned(),
+                    ..valid.clone()
+                },
+                EnrollmentHandoff {
+                    expires_at: now,
+                    ..valid.clone()
+                },
+                EnrollmentHandoff {
+                    expires_at: now + MAX_ENROLLMENT_TTL_MS + 1,
+                    ..valid.clone()
+                },
+            ] {
+                assert!(validate_enrollment(&invalid, now).is_err());
+            }
+        }
+
+        #[test]
+        fn prepared_key_and_enrollment_handoff_are_owner_only_regular_files() {
+            use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+            let directory = tempfile::tempdir().unwrap();
+            let key_path = directory.path().join("installation.key");
+            load_or_create_identity(&key_path).unwrap();
+            assert_eq!(
+                fs::symlink_metadata(&key_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+
+            let handoff_path = directory.path().join("enrollment.json");
+            let handoff = serde_json::json!({
+                "enrollment_capability": URL_SAFE_NO_PAD.encode([7_u8; 32]),
+                "installation_audience": INSTALLATION_ENROLLMENT_AUDIENCE,
+                "expires_at": unix_ms() + 60_000,
+            });
+            write_owner_only(&handoff_path, &serde_json::to_vec(&handoff).unwrap()).unwrap();
+            assert!(read_enrollment_handoff(&handoff_path).is_ok());
+
+            fs::set_permissions(&handoff_path, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(read_enrollment_handoff(&handoff_path).is_err());
+            fs::set_permissions(&handoff_path, fs::Permissions::from_mode(0o600)).unwrap();
+            let symlink_path = directory.path().join("enrollment-link.json");
+            symlink(&handoff_path, &symlink_path).unwrap();
+            assert!(read_enrollment_handoff(&symlink_path).is_err());
+        }
+
+        #[test]
+        fn cloud_response_contracts_reject_unknown_or_missing_authority_fields() {
+            let valid = serde_json::json!({
+                "pairing_id": Uuid::from_u128(1),
+                "installation_id": Uuid::from_u128(2),
+                "secret": "not-a-real-pairing-secret-value",
+                "fingerprint": "AAAA-BBBB",
+                "expires_at": unix_ms() + 60_000,
+            });
+            assert!(serde_json::from_value::<InitiationResponse>(valid.clone()).is_ok());
+
+            let mut unknown = valid.clone();
+            unknown["owner_bearer"] = serde_json::json!("must-never-enter-uhc");
+            assert!(serde_json::from_value::<InitiationResponse>(unknown).is_err());
+            let mut missing = valid;
+            missing.as_object_mut().unwrap().remove("fingerprint");
+            assert!(serde_json::from_value::<InitiationResponse>(missing).is_err());
+
+            assert!(
+                serde_json::from_value::<SemanticSuccess>(serde_json::json!({"ok": true})).is_ok()
+            );
+            assert!(serde_json::from_value::<SemanticSuccess>(
+                serde_json::json!({"ok": true, "authority": "extra"})
+            )
+            .is_err());
+        }
+
+        #[test]
+        fn pairing_ceremony_has_its_own_short_bounded_expiry_window() {
+            let now = 1_000_000_i64;
+            let response = InitiationResponse {
+                pairing_id: Uuid::from_u128(1),
+                installation_id: Uuid::from_u128(2),
+                secret: URL_SAFE_NO_PAD.encode([9_u8; 32]),
+                fingerprint: "AAAA-BBBB".to_owned(),
+                expires_at: now + 5 * 60 * 1_000,
+            };
+            assert!(validate_initiation(&response, "AAAA-BBBB", now).is_ok());
+
+            for invalid in [
+                InitiationResponse {
+                    fingerprint: "CCCC-DDDD".to_owned(),
+                    ..response.clone()
+                },
+                InitiationResponse {
+                    expires_at: now,
+                    ..response.clone()
+                },
+                InitiationResponse {
+                    expires_at: now + MAX_PAIRING_TTL_MS + 1,
+                    ..response
+                },
+            ] {
+                assert!(validate_initiation(&invalid, "AAAA-BBBB", now).is_err());
+            }
+        }
     }
 }
 

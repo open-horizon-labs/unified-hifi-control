@@ -1083,3 +1083,47 @@ fn pairing_possession_proof_binds_all_ceremony_inputs() {
     );
     assert!(key.verifying_key().verify(&altered, &signature).is_err());
 }
+
+#[test]
+fn enrollment_possession_proof_binds_one_use_capability_audience_and_local_key() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/hiphi-enrollment-v1.json")).unwrap();
+    let valid = &fixture["valid"];
+    let public_key: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(valid["installation_public_key"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&public_key).unwrap();
+    let signature = ed25519_dalek::Signature::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(valid["possession_signature"].as_str().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let message = cloud_connector::pairing::enrollment_possession_message(
+        valid["enrollment_capability"].as_str().unwrap(),
+        valid["installation_audience"].as_str().unwrap(),
+        valid["public_key_fingerprint"].as_str().unwrap(),
+    );
+    assert_eq!(
+        URL_SAFE_NO_PAD.encode(&message),
+        valid["possession_message"].as_str().unwrap()
+    );
+    assert!(key.verify(&message, &signature).is_ok());
+
+    for adversarial in fixture["adversarial"].as_array().unwrap() {
+        let altered = cloud_connector::pairing::enrollment_possession_message(
+            adversarial["enrollment_capability"].as_str().unwrap(),
+            adversarial["installation_audience"].as_str().unwrap(),
+            adversarial["public_key_fingerprint"].as_str().unwrap(),
+        );
+        assert!(
+            key.verify(&altered, &signature).is_err(),
+            "accepted {}",
+            adversarial["name"].as_str().unwrap()
+        );
+    }
+}

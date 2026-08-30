@@ -30,6 +30,15 @@ absolute volume). It carries no URLs, HTTP headers, cookies, provider
 credentials, raw adapter IDs, or executable payloads. The local aggregator
 maintains the reverse handle map.
 
+Fresh installation enrollment is owner-authorized without moving owner
+authority onto the LAN host. UHC first creates its installation key locally and
+exports only the public key and fingerprint. A signed-in owner then mints a
+short-lived, one-use enrollment capability bound to that public key and the
+exact `uhc-connector` audience. UHC accepts the capability only from an
+owner-only local handoff file, signs the length-prefixed enrollment message with
+its local key, and consumes the handoff after successful initiation. The UHC
+pairing CLI never accepts, stores, or forwards the owner's bearer token.
+
 Every command is independently authorized by a compact Ed25519 JWS grant. UHC
 pins issuer keys by `key_id` and verifies issuer, audience, installation,
 control node, request, epoch, scope, exact canonical payload hash, expiry, and
