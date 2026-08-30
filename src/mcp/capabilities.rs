@@ -50,13 +50,12 @@
 //!
 //! **Capability is per provider, not per device.** A fixed-volume Roon output —
 //! an endpoint feeding an analogue preamp — has no volume control, and this module
-//! reports `volume: supported` for it. UHC cannot currently do better: the
-//! aggregator's `volume_control: None` conflates "this output has no volume
-//! control" with "no volume has been read yet", so deriving from it would mislabel
-//! every freshly discovered zone. The wire payload carries the aggregator's
-//! `has_volume_control` observation beside the capability so a client can combine
-//! the two itself; the ambiguity is documented on that field rather than resolved
-//! by guessing.
+//! reports `volume: supported` for it. The wire payload therefore carries
+//! `has_volume_control` beside the provider capability. It uses an explicit
+//! per-device capability when a provider supplies one (Spotify's
+//! `supports_volume`), even when the current value is null; otherwise it falls
+//! back to whether the aggregator has observed a numeric volume control. Clients
+//! can combine that device observation with the provider-level capability.
 //!
 //! **Capability is per operation family, not per action.** `transport` covers
 //! play/pause and `transport_skip` covers next/previous, because UPnP refuses the
@@ -379,7 +378,11 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
         // (the same browse/load session `hifi_search` already drives);
         // favorites remains a gap -- see `GAPS` below -- because Roon exposes
         // it as a browse hierarchy this slice does not yet walk into.
-        Capability::Browse | Capability::SavedPlaylists => matches!(
+        Capability::Browse => matches!(
+            target,
+            ZoneTarget::MusicAssistant | ZoneTarget::Lms | ZoneTarget::Roon
+        ),
+        Capability::SavedPlaylists => matches!(
             target,
             ZoneTarget::Spotify | ZoneTarget::MusicAssistant | ZoneTarget::Lms | ZoneTarget::Roon
         ),
@@ -695,10 +698,33 @@ pub fn support(target: ZoneTarget, capability: Capability) -> Support {
             evidence: "the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.",
         };
     }
-    if matches!(
-        target,
-        ZoneTarget::AppleMusic | ZoneTarget::Spotify | ZoneTarget::MusicAssistant
-    ) {
+    if target == ZoneTarget::Spotify {
+        return match capability {
+            Capability::Browse => Support::NotImplemented {
+                tracked_by: "#473",
+                evidence: "Spotify removed categories, category playlists, featured playlists, and new releases from the Web API surface available to new Development Mode applications in February 2026. A future browse implementation must use a currently available, quota-aware surface rather than call those retired endpoints.",
+            },
+            Capability::QueueJump
+            | Capability::QueueReorder
+            | Capability::QueueRemove
+            | Capability::QueueClear
+            | Capability::QueueTransfer => Support::Unsupported {
+                evidence: "Spotify's Web API exposes Get the User's Queue and Add Item to Playback Queue, but no endpoint to jump, reorder, remove, clear, or transfer active queue contents. Verified from the Spotify Web API Player reference, not inferred from a device.",
+            },
+            Capability::PlayNext => Support::NotImplemented {
+                tracked_by: "#474",
+                evidence: "Spotify exposes Add Item to Playback Queue and UHC routes it through hifi_play action=queue, but UHC does not expose a distinct play-next operation for Spotify.",
+            },
+            Capability::MultiroomSync => Support::Unsupported {
+                evidence: "Spotify's Transfer Playback endpoint accepts a single target device and does not synchronize multiple Connect devices; transfer is device selection, not multiroom grouping. Verified from the Spotify Web API Transfer Playback reference, not inferred from a device.",
+            },
+            _ => Support::NotImplemented {
+                tracked_by: "#462",
+                evidence: "the Spotify adapter has no routed implementation for this capability; the provider-neutral streaming follow-up tracks it.",
+            },
+        };
+    }
+    if matches!(target, ZoneTarget::AppleMusic | ZoneTarget::MusicAssistant) {
         return Support::NotImplemented {
             tracked_by: "#462",
             evidence: "the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.",
@@ -769,13 +795,13 @@ pub struct McpCapabilityZone {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zone_name: Option<String>,
     pub provider: Provider,
-    /// Whether the aggregator currently holds a volume control for this zone.
+    /// Whether the latest device observation says this zone accepts volume.
     ///
-    /// **An observation, not a capability.** `false` means either "this output
-    /// has no volume control" or "no volume has been read yet", and UHC cannot
-    /// tell those apart — which is exactly why `volume`'s capability state is
-    /// per provider and this is reported separately for the client to weigh.
-    /// Absent when the aggregator holds no such zone.
+    /// **An observation, not a provider capability.** When the provider exposes
+    /// an explicit per-device flag (currently Spotify), that flag is authoritative
+    /// even if the numeric value is absent. Other providers fall back to whether
+    /// a numeric control has been observed, so `false` can still mean "not yet
+    /// observed" there. Absent when the aggregator holds no such zone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub has_volume_control: Option<bool>,
 }
@@ -1104,7 +1130,10 @@ mod tests {
         );
         assert!(matches!(
             support(ZoneTarget::Spotify, Capability::Browse),
-            Support::Supported
+            Support::NotImplemented {
+                tracked_by: "#473",
+                ..
+            }
         ));
     }
 

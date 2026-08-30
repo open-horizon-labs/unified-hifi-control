@@ -10,6 +10,8 @@ use rust_mcp_sdk::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::spotify::refusal_for_spotify_error;
+
 #[mcp_tool(
     name = "hifi_queue",
     description = "Read or edit a playback queue. action='read' is the default. Music Assistant supports jump, reorder, remove, clear, and transfer against its active queue; each mutation returns a fresh queue readback. transfer (Alpha capability: expect refinement across releases) moves the active queue from zone_id to target_zone_id (both must be Music Assistant zones). Queue add is hifi_play action='queue'."
@@ -131,7 +133,7 @@ pub async fn handle_queue(
             .await
         {
             Ok(value) => Ok(env.json_result(&value)),
-            Err(e) => env.failed(format!("Queue error: {e}")),
+            Err(e) => env.refused(format!("Queue error: {e}"), refusal_for_spotify_error(&e)),
         },
         LibraryRoute::AppleMusic => match state
             .adapter_registry

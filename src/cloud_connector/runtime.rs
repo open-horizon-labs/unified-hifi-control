@@ -373,9 +373,7 @@ where
             }
             artwork = artwork_rx.recv() => {
                 if let Some(artwork) = artwork {
-                    tokio::time::timeout(ARTWORK_WRITE_TIMEOUT, socket.send(artwork))
-                        .await
-                        .map_err(|_| anyhow::anyhow!("relay artwork write exceeded the control-priority bound"))??;
+                    send_artwork_message(&mut socket, artwork).await?;
                     continue;
                 }
                 // All artwork workers have gone away; keep servicing the relay.
@@ -558,6 +556,20 @@ where
     tokio::time::timeout(SOCKET_WRITE_TIMEOUT, socket.send(message))
         .await
         .map_err(|_| anyhow::anyhow!("relay write timed out"))??;
+    Ok(())
+}
+async fn send_artwork_message<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    message: Message,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::time::timeout(ARTWORK_WRITE_TIMEOUT, socket.send(message))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("relay artwork write exceeded the control-priority bound")
+        })??;
     Ok(())
 }
 async fn send_json<S, T: serde::Serialize>(

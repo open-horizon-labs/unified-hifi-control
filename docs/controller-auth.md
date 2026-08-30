@@ -34,14 +34,15 @@ or a local-only setup surface; it is never placed in a tunnel URL.
 
 The local install flow is:
 
-1. Start UHC and expose its configured port through a temporary HTTPS tunnel.
-2. Open the tunnel URL and enter the one-time bootstrap secret.
-3. UHC invalidates the secret and issues the browser controller session plus
-   CSRF token.
-4. The authenticated Settings UI configures Spotify and starts OAuth. The
-   exact HTTPS callback URI remains registered with Spotify.
-5. The UI creates a scoped controller/MCP token only when requested.
-6. Stop the tunnel after setup unless the operator has deliberately configured
+1. Start UHC locally and bootstrap the browser controller session on its LAN
+   address; never put that session or bootstrap secret in a tunnel URL.
+2. The authenticated Settings UI configures Spotify, then opens a temporary
+   HTTPS tunnel only to UHC's callback-only loopback listener.
+3. The exact HTTPS callback URI remains registered with Spotify. The public
+   listener accepts only that callback plus its bounded liveness probe; it
+   does not expose the UHC UI, bootstrap, MCP, provider settings, or LAN API.
+4. The UI creates a scoped controller/MCP token only when requested.
+5. Stop the tunnel after OAuth unless the operator has deliberately configured
    a persistent authenticated reverse proxy.
 
 Recovery uses a new one-time bootstrap secret from the local console/package,
