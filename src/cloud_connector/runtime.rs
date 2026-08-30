@@ -106,17 +106,17 @@ async fn run(
                 continue;
             }
         };
-        let issuer_key = match issuer_verifying_key(&config) {
+        let session_issuer_key = match session_issuer_verifying_key(&config) {
             Ok(key) => key,
             Err(error) => {
-                tracing::error!("HiPhi Cloud issuer key is invalid: {error}");
+                tracing::error!("HiPhi Cloud session issuer key is invalid: {error}");
                 break;
             }
         };
         let verified_grant = match verify_installation_session_grant(
             &grant,
-            &config.issuer_key_id,
-            &issuer_key,
+            &config.session_issuer_key_id,
+            &session_issuer_key,
             &identity,
             config.endpoint.as_str(),
             now_ms(),
@@ -335,7 +335,7 @@ where
     });
     send_json(&mut socket, &snapshot).await?;
 
-    let issuer_key = issuer_verifying_key(config)?;
+    let command_issuer_key = command_issuer_verifying_key(config)?;
     let mut verifier = CommandGrantVerifier::new(
         "hiphi-command-authorization",
         UHC_AUDIENCE,
@@ -343,7 +343,7 @@ where
         epoch,
         grant_generation,
     );
-    verifier.pin_key(config.issuer_key_id.clone(), issuer_key);
+    verifier.pin_key(config.command_issuer_key_id.clone(), command_issuer_key);
     let (artwork_tx, mut artwork_rx) = mpsc::channel(ARTWORK_QUEUE_CAPACITY);
     let artwork_slots =
         std::sync::Arc::new(Semaphore::new(ARTWORK_QUEUE_CAPACITY + ARTWORK_CONCURRENCY));
@@ -800,15 +800,23 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-fn issuer_verifying_key(
+fn session_issuer_verifying_key(
     config: &CloudConnectorConfig,
 ) -> anyhow::Result<ed25519_dalek::VerifyingKey> {
+    verifying_key(&config.session_issuer_public_key, "session issuer")
+}
+
+fn command_issuer_verifying_key(
+    config: &CloudConnectorConfig,
+) -> anyhow::Result<ed25519_dalek::VerifyingKey> {
+    verifying_key(&config.command_issuer_public_key, "command issuer")
+}
+
+fn verifying_key(bytes: &[u8], authority: &str) -> anyhow::Result<ed25519_dalek::VerifyingKey> {
     Ok(ed25519_dalek::VerifyingKey::from_bytes(
-        config
-            .issuer_public_key
-            .as_slice()
+        bytes
             .try_into()
-            .map_err(|_| anyhow::anyhow!("issuer key must be 32 bytes"))?,
+            .map_err(|_| anyhow::anyhow!("{authority} key must be 32 bytes"))?,
     )?)
 }
 
@@ -847,8 +855,8 @@ mod tests {
             config::CloudConnectorConfig,
             identity::InstallationIdentity,
             protocol::{
-                CommandAction, CommandPayload, ConnectorMessage, SessionChallengeMessage,
-                PROTOCOL_VERSION,
+                CommandAction, CommandEnvelope, CommandGrantClaims, CommandPayload,
+                ConnectorMessage, SessionChallengeMessage, PROTOCOL_VERSION,
             },
             state::{ControlEligibility, SemanticStateInput, SemanticZoneInput},
             transport::{RelayEndpoint, SessionEpochGuard},
@@ -857,7 +865,8 @@ mod tests {
         coordinator::AdapterCoordinator,
         knobs::KnobStore,
     };
-    use ed25519_dalek::SigningKey;
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer as _, SigningKey};
     use futures::{SinkExt as _, StreamExt as _};
     use std::{
         sync::{
@@ -888,6 +897,65 @@ mod tests {
             connector_version: env!("UHC_VERSION").into(),
             issued_at: 1_800_000_000_000,
             signature: "proof_012345678901234567890123456789".into(),
+        }
+    }
+
+    fn signed_command(
+        key_id: &str,
+        key: &SigningKey,
+        installation_id: &str,
+        epoch: u64,
+        generation: u64,
+        now: i64,
+    ) -> crate::cloud_connector::protocol::CommandEnvelope {
+        let control_node_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let idempotency_key = Uuid::new_v4();
+        let payload = CommandPayload {
+            zone_handle: "zone_distinct_authority_test".into(),
+            action: CommandAction::Next,
+        };
+        let claims = CommandGrantClaims {
+            protocol_version: PROTOCOL_VERSION,
+            issuer: "hiphi-command-authorization".into(),
+            audience: super::UHC_AUDIENCE.into(),
+            installation_id: installation_id.into(),
+            control_node_id,
+            request_id,
+            idempotency_key,
+            scope: payload.action.scope().into(),
+            payload_sha256: payload.canonical_hash().unwrap(),
+            epoch,
+            issued_at: now - 100,
+            expires_at: now + 5_000,
+            grant_generation: generation,
+        };
+        let encoded_header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "alg": "EdDSA",
+                "kid": key_id,
+            }))
+            .unwrap(),
+        );
+        let encoded_claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).unwrap());
+        let signature = key.sign(format!("{encoded_header}.{encoded_claims}").as_bytes());
+        let grant = format!(
+            "{encoded_header}.{encoded_claims}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        );
+        CommandEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            installation_id: installation_id.into(),
+            control_node_id,
+            epoch,
+            message_id: "message_distinct_authority_test".into(),
+            request_id,
+            idempotency_key,
+            created_at: claims.issued_at,
+            expires_at: claims.expires_at,
+            payload,
+            grant,
         }
     }
 
@@ -1254,10 +1322,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_run_connection_sends_hello_snapshot_then_honors_revocation() {
+    async fn production_connection_uses_distinct_command_authority_then_honors_revocation() {
         let installation_id = Uuid::new_v4().to_string();
         let identity = InstallationIdentity::generate(installation_id.clone()).unwrap();
-        let issuer = SigningKey::from_bytes(&[31; 32]);
+        let session_issuer = SigningKey::from_bytes(&[30; 32]);
+        let command_issuer = SigningKey::from_bytes(&[31; 32]);
         let temp = tempfile::tempdir().unwrap();
         let endpoint = "wss://cloud.invalid/v1/relay/connect";
         let config = CloudConnectorConfig {
@@ -1265,8 +1334,10 @@ mod tests {
             installation_id: installation_id.clone(),
             key_path: temp.path().join("installation.key"),
             epoch_path: temp.path().join("epoch"),
-            issuer_key_id: "issuer-1".into(),
-            issuer_public_key: issuer.verifying_key().to_bytes().to_vec(),
+            session_issuer_key_id: "session-issuer-1".into(),
+            session_issuer_public_key: session_issuer.verifying_key().to_bytes().to_vec(),
+            command_issuer_key_id: "command-issuer-1".into(),
+            command_issuer_public_key: command_issuer.verifying_key().to_bytes().to_vec(),
         };
         let state = empty_app_state().await;
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
@@ -1281,6 +1352,14 @@ mod tests {
             expires_at: now + 30_000,
         });
         let epoch = u64::try_from(now).unwrap();
+        let command = signed_command(
+            "command-issuer-1",
+            &command_issuer,
+            &installation_id,
+            epoch,
+            0,
+            now,
+        );
         let server_task = tokio::spawn(async move {
             server
                 .send(Message::Text(
@@ -1316,6 +1395,19 @@ mod tests {
                 if value.installation_id == installation_id && value.epoch == epoch));
             server
                 .send(Message::Text(
+                    serde_json::to_string(&RelayMessage::Command(command))
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let Message::Text(result) = server.next().await.unwrap().unwrap() else {
+                panic!("expected command result")
+            };
+            let result: ConnectorMessage = serde_json::from_str(&result).unwrap();
+            assert!(matches!(result, ConnectorMessage::CommandResult(_)));
+            server
+                .send(Message::Text(
                     serde_json::to_string(&RelayMessage::Revoke {
                         reason_code: "owner_revoked".into(),
                     })
@@ -1342,6 +1434,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(exit, ConnectionExit::Revoked);
+        assert_eq!(ledger.len(), 1, "the command authority grant was accepted");
         server_task.await.unwrap();
     }
 }

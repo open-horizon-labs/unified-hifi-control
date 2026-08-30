@@ -40,7 +40,21 @@ its local key, and consumes the handoff after successful initiation. The UHC
 pairing CLI never accepts, stores, or forwards the owner's bearer token.
 
 Every command is independently authorized by a compact Ed25519 JWS grant. UHC
-pins issuer keys by `key_id` and verifies issuer, audience, installation,
+pins the session-grant and command-grant authorities independently. The
+session authority may authenticate a short-lived relay session but cannot mint
+a command UHC accepts; the command authority may authorize an exact command
+but cannot authenticate a relay session. UHC rejects connector configuration
+that reuses either the same key ID or the same public key for both roles.
+
+Operators configure the split trust roots with
+`UHC_HIPHI_SESSION_ISSUER_KEY_ID`, `UHC_HIPHI_SESSION_ISSUER_PUBLIC_KEY`,
+`UHC_HIPHI_COMMAND_ISSUER_KEY_ID`, and
+`UHC_HIPHI_COMMAND_ISSUER_PUBLIC_KEY`. The public keys use unpadded URL-safe
+base64. The old combined `UHC_HIPHI_ISSUER_*` pair is deliberately not a
+fallback because accepting it would silently collapse the two authorities.
+
+For every command, UHC pins the command issuer by `key_id` and verifies issuer,
+audience, installation,
 control node, request, epoch, scope, exact canonical payload hash, expiry, and
 grant generation before dispatch. The control-node identity is carried in the
 signed grant and the command envelope, allowing one installation to serve
@@ -58,6 +72,8 @@ image, and capability values are never logged or placed in URLs.
 ## Consequences
 
 - Open-source UHC can be audited without exposing a cloud signing secret.
+- Compromise or misuse of one cloud signing role does not automatically grant
+  the other role.
 - HiPhi Cloud can provide account, entitlement, and façade policy without
   gaining LAN access or provider credential authority.
 - The connector requires a direct Ed25519 dependency when wired into the

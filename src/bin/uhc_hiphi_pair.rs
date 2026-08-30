@@ -243,7 +243,8 @@ mod command {
         println!("pairing_complete=true");
         println!("UHC_HIPHI_INSTALLATION_ID={}", response.installation_id);
         println!("UHC_HIPHI_RELAY_URL={}", relay.as_str());
-        println!("issuer_public_key_configuration_required=true");
+        println!("session_issuer_public_key_configuration_required=true");
+        println!("command_issuer_public_key_configuration_required=true");
         Ok(())
     }
 
