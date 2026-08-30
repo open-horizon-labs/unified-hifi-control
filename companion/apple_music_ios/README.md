@@ -46,7 +46,9 @@ Release consumers should resolve this library as the
 UHC release tag. The nested package remains available for development in this
 repository; both entry points compile the same public source directory. A
 private product shell must not copy these sources or replace this package with
-a provider fork.
+a provider fork. The root manifest is a remote-consumption entry point; tests
+remain in the nested provider and UHCKit development packages so macOS tests do
+not attempt to compile this deliberately iOS-only target.
 
 `AppleMusicCompanionHost` provides the host lifecycle: request authorization,
 claim a pairing code, publish a bounded snapshot, poll/execute/acknowledge

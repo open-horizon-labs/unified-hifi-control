@@ -25,11 +25,6 @@ let package = Package(
             name: "UHCKit",
             path: "companion/uhckit/Sources/UHCKit"
         ),
-        .testTarget(
-            name: "UHCKitTests",
-            dependencies: ["UHCKit"],
-            path: "companion/uhckit/Tests/UHCKitTests"
-        ),
         .target(
             name: "AppleMusicIOSCompanion",
             path: "companion/apple_music_ios/Sources/AppleMusicIOSCompanion"
