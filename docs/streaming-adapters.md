@@ -86,6 +86,45 @@ standard authorization-code flow:
 - `POST /api/providers/spotify/oauth/revoke` clears the adapter and removes
   the durable credential file.
 
+### Spotify's 2026 Development Mode boundary
+
+UHC controls existing Spotify Connect devices; it is not a Connect receiver
+and receives no audio. For applications created under Spotify's current
+Development Mode rules, UHC uses `/me/playlists`, parses a playlist's `items`
+summary, and limits search requests to 10 results. Development Mode is the
+default, and in that mode UHC refuses the removed categories,
+category-playlists, featured-playlists, and new-releases operations before a
+provider request. Use search, the authenticated user's playlists, and saved
+tracks instead. See Spotify's
+[February 2026 migration guide](https://developer.spotify.com/documentation/web-api/tutorials/february-2026-migration-guide)
+and [change log](https://developer.spotify.com/documentation/web-api/references/changes/february-2026).
+
+Existing Spotify applications with Extended Quota entitlement can retain
+those legacy browse operations by setting
+`UHC_SPOTIFY_QUOTA_MODE=extended`. This switch must only be set when the
+Spotify application actually has Extended Quota access; it does not grant
+entitlement. `UHC_SPOTIFY_QUOTA_MODE=development` is equivalent to the default.
+An invalid value is rejected to Development Mode and logged at startup.
+
+Spotify's active playback queue can be read and a track or episode can be
+added. The Web API does not provide active-queue jump, reorder, remove, clear,
+or queue-transfer operations. Likewise,
+[Transfer Playback](https://developer.spotify.com/documentation/web-api/reference/transfer-a-users-playback)
+selects one Connect device; it is not multiroom grouping or synchronized
+playback. A device with a nullable ID is omitted from UHC's zone inventory,
+while `supports_volume` determines whether UHC exposes volume control even if
+Spotify also returns a `volume_percent` value.
+
+Spotify may return HTTP 429 for a short-term rate limit or with the structured
+reason `QUOTA_EXCEEDED` for application quota exhaustion. UHC reports those as
+different failures and never includes Spotify's response body in the error.
+Short-term failures honor Spotify's `Retry-After` header and block repeated
+requests locally until that delay expires. Because the quota response provides
+no reset time, UHC blocks retries for 15 minutes (or until credentials change)
+after `QUOTA_EXCEEDED` to avoid a request storm.
+Spotify's [July 2026 quota update](https://developer.spotify.com/blog/2026-07-23-web-api-quota-updates)
+describes the current Development Mode allowance.
+
 The credential envelope uses an operator-managed 32-byte key. Set
 `UHC_CREDENTIAL_KEY` (hex or base64url) or `UHC_CREDENTIAL_KEY_FILE`; when
 neither is set, UHC creates `credential.key` beside the encrypted credential

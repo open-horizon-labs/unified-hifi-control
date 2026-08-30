@@ -398,7 +398,7 @@
     }
   },
   "hifi_spotify": {
-    "description": "Spotify catalog and library access. Actions include browse_categories, browse_category_playlists, browse_featured_playlists, browse_new_releases, playlists, playlist_tracks, saved_tracks, saved_tracks_check, saved_tracks_add/remove, create_playlist, update_playlist, playlist_add/replace/remove. Use hifi_search and hifi_play for catalog search and playback. Playlist/library writes require the corresponding Spotify scopes.",
+    "description": "Spotify personal-library access. Actions: playlists, playlist_tracks, saved_tracks, saved_tracks_check, saved_tracks_add/remove, create_playlist, update_playlist, playlist_add/replace/remove. Extended Quota apps configured with UHC_SPOTIFY_QUOTA_MODE=extended may also use browse_categories, browse_category_playlists, browse_featured_playlists, and browse_new_releases; those actions are unavailable by default because Spotify removed them from the February 2026 Development Mode API. Use hifi_search and hifi_play for catalog search, playback, and queue-add. The Web API can read/add to the active queue but cannot jump, reorder, remove, clear, or transfer queue contents. Transfer Playback selects one device; it is not multiroom synchronization. Playlist/library writes require the corresponding Spotify scopes.",
     "inputSchema": {
       "properties": {
         "action": {
@@ -406,7 +406,7 @@
           "type": "string"
         },
         "category_id": {
-          "description": "Spotify browse category id.",
+          "description": "Spotify browse category id. Extended Quota mode only.",
           "nullable": true,
           "type": "string"
         },
