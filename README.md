@@ -254,7 +254,7 @@ Control your hi-fi with natural language. The bridge includes an MCP server so C
 | `hifi_hqplayer_load_profile` | Switch HQPlayer profile |
 | `hifi_hqplayer_set_pipeline` | Change filter, shaper, dither settings |
 
-*Spotify is a controller for existing Spotify Connect devices, not a receiver. Spotify search, exact play/queue-add, queue read, playlists, liked tracks, repeat, and shuffle require the corresponding OAuth scopes. New Development Mode applications cannot use the removed categories, featured-playlists, or new-releases browse endpoints. Spotify exposes no active-queue jump/reorder/remove/clear/transfer operations, and Transfer Playback selects one device rather than synchronizing a multiroom group. Transport controls work with all enabled adapters.*
+*Spotify is a controller for existing Spotify Connect devices, not a receiver. Spotify search, exact play/queue-add, queue read, playlists, liked tracks, repeat, and shuffle require the corresponding OAuth scopes. New Development Mode applications cannot use the removed categories, featured-playlists, or new-releases browse endpoints; UHC defaults to that mode. Existing Extended Quota applications can explicitly retain those legacy browse calls with `UHC_SPOTIFY_QUOTA_MODE=extended`. Spotify exposes no active-queue jump/reorder/remove/clear/transfer operations, and Transfer Playback selects one device rather than synchronizing a multiroom group. Transport controls work with all enabled adapters.*
 
 The MCP endpoint is unauthenticated like the rest of the bridge — see [Security and Network Exposure](#security-and-network-exposure).
 

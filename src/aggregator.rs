@@ -62,6 +62,7 @@ pub struct ZoneAggregator {
 #[derive(Default)]
 struct AggregateState {
     zones: HashMap<String, Zone>,
+    volume_capabilities: HashMap<String, bool>,
     hqplayer_snapshots: HashMap<String, HqpSnapshot>,
     projection_revision: u64,
     source_cursors: HashMap<String, ProjectionCursor>,
@@ -155,11 +156,11 @@ impl ZoneAggregator {
                     self.observed_playback
                         .record_zone(&zone, observation_now())
                         .await;
-                    self.state
-                        .write()
-                        .await
-                        .zones
-                        .insert(zone.zone_id.clone(), zone);
+                    let mut aggregate = self.state.write().await;
+                    aggregate
+                        .volume_capabilities
+                        .insert(zone.zone_id.clone(), zone.volume_control.is_some());
+                    aggregate.zones.insert(zone.zone_id.clone(), zone);
                 }
 
                 BusEvent::ZoneUpdated {
@@ -180,7 +181,9 @@ impl ZoneAggregator {
                 BusEvent::ZoneRemoved { zone_id } => {
                     debug!("Zone removed: {}", zone_id);
                     self.observed_playback.clear_zone(zone_id.as_str()).await;
-                    self.state.write().await.zones.remove(zone_id.as_str());
+                    let mut aggregate = self.state.write().await;
+                    aggregate.zones.remove(zone_id.as_str());
+                    aggregate.volume_capabilities.remove(zone_id.as_str());
                 }
 
                 BusEvent::ProviderAccountUpdated { provider, account } => {
@@ -318,6 +321,16 @@ impl ZoneAggregator {
                     }
                 }
 
+                BusEvent::VolumeCapabilityChanged { zone_id, supported } => {
+                    debug!("Volume capability changed: {} = {}", zone_id, supported);
+                    let mut aggregate = self.state.write().await;
+                    if aggregate.zones.contains_key(zone_id.as_str()) {
+                        aggregate
+                            .volume_capabilities
+                            .insert(zone_id.to_string(), supported);
+                    }
+                }
+
                 BusEvent::SeekPositionChanged { zone_id, position } => {
                     debug!("Seek position changed: {} = {}", zone_id, position);
                     if let Some(zone) = self.state.write().await.zones.get_mut(zone_id.as_str()) {
@@ -343,6 +356,7 @@ impl ZoneAggregator {
 
                         for zone_id in &zone_ids {
                             aggregate.zones.remove(zone_id);
+                            aggregate.volume_capabilities.remove(zone_id);
                         }
                         zone_ids
                     };
@@ -397,6 +411,22 @@ impl ZoneAggregator {
     /// Get a specific zone
     pub async fn get_zone(&self, zone_id: &str) -> Option<Zone> {
         self.state.read().await.zones.get(zone_id).cloned()
+    }
+
+    /// Return whether the current device observation says this zone can accept
+    /// volume commands. This is separate from `Zone::volume_control`, whose
+    /// numeric value is absent when a provider reports support but no current
+    /// volume value.
+    pub async fn has_volume_control(&self, zone_id: &str) -> Option<bool> {
+        let aggregate = self.state.read().await;
+        let zone = aggregate.zones.get(zone_id)?;
+        Some(
+            aggregate
+                .volume_capabilities
+                .get(zone_id)
+                .copied()
+                .unwrap_or_else(|| zone.volume_control.is_some()),
+        )
     }
 
     /// Get now playing for a zone

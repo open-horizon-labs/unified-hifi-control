@@ -50,13 +50,12 @@
 //!
 //! **Capability is per provider, not per device.** A fixed-volume Roon output —
 //! an endpoint feeding an analogue preamp — has no volume control, and this module
-//! reports `volume: supported` for it. UHC cannot currently do better: the
-//! aggregator's `volume_control: None` conflates "this output has no volume
-//! control" with "no volume has been read yet", so deriving from it would mislabel
-//! every freshly discovered zone. The wire payload carries the aggregator's
-//! `has_volume_control` observation beside the capability so a client can combine
-//! the two itself; the ambiguity is documented on that field rather than resolved
-//! by guessing.
+//! reports `volume: supported` for it. The wire payload therefore carries
+//! `has_volume_control` beside the provider capability. It uses an explicit
+//! per-device capability when a provider supplies one (Spotify's
+//! `supports_volume`), even when the current value is null; otherwise it falls
+//! back to whether the aggregator has observed a numeric volume control. Clients
+//! can combine that device observation with the provider-level capability.
 //!
 //! **Capability is per operation family, not per action.** `transport` covers
 //! play/pause and `transport_skip` covers next/previous, because UPnP refuses the
@@ -796,13 +795,13 @@ pub struct McpCapabilityZone {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zone_name: Option<String>,
     pub provider: Provider,
-    /// Whether the aggregator currently holds a volume control for this zone.
+    /// Whether the latest device observation says this zone accepts volume.
     ///
-    /// **An observation, not a capability.** `false` means either "this output
-    /// has no volume control" or "no volume has been read yet", and UHC cannot
-    /// tell those apart — which is exactly why `volume`'s capability state is
-    /// per provider and this is reported separately for the client to weigh.
-    /// Absent when the aggregator holds no such zone.
+    /// **An observation, not a provider capability.** When the provider exposes
+    /// an explicit per-device flag (currently Spotify), that flag is authoritative
+    /// even if the numeric value is absent. Other providers fall back to whether
+    /// a numeric control has been observed, so `false` can still mean "not yet
+    /// observed" there. Absent when the aggregator holds no such zone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub has_volume_control: Option<bool>,
 }
