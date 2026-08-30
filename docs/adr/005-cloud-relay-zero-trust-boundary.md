@@ -74,4 +74,10 @@ image, and capability values are never logged or placed in URLs.
 The focused connector tests cover fixture parsing, key-file permissions,
 opaque handles, command allowlisting and canonical hashing, wrong audience/key
 or installation, expiry, generation revocation, replay, dropped-result
-idempotency, artwork bounds, and snapshot-first reconnect behavior.
+idempotency, artwork bounds, and snapshot-first reconnect behavior. A
+provider-bound Spotify scenario additionally proves that the cloud projection
+contains only semantic state and opaque handles: Spotify identifiers,
+credentials, URLs, and raw artwork keys remain connector-local. It also proves
+that a restricted or volume-disabled device is refused before the provider
+registry, while a currently allowed action uses that registry rather than a
+provider-specific cloud route.

@@ -547,6 +547,9 @@ async fn dispatch(
     let Some(provider_id) = store.provider_id(&payload.zone_handle) else {
         return CommandOutcome::Forbidden;
     };
+    if !store.accepts_transport_action(&payload.zone_handle, &payload.action) {
+        return CommandOutcome::Rejected;
+    }
     let action = match payload.action {
         super::protocol::CommandAction::PlayPause => {
             if store.state(&payload.zone_handle) == Some("playing") {
@@ -557,8 +560,16 @@ async fn dispatch(
         }
         super::protocol::CommandAction::Next => crate::mqtt::command::ParsedAction::Next,
         super::protocol::CommandAction::Previous => crate::mqtt::command::ParsedAction::Previous,
-        super::protocol::CommandAction::VolumeUp => crate::mqtt::command::ParsedAction::VolumeUp,
+        super::protocol::CommandAction::VolumeUp => {
+            if !store.supports_relative_volume(&payload.zone_handle) {
+                return CommandOutcome::Rejected;
+            }
+            crate::mqtt::command::ParsedAction::VolumeUp
+        }
         super::protocol::CommandAction::VolumeDown => {
+            if !store.supports_relative_volume(&payload.zone_handle) {
+                return CommandOutcome::Rejected;
+            }
             crate::mqtt::command::ParsedAction::VolumeDown
         }
         super::protocol::CommandAction::VolumeAbsolute { value } => {
@@ -776,6 +787,7 @@ mod tests {
             openhome::OpenHomeAdapter,
             roon::RoonAdapter,
             upnp::UPnPAdapter,
+            AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
         },
         aggregator::ZoneAggregator,
         api::AppState,
@@ -783,7 +795,11 @@ mod tests {
         cloud_connector::{
             config::CloudConnectorConfig,
             identity::InstallationIdentity,
-            protocol::{ConnectorMessage, SessionChallengeMessage, PROTOCOL_VERSION},
+            protocol::{
+                CommandAction, CommandPayload, ConnectorMessage, SessionChallengeMessage,
+                PROTOCOL_VERSION,
+            },
+            state::{ControlEligibility, SemanticStateInput, SemanticZoneInput},
             transport::{RelayEndpoint, SessionEpochGuard},
             InstallationSessionProof,
         },
@@ -792,7 +808,13 @@ mod tests {
     };
     use ed25519_dalek::SigningKey;
     use futures::{SinkExt as _, StreamExt as _};
-    use std::{sync::Arc, time::Instant};
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Instant,
+    };
     use tokio_tungstenite::{
         tungstenite::{http::header::AUTHORIZATION, protocol::Role, Message},
         WebSocketStream,
@@ -829,6 +851,34 @@ mod tests {
         )
     }
 
+    #[derive(Default)]
+    struct RecordingSpotifyAdapter {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AdapterLogic for RecordingSpotifyAdapter {
+        fn prefix(&self) -> &'static str {
+            "spotify"
+        }
+
+        async fn run(&self, _ctx: AdapterContext) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn handle_command(
+            &self,
+            _zone_id: &str,
+            _command: AdapterCommand,
+        ) -> anyhow::Result<AdapterCommandResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(AdapterCommandResponse {
+                success: true,
+                error: None,
+            })
+        }
+    }
+
     fn challenge(endpoint: &str, expires_at: i64) -> SessionChallengeMessage {
         SessionChallengeMessage {
             protocol_version: 1,
@@ -837,6 +887,132 @@ mod tests {
             nonce: "nonce_012345678901234567890123456789".to_owned(),
             expires_at,
         }
+    }
+
+    #[tokio::test]
+    async fn volume_disabled_spotify_zone_is_rejected_before_registry_dispatch() {
+        let state = empty_app_state().await;
+        let spotify = Arc::new(RecordingSpotifyAdapter::default());
+        state.adapter_registry.register(spotify.clone()).await;
+
+        let mut store = StateStore::default();
+        let projection = store
+            .snapshot(SemanticStateInput {
+                installation_id: Uuid::new_v4().to_string(),
+                epoch: 7,
+                revision: 1,
+                observed_at: u64::try_from(super::now_ms()).unwrap(),
+                expires_at: u64::try_from(super::now_ms() + 30_000).unwrap(),
+                zones: vec![SemanticZoneInput {
+                    provider_id: "spotify:private-device-id".into(),
+                    name: "Spotify without volume".into(),
+                    state: "paused".into(),
+                    control: ControlEligibility::all(),
+                    volume: None,
+                    now_playing: None,
+                }],
+            })
+            .unwrap();
+        let payload = CommandPayload {
+            zone_handle: projection.zones[0].zone_handle.clone(),
+            action: CommandAction::VolumeUp,
+        };
+
+        assert_eq!(
+            super::dispatch(&state, &store, &payload).await,
+            super::CommandOutcome::Rejected
+        );
+        assert_eq!(spotify.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn restricted_spotify_zone_is_rejected_before_registry_dispatch() {
+        let state = empty_app_state().await;
+        let spotify = Arc::new(RecordingSpotifyAdapter::default());
+        state.adapter_registry.register(spotify.clone()).await;
+
+        let mut store = StateStore::default();
+        let projection = store
+            .snapshot(SemanticStateInput {
+                installation_id: Uuid::new_v4().to_string(),
+                epoch: 7,
+                revision: 1,
+                observed_at: u64::try_from(super::now_ms()).unwrap(),
+                expires_at: u64::try_from(super::now_ms() + 30_000).unwrap(),
+                zones: vec![SemanticZoneInput {
+                    provider_id: "spotify:private-restricted-device-id".into(),
+                    name: "Restricted Spotify device".into(),
+                    state: "paused".into(),
+                    control: ControlEligibility {
+                        play: false,
+                        pause: false,
+                        next: false,
+                        previous: false,
+                    },
+                    volume: None,
+                    now_playing: None,
+                }],
+            })
+            .unwrap();
+        let payload = CommandPayload {
+            zone_handle: projection.zones[0].zone_handle.clone(),
+            action: CommandAction::Next,
+        };
+
+        assert_eq!(
+            super::dispatch(&state, &store, &payload).await,
+            super::CommandOutcome::Rejected
+        );
+        assert_eq!(spotify.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn truthful_spotify_actions_dispatch_only_through_registry() {
+        let state = empty_app_state().await;
+        let spotify = Arc::new(RecordingSpotifyAdapter::default());
+        state.adapter_registry.register(spotify.clone()).await;
+
+        let mut store = StateStore::default();
+        let projection = store
+            .snapshot(SemanticStateInput {
+                installation_id: Uuid::new_v4().to_string(),
+                epoch: 7,
+                revision: 1,
+                observed_at: u64::try_from(super::now_ms()).unwrap(),
+                expires_at: u64::try_from(super::now_ms() + 30_000).unwrap(),
+                zones: vec![SemanticZoneInput {
+                    provider_id: "spotify:private-device-id".into(),
+                    name: "Spotify with volume".into(),
+                    state: "paused".into(),
+                    control: ControlEligibility::all(),
+                    volume: Some(super::super::state::VolumeInput {
+                        value: 42.0,
+                        min: 0.0,
+                        max: 100.0,
+                        step: 1.0,
+                        scale: "percent".into(),
+                    }),
+                    now_playing: None,
+                }],
+            })
+            .unwrap();
+        let handle = projection.zones[0].zone_handle.clone();
+
+        for action in [CommandAction::Next, CommandAction::VolumeUp] {
+            assert_eq!(
+                super::dispatch(
+                    &state,
+                    &store,
+                    &CommandPayload {
+                        zone_handle: handle.clone(),
+                        action,
+                    },
+                )
+                .await,
+                super::CommandOutcome::Executed
+            );
+        }
+        assert_eq!(spotify.calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

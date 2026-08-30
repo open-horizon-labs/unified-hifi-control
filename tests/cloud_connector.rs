@@ -293,6 +293,7 @@ fn opaque_handles_round_trip_locally_without_provider_id_in_projection() {
                 provider_id: "roon:secret-provider-id".into(),
                 name: "Lounge".into(),
                 state: "playing".into(),
+                control: cloud_connector::state::ControlEligibility::all(),
                 volume: None,
                 now_playing: None,
             }],
@@ -322,6 +323,74 @@ fn opaque_handles_round_trip_locally_without_provider_id_in_projection() {
 }
 
 #[test]
+fn spotify_projection_keeps_identity_credentials_urls_and_raw_artwork_local() {
+    use cloud_connector::state::{
+        ControlEligibility, NowPlayingInput, SemanticZoneInput, VolumeInput,
+    };
+
+    let provider_id = "spotify:device_7c4d3b2a";
+    let account_token = "Bearer spotify-owner-token-must-stay-local";
+    let raw_artwork_key = "https://i.scdn.co/image/provider-image-key-7c4d3b2a";
+    let mut store = StateStore::default();
+    let projection = store
+        .snapshot(SemanticStateInput {
+            installation_id: "11111111-1111-4111-8111-111111111111".into(),
+            epoch: 7,
+            revision: 1,
+            observed_at: 10,
+            expires_at: 20,
+            zones: vec![SemanticZoneInput {
+                provider_id: provider_id.into(),
+                name: "Kitchen".into(),
+                state: "playing".into(),
+                control: ControlEligibility::all(),
+                volume: Some(VolumeInput {
+                    value: 42.0,
+                    min: 0.0,
+                    max: 100.0,
+                    step: 1.0,
+                    scale: "percent".into(),
+                }),
+                now_playing: Some(NowPlayingInput {
+                    title: "Public song title".into(),
+                    artist: "Public artist".into(),
+                    art_revision: Some("art_0123456789abcdef".into()),
+                    image_key: Some(raw_artwork_key.into()),
+                }),
+            }],
+        })
+        .unwrap();
+
+    let encoded = serde_json::to_string(&projection).unwrap();
+    for forbidden in [
+        provider_id,
+        "device_7c4d3b2a",
+        account_token,
+        raw_artwork_key,
+        "i.scdn.co",
+        "spotify-owner-token",
+    ] {
+        assert!(
+            !encoded.contains(forbidden),
+            "cloud projection leaked provider-native value `{forbidden}`"
+        );
+    }
+    assert_eq!(
+        store.provider_id(&projection.zones[0].zone_handle),
+        Some(provider_id),
+        "the reverse mapping remains connector-local"
+    );
+    assert_eq!(
+        store.artwork_key(
+            &projection.zones[0].zone_handle,
+            projection.now_playing[0].image_revision.as_deref().unwrap(),
+        ),
+        Some(raw_artwork_key),
+        "the raw image key remains connector-local for bounded artwork fetches"
+    );
+}
+
+#[test]
 fn stale_state_is_not_command_eligible() {
     let mut store = StateStore::default();
     let projection = store
@@ -341,12 +410,15 @@ fn stale_state_is_not_command_eligible() {
 
 #[test]
 fn outbound_projection_rejects_oversized_duplicate_and_nonfinite_state() {
-    use cloud_connector::state::{NowPlayingInput, SemanticZoneInput, VolumeInput};
+    use cloud_connector::state::{
+        ControlEligibility, NowPlayingInput, SemanticZoneInput, VolumeInput,
+    };
 
     let zone = |provider_id: &str| SemanticZoneInput {
         provider_id: provider_id.into(),
         name: "Lounge".into(),
         state: "playing".into(),
+        control: ControlEligibility::all(),
         volume: None,
         now_playing: None,
     };
@@ -391,7 +463,7 @@ fn outbound_projection_rejects_oversized_duplicate_and_nonfinite_state() {
 
 #[test]
 fn absolute_volume_is_bounded_by_the_last_truthful_zone_projection() {
-    use cloud_connector::state::{SemanticZoneInput, VolumeInput};
+    use cloud_connector::state::{ControlEligibility, SemanticZoneInput, VolumeInput};
 
     let mut store = StateStore::default();
     let projection = store
@@ -405,6 +477,7 @@ fn absolute_volume_is_bounded_by_the_last_truthful_zone_projection() {
                 provider_id: "roon:bounded".into(),
                 name: "Bounded".into(),
                 state: "playing".into(),
+                control: ControlEligibility::all(),
                 volume: Some(VolumeInput {
                     value: -23.5,
                     min: -80.0,
