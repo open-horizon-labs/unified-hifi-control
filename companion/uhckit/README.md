@@ -20,22 +20,23 @@ wire contract and client implementation explicit; production clients must not
 track a development branch. Once a release tag contains the root manifest,
 consumers may use SwiftPM's `exact` version requirement instead.
 
-The root manifest and this directory's manifest point at the same sources and
-tests. No source is copied between the public UHC client and downstream product
-shells.
+The root manifest and this directory's manifest point at the same sources. No
+source is copied between the public UHC client and downstream product shells.
+The root manifest is intentionally a remote-consumption entry point; this
+nested package remains the single test owner so its macOS test run does not
+compile unrelated iOS-only products.
 
 ## Local development
 
-Run either package entry point:
+Run the nested development package:
 
 ```sh
-swift test
 swift test --package-path companion/uhckit
 ```
 
-Both commands exercise the same contract tests against
-`tests/fixtures/uhckit_contract.json`, which the Rust server contract suite also
-guards.
+The contract tests consume `tests/fixtures/uhckit_contract.json`, which the Rust
+server contract suite also guards. CI separately builds the root `UHCKit`
+target and a fresh detached checkout to verify the remote mapping.
 
 Transport evidence and the unresolved direct-Watch-versus-phone-relay question
 are documented in [Transport.md](Transport.md).

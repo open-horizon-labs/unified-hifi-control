@@ -1,9 +1,9 @@
 // swift-tools-version: 5.9
 //
-// Root package entry point for consumers that resolve UHCKit directly from the
-// Unified Hi-Fi Control Git repository. The package source remains under
-// companion/uhckit so the Apple workspace and local development package share
-// one implementation.
+// Root package entry point for consumers that resolve UHC's reusable Apple
+// libraries directly from the Unified Hi-Fi Control Git repository. Sources
+// remain in their companion packages so local and remote consumers share one
+// implementation.
 import PackageDescription
 
 let package = Package(
@@ -15,16 +15,19 @@ let package = Package(
     ],
     products: [
         .library(name: "UHCKit", targets: ["UHCKit"]),
+        .library(
+            name: "AppleMusicIOSCompanion",
+            targets: ["AppleMusicIOSCompanion"]
+        ),
     ],
     targets: [
         .target(
             name: "UHCKit",
             path: "companion/uhckit/Sources/UHCKit"
         ),
-        .testTarget(
-            name: "UHCKitTests",
-            dependencies: ["UHCKit"],
-            path: "companion/uhckit/Tests/UHCKitTests"
+        .target(
+            name: "AppleMusicIOSCompanion",
+            path: "companion/apple_music_ios/Sources/AppleMusicIOSCompanion"
         ),
     ]
 )
