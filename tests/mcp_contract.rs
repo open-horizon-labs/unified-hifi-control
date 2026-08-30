@@ -832,6 +832,7 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
         &[
             ("action", true),
             ("playlist_id", false),
+            ("category_id", false),
             ("name", false),
             ("description", false),
             ("uri", false),

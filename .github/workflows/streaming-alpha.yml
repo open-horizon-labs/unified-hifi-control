@@ -1,0 +1,47 @@
+name: Streaming Alpha Rust
+
+on:
+  pull_request:
+    branches: [integration/streaming-ha-alpha]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "tests/**"
+      - ".github/workflows/streaming-alpha.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Format, lint, and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "streaming-alpha"
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Check the HTTP API contract
+        run: cargo test --test api_contract
+
+      - name: Run workspace tests
+        run: cargo test --workspace

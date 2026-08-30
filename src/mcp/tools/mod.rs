@@ -144,6 +144,7 @@ pub fn declared_params(tool: &str) -> &'static [&'static str] {
         "hifi_spotify" => &[
             "action",
             "playlist_id",
+            "category_id",
             "name",
             "description",
             "uri",

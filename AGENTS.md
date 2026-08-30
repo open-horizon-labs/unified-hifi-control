@@ -196,9 +196,10 @@ it, and made the table derived so the same error cannot be typed again.
 Two things this table does **not** claim:
 
 - **It is per provider, not per device.** A fixed-volume Roon output reports
-  `volume` as supported. UHC cannot currently distinguish "this output has no
-  volume control" from "no volume has been read yet", so `hifi_capabilities` reports
-  the aggregator's `has_volume_control` observation separately rather than guessing.
+  `volume` as supported. `hifi_capabilities` reports `has_volume_control`
+  separately: an explicit device flag is authoritative when available (Spotify's
+  `supports_volume`, even with a null current value); other providers fall back to
+  whether the aggregator has observed a numeric control.
 - **Every ⛔ for OpenHome and UPnP rests on specification knowledge, not on a call
   to a device.** Each cell says so in its own footnote. LMS's cells come from a live
   Lyrion 9.1.2 inventory (#402/#403) and are the strongest rows here.
