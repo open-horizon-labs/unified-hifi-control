@@ -84,12 +84,13 @@ async fn one_zone(
     }
 
     let zone = state.aggregator.get_zone(zone_id).await;
+    let has_volume_control = state.aggregator.has_volume_control(zone_id).await;
     let report = McpCapabilityReport {
         zones: vec![McpCapabilityZone {
             zone_id: zone_id.to_string(),
             zone_name: zone.as_ref().map(|z| z.zone_name.clone()),
             provider: target.provider(),
-            has_volume_control: zone.as_ref().map(|z| z.volume_control.is_some()),
+            has_volume_control,
         }],
         providers: vec![provider_capabilities(target)],
     };
@@ -105,16 +106,15 @@ async fn every_zone(state: &AppState, env: Envelope) -> CallToolResult {
     // Same visibility policy as `hifi_zones`. This report is how a client discovers what it can do
     // with each zone, so listing a hidden zone here would put it back in front of the assistant
     // that `hifi_zones` just withheld it from.
-    let zones: Vec<McpCapabilityZone> = crate::zone_list::visible_zones(state)
-        .await
-        .into_iter()
-        .map(|zone| McpCapabilityZone {
+    let mut zones = Vec::new();
+    for zone in crate::zone_list::visible_zones(state).await {
+        zones.push(McpCapabilityZone {
             provider: ZoneTarget::classify(&zone.zone_id).provider(),
-            has_volume_control: Some(zone.volume_control.is_some()),
+            has_volume_control: state.aggregator.has_volume_control(&zone.zone_id).await,
             zone_id: zone.zone_id,
             zone_name: Some(zone.zone_name),
-        })
-        .collect();
+        });
+    }
 
     let providers: Vec<McpProviderCapabilities> = ZoneTarget::PROVIDERS
         .iter()
