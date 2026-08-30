@@ -41,6 +41,13 @@ tokens stay in the app's secure storage. UHC receives only the explicitly
 paired snapshot/command contract.
 UHC never receives or relays audio.
 
+Release consumers should resolve this library as the
+`AppleMusicIOSCompanion` product from the repository-root package and pin a
+UHC release tag. The nested package remains available for development in this
+repository; both entry points compile the same public source directory. A
+private product shell must not copy these sources or replace this package with
+a provider fork.
+
 `AppleMusicCompanionHost` provides the host lifecycle: request authorization,
 claim a pairing code, publish a bounded snapshot, poll/execute/acknowledge
 commands, and revoke. The snapshot deliberately leaves volume and route
