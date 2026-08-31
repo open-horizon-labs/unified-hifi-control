@@ -18,7 +18,7 @@ mod command {
     use serde::{Deserialize, Serialize};
     use unified_hifi_control::cloud_connector::{
         pairing::{enrollment_possession_message, possession_message},
-        InstallationIdentity,
+        CloudConnectorConfig, InstallationIdentity,
     };
     use url::Url;
     use uuid::Uuid;
@@ -107,7 +107,7 @@ mod command {
         let config_dir = unified_hifi_control::config::get_config_dir();
         fs::create_dir_all(&config_dir)?;
         let key_path = config_dir.join("hiphi-installation.key");
-        if key_path.exists() && std::env::var_os("UHC_HIPHI_INSTALLATION_ID").is_some() {
+        if CloudConnectorConfig::from_runtime(&config_dir)?.is_some() {
             anyhow::bail!("this UHC is already configured with a HiPhi installation identity");
         }
         let identity = load_or_create_identity(&key_path)?;
@@ -134,7 +134,7 @@ mod command {
                 pending_path.display()
             );
         }
-        if key_path.exists() && std::env::var_os("UHC_HIPHI_INSTALLATION_ID").is_some() {
+        if CloudConnectorConfig::from_runtime(&config_dir)?.is_some() {
             anyhow::bail!("this UHC is already configured with a HiPhi installation identity");
         }
         let identity =

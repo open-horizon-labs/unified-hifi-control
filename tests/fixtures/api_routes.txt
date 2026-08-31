@@ -21,6 +21,7 @@ GET /api/bridges/applemusic/content
 GET /api/bridges/applemusic/status
 GET /api/collections/image
 GET /api/controller/status
+GET /api/hiphi/pairing/status
 GET /api/home-assistant/integration
 GET /api/mqtt/status
 GET /api/providers/musicassistant/status

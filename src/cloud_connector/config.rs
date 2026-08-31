@@ -1,4 +1,8 @@
-use std::{collections::HashSet, env, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashSet},
+    env,
+    path::PathBuf,
+};
 
 use super::transport::{EndpointError, RelayEndpoint};
 use base64::Engine as _;
@@ -7,6 +11,7 @@ use serde::Deserialize;
 
 pub const MAX_ISSUER_KEYS: usize = 8;
 const MAX_ISSUER_RING_JSON_BYTES: usize = 4 * 1024;
+const MAX_PERSISTED_CONFIG_BYTES: u64 = 16 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct IssuerVerifyingKeyRing {
@@ -90,6 +95,10 @@ pub enum ConfigError {
     Missing(&'static str),
     #[error("invalid HiPhi Cloud setting {0}")]
     Invalid(&'static str),
+    #[error("HiPhi Cloud persisted configuration is unsafe or invalid")]
+    InvalidPersisted,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
     #[error(transparent)]
     Endpoint(#[from] EndpointError),
 }
@@ -119,6 +128,56 @@ impl CloudConnectorConfig {
         )?))
     }
 
+    /// Load connector configuration without depending on a packaging-specific
+    /// launcher. Explicit process environment wins; otherwise UHC reads the
+    /// owner-only file written by the pairing ceremony itself.
+    pub fn from_runtime(config_dir: impl Into<PathBuf>) -> Result<Option<Self>, ConfigError> {
+        let config_dir = config_dir.into();
+        match Self::from_env(config_dir.clone())? {
+            Some(config) => Ok(Some(config)),
+            None => Self::from_persisted(config_dir),
+        }
+    }
+
+    pub fn from_persisted(config_dir: impl Into<PathBuf>) -> Result<Option<Self>, ConfigError> {
+        let config_dir = config_dir.into();
+        let path = config_dir.join("hiphi.env");
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.file_type().is_file() || metadata.len() > MAX_PERSISTED_CONFIG_BYTES {
+            return Err(ConfigError::InvalidPersisted);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(ConfigError::InvalidPersisted);
+            }
+        }
+        let contents = std::fs::read_to_string(&path)?;
+        if contents.trim().is_empty() {
+            return Ok(None);
+        }
+        let mut values = parse_persisted_config(&contents)?;
+        let endpoint = take_persisted(&mut values, "UHC_HIPHI_RELAY_URL")?;
+        let installation_id = take_persisted(&mut values, "UHC_HIPHI_INSTALLATION_ID")?;
+        let session_keys = take_persisted(&mut values, "UHC_HIPHI_SESSION_ISSUER_KEYS")?;
+        let command_keys = take_persisted(&mut values, "UHC_HIPHI_COMMAND_ISSUER_KEYS")?;
+        if !values.is_empty() {
+            return Err(ConfigError::InvalidPersisted);
+        }
+        Ok(Some(Self::from_values(
+            config_dir,
+            &endpoint,
+            &installation_id,
+            &session_keys,
+            &command_keys,
+        )?))
+    }
+
     /// Validate an explicit connector binding before it is persisted by a
     /// local enrollment tool. This applies the same rules as service startup.
     pub fn from_values(
@@ -145,6 +204,27 @@ impl CloudConnectorConfig {
             command_issuer_keys,
         })
     }
+}
+
+fn parse_persisted_config(contents: &str) -> Result<BTreeMap<String, String>, ConfigError> {
+    let mut values = BTreeMap::new();
+    for line in contents.lines() {
+        let (name, value) = line.split_once('=').ok_or(ConfigError::InvalidPersisted)?;
+        if name.is_empty()
+            || value.is_empty()
+            || values.insert(name.to_owned(), value.to_owned()).is_some()
+        {
+            return Err(ConfigError::InvalidPersisted);
+        }
+    }
+    Ok(values)
+}
+
+fn take_persisted(
+    values: &mut BTreeMap<String, String>,
+    name: &'static str,
+) -> Result<String, ConfigError> {
+    values.remove(name).ok_or(ConfigError::InvalidPersisted)
 }
 
 fn parse_key_ring(
@@ -310,5 +390,71 @@ mod tests {
             ),
             Err(ConfigError::Invalid("issuer authority separation"))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_runtime_config_is_owner_only_exact_and_complete() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hiphi.env");
+        let session_keys = key_ring(&[("session-issuer-1", 7)]);
+        let command_keys = key_ring(&[("command-issuer-1", 8)]);
+        std::fs::write(
+            &path,
+            format!(
+                "UHC_HIPHI_RELAY_URL=wss://cloud.example/v1/relay\n\
+                 UHC_HIPHI_INSTALLATION_ID=11111111-1111-4111-8111-111111111111\n\
+                 UHC_HIPHI_SESSION_ISSUER_KEYS={session_keys}\n\
+                 UHC_HIPHI_COMMAND_ISSUER_KEYS={command_keys}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let config = CloudConnectorConfig::from_persisted(directory.path())
+            .unwrap()
+            .expect("complete config should load");
+        assert_eq!(
+            config.installation_id,
+            "11111111-1111-4111-8111-111111111111"
+        );
+
+        for invalid in [
+            format!(
+                "UHC_HIPHI_RELAY_URL=wss://cloud.example/v1/relay\n\
+                 UHC_HIPHI_INSTALLATION_ID=11111111-1111-4111-8111-111111111111\n\
+                 UHC_HIPHI_SESSION_ISSUER_KEYS={session_keys}\n"
+            ),
+            format!(
+                "UHC_HIPHI_RELAY_URL=wss://cloud.example/v1/relay\n\
+                 UHC_HIPHI_RELAY_URL=wss://cloud.example/v1/relay\n\
+                 UHC_HIPHI_INSTALLATION_ID=11111111-1111-4111-8111-111111111111\n\
+                 UHC_HIPHI_SESSION_ISSUER_KEYS={session_keys}\n\
+                 UHC_HIPHI_COMMAND_ISSUER_KEYS={command_keys}\n"
+            ),
+            format!(
+                "UHC_HIPHI_RELAY_URL=wss://cloud.example/v1/relay\n\
+                 UHC_HIPHI_INSTALLATION_ID=11111111-1111-4111-8111-111111111111\n\
+                 UHC_HIPHI_SESSION_ISSUER_KEYS={session_keys}\n\
+                 UHC_HIPHI_COMMAND_ISSUER_KEYS={command_keys}\n\
+                 SHELL_COMMAND=touch /tmp/nope\n"
+            ),
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(CloudConnectorConfig::from_persisted(directory.path()).is_err());
+        }
+
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(CloudConnectorConfig::from_persisted(directory.path())
+            .unwrap()
+            .is_none());
+
+        std::fs::write(&path, "UHC_HIPHI_RELAY_URL=wss://cloud.example/v1/relay\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(CloudConnectorConfig::from_persisted(directory.path()).is_err());
     }
 }

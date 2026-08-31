@@ -318,6 +318,9 @@ pub struct AppState {
     /// Fully inert until both configured and enabled; see
     /// `crate::mqtt::MqttPublisher`.
     pub mqtt: Arc<crate::mqtt::MqttPublisher>,
+    /// Process-owned HiPhi connector lifecycle. It is package-agnostic and
+    /// survives Settings reloads by reconstructing from owner-only config.
+    pub hiphi_connector: crate::cloud_connector::runtime::ConnectorSupervisor,
 }
 
 impl AppState {
@@ -384,6 +387,7 @@ impl AppState {
             apple_feedback: crate::mcp::feedback::FeedbackStore::from_config(),
             reliable_commands: None,
             mqtt,
+            hiphi_connector: crate::cloud_connector::runtime::ConnectorSupervisor::default(),
         }
     }
 

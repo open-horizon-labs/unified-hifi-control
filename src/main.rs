@@ -609,19 +609,18 @@ mod server {
         // pinned issuer configuration is present; it requests a fresh,
         // installation-signed short-lived session grant for every reconnect and
         // never adds a LAN route or proxies this server's HTTP API.
-        let _hiphi_connector =
-            match cloud_connector::runtime::spawn_from_env(state.clone(), config::get_config_dir())
-            {
-                Ok(Some(_handle)) => {
-                    tracing::info!("HiPhi Cloud connector started (outbound WSS)");
-                    true
-                }
-                Ok(None) => false,
-                Err(error) => {
-                    tracing::warn!("HiPhi Cloud connector disabled: {error}");
-                    false
-                }
-            };
+        match state
+            .hiphi_connector
+            .start_from_runtime(state.clone(), config::get_config_dir())
+            .await
+        {
+            Ok(cloud_connector::runtime::ConnectorStart::Started) => {
+                tracing::info!("HiPhi Cloud connector started (outbound WSS)");
+            }
+            Ok(cloud_connector::runtime::ConnectorStart::AlreadyRunning) => {}
+            Ok(cloud_connector::runtime::ConnectorStart::NotConfigured) => {}
+            Err(error) => tracing::warn!("HiPhi Cloud connector disabled: {error}"),
+        }
         provider_startables.push(state.musicassistant.clone());
         let mut startable_adapters = (*state.startable_adapters).clone();
         startable_adapters.push(state.musicassistant.clone());
@@ -885,6 +884,7 @@ mod server {
             // Installation-bound controller bootstrap/session boundary
             .route("/api/controller/bootstrap", post(controller_bootstrap))
             .route("/api/controller/status", get(controller_status))
+            .route("/api/hiphi/pairing/status", get(api::hiphi_pairing::status))
             .route("/api/hiphi/pairing/prepare", post(api::hiphi_pairing::prepare))
             .route("/api/hiphi/pairing/initiate", post(api::hiphi_pairing::initiate))
             .route("/api/hiphi/pairing/complete", post(api::hiphi_pairing::complete))

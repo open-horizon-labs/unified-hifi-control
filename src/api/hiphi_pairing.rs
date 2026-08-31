@@ -5,7 +5,7 @@
 //! the bounded public handoff contract, and projects only public ceremony data
 //! back to the Settings UI.
 
-use axum::{http::StatusCode, response::IntoResponse, Json};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -77,6 +77,13 @@ pub struct CompleteResponse {
     pub installation_id: String,
     pub relay_endpoint: String,
     pub restart_required: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PairingStatusResponse {
+    pub paired: bool,
+    pub installation_id: Option<String>,
+    pub connector_state: &'static str,
 }
 
 fn helper_path() -> anyhow::Result<PathBuf> {
@@ -232,8 +239,31 @@ pub async fn initiate(Json(request): Json<InitiateRequest>) -> axum::response::R
     }
 }
 
-pub async fn complete(Json(request): Json<CompleteRequest>) -> axum::response::Response {
-    match run_helper(&["complete", &request.account_id])
+pub async fn status(State(state): State<crate::api::AppState>) -> axum::response::Response {
+    match state
+        .hiphi_connector
+        .status_from_runtime(crate::config::get_config_dir())
+        .await
+    {
+        Ok(status) => Json(PairingStatusResponse {
+            paired: status.configured,
+            installation_id: status.installation_id,
+            connector_state: status.phase.as_str(),
+        })
+        .into_response(),
+        Err(error_value) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "pairing_status_failed",
+            error_value.to_string(),
+        ),
+    }
+}
+
+pub async fn complete(
+    State(state): State<crate::api::AppState>,
+    Json(request): Json<CompleteRequest>,
+) -> axum::response::Response {
+    let parsed = run_helper(&["complete", &request.account_id])
         .await
         .and_then(|fields| {
             if field(&fields, "pairing_complete")? != "true" {
@@ -245,8 +275,29 @@ pub async fn complete(Json(request): Json<CompleteRequest>) -> axum::response::R
                 relay_endpoint: field(&fields, "UHC_HIPHI_RELAY_URL")?.to_string(),
                 restart_required: field(&fields, "connector_restart_required")? == "true",
             })
-        }) {
-        Ok(response) => Json(response).into_response(),
+        });
+    match parsed {
+        Ok(mut response) => {
+            match state
+                .hiphi_connector
+                .start_from_runtime(state.clone(), crate::config::get_config_dir())
+                .await
+            {
+                Ok(crate::cloud_connector::runtime::ConnectorStart::Started)
+                | Ok(crate::cloud_connector::runtime::ConnectorStart::AlreadyRunning) => {
+                    response.restart_required = false;
+                }
+                Ok(crate::cloud_connector::runtime::ConnectorStart::NotConfigured) => {
+                    tracing::error!("HiPhi pairing completed without persisted connector config");
+                }
+                Err(error_value) => {
+                    tracing::error!(
+                        "HiPhi pairing completed but connector activation failed: {error_value}"
+                    );
+                }
+            }
+            Json(response).into_response()
+        }
         Err(error_value) => error(
             StatusCode::BAD_REQUEST,
             "pairing_complete_failed",

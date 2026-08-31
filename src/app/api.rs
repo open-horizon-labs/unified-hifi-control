@@ -145,6 +145,25 @@ pub struct HiphiCompleteResponse {
     pub restart_required: bool,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct HiphiPairingStatus {
+    pub paired: bool,
+    pub installation_id: Option<String>,
+    pub connector_state: String,
+}
+
+impl HiphiPairingStatus {
+    pub fn display_state(&self) -> &'static str {
+        match self.connector_state.as_str() {
+            "online" => "Connected to HiPhi Cloud",
+            "connecting" => "Paired · connecting",
+            "offline" => "Paired · reconnecting",
+            "revoked" => "Cloud access revoked",
+            _ => "Not paired",
+        }
+    }
+}
+
 /// `GET /api/controller/status`.
 pub async fn fetch_controller_status() -> Result<ControllerStatus, String> {
     fetch_json("/api/controller/status").await

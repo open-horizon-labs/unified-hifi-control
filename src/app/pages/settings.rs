@@ -6,12 +6,12 @@ use dioxus::prelude::*;
 
 use crate::app::api::{
     source_label, AppSettings, AppleBridgeStatus, HiphiCompleteRequest, HiphiCompleteResponse,
-    HiphiEnrollmentHandoff, HiphiInitiateRequest, HiphiInitiateResponse, HiphiPrepareResponse,
-    HqpStatus, LmsConfig, ManagedZone, ManagedZonesResponse, MoveDirection, MqttConfigureRequest,
-    MqttStatusResponse, MusicAssistantConfigureRequest, MusicAssistantStatusResponse,
-    ProviderAuthResponse, ProviderOAuthStart, RoonStatus, SpotifyAccountResponse,
-    SpotifyConfigureRequest, SpotifyConfigureResponse, SpotifyTunnelStatus, ZoneNameRequest,
-    ZoneOrderRequest, ZoneVisibilityRequest, ZonesResponse,
+    HiphiEnrollmentHandoff, HiphiInitiateRequest, HiphiInitiateResponse, HiphiPairingStatus,
+    HiphiPrepareResponse, HqpStatus, LmsConfig, ManagedZone, ManagedZonesResponse, MoveDirection,
+    MqttConfigureRequest, MqttStatusResponse, MusicAssistantConfigureRequest,
+    MusicAssistantStatusResponse, ProviderAuthResponse, ProviderOAuthStart, RoonStatus,
+    SpotifyAccountResponse, SpotifyConfigureRequest, SpotifyConfigureResponse, SpotifyTunnelStatus,
+    ZoneNameRequest, ZoneOrderRequest, ZoneVisibilityRequest, ZonesResponse,
 };
 use crate::app::components::{ErrorAlert, Layout};
 use crate::app::settings_context::{initial_app_settings, use_settings};
@@ -118,6 +118,9 @@ fn HiphiCloudPairing() -> Element {
     let public_key_copy = use_signal(CopyState::default);
     let pairing_id_copy = use_signal(CopyState::default);
     let pairing_secret_copy = use_signal(CopyState::default);
+    let mut pairing_status = use_resource(|| async {
+        crate::app::api::fetch_json::<HiphiPairingStatus>("/api/hiphi/pairing/status").await
+    });
 
     let prepare = move |_| {
         action.set(ProviderActionState::Loading);
@@ -174,7 +177,8 @@ fn HiphiCloudPairing() -> Element {
         let account = account_id().trim().to_string();
         if account.is_empty() {
             error.set(Some(
-                "Paste the account ID shown after confirming the NAS in HiPhi Cloud.".to_string(),
+                "Paste the account ID shown after confirming the installation in HiPhi Cloud."
+                    .to_string(),
             ));
             return;
         }
@@ -191,6 +195,7 @@ fn HiphiCloudPairing() -> Element {
             {
                 Ok(response) if response.paired => {
                     completed.set(Some(response));
+                    pairing_status.restart();
                     action.set(ProviderActionState::Success);
                 }
                 Ok(_) => {
@@ -205,6 +210,12 @@ fn HiphiCloudPairing() -> Element {
         });
     };
 
+    let status_snapshot = pairing_status.read().as_ref().cloned();
+    let status_pending = status_snapshot.is_none();
+    let paired_status = status_snapshot
+        .and_then(Result::ok)
+        .filter(|status| status.paired);
+
     rsx! {
         section { class: "mb-8", aria_labelledby: "hiphi-cloud-heading",
             div { class: "mb-4",
@@ -215,9 +226,20 @@ fn HiphiCloudPairing() -> Element {
                 }
             }
             div { class: "card p-5 sm:p-6 space-y-6",
+                if status_pending {
+                    p { class: "text-sm text-secondary", "Checking this installation’s HiPhi Cloud connection…" }
+                } else if let Some(status) = paired_status {
+                    div { class: "status-ok", role: "status",
+                        p { class: "font-medium", "This UHC installation is paired." }
+                        p { class: "mt-1", "{status.display_state()}" }
+                        if let Some(installation_id) = status.installation_id {
+                            p { class: "mt-2 text-xs text-muted break-all", "Installation ID: {installation_id}" }
+                        }
+                    }
+                } else {
                 div {
-                    h3 { class: "font-semibold", "1. Prepare this NAS" }
-                    p { class: "mt-1 text-sm text-secondary", "The private installation key stays on this NAS. Only its public key is shown." }
+                    h3 { class: "font-semibold", "1. Prepare this UHC installation" }
+                    p { class: "mt-1 text-sm text-secondary", "The private installation key stays with this UHC installation. Only its public key is shown." }
                     button {
                         r#type: "button",
                         class: "btn-primary mt-3",
@@ -277,7 +299,7 @@ fn HiphiCloudPairing() -> Element {
                     }
                     if let Some(pairing) = initiated() {
                         div { class: "mt-4 rounded-md border border-default bg-elevated p-4 space-y-3",
-                            p { class: "font-medium", "Return to HiPhi Cloud and claim this pending NAS." }
+                            p { class: "font-medium", "Return to HiPhi Cloud and claim this pending UHC installation." }
                             label { class: "text-sm font-medium", "Pairing ID" }
                             div { class: "flex flex-col gap-2 sm:flex-row",
                                 code { class: "min-w-0 flex-1 break-all", "{pairing.pairing_id}" }
@@ -302,13 +324,14 @@ fn HiphiCloudPairing() -> Element {
                     button { r#type: "button", class: "btn-primary mt-3", disabled: initiated().is_none() || matches!(action(), ProviderActionState::Loading), onclick: complete_pairing, "Complete pairing" }
                     if let Some(result) = completed() {
                         div { class: "mt-4 status-ok", role: "status",
-                            p { class: "font-medium", "This NAS is paired." }
-                            if result.restart_required { p { class: "mt-1", "Restart Unified Hi-Fi Control once in QNAP App Center to start the outbound connector." } }
+                            p { class: "font-medium", "This UHC installation is paired." }
+                            if result.restart_required { p { class: "mt-1", "The connector could not start automatically. Restart Unified Hi-Fi Control using this installation’s normal restart control." } }
                         }
                     }
                 }
 
                 if let Some(message) = error() { p { class: "status-err", role: "alert", "{message}" } }
+                }
             }
         }
     }

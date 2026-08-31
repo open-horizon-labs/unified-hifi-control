@@ -9,8 +9,7 @@
 use futures::{SinkExt, StreamExt};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio_tungstenite::{
     connect_async_with_config,
     tungstenite::{
@@ -62,31 +61,149 @@ enum ConnectionExit {
     Shutdown,
 }
 
-pub fn spawn_from_env(
-    state: crate::api::AppState,
-    config_dir: impl Into<std::path::PathBuf>,
-) -> anyhow::Result<Option<JoinHandle<()>>> {
-    let Some(config) = CloudConnectorConfig::from_env(config_dir)? else {
-        return Ok(None);
-    };
-    let identity = if config.key_path.exists() {
-        InstallationIdentity::load(&config.key_path, config.installation_id.clone())?
-    } else {
-        let identity = InstallationIdentity::generate(config.installation_id.clone())?;
-        if let Some(parent) = config.key_path.parent() {
-            std::fs::create_dir_all(parent)?;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorPhase {
+    Unconfigured,
+    Offline,
+    Connecting,
+    Online,
+    Revoked,
+}
+
+impl ConnectorPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unconfigured => "unconfigured",
+            Self::Offline => "offline",
+            Self::Connecting => "connecting",
+            Self::Online => "online",
+            Self::Revoked => "revoked",
         }
-        identity.save(&config.key_path)?;
-        identity
-    };
-    Ok(Some(tokio::spawn(run(state, config, identity))))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorStatus {
+    pub configured: bool,
+    pub installation_id: Option<String>,
+    pub phase: ConnectorPhase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorStart {
+    NotConfigured,
+    Started,
+    AlreadyRunning,
+}
+
+#[derive(Default)]
+struct SupervisorState {
+    active: bool,
+    generation: u64,
+    installation_id: Option<String>,
+    phase: Option<ConnectorPhase>,
+}
+
+/// Owns the single outbound connector task for this UHC process. Pairing can
+/// activate it immediately, while startup reconstructs the same state from the
+/// owner-only persisted binding without relying on a package launcher.
+#[derive(Clone, Default)]
+pub struct ConnectorSupervisor {
+    inner: std::sync::Arc<Mutex<SupervisorState>>,
+}
+
+#[derive(Clone, Copy)]
+struct ConnectionLifecycle<'a> {
+    supervisor: &'a ConnectorSupervisor,
+    generation: u64,
+}
+
+impl ConnectorSupervisor {
+    pub async fn start_from_runtime(
+        &self,
+        state: crate::api::AppState,
+        config_dir: impl Into<std::path::PathBuf>,
+    ) -> anyhow::Result<ConnectorStart> {
+        let Some(config) = CloudConnectorConfig::from_runtime(config_dir)? else {
+            return Ok(ConnectorStart::NotConfigured);
+        };
+        let identity = InstallationIdentity::load(&config.key_path, config.installation_id.clone())
+            .map_err(|error| {
+                anyhow::anyhow!("paired HiPhi installation key is unavailable: {error}")
+            })?;
+
+        let generation = {
+            let mut inner = self.inner.lock().await;
+            if inner.active {
+                if inner.installation_id.as_deref() == Some(config.installation_id.as_str()) {
+                    return Ok(ConnectorStart::AlreadyRunning);
+                }
+                anyhow::bail!("a different HiPhi connector task is already active");
+            }
+            inner.generation = inner.generation.saturating_add(1);
+            inner.active = true;
+            inner.installation_id = Some(config.installation_id.clone());
+            inner.phase = Some(ConnectorPhase::Connecting);
+            inner.generation
+        };
+
+        let supervisor = self.clone();
+        tokio::spawn(async move {
+            let final_phase = run(state, config, identity, supervisor.clone(), generation).await;
+            supervisor.finish(generation, final_phase).await;
+        });
+        Ok(ConnectorStart::Started)
+    }
+
+    pub async fn status_from_runtime(
+        &self,
+        config_dir: impl Into<std::path::PathBuf>,
+    ) -> anyhow::Result<ConnectorStatus> {
+        let Some(config) = CloudConnectorConfig::from_runtime(config_dir)? else {
+            return Ok(ConnectorStatus {
+                configured: false,
+                installation_id: None,
+                phase: ConnectorPhase::Unconfigured,
+            });
+        };
+        let inner = self.inner.lock().await;
+        let phase = if inner.active
+            && inner.installation_id.as_deref() == Some(config.installation_id.as_str())
+        {
+            inner.phase.unwrap_or(ConnectorPhase::Offline)
+        } else {
+            ConnectorPhase::Offline
+        };
+        Ok(ConnectorStatus {
+            configured: true,
+            installation_id: Some(config.installation_id),
+            phase,
+        })
+    }
+
+    async fn set_phase(&self, generation: u64, phase: ConnectorPhase) {
+        let mut inner = self.inner.lock().await;
+        if inner.active && inner.generation == generation {
+            inner.phase = Some(phase);
+        }
+    }
+
+    async fn finish(&self, generation: u64, phase: ConnectorPhase) {
+        let mut inner = self.inner.lock().await;
+        if inner.generation == generation {
+            inner.active = false;
+            inner.phase = Some(phase);
+        }
+    }
 }
 
 async fn run(
     state: crate::api::AppState,
     config: CloudConnectorConfig,
     identity: InstallationIdentity,
-) {
+    supervisor: ConnectorSupervisor,
+    generation: u64,
+) -> ConnectorPhase {
     let mut backoff = super::transport::Backoff::default();
     let shutdown = state.shutdown.clone();
     let mut store = StateStore::default();
@@ -94,11 +211,15 @@ async fn run(
         Ok(guard) => guard,
         Err(error) => {
             tracing::error!("HiPhi Cloud epoch state is unavailable: {error}");
-            return;
+            return ConnectorPhase::Offline;
         }
     };
     let mut ledger = CommandLedger::default();
+    let mut final_phase = ConnectorPhase::Offline;
     loop {
+        supervisor
+            .set_phase(generation, ConnectorPhase::Connecting)
+            .await;
         let delay = backoff.next_delay();
         tokio::select! { _ = shutdown.cancelled() => break, _ = tokio::time::sleep(delay) => {} }
         let grant = match tokio::select! {
@@ -156,6 +277,10 @@ async fn run(
                     &mut store,
                     &mut epoch_guard,
                     &mut ledger,
+                    ConnectionLifecycle {
+                        supervisor: &supervisor,
+                        generation,
+                    },
                     socket,
                 )
                 .await
@@ -163,16 +288,30 @@ async fn run(
                     // Reset only after the authenticated session completed its
                     // challenge/proof ceremony.  A socket that accepts TCP
                     // and then rejects the protocol must still back off.
-                    Ok(ConnectionExit::Disconnected) => backoff.reset(),
-                    Ok(ConnectionExit::Revoked) => break,
+                    Ok(ConnectionExit::Disconnected) => {
+                        supervisor
+                            .set_phase(generation, ConnectorPhase::Offline)
+                            .await;
+                        backoff.reset();
+                    }
+                    Ok(ConnectionExit::Revoked) => {
+                        final_phase = ConnectorPhase::Revoked;
+                        break;
+                    }
                     Ok(ConnectionExit::Shutdown) => break,
-                    Err(error) => tracing::warn!("HiPhi Cloud relay disconnected: {error}"),
+                    Err(error) => {
+                        supervisor
+                            .set_phase(generation, ConnectorPhase::Offline)
+                            .await;
+                        tracing::warn!("HiPhi Cloud relay disconnected: {error}");
+                    }
                 }
             }
             Ok(Err(error)) => tracing::debug!("HiPhi Cloud relay unavailable: {error}"),
             Err(_) => tracing::debug!("HiPhi Cloud relay connect timed out"),
         }
     }
+    final_phase
 }
 
 async fn request_session_grant(
@@ -261,6 +400,7 @@ async fn run_connection<S>(
     store: &mut StateStore,
     epoch_guard: &mut SessionEpochGuard,
     ledger: &mut CommandLedger,
+    lifecycle: ConnectionLifecycle<'_>,
     mut socket: tokio_tungstenite::WebSocketStream<S>,
 ) -> anyhow::Result<ConnectionExit>
 where
@@ -340,6 +480,10 @@ where
         now_playing: projection.now_playing,
     });
     send_json(&mut socket, &snapshot).await?;
+    lifecycle
+        .supervisor
+        .set_phase(lifecycle.generation, ConnectorPhase::Online)
+        .await;
 
     let mut verifier = CommandGrantVerifier::new(
         "hiphi-command-authorization",
@@ -850,8 +994,8 @@ fn websocket_upgrade_request(
 mod tests {
     use super::{
         request_session_grant_at, run_connection, session_grant_client, validate_challenge,
-        websocket_upgrade_request, CommandLedger, ConnectionExit, RelayMessage, StateStore,
-        MAX_SESSION_GRANT_RESPONSE_BYTES,
+        websocket_upgrade_request, CommandLedger, ConnectionExit, ConnectionLifecycle,
+        ConnectorSupervisor, RelayMessage, StateStore, MAX_SESSION_GRANT_RESPONSE_BYTES,
     };
     use crate::{
         adapters::{
@@ -1000,6 +1144,98 @@ mod tests {
             Instant::now(),
             CancellationToken::new(),
         )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persisted_pairing_survives_restart_and_supervisor_is_duplicate_safe() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let installation_id = Uuid::new_v4().to_string();
+        let session_issuer = SigningKey::from_bytes(&[41; 32]);
+        let command_issuer = SigningKey::from_bytes(&[42; 32]);
+        let session_keys = serde_json::json!({
+            "version": 1,
+            "keys": [{
+                "kid": "session-v1",
+                "key": base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(session_issuer.verifying_key().to_bytes()),
+            }],
+        });
+        let command_keys = serde_json::json!({
+            "version": 1,
+            "keys": [{
+                "kid": "command-v1",
+                "key": base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(command_issuer.verifying_key().to_bytes()),
+            }],
+        });
+        let environment_path = directory.path().join("hiphi.env");
+        std::fs::write(
+            &environment_path,
+            format!(
+                "UHC_HIPHI_RELAY_URL=wss://cloud.invalid/v1/relay/connect\n\
+                 UHC_HIPHI_INSTALLATION_ID={installation_id}\n\
+                 UHC_HIPHI_SESSION_ISSUER_KEYS={session_keys}\n\
+                 UHC_HIPHI_COMMAND_ISSUER_KEYS={command_keys}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&environment_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+
+        let supervisor = ConnectorSupervisor::default();
+        let status = supervisor
+            .status_from_runtime(directory.path())
+            .await
+            .unwrap();
+        assert!(status.configured);
+        assert_eq!(
+            status.installation_id.as_deref(),
+            Some(installation_id.as_str())
+        );
+        assert_eq!(status.phase, super::ConnectorPhase::Offline);
+
+        let state = empty_app_state().await;
+        assert!(
+            supervisor
+                .start_from_runtime(state.clone(), directory.path())
+                .await
+                .is_err(),
+            "a persisted binding must not replace a missing private key"
+        );
+
+        let identity = InstallationIdentity::generate(installation_id.clone()).unwrap();
+        identity
+            .save(&directory.path().join("hiphi-installation.key"))
+            .unwrap();
+        assert_eq!(
+            supervisor
+                .start_from_runtime(state.clone(), directory.path())
+                .await
+                .unwrap(),
+            super::ConnectorStart::Started
+        );
+        assert_eq!(
+            supervisor
+                .start_from_runtime(state.clone(), directory.path())
+                .await
+                .unwrap(),
+            super::ConnectorStart::AlreadyRunning
+        );
+
+        state.shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if !supervisor.inner.lock().await.active {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connector should stop on process shutdown");
     }
 
     #[derive(Default)]
@@ -1448,6 +1684,7 @@ mod tests {
         let mut store = StateStore::default();
         let mut epoch_guard = SessionEpochGuard::load(&config.epoch_path).unwrap();
         let mut ledger = CommandLedger::default();
+        let supervisor = ConnectorSupervisor::default();
         let exit = run_connection(
             &state,
             &config,
@@ -1457,6 +1694,10 @@ mod tests {
             &mut store,
             &mut epoch_guard,
             &mut ledger,
+            ConnectionLifecycle {
+                supervisor: &supervisor,
+                generation: 1,
+            },
             client,
         )
         .await
@@ -1561,6 +1802,7 @@ mod tests {
             let mut store = StateStore::default();
             let mut epoch_guard = SessionEpochGuard::load(&config.epoch_path).unwrap();
             let mut ledger = CommandLedger::default();
+            let supervisor = ConnectorSupervisor::default();
             let exit = run_connection(
                 &state,
                 &config,
@@ -1570,6 +1812,10 @@ mod tests {
                 &mut store,
                 &mut epoch_guard,
                 &mut ledger,
+                ConnectionLifecycle {
+                    supervisor: &supervisor,
+                    generation: 1,
+                },
                 client,
             )
             .await;

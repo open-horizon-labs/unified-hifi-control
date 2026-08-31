@@ -11,6 +11,7 @@ const SETTINGS: &str = include_str!("../src/app/pages/settings.rs");
 #[test]
 fn settings_exposes_the_complete_local_pairing_ceremony() {
     for route in [
+        "/api/hiphi/pairing/status",
         "/api/hiphi/pairing/prepare",
         "/api/hiphi/pairing/initiate",
         "/api/hiphi/pairing/complete",
@@ -30,6 +31,17 @@ fn settings_exposes_the_complete_local_pairing_ceremony() {
     ] {
         assert!(SETTINGS.contains(copy), "missing onboarding copy: {copy}");
     }
+
+    assert!(
+        SETTINGS.contains("This UHC installation is paired"),
+        "paired state must survive a page reload through server authority"
+    );
+    assert!(
+        !SETTINGS.contains("QNAP App Center")
+            && !SETTINGS.contains("Prepare this NAS")
+            && !SETTINGS.contains("This NAS is paired"),
+        "HiPhi onboarding must not assume one installation package"
+    );
 }
 
 #[test]
