@@ -88,13 +88,38 @@ pub struct PairingStatusResponse {
 
 fn helper_path() -> anyhow::Result<PathBuf> {
     let current = std::env::current_exe()?;
-    let helper = current.with_file_name("uhc-hiphi-pair");
-    if !helper.is_file() {
-        anyhow::bail!(
-            "the HiPhi pairing helper is missing beside the UHC executable; install the current QPKG build"
-        );
+    for helper in helper_candidates(&current) {
+        if helper.is_file() {
+            return Ok(helper);
+        }
     }
-    Ok(helper)
+    anyhow::bail!(
+        "the HiPhi pairing helper is missing beside the UHC executable; install a current UHC package"
+    );
+}
+
+fn helper_candidates(current: &Path) -> Vec<PathBuf> {
+    let mut candidates = vec![current.with_file_name(if cfg!(windows) {
+        "uhc-hiphi-pair.exe"
+    } else {
+        "uhc-hiphi-pair"
+    })];
+    let filename = current
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let direct_name = match filename {
+        "unified-hifi-linux-x64" => Some("uhc-hiphi-pair-x64"),
+        "unified-hifi-linux-arm64" => Some("uhc-hiphi-pair-arm64"),
+        "unified-hifi-linux-armv7" => Some("uhc-hiphi-pair-armv7"),
+        "unified-hifi-macos-universal" => Some("uhc-hiphi-pair-macos-universal"),
+        "unified-hifi-win64.exe" => Some("uhc-hiphi-pair-win64.exe"),
+        _ => None,
+    };
+    if let Some(name) = direct_name {
+        candidates.push(current.with_file_name(name));
+    }
+    candidates
 }
 
 async fn run_helper(arguments: &[&str]) -> anyhow::Result<BTreeMap<String, String>> {
@@ -325,5 +350,33 @@ mod tests {
             fields.get("key").map(String::as_str),
             Some("value=with=equals")
         );
+    }
+
+    #[test]
+    fn packaged_and_direct_binary_names_find_the_matching_pairing_helper() {
+        let packaged = helper_candidates(Path::new("/opt/uhc/unified-hifi-control"));
+        assert_eq!(
+            packaged[0].file_name().and_then(|name| name.to_str()),
+            Some(if cfg!(windows) {
+                "uhc-hiphi-pair.exe"
+            } else {
+                "uhc-hiphi-pair"
+            })
+        );
+
+        for (server, helper) in [
+            ("unified-hifi-linux-x64", "uhc-hiphi-pair-x64"),
+            ("unified-hifi-linux-arm64", "uhc-hiphi-pair-arm64"),
+            ("unified-hifi-linux-armv7", "uhc-hiphi-pair-armv7"),
+            (
+                "unified-hifi-macos-universal",
+                "uhc-hiphi-pair-macos-universal",
+            ),
+            ("unified-hifi-win64.exe", "uhc-hiphi-pair-win64.exe"),
+        ] {
+            assert!(helper_candidates(Path::new(server))
+                .iter()
+                .any(|path| { path.file_name().and_then(|name| name.to_str()) == Some(helper) }));
+        }
     }
 }
