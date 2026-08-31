@@ -119,7 +119,9 @@ impl CloudConnectorConfig {
         )?))
     }
 
-    fn from_values(
+    /// Validate an explicit connector binding before it is persisted by a
+    /// local enrollment tool. This applies the same rules as service startup.
+    pub fn from_values(
         config_dir: PathBuf,
         endpoint: &str,
         installation_id: &str,

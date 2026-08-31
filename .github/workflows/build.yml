@@ -637,15 +637,19 @@ jobs:
         run: |
           # Force rebuild of main crate to pick up version env vars and embedded assets
           cargo clean -p unified-hifi-control 2>/dev/null || true
-          cargo zigbuild --release --target x86_64-unknown-linux-musl
+          cargo zigbuild --release --target x86_64-unknown-linux-musl \
+            --bin unified-hifi-control --bin uhc-hiphi-pair
 
       - name: Rename binary
         run: |
           mkdir -p dist/bin
           cp target/x86_64-unknown-linux-musl/release/unified-hifi-control dist/bin/unified-hifi-linux-x64
+          cp target/x86_64-unknown-linux-musl/release/uhc-hiphi-pair dist/bin/uhc-hiphi-pair-x64
 
       - name: Verify ELF hardening
-        run: scripts/check-elf-hardening.sh dist/bin/unified-hifi-linux-x64
+        run: |
+          scripts/check-elf-hardening.sh dist/bin/unified-hifi-linux-x64
+          scripts/check-elf-hardening.sh dist/bin/uhc-hiphi-pair-x64
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
@@ -865,7 +869,8 @@ jobs:
         run: |
           # Force rebuild of main crate to pick up version env vars and embedded assets
           cargo clean -p unified-hifi-control 2>/dev/null || true
-          cargo zigbuild --release --target ${{ matrix.target }}
+          cargo zigbuild --release --target ${{ matrix.target }} \
+            --bin unified-hifi-control --bin uhc-hiphi-pair
 
       - name: Smoke test armv7 binary
         if: matrix.target == 'armv7-unknown-linux-musleabihf'
@@ -877,9 +882,12 @@ jobs:
         run: |
           mkdir -p dist/bin
           cp target/${{ matrix.target }}/release/unified-hifi-control dist/bin/${{ matrix.output }}
+          cp target/${{ matrix.target }}/release/uhc-hiphi-pair dist/bin/uhc-hiphi-pair-${{ matrix.arch }}
 
       - name: Verify ELF hardening
-        run: scripts/check-elf-hardening.sh dist/bin/${{ matrix.output }}
+        run: |
+          scripts/check-elf-hardening.sh dist/bin/${{ matrix.output }}
+          scripts/check-elf-hardening.sh dist/bin/uhc-hiphi-pair-${{ matrix.arch }}
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
@@ -1467,7 +1475,9 @@ jobs:
         run: |
           mkdir -p qnap-build/shared
           cp dist/bin/unified-hifi-linux-x64 qnap-build/shared/unified-hifi-control
+          cp dist/bin/uhc-hiphi-pair-x64 qnap-build/shared/uhc-hiphi-pair
           chmod +x qnap-build/shared/unified-hifi-control
+          chmod +x qnap-build/shared/uhc-hiphi-pair
           cp build/qnap/shared/*.sh qnap-build/shared/
           chmod +x qnap-build/shared/*.sh
           cp -r build/qnap/shared/icons qnap-build/
@@ -1548,7 +1558,9 @@ jobs:
         run: |
           mkdir -p qnap-build/shared
           cp dist/bin/unified-hifi-linux-arm64 qnap-build/shared/unified-hifi-control
+          cp dist/bin/uhc-hiphi-pair-arm64 qnap-build/shared/uhc-hiphi-pair
           chmod +x qnap-build/shared/unified-hifi-control
+          chmod +x qnap-build/shared/uhc-hiphi-pair
           cp build/qnap/shared/*.sh qnap-build/shared/
           chmod +x qnap-build/shared/*.sh
           cp -r build/qnap/shared/icons qnap-build/

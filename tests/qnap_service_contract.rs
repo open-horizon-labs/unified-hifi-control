@@ -1,6 +1,7 @@
 //! Safety and packaging contract for the privileged QNAP service wrapper.
 
 const SERVICE: &str = include_str!("../build/qnap/shared/unified-hifi-control.sh");
+const INSTALL: &str = include_str!("../build/qnap/shared/install.sh");
 const UNINSTALL: &str = include_str!("../build/qnap/shared/uninstall.sh");
 const QPKG_CONFIG: &str = include_str!("../build/qnap/qpkg.cfg");
 const BUILD_WORKFLOW: &str = include_str!("../.github/workflows/build.yml");
@@ -89,6 +90,65 @@ fn qnap_service_keeps_credentials_private_and_stops_only_its_recorded_process() 
         !SERVICE.contains("pkill -9"),
         "the package must not use a broad force-kill fallback"
     );
+}
+
+#[test]
+fn qnap_package_persists_and_loads_the_complete_hiphi_connector_configuration() {
+    assert!(
+        INSTALL.contains("touch \"${QPKG_ROOT}/config/hiphi.env\""),
+        "the package must create a stable connector configuration file"
+    );
+    assert!(
+        INSTALL.contains("chmod 600 \"${QPKG_ROOT}/config/hiphi.env\""),
+        "connector configuration must not be readable by other NAS users"
+    );
+    assert!(
+        INSTALL.contains("[ -L \"${QPKG_ROOT}/config/hiphi.env\" ]"),
+        "install must not chmod through a connector-config symlink"
+    );
+    for setting in [
+        "UHC_HIPHI_RELAY_URL",
+        "UHC_HIPHI_INSTALLATION_ID",
+        "UHC_HIPHI_SESSION_ISSUER_KEYS",
+        "UHC_HIPHI_COMMAND_ISSUER_KEYS",
+    ] {
+        assert!(
+            SERVICE.contains(setting),
+            "the service wrapper must load {setting} before starting UHC"
+        );
+    }
+    assert!(
+        !SERVICE.contains(". \"$HIPHI_ENV_FILE\"")
+            && !SERVICE.contains("source \"$HIPHI_ENV_FILE\""),
+        "the privileged service wrapper must parse known keys rather than execute the config file as shell"
+    );
+    let symlink_check = SERVICE
+        .find("[ -L \"$HIPHI_ENV_FILE\" ]")
+        .expect("service rejects connector-config symlinks");
+    let missing_check = SERVICE
+        .find("[ -e \"$HIPHI_ENV_FILE\" ] || return 0")
+        .expect("service permits a fresh unpaired install");
+    assert!(
+        symlink_check < missing_check,
+        "a dangling config symlink must not bypass the safety check"
+    );
+}
+
+#[test]
+fn qnap_artifact_contains_the_pairing_helper_for_each_packaged_architecture() {
+    let x64_job = BUILD_WORKFLOW
+        .split("build-qnap-x64:")
+        .nth(1)
+        .and_then(|tail| tail.split("build-qnap-arm:").next())
+        .expect("x64 QNAP job exists");
+    let arm_job = BUILD_WORKFLOW
+        .split("build-qnap-arm:")
+        .nth(1)
+        .and_then(|tail| tail.split("build-docker-x64:").next())
+        .expect("ARM QNAP job exists");
+
+    assert!(x64_job.contains("cp dist/bin/uhc-hiphi-pair-x64 qnap-build/shared/uhc-hiphi-pair"));
+    assert!(arm_job.contains("cp dist/bin/uhc-hiphi-pair-arm64 qnap-build/shared/uhc-hiphi-pair"));
 }
 
 #[test]
