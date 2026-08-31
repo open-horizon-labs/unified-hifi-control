@@ -156,6 +156,19 @@ fn write_handoff(handoff: &EnrollmentHandoffUpload) -> anyhow::Result<PathBuf> {
         options.mode(0o600);
     }
     let mut file = options.open(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // QNAP shared-volume ACL inheritance can add group/other mode bits
+        // after create(0600). Clear them on the open file descriptor and
+        // verify the filesystem actually honored the owner-only boundary
+        // before placing a one-use capability in the file.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        if file.metadata()?.permissions().mode() & 0o077 != 0 {
+            anyhow::bail!("the UHC config volume cannot enforce owner-only enrollment files");
+        }
+    }
     file.write_all(&bytes)?;
     file.sync_all()?;
     Ok(path)

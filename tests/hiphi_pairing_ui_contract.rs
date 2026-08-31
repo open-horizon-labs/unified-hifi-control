@@ -51,3 +51,11 @@ fn pairing_origin_is_server_pinned() {
     assert!(API.contains("https://relay.hiphi.audio"));
     assert!(!API.contains("request.cloud_origin"));
 }
+
+#[test]
+fn browser_handoff_explicitly_clears_inherited_group_and_other_permissions() {
+    assert!(
+        API.contains("file.set_permissions"),
+        "the QNAP config volume may inherit ACL mode bits despite create mode 0600"
+    );
+}
