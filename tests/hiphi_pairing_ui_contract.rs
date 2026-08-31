@@ -45,6 +45,15 @@ fn settings_exposes_the_complete_local_pairing_ceremony() {
 }
 
 #[test]
+fn paired_status_keeps_refreshing_after_the_page_loads() {
+    assert!(
+        SETTINGS.contains("dioxus_sdk_time::sleep(HIPHI_STATUS_POLL_INTERVAL)")
+            && SETTINGS.contains("pairing_status.restart()"),
+        "Settings must refresh connector state so online, reconnecting, and revoked do not go stale"
+    );
+}
+
+#[test]
 fn browser_contract_never_serializes_the_private_installation_key() {
     assert!(!API.contains("installation_private_key"));
     assert!(!API.contains("private_key"));

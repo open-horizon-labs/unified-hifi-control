@@ -19,6 +19,8 @@ use crate::app::sse::use_sse;
 use crate::app::theme::{use_theme, Theme};
 use crate::app::{McpEndpoint, Route};
 
+const HIPHI_STATUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// OpenHome status response
 #[derive(Clone, Debug, Default, serde::Deserialize, PartialEq)]
 struct OpenHomeStatus {
@@ -120,6 +122,19 @@ fn HiphiCloudPairing() -> Element {
     let pairing_secret_copy = use_signal(CopyState::default);
     let mut pairing_status = use_resource(|| async {
         crate::app::api::fetch_json::<HiphiPairingStatus>("/api/hiphi/pairing/status").await
+    });
+
+    // Pairing is durable, but relay presence changes independently of page
+    // navigation. Refresh only this small status resource so a page opened
+    // while online cannot keep claiming connectivity after a disconnect (or
+    // stay on "connecting" after recovery).
+    use_effect(move || {
+        spawn(async move {
+            loop {
+                dioxus_sdk_time::sleep(HIPHI_STATUS_POLL_INTERVAL).await;
+                pairing_status.restart();
+            }
+        });
     });
 
     let prepare = move |_| {
