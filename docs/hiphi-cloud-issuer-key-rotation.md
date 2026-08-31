@@ -1,5 +1,9 @@
 # HiPhi Cloud issuer-key rotation
 
+This procedure implements the signer-compromise and verifier-overlap controls
+described in the public
+[HiPhi Cloud connector threat model](hiphi-cloud-threat-model.md).
+
 UHC independently pins two HiPhi Cloud authorities. The installation-session
 authority authenticates the outbound WebSocket session; the command authority
 authorizes exact remote commands. They must never share a key ID or public key.

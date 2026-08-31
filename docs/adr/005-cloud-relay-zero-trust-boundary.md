@@ -58,6 +58,9 @@ combined `UHC_HIPHI_ISSUER_*` pair are deliberately not fallbacks: accepting
 multiple configuration shapes would make the active trust roots ambiguous.
 The complete publish, switch, wait, and retire sequence is documented in
 [`../hiphi-cloud-issuer-key-rotation.md`](../hiphi-cloud-issuer-key-rotation.md).
+The public attacker model, runtime data classification, release invariants, and
+known residual risks are documented in
+[`../hiphi-cloud-threat-model.md`](../hiphi-cloud-threat-model.md).
 
 For every command, UHC pins the command issuer by `key_id` and verifies issuer,
 audience, installation,
