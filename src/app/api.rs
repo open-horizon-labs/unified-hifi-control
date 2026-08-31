@@ -100,6 +100,51 @@ pub struct ControllerBootstrapResponse {
     pub expires_at: u64,
 }
 
+// =============================================================================
+// HiPhi Cloud installation pairing
+// =============================================================================
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct HiphiPrepareResponse {
+    pub installation_public_key: String,
+    pub installation_fingerprint: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HiphiEnrollmentHandoff {
+    pub enrollment_capability: String,
+    pub installation_audience: String,
+    pub expires_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct HiphiInitiateRequest {
+    pub enrollment: HiphiEnrollmentHandoff,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct HiphiInitiateResponse {
+    pub pairing_id: String,
+    pub installation_id: String,
+    pub pairing_secret: String,
+    pub installation_fingerprint: String,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct HiphiCompleteRequest {
+    pub account_id: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct HiphiCompleteResponse {
+    pub paired: bool,
+    pub installation_id: String,
+    pub relay_endpoint: String,
+    pub restart_required: bool,
+}
+
 /// `GET /api/controller/status`.
 pub async fn fetch_controller_status() -> Result<ControllerStatus, String> {
     fetch_json("/api/controller/status").await

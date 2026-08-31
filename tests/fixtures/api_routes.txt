@@ -85,6 +85,9 @@ POST /api/bridges/applemusic/revoke
 POST /api/bridges/applemusic/state
 POST /api/collections
 POST /api/controller/bootstrap
+POST /api/hiphi/pairing/complete
+POST /api/hiphi/pairing/initiate
+POST /api/hiphi/pairing/prepare
 POST /api/mqtt/configure
 POST /api/play_ref
 POST /api/providers/spotify/tunnel/start

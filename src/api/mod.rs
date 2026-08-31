@@ -44,6 +44,7 @@ pub mod browse;
 pub mod controller_auth;
 pub mod credentials;
 pub mod ha_integration;
+pub mod hiphi_pairing;
 pub mod ingress;
 pub mod mqtt_bootstrap;
 pub mod mqtt_settings;

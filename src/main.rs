@@ -885,6 +885,9 @@ mod server {
             // Installation-bound controller bootstrap/session boundary
             .route("/api/controller/bootstrap", post(controller_bootstrap))
             .route("/api/controller/status", get(controller_status))
+            .route("/api/hiphi/pairing/prepare", post(api::hiphi_pairing::prepare))
+            .route("/api/hiphi/pairing/initiate", post(api::hiphi_pairing::initiate))
+            .route("/api/hiphi/pairing/complete", post(api::hiphi_pairing::complete))
             // Provider authorization and native companion pairing
             .route("/api/providers/{provider}/oauth/start", get(api_oauth_start))
             .route("/api/providers/{provider}/oauth/callback", get(api_oauth_callback))
