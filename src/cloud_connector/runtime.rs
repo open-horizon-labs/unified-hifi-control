@@ -112,17 +112,9 @@ async fn run(
                 continue;
             }
         };
-        let session_issuer_key = match session_issuer_verifying_key(&config) {
-            Ok(key) => key,
-            Err(error) => {
-                tracing::error!("HiPhi Cloud session issuer key is invalid: {error}");
-                break;
-            }
-        };
         let verified_grant = match verify_installation_session_grant(
             &grant,
-            &config.session_issuer_key_id,
-            &session_issuer_key,
+            &config.session_issuer_keys,
             &identity,
             config.endpoint.as_str(),
             now_ms(),
@@ -349,7 +341,6 @@ where
     });
     send_json(&mut socket, &snapshot).await?;
 
-    let command_issuer_key = command_issuer_verifying_key(config)?;
     let mut verifier = CommandGrantVerifier::new(
         "hiphi-command-authorization",
         UHC_AUDIENCE,
@@ -357,7 +348,9 @@ where
         epoch,
         grant_generation,
     );
-    verifier.pin_key(config.command_issuer_key_id.clone(), command_issuer_key);
+    for (key_id, key) in config.command_issuer_keys.iter() {
+        verifier.pin_key(key_id.to_owned(), *key);
+    }
     let (artwork_tx, mut artwork_rx) = mpsc::channel(ARTWORK_QUEUE_CAPACITY);
     let artwork_slots =
         std::sync::Arc::new(Semaphore::new(ARTWORK_QUEUE_CAPACITY + ARTWORK_CONCURRENCY));
@@ -841,26 +834,6 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-fn session_issuer_verifying_key(
-    config: &CloudConnectorConfig,
-) -> anyhow::Result<ed25519_dalek::VerifyingKey> {
-    verifying_key(&config.session_issuer_public_key, "session issuer")
-}
-
-fn command_issuer_verifying_key(
-    config: &CloudConnectorConfig,
-) -> anyhow::Result<ed25519_dalek::VerifyingKey> {
-    verifying_key(&config.command_issuer_public_key, "command issuer")
-}
-
-fn verifying_key(bytes: &[u8], authority: &str) -> anyhow::Result<ed25519_dalek::VerifyingKey> {
-    Ok(ed25519_dalek::VerifyingKey::from_bytes(
-        bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("{authority} key must be 32 bytes"))?,
-    )?)
-}
-
 fn websocket_upgrade_request(
     endpoint: &str,
     grant: &str,
@@ -893,7 +866,7 @@ mod tests {
         api::AppState,
         bus::create_bus,
         cloud_connector::{
-            config::CloudConnectorConfig,
+            config::{CloudConnectorConfig, IssuerVerifyingKeyRing},
             identity::InstallationIdentity,
             protocol::{
                 CommandAction, CommandEnvelope, CommandGrantClaims, CommandPayload,
@@ -1366,7 +1339,9 @@ mod tests {
     async fn production_connection_uses_distinct_command_authority_then_honors_revocation() {
         let installation_id = Uuid::new_v4().to_string();
         let identity = InstallationIdentity::generate(installation_id.clone()).unwrap();
+        let previous_session_issuer = SigningKey::from_bytes(&[28; 32]);
         let session_issuer = SigningKey::from_bytes(&[30; 32]);
+        let previous_command_issuer = SigningKey::from_bytes(&[29; 32]);
         let command_issuer = SigningKey::from_bytes(&[31; 32]);
         let temp = tempfile::tempdir().unwrap();
         let endpoint = "wss://cloud.invalid/v1/relay/connect";
@@ -1375,10 +1350,22 @@ mod tests {
             installation_id: installation_id.clone(),
             key_path: temp.path().join("installation.key"),
             epoch_path: temp.path().join("epoch"),
-            session_issuer_key_id: "session-issuer-1".into(),
-            session_issuer_public_key: session_issuer.verifying_key().to_bytes().to_vec(),
-            command_issuer_key_id: "command-issuer-1".into(),
-            command_issuer_public_key: command_issuer.verifying_key().to_bytes().to_vec(),
+            session_issuer_keys: IssuerVerifyingKeyRing::from_entries([
+                (
+                    "session-issuer-1".into(),
+                    previous_session_issuer.verifying_key(),
+                ),
+                ("session-issuer-2".into(), session_issuer.verifying_key()),
+            ])
+            .unwrap(),
+            command_issuer_keys: IssuerVerifyingKeyRing::from_entries([
+                (
+                    "command-issuer-1".into(),
+                    previous_command_issuer.verifying_key(),
+                ),
+                ("command-issuer-2".into(), command_issuer.verifying_key()),
+            ])
+            .unwrap(),
         };
         let state = empty_app_state().await;
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
@@ -1394,7 +1381,7 @@ mod tests {
         });
         let epoch = u64::try_from(now).unwrap();
         let command = signed_command(
-            "command-issuer-1",
+            "command-issuer-2",
             &command_issuer,
             &installation_id,
             epoch,
@@ -1492,10 +1479,16 @@ mod tests {
             installation_id: installation_id.clone(),
             key_path: temp.path().join("installation.key"),
             epoch_path: temp.path().join("epoch"),
-            session_issuer_key_id: "session-issuer-1".into(),
-            session_issuer_public_key: session_issuer.verifying_key().to_bytes().to_vec(),
-            command_issuer_key_id: "command-issuer-1".into(),
-            command_issuer_public_key: command_issuer.verifying_key().to_bytes().to_vec(),
+            session_issuer_keys: IssuerVerifyingKeyRing::from_entries([(
+                "session-issuer-1".into(),
+                session_issuer.verifying_key(),
+            )])
+            .unwrap(),
+            command_issuer_keys: IssuerVerifyingKeyRing::from_entries([(
+                "command-issuer-1".into(),
+                command_issuer.verifying_key(),
+            )])
+            .unwrap(),
         };
         let state = empty_app_state().await;
         let shutdown = state.shutdown.clone();

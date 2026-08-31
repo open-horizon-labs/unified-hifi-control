@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
+    config::IssuerVerifyingKeyRing,
     identity::InstallationIdentity,
     protocol::{InstallationSessionGrantClaims, PROTOCOL_VERSION, RELAY_AUDIENCE},
     transport::RelayEndpoint,
@@ -66,8 +67,7 @@ pub enum SessionGrantError {
 /// authorizer key can produce a grant accepted here.
 pub fn verify_installation_session_grant(
     grant: &str,
-    expected_key_id: &str,
-    issuer_key: &VerifyingKey,
+    issuer_keys: &IssuerVerifyingKeyRing,
     identity: &InstallationIdentity,
     expected_endpoint: &str,
     now_ms: i64,
@@ -95,9 +95,9 @@ pub fn verify_installation_session_grant(
     if header.alg != "EdDSA" || header.typ != SESSION_JWS_TYPE {
         return Err(SessionGrantError::Malformed);
     }
-    if header.kid != expected_key_id {
-        return Err(SessionGrantError::UnknownKey);
-    }
+    let issuer_key = issuer_keys
+        .get(&header.kid)
+        .ok_or(SessionGrantError::UnknownKey)?;
     let signature = Signature::from_slice(
         &base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(encoded_signature)

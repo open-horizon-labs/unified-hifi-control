@@ -46,12 +46,18 @@ a command UHC accepts; the command authority may authorize an exact command
 but cannot authenticate a relay session. UHC rejects connector configuration
 that reuses either the same key ID or the same public key for both roles.
 
-Operators configure the split trust roots with
-`UHC_HIPHI_SESSION_ISSUER_KEY_ID`, `UHC_HIPHI_SESSION_ISSUER_PUBLIC_KEY`,
-`UHC_HIPHI_COMMAND_ISSUER_KEY_ID`, and
-`UHC_HIPHI_COMMAND_ISSUER_PUBLIC_KEY`. The public keys use unpadded URL-safe
-base64. The old combined `UHC_HIPHI_ISSUER_*` pair is deliberately not a
-fallback because accepting it would silently collapse the two authorities.
+Operators configure the split trust roots with the versioned JSON rings
+`UHC_HIPHI_SESSION_ISSUER_KEYS` and `UHC_HIPHI_COMMAND_ISSUER_KEYS`. Each ring
+contains one to eight key-ID and unpadded URL-safe base64 Ed25519 public-key
+pairs. UHC rejects malformed, empty, oversized, duplicate, weak-key, or
+cross-authority rings before connecting. This bounded overlap allows a new key
+to be published before its signer becomes active and the previous verifier to
+remain until every grant it signed has expired. The old single-key
+`UHC_HIPHI_*_ISSUER_KEY_ID` / `*_PUBLIC_KEY` settings and the still older
+combined `UHC_HIPHI_ISSUER_*` pair are deliberately not fallbacks: accepting
+multiple configuration shapes would make the active trust roots ambiguous.
+The complete publish, switch, wait, and retire sequence is documented in
+[`../hiphi-cloud-issuer-key-rotation.md`](../hiphi-cloud-issuer-key-rotation.md).
 
 For every command, UHC pins the command issuer by `key_id` and verifies issuer,
 audience, installation,

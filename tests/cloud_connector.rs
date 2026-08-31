@@ -22,9 +22,18 @@ fn signed_session_grant(
     key: &SigningKey,
     claims: &cloud_connector::protocol::InstallationSessionGrantClaims,
 ) -> String {
+    signed_session_grant_with_kid("issuer-1", key, claims)
+}
+
+fn signed_session_grant_with_kid(
+    key_id: &str,
+    key: &SigningKey,
+    claims: &cloud_connector::protocol::InstallationSessionGrantClaims,
+) -> String {
     use base64::Engine as _;
-    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(r#"{"alg":"EdDSA","kid":"issuer-1","typ":"hiphi-session+jwt"}"#);
+    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(
+        r#"{{"alg":"EdDSA","kid":"{key_id}","typ":"hiphi-session+jwt"}}"#
+    ));
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(serde_json::to_vec(claims).unwrap());
     let signature = key.sign(format!("{header}.{payload}").as_bytes());
@@ -32,6 +41,58 @@ fn signed_session_grant(
         "{header}.{payload}.{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes())
     )
+}
+
+#[test]
+fn session_issuer_rotation_overlaps_then_retires_the_old_key() {
+    use sha2::{Digest as _, Sha256};
+
+    let old = SigningKey::generate(&mut OsRng);
+    let new = SigningKey::generate(&mut OsRng);
+    let identity =
+        InstallationIdentity::generate("11111111-1111-4111-8111-111111111111".to_owned()).unwrap();
+    let now = 1_800_000_000_000_i64;
+    let claims = cloud_connector::protocol::InstallationSessionGrantClaims {
+        protocol_version: 1,
+        connector_version: env!("UHC_VERSION").into(),
+        issuer: "hiphi-installation-authorization".into(),
+        audience: "hiphi-relay".into(),
+        installation_id: identity.installation_id().to_owned(),
+        endpoint: "wss://cloud.example/v1/relay/connect".into(),
+        public_key_sha256: hex::encode(Sha256::digest(identity.verifying_key().as_bytes())),
+        grant_jti: uuid(102),
+        issued_at: now - 1_000,
+        expires_at: now + 60_000,
+        grant_generation: 7,
+    };
+    let overlapping = IssuerVerifyingKeyRing::from_entries([
+        ("session-old".to_owned(), old.verifying_key()),
+        ("session-new".to_owned(), new.verifying_key()),
+    ])
+    .unwrap();
+    for (kid, key) in [("session-old", &old), ("session-new", &new)] {
+        assert!(verify_installation_session_grant(
+            &signed_session_grant_with_kid(kid, key, &claims),
+            &overlapping,
+            &identity,
+            "wss://cloud.example/v1/relay/connect",
+            now,
+        )
+        .is_ok());
+    }
+    let retired =
+        IssuerVerifyingKeyRing::from_entries([("session-new".to_owned(), new.verifying_key())])
+            .unwrap();
+    assert_eq!(
+        verify_installation_session_grant(
+            &signed_session_grant_with_kid("session-old", &old, &claims),
+            &retired,
+            &identity,
+            "wss://cloud.example/v1/relay/connect",
+            now,
+        ),
+        Err(SessionGrantError::UnknownKey)
+    );
 }
 
 #[test]
@@ -56,10 +117,12 @@ fn session_grant_is_verified_before_it_can_authenticate_the_websocket_upgrade() 
         grant_generation: 7,
     };
     let grant = signed_session_grant(&issuer, &claims);
+    let issuer_keys =
+        IssuerVerifyingKeyRing::from_entries([("issuer-1".to_owned(), issuer.verifying_key())])
+            .unwrap();
     let verified = verify_installation_session_grant(
         &grant,
-        "issuer-1",
-        &issuer.verifying_key(),
+        &issuer_keys,
         &identity,
         "wss://cloud.example/v1/relay/connect",
         now,
@@ -73,8 +136,7 @@ fn session_grant_is_verified_before_it_can_authenticate_the_websocket_upgrade() 
     assert_eq!(
         verify_installation_session_grant(
             &wrong_version_grant,
-            "issuer-1",
-            &issuer.verifying_key(),
+            &issuer_keys,
             &identity,
             "wss://cloud.example/v1/relay/connect",
             now,
@@ -88,8 +150,7 @@ fn session_grant_is_verified_before_it_can_authenticate_the_websocket_upgrade() 
     assert_eq!(
         verify_installation_session_grant(
             &forged_payload,
-            "issuer-1",
-            &issuer.verifying_key(),
+            &issuer_keys,
             &identity,
             "wss://cloud.example/v1/relay/connect",
             now,
@@ -563,10 +624,10 @@ fn session_epoch_high_water_mark_survives_reconnect_and_process_restart() {
     }
 }
 
-fn signed_grant(identity: &SigningKey, claims: &GrantClaims) -> String {
+fn signed_grant_with_kid(key_id: &str, identity: &SigningKey, claims: &GrantClaims) -> String {
     use base64::Engine as _;
     let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(r#"{"alg":"EdDSA","kid":"issuer-1"}"#);
+        .encode(format!(r#"{{"alg":"EdDSA","kid":"{key_id}"}}"#));
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(serde_json::to_vec(claims).unwrap());
     let sig = identity.sign(format!("{header}.{payload}").as_bytes());
@@ -576,12 +637,57 @@ fn signed_grant(identity: &SigningKey, claims: &GrantClaims) -> String {
     )
 }
 
+#[test]
+fn command_issuer_rotation_overlaps_then_retires_the_old_key() {
+    let old = SigningKey::generate(&mut OsRng);
+    let new = SigningKey::generate(&mut OsRng);
+    let overlapping = || {
+        let mut verifier = CommandGrantVerifier::new(
+            "hiphi-command-authorization",
+            "uhc-connector",
+            id("install"),
+            7,
+            3,
+        );
+        verifier.pin_key("command-old", old.verifying_key());
+        verifier.pin_key("command-new", new.verifying_key());
+        verifier
+    };
+    let old_command = command_with_claims_and_kid(1_000, "command-old", &old, 3, |_| {});
+    let new_command = command_with_claims_and_kid(1_000, "command-new", &new, 3, |_| {});
+    assert!(overlapping().verify(&old_command, 1_000).is_ok());
+    assert!(overlapping().verify(&new_command, 1_000).is_ok());
+
+    let mut retired = CommandGrantVerifier::new(
+        "hiphi-command-authorization",
+        "uhc-connector",
+        id("install"),
+        7,
+        3,
+    );
+    retired.pin_key("command-new", new.verifying_key());
+    assert_eq!(
+        retired.verify(&old_command, 1_000),
+        Err(GrantError::UnknownKey)
+    );
+}
+
 fn command_and_grant(now: u64, key: &SigningKey, generation: u64) -> CommandEnvelope {
     command_with_claims(now, key, generation, |_| {})
 }
 
 fn command_with_claims(
     now: u64,
+    key: &SigningKey,
+    generation: u64,
+    mutate: impl FnOnce(&mut GrantClaims),
+) -> CommandEnvelope {
+    command_with_claims_and_kid(now, "issuer-1", key, generation, mutate)
+}
+
+fn command_with_claims_and_kid(
+    now: u64,
+    key_id: &str,
     key: &SigningKey,
     generation: u64,
     mutate: impl FnOnce(&mut GrantClaims),
@@ -621,7 +727,7 @@ fn command_with_claims(
         created_at: claims.issued_at,
         expires_at: claims.expires_at,
         payload,
-        grant: signed_grant(key, &claims),
+        grant: signed_grant_with_kid(key_id, key, &claims),
     }
 }
 
