@@ -95,7 +95,7 @@ dioxus-primitives = { git = "https://github.com/DioxusLabs/components", version 
 axum = { version = "0.8", features = ["macros"], optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 tower = { version = "0.5", optional = true }
-tower-http = { version = "0.6", features = ["cors", "compression-gzip", "trace"], optional = true }
+tower-http = { version = "0.7", features = ["cors", "compression-gzip", "trace"], optional = true }
 
 # Roon API (server only)
 roon-api = { git = "https://github.com/open-horizon-labs/rust-roon-api.git", branch = "ohc/main", features = ["transport", "image", "status", "browse"], optional = true }
