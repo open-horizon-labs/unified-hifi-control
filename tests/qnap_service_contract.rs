@@ -93,6 +93,58 @@ fn qnap_service_keeps_credentials_private_and_stops_only_its_recorded_process() 
 }
 
 #[test]
+fn qnap_service_bounds_and_reclaims_its_own_log() {
+    assert!(
+        SERVICE.contains("UHC_LOG_MAX_BYTES"),
+        "the package must expose a bounded log-size policy"
+    );
+    assert!(
+        SERVICE.contains("UHC_LOG_ARCHIVES"),
+        "the package must expose a bounded archive-retention policy"
+    );
+    assert!(
+        SERVICE.contains("UHC_LOG_CHECK_SECONDS"),
+        "the package must check log size while the service is running"
+    );
+    assert!(
+        SERVICE.contains("tail -c \"$LOG_MAX_BYTES\""),
+        "rotation must retain only a bounded tail instead of copying an oversized log"
+    );
+    assert!(
+        SERVICE.contains("rotate \"$SERVICE_PID\""),
+        "rotation must be package-owned rather than editing QNAP's global cron table"
+    );
+    assert!(
+        SERVICE.contains("RUST_LOG=${RUST_LOG:-unified_hifi_control=info"),
+        "QNAP must default to production-safe info logging"
+    );
+    assert!(
+        INSTALL.contains("chmod 600 \"${QPKG_ROOT}/unified-hifi-control.log\""),
+        "the retained service log must remain owner-only"
+    );
+}
+
+#[test]
+fn qnap_rotator_is_stopped_only_after_process_identity_validation() {
+    assert!(
+        SERVICE.contains("is_our_rotator_pid"),
+        "a stale rotator PID must not be trusted"
+    );
+    let stop = SERVICE
+        .split("  stop)")
+        .nth(1)
+        .and_then(|tail| tail.split("  restart)").next())
+        .expect("stop arm exists");
+    let kill = stop
+        .find("kill \"$ROTATOR_PID\"")
+        .expect("stop arm terminates the package rotator");
+    let validation = stop[..kill]
+        .rfind("is_our_rotator_pid \"$ROTATOR_PID\"")
+        .expect("rotator identity is checked before signaling");
+    assert!(validation < kill);
+}
+
+#[test]
 fn qnap_package_persists_and_loads_the_complete_hiphi_connector_configuration() {
     assert!(
         INSTALL.contains("touch \"${QPKG_ROOT}/config/hiphi.env\""),

@@ -22,6 +22,7 @@ chmod +x "${QPKG_ROOT}/unified-hifi-control.sh"
 
 # Create log file
 touch "${QPKG_ROOT}/unified-hifi-control.log"
+chmod 600 "${QPKG_ROOT}/unified-hifi-control.log"
 
 # Keep provider credentials in the package-owned config volume.  The server's
 # config resolver creates the `unified-hifi` subdirectory below this path;
