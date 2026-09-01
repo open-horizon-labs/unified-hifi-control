@@ -83,5 +83,5 @@ src/producers/hqplayer_command_service.rs|build|concrete-adapter-type|HqpInstanc
 src/producers/hqplayer_command_service.rs||concrete-adapter-type|HqpInstanceManager
 src/api/mod.rs|AdapterRegistry|concrete-adapter-type|Startable
 src/api/mod.rs|register_with_lifecycle|concrete-adapter-type|Startable
-src/api/provider_auth.rs|oauth_callback_json|concrete-adapter-type|Startable
+src/api/provider_auth.rs|complete_spotify_authorization|concrete-adapter-type|Startable
 src/api/provider_auth.rs|oauth_revoke|concrete-adapter-type|Startable
