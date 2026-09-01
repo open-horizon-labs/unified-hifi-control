@@ -718,9 +718,8 @@ pub fn HqPlayer() -> Element {
                             "Tell Unified Hi-Fi Control which playback-zone name and HQPlayer instance describe the same existing signal path."
                         }
                     }
-                    div { class: "card overflow-hidden",
+                    div { key: "{zone_match_key}", class: "card overflow-hidden",
                         ZoneLinkTable {
-                            key: "{zone_match_key}",
                             zones: zones_list,
                             links: links_list,
                             instances: instances_list,
