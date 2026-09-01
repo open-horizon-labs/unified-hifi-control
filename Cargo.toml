@@ -39,14 +39,18 @@ server = [
     "dep:ed25519-dalek",
     "dep:uuid",
 ]
-# The browser bundle still needs Dioxus fullstack's hydration support so it
-# can attach to SSR markup. This does not enable the server target; that stays
-# behind the separate `server` feature used by native binaries.
-web = ["dioxus/web", "dioxus/fullstack"]
+# Hydrate SSR markup in the browser without enabling the Dioxus CLI's inferred
+# fullstack server build. Native server binaries enable the separate `server`
+# feature explicitly.
+web = ["dioxus/web", "dep:dioxus_web_hydrate"]
 
 [dependencies]
 # Dioxus UI framework (SSR + client hydration + router)
 dioxus = { version = "0.7.10", features = ["router"] }
+# Enable the browser renderer's hydration support without enabling Dioxus
+# fullstack inference in the CLI. The server target remains an explicit
+# `server` feature, while the web bundle can still hydrate SSR markup.
+dioxus_web_hydrate = { package = "dioxus-web", version = "0.7.10", default-features = false, features = ["document", "hydrate", "mounted", "devtools"], optional = true }
 dioxus-sdk-time = "0.7"
 
 # Serialization (shared)

@@ -5454,6 +5454,7 @@ dependencies = [
  "dioxus",
  "dioxus-primitives",
  "dioxus-sdk-time",
+ "dioxus-web",
  "ed25519-dalek",
  "futures",
  "gethostname",
