@@ -107,7 +107,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "coo
 # WebSocket client (server only) - Music Assistant event subscription (#506).
 # rustls to match reqwest's TLS backend rather than pulling in a second (native-tls)
 # implementation.
-tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"], optional = true }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"], optional = true }
 
 # Logging subscriber (server only - needs tokio)
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
