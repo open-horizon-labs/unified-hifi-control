@@ -1,8 +1,8 @@
-name: Streaming Alpha Rust
+name: v4 Streaming and Companion Rust
 
 on:
   pull_request:
-    branches: [integration/streaming-ha-alpha]
+    branches: [v4]
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
@@ -43,7 +43,7 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "streaming-alpha"
+          shared-key: "v4-streaming"
 
       - name: Check formatting
         run: cargo fmt --check

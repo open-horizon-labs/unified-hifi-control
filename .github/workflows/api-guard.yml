@@ -2,7 +2,7 @@ name: API Guard
 
 on:
   pull_request:
-    branches: [master, v3, 'integration/streaming-ha-alpha']
+    branches: [master, v3, v4]
     paths:
       - 'src/main.rs'
       - 'src/api/**'

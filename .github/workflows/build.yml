@@ -2,10 +2,10 @@ name: Build
 
 on:
   pull_request:
-    branches: [master, v3, 'integration/streaming-ha-alpha']
+    branches: [master, v3, v4]
     types: [opened, synchronize, reopened, labeled]
   push:
-    branches: [v3, 'feature/**']
+    branches: [v3, v4, 'feature/**']
     # Tag pushes are the single release trigger. `release: [published]` used to be
     # listed here as well, which meant `gh release create` — the way releases are
     # actually cut — fired both events for the same commit and built the entire
@@ -2055,7 +2055,7 @@ jobs:
           ### macOS Companion Apps
           - `unified-hifi-applemusic-companion-macos-arm64-*.dmg` - Apple Music
             companion (Apple Silicon only). Unsigned: see the "Unsigned app"
-            note in [companion/apple_music/README.md](https://github.com/${{ github.repository }}/blob/v3/companion/apple_music/README.md)
+            note in [companion/apple_music/README.md](https://github.com/${{ github.repository }}/blob/v4/companion/apple_music/README.md)
             for the right-click-Open / xattr workaround required on first launch.
 
           ### LMS Plugin
@@ -2066,7 +2066,7 @@ jobs:
           - `SHA256SUMS.asc` - detached GPG signature over `SHA256SUMS` (present once the owner has enrolled the signing key; see below if absent)
           - Docker images (`muness/unified-hifi-control`) are signed keylessly with [cosign](https://docs.sigstore.dev/cosign/overview/) via GitHub Actions OIDC
 
-          See [Verifying Release Artifacts](https://github.com/${{ github.repository }}/blob/v3/docs/gh-release.md#release-signing) for step-by-step verification commands.
+          See [Verifying Release Artifacts](https://github.com/${{ github.repository }}/blob/v4/docs/gh-release.md#release-signing) for step-by-step verification commands.
           EOF
 
       - name: Generate beta LMS repository feed
@@ -2119,7 +2119,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: v3
+          ref: v4
 
       - name: Get release version
         id: version
@@ -2183,7 +2183,7 @@ jobs:
           title: "chore: Update LMS plugin to v${{ steps.version.outputs.version }}"
           body: "Auto-generated PR to update LMS plugin metadata for release v${{ steps.version.outputs.version }}."
           branch: chore/lms-update-${{ steps.version.outputs.version }}
-          base: v3
+          base: v4
           add-paths: |
             lms-plugin/repo.xml
             lms-plugin/install.xml
@@ -2201,7 +2201,7 @@ jobs:
   # that: they would have to re-point their Additional Repositories entry at each new build, and
   # nothing told them the channel existed. The feed was generated and then unreachable.
   #
-  # This commits the same file to a fixed path on `v3`, so the beta channel gets a permanent URL the
+  # This commits the same file to a fixed path on `v4`, so the beta channel gets a permanent URL the
   # way the stable channel already has one via `lms-plugin/repo.xml`.
   #
   # It downloads the asset rather than regenerating the XML, so there is exactly one definition of
@@ -2218,7 +2218,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: v3
+          ref: v4
 
       - name: Fetch the published beta feed
         run: |
@@ -2244,7 +2244,7 @@ jobs:
           title: "chore: Point LMS beta feed at v${{ needs.plan.outputs.version }}"
           body: "Auto-generated. Updates `lms-plugin/repo-beta.xml` so the beta repository URL serves v${{ needs.plan.outputs.version }}."
           branch: chore/lms-beta-feed-${{ needs.plan.outputs.version }}
-          base: v3
+          base: v4
           add-paths: lms-plugin/repo-beta.xml
 
       - name: Enable auto-merge

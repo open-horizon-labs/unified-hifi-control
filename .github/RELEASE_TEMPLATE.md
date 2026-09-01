@@ -33,7 +33,7 @@ Search for "Unified Hi-Fi Control" in Roon Extension Manager and install.
 
 Add this repository URL in LMS Settings → Plugins → Additional Repositories:
 ```
-https://raw.githubusercontent.com/open-horizon-labs/unified-hifi-control/v3/lms-plugin/repo.xml
+https://raw.githubusercontent.com/open-horizon-labs/unified-hifi-control/v4/lms-plugin/repo.xml
 ```
 Then install "Unified Hi-Fi Control" from the plugin list.
 
@@ -86,7 +86,7 @@ cosign verify muness/unified-hifi-control:{{VERSION}} \
 ```
 
 Full details, including which platforms are signed today versus pending
-owner credentials: [docs/gh-release.md#release-signing](https://github.com/open-horizon-labs/unified-hifi-control/blob/v3/docs/gh-release.md#release-signing).
+owner credentials: [docs/gh-release.md#release-signing](https://github.com/open-horizon-labs/unified-hifi-control/blob/v4/docs/gh-release.md#release-signing).
 
 ---
 

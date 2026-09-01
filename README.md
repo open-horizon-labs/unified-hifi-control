@@ -1,6 +1,6 @@
 # Unified Hi-Fi Control
 
-[![Build](https://github.com/open-horizon-labs/unified-hifi-control/actions/workflows/build.yml/badge.svg?branch=v3)](https://github.com/open-horizon-labs/unified-hifi-control/actions/workflows/build.yml)
+[![Build](https://github.com/open-horizon-labs/unified-hifi-control/actions/workflows/build.yml/badge.svg?branch=v4)](https://github.com/open-horizon-labs/unified-hifi-control/actions/workflows/build.yml)
 [![GitHub Release](https://img.shields.io/github/v/release/open-horizon-labs/unified-hifi-control)](https://github.com/open-horizon-labs/unified-hifi-control/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/open-horizon-labs/unified-hifi-control/total)](https://github.com/open-horizon-labs/unified-hifi-control/releases)
 
@@ -14,10 +14,12 @@ Once the bridge is running, control your system from:
 
 - **Web UI** — Built-in at `http://your-bridge:8088`
 - **[roon-knob](https://github.com/muness/roon-knob)** — ESP32-S3 hardware knob with OLED display
-- **iOS & Apple Watch** — In alpha testing. [Get in touch](https://github.com/open-horizon-labs/unified-hifi-control/issues) if you'd like to try it.
+- **iPhone, iPad & Apple Watch** — In alpha testing. [Request TestFlight access](https://github.com/open-horizon-labs/unified-hifi-control/issues/new?title=Request%20Apple%20Music%20Companion%20TestFlight%20access).
 - **Claude & AI agents** — Via the built-in MCP server (see [MCP Server](#mcp-server-claude-integration) below)
 
 ## Installation
+
+See [INSTALL.md](INSTALL.md) for every supported installation and companion path.
 
 ### Docker (Recommended)
 
@@ -45,13 +47,13 @@ Download the QPKG package from [Releases](https://github.com/open-horizon-labs/u
 
 Add this repository URL in LMS Settings → Plugins → Additional Repositories:
 ```text
-https://raw.githubusercontent.com/open-horizon-labs/unified-hifi-control/v3/lms-plugin/repo.xml
+https://raw.githubusercontent.com/open-horizon-labs/unified-hifi-control/v4/lms-plugin/repo.xml
 ```
 Then install "Unified Hi-Fi Control" from the plugin list. The plugin automatically downloads and manages the bridge binary.
 
 **Beta channel.** To test pre-releases instead, use this URL — it always points at the newest beta, so LMS picks up each one without you re-pointing it:
 ```text
-https://raw.githubusercontent.com/open-horizon-labs/unified-hifi-control/v3/lms-plugin/repo-beta.xml
+https://raw.githubusercontent.com/open-horizon-labs/unified-hifi-control/v4/lms-plugin/repo-beta.xml
 ```
 Betas are less soaked than releases. Use one channel or the other, not both at once — LMS would see two entries for the same plugin.
 
@@ -65,12 +67,10 @@ no separate server, no Docker Compose, no terminal. In Home Assistant, go to
 https://github.com/open-horizon-labs/uhc-home-assistant-addon
 ```
 
-Then install **Unified Hi-Fi Control** from the store. This is the Tier 1
-add-on: the UI opens in its own browser tab at `http://<your-ha-host>:8088`,
-not embedded in the HA dashboard (that's a separate, later "ingress" add-on).
-It runs with host networking, same as the Docker install above, for Roon/mDNS
-discovery. Full walkthrough, including where to find the one-time controller
-bootstrap token on first start, is in the
+Then install **Unified Hi-Fi Control** from the store. It runs with host
+networking for Roon/mDNS discovery, opens inside Home Assistant through ingress,
+and also remains available to trusted-LAN controllers at
+`http://<your-ha-host>:8088`. Full setup and security behavior are in the
 [add-on repo's DOCS.md](https://github.com/open-horizon-labs/uhc-home-assistant-addon/blob/main/unified-hifi-control/DOCS.md).
 
 ### Binary Downloads
@@ -179,7 +179,10 @@ mature:
   receiver itself.
 - **Apple Music** — pairs with the native iOS/macOS companion
   (`companion/apple_music_ios`, `companion/apple_music`) to control a
-  `SystemMusicPlayer` session from UHC.
+  `SystemMusicPlayer` session from UHC. [Request TestFlight access](https://github.com/open-horizon-labs/unified-hifi-control/issues/new?title=Request%20Apple%20Music%20Companion%20TestFlight%20access)
+  for iPhone/iPad, or download the Apple Silicon companion DMG named
+  `unified-hifi-applemusic-companion-macos-arm64-*.dmg` from
+  [Releases](https://github.com/open-horizon-labs/unified-hifi-control/releases/latest).
 - **Music Assistant** — an optional peer adapter for an existing Music
   Assistant server, using its authenticated JSON API and a long-lived
   access token.
@@ -310,6 +313,7 @@ The bridge automatically downloads new [roon-knob](https://github.com/muness/roo
 | **v1** | Node.js | Proof of concept — validated the idea of a unified control surface |
 | **v2** | Node.js | Production release — in-memory event bus, multi-backend support |
 | **v3** | Rust | Complete rewrite — native packages (Synology, QNAP, LMS plugin), 10x smaller memory footprint, single static binary |
+| **v4** | Rust | Streaming services, native companions, Home Assistant/Music Assistant, and optional authenticated HiPhi remote access |
 
 The v3 rewrite was motivated by packaging requests (NAS users wanted native packages, not Docker) and the opportunity to dramatically reduce resource usage. The Rust binary uses ~15MB RAM vs ~150MB for Node.js.
 

@@ -5,7 +5,7 @@ on:
   pull_request:
     branches:
       - v3
-      - integration/streaming-ha-alpha
+      - v4
     paths:
       - Package.swift
       - companion/uhckit/**
