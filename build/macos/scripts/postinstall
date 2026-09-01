@@ -7,9 +7,13 @@ set -e
 # Create data directory
 mkdir -p /usr/local/var/unified-hifi-control
 mkdir -p /usr/local/var/log
+mkdir -p /usr/local/var/log/unified-hifi-control
 
 # Set permissions
 chmod 755 /usr/local/bin/unified-hifi-control
+chown -R _www:_www /usr/local/var/unified-hifi-control
+chown -R _www:_www /usr/local/var/log/unified-hifi-control
+chmod 700 /usr/local/var/log/unified-hifi-control
 
 # Load the LaunchDaemon
 launchctl load /Library/LaunchDaemons/com.cloudatlas.unified-hifi-control.plist 2>/dev/null || true

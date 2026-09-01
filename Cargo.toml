@@ -20,6 +20,7 @@ server = [
     "dep:reqwest",
     "dep:tokio-tungstenite",
     "dep:tracing-subscriber",
+    "dep:tracing-appender",
     "dep:config",
     "dep:image",
     "dep:resvg",
@@ -111,6 +112,7 @@ tokio-tungstenite = { version = "0.21", default-features = false, features = ["c
 
 # Logging subscriber (server only - needs tokio)
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+tracing-appender = { version = "0.2.5", optional = true }
 
 # Config (server only)
 config = { version = "0.15", optional = true }

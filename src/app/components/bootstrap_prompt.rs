@@ -35,8 +35,8 @@ pub fn BootstrapPrompt() -> Element {
                     div { class: "card bg-elevated p-3 mb-4 text-sm",
                         p { class: "font-medium mb-1", "Where to find the token:" }
                         ul { class: "list-disc list-inside space-y-1 text-secondary",
-                            li { "QNAP: open " code { "$QPKG_ROOT/unified-hifi-control.log" } " (QTS App Center → UHC → the log file icon)." }
-                            li { "Synology, Docker, or a plain binary install: check the server log or console output where UHC started." }
+                            li { "Native package: open today's " code { "uhc-server.YYYY-MM-DD.log" } " in the package log directory." }
+                            li { "Docker, systemd, or a plain binary install: check the managed server log or console output where UHC started." }
                             li { "Look for a line starting with " code { "UHC controller bootstrap token" } "." }
                             li { "If your operator set " code { "UHC_BOOTSTRAP_TOKEN" } " in the environment, use that value instead." }
                         }

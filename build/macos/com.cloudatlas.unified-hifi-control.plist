@@ -23,10 +23,10 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/usr/local/var/log/unified-hifi-control.log</string>
+    <string>/usr/local/var/log/unified-hifi-control-launcher.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/usr/local/var/log/unified-hifi-control.log</string>
+    <string>/usr/local/var/log/unified-hifi-control-launcher.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
@@ -34,6 +34,8 @@
         <string>8088</string>
         <key>CONFIG_DIR</key>
         <string>/usr/local/var/unified-hifi-control</string>
+        <key>UHC_LOG_DIR</key>
+        <string>/usr/local/var/log/unified-hifi-control</string>
     </dict>
 
     <key>WorkingDirectory</key>

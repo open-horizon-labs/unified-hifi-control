@@ -175,11 +175,11 @@ or click **Get an HTTPS address**, UHC does not just fail with a raw
 prompt instead. It explains, in beginner language, that this is a one-time
 step and tells you where to find the token:
 
-- **QNAP**: `$QPKG_ROOT/unified-hifi-control.log` (the log file icon in QTS
-  App Center → UHC).
-- **Synology, Docker, or a plain binary install**: the server log or console
-  output where UHC started — look for the line beginning
-  `UHC controller bootstrap token`.
+- **Native packages**: open the current `uhc-server.YYYY-MM-DD.log` in the
+  package's log directory.
+- **Docker, systemd, or a plain binary install**: check the managed server log
+  or console output where UHC started.
+- In either case, look for the line beginning `UHC controller bootstrap token`.
 - If your operator set `UHC_BOOTSTRAP_TOKEN` in the environment, use that
   value instead; UHC never echoes an operator-supplied token to the log.
 
