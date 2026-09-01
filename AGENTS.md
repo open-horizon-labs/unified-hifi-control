@@ -14,7 +14,7 @@ Use GitHub for all task tracking:
 ### Branches
 **Purpose:** Isolate work in progress
 - Create a branch for each issue: `fix/issue-123-description` or `feat/issue-123-description`
-- Base Rust work on `v3`, not `master`
+- Base new Rust work on `v4`, not `master` or the maintained `v3` line
 - Keep branches focused on a single issue
 
 ### Pull Requests
@@ -66,9 +66,10 @@ Use GitHub for all task tracking:
 ## Branch Strategy
 
 - `master` = Node.js v2.x (legacy, stable)
-- `v3` = Rust v3.x (active development)
+- `v3` = Rust v3.x (maintenance)
+- `v4` = Rust streaming, companion, Home Assistant, and optional HiPhi line (active development)
 
-**Default branch for Rust development: `v3`**
+**Default branch for Rust development: `v4`**
 
 ## Test-Driven Development (TDD)
 

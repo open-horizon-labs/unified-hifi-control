@@ -137,7 +137,7 @@ cargo install dioxus-cli@0.7.10 --locked
 ```bash
 git clone https://github.com/open-horizon-labs/unified-hifi-control.git
 cd unified-hifi-control
-git checkout v3
+git checkout v4
 
 # Build matching CSS, server, and WASM hydration bundle, then run it.
 UHC_PORT=8088 make web-run

@@ -228,10 +228,10 @@ without weakening the check for genuine leaks.
 CI: `.github/workflows/ha-integration.yml` runs the test suite plus
 `hacs/action` (HACS repository validation) and
 `home-assistant/actions/hassfest` (manifest/schema validation) on pushes
-and PRs to `v3` that touch the integration. Per this repo's stacked-PR
+and PRs to `v4` that touch the integration. Per this repo's stacked-PR
 convention, feature-branch-based PRs (including the one that introduced
 this integration) do not run CI — the workflow was verified locally and
-becomes active once this lands on `v3`.
+becomes active once this lands on `v4`.
 
 ## Known follow-ups
 

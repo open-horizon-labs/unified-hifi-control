@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-const ALPHA: &str = "integration/streaming-ha-alpha";
+const DEVELOPMENT_BRANCH: &str = "v4";
 
 fn workflow(name: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -11,7 +11,7 @@ fn workflow(name: &str) -> String {
 }
 
 #[test]
-fn alpha_pull_requests_run_rust_and_api_contract_checks() {
+fn development_pull_requests_run_rust_and_api_contract_checks() {
     for name in ["build.yml", "api-guard.yml"] {
         let source = workflow(name);
         let pull_request = source
@@ -20,27 +20,35 @@ fn alpha_pull_requests_run_rust_and_api_contract_checks() {
             .unwrap_or_else(|| panic!("{name} has no pull_request trigger"));
         let trigger = pull_request.split("jobs:").next().unwrap_or(pull_request);
         assert!(
-            trigger.contains(ALPHA),
-            "{name} must run for pull requests targeting {ALPHA}"
+            trigger.contains(DEVELOPMENT_BRANCH),
+            "{name} must run for pull requests targeting {DEVELOPMENT_BRANCH}"
         );
     }
 }
 
 #[test]
-fn alpha_home_assistant_changes_run_the_ha_workflow() {
+fn development_home_assistant_changes_run_the_ha_workflow() {
     let source = workflow("ha-integration.yml");
+    let development_branch_triggers = source
+        .lines()
+        .filter(|line| {
+            line.trim_start().starts_with("branches:") && line.contains(DEVELOPMENT_BRANCH)
+        })
+        .count();
     assert_eq!(
-        source.matches(ALPHA).count(),
-        2,
-        "HA integration must cover alpha push and pull-request triggers"
+        development_branch_triggers, 2,
+        "HA integration must cover v4 push and pull-request triggers"
     );
 }
 
 #[test]
-fn alpha_does_not_enable_edge_image_publication() {
+fn development_does_not_enable_edge_image_publication() {
     let source = workflow("docker.yml");
+    let development_branch_triggers = source.lines().any(|line| {
+        line.trim_start().starts_with("branches:") && line.contains(DEVELOPMENT_BRANCH)
+    });
     assert!(
-        !source.contains(ALPHA),
-        "alpha work must not enter the Docker edge publication workflow"
+        !development_branch_triggers,
+        "v4 work must not enter the Docker edge publication workflow"
     );
 }

@@ -2,7 +2,7 @@ name: HiPhi Cloud connector
 
 on:
   pull_request:
-    branches: [integration/streaming-ha-alpha]
+    branches: [v4]
     paths:
       - '.github/workflows/hiphi-cloud-connector.yml'
       - 'Cargo.toml'
