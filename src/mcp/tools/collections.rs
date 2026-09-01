@@ -591,7 +591,35 @@ async fn handle_roon(
         .await
     {
         Ok(value) => value,
-        Err(error) => return env.failed(format!("Collection error: {error}")),
+        Err(error)
+            if resume
+                .as_ref()
+                .is_some_and(|target| !target.trail.is_empty())
+                && (error
+                    .to_string()
+                    .contains("no longer valid in this browse session")
+                    || error.to_string().contains("InvalidItemKey")) =>
+        {
+            // Roon item keys are scoped to a Core-side browse session. If the
+            // Core reconnects, re-walk the saved breadcrumb trail and retry
+            // the same node rather than making the user start at the root.
+            let target = resume.as_ref().expect("resume checked above");
+            let (session_key, item_key) = match state.roon.resolve_trail(&args.zone_id, &target.trail).await {
+                Ok(pair) => pair,
+                Err(_) => return env.failed("Collection error: Roon refreshed; this browse page expired. Refresh to continue."),
+            };
+            params["item_key"] = json!(item_key);
+            params["session_key"] = json!(session_key);
+            match state
+                .adapter_registry
+                .library_content("roon", operation, &params)
+                .await
+            {
+                Ok(value) => value,
+                Err(_) => return env.failed("Collection error: Roon refreshed; this browse page expired. Refresh to continue."),
+            }
+        }
+        Err(_) => return env.failed("Collection error: Roon is unavailable right now. Try again."),
     };
 
     let Some(session_key) = response.get("session_key").and_then(Value::as_str) else {
