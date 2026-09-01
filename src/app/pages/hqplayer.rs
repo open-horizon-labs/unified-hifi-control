@@ -520,7 +520,9 @@ pub fn HqPlayer() -> Element {
         .map(|link| format!("{}={}", link.zone_id, link.instance))
         .collect::<Vec<_>>();
     zone_match_key_parts.sort();
-    let zone_match_key = zone_match_key_parts.join("|");
+    // The server-side RSX expansion drops DOM keys, so prefix this value with `_` to
+    // keep server builds warning-free while the web build still uses it for remounting.
+    let _zone_match_key = zone_match_key_parts.join("|");
     let instances_list = instances
         .read()
         .clone()
@@ -718,7 +720,7 @@ pub fn HqPlayer() -> Element {
                             "Tell Unified Hi-Fi Control which playback-zone name and HQPlayer instance describe the same existing signal path."
                         }
                     }
-                    div { key: "{zone_match_key}", class: "card overflow-hidden",
+                    div { key: "{_zone_match_key}", class: "card overflow-hidden",
                         ZoneLinkTable {
                             zones: zones_list,
                             links: links_list,
