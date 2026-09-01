@@ -438,6 +438,7 @@ mod command {
         ok: bool,
     }
 
+    #[cfg(unix)]
     fn write_owner_only(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
         let mut file = fs::OpenOptions::new()
@@ -451,6 +452,12 @@ mod command {
         Ok(())
     }
 
+    #[cfg(not(unix))]
+    fn write_owner_only(_path: &Path, _bytes: &[u8]) -> anyhow::Result<()> {
+        anyhow::bail!("HiPhi enrollment requires verified owner-only file permissions")
+    }
+
+    #[cfg(unix)]
     fn persist_connector_environment(
         path: &Path,
         relay_endpoint: &str,
@@ -486,6 +493,17 @@ mod command {
             let _ = fs::remove_file(&temporary);
         }
         write_result
+    }
+
+    #[cfg(not(unix))]
+    fn persist_connector_environment(
+        _path: &Path,
+        _relay_endpoint: &str,
+        _installation_id: &str,
+        _session_keys: &str,
+        _command_keys: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("HiPhi enrollment requires verified owner-only file permissions")
     }
 
     #[cfg(test)]

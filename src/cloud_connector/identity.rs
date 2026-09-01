@@ -38,36 +38,49 @@ impl InstallationIdentity {
             return Err(IdentityError::InvalidInstallationId);
         }
         let path = path.as_ref();
-        let metadata = fs::symlink_metadata(path)?;
-        if !metadata.file_type().is_file() {
+        #[cfg(not(unix))]
+        {
+            let _ = path;
             return Err(IdentityError::InsecurePermissions);
         }
         #[cfg(unix)]
         {
+            let metadata = fs::symlink_metadata(path)?;
+            if !metadata.file_type().is_file() {
+                return Err(IdentityError::InsecurePermissions);
+            }
             use std::os::unix::fs::PermissionsExt as _;
             if metadata.permissions().mode() & 0o077 != 0 {
                 return Err(IdentityError::InsecurePermissions);
             }
+            let bytes = fs::read(path)?;
+            let raw: [u8; 32] = bytes.try_into().map_err(|_| IdentityError::InvalidKey)?;
+            Ok(Self {
+                installation_id,
+                signing_key: SigningKey::from_bytes(&raw),
+            })
         }
-        let bytes = fs::read(path)?;
-        let raw: [u8; 32] = bytes.try_into().map_err(|_| IdentityError::InvalidKey)?;
-        Ok(Self {
-            installation_id,
-            signing_key: SigningKey::from_bytes(&raw),
-        })
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), IdentityError> {
-        use std::os::unix::fs::OpenOptionsExt;
         let path = path.as_ref();
-        let mut options = fs::OpenOptions::new();
-        options.create(true).truncate(true).write(true).mode(0o600);
-        let mut file = options.open(path)?;
-        use std::io::Write;
-        file.write_all(&self.signing_key.to_bytes())?;
-        file.sync_all()?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        Ok(())
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            return Err(IdentityError::InsecurePermissions);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+            let mut options = fs::OpenOptions::new();
+            options.create(true).truncate(true).write(true).mode(0o600);
+            let mut file = options.open(path)?;
+            use std::io::Write;
+            file.write_all(&self.signing_key.to_bytes())?;
+            file.sync_all()?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            Ok(())
+        }
     }
 
     pub fn installation_id(&self) -> &str {
@@ -129,5 +142,3 @@ impl ZoneHandleMap {
 }
 
 use base64::Engine as _;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
