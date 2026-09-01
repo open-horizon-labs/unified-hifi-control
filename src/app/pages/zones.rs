@@ -5,7 +5,6 @@
 use crate::app::api::{HqpMatrixProfilesResponse, HqpProfile, NowPlaying, Zone, ZonesResponse};
 use crate::app::components::{ErrorAlert, HqpControlsCompact, Layout, VolumeControlsCompact};
 use crate::app::sse::{use_sse, SseEvent};
-use crate::app::Route;
 use dioxus::prelude::*;
 use std::collections::HashMap;
 
@@ -84,8 +83,7 @@ pub fn Zones() -> Element {
         if matches!(
             event.as_ref(),
             Some(
-                SseEvent::ZoneDiscovered { .. }
-                    | SseEvent::ZoneUpdated { .. }
+                SseEvent::ZoneUpdated { .. }
                     | SseEvent::ZoneRemoved { .. }
                     | SseEvent::RoonConnected
                     | SseEvent::RoonDisconnected
@@ -378,10 +376,6 @@ fn ZoneCard(
         base_image_url
     };
     let has_image = !image_url.is_empty();
-    // #581: the API returns origin-absolute art paths, so behind an ingress
-    // prefix they must be mapped before becoming an `<img src>` or they
-    // escape the proxy and 404 against Home Assistant itself.
-    let image_url = crate::app::base_path::href(&image_url);
 
     // Now playing display
     let (track, artist) = np
@@ -495,28 +489,6 @@ fn ZoneCard(
                     volume_step: volume_step,
                     on_vol_down: move |_| on_control.call((zone_id_vol_down.clone(), "vol_down".to_string())),
                     on_vol_up: move |_| on_control.call((zone_id_vol_up.clone(), "vol_up".to_string())),
-                }
-            }
-
-            // Library browse moved off the zone card and onto the Library
-            // home page (#550) -- one browse surface instead of one per
-            // zone. This is just a deep link that arms this zone as the
-            // Library page's play target and opens its source. Gated on the
-            // server-reported `browse_supported` -- whether `/api/collections`
-            // actually implements this zone's provider -- so LMS and Roon
-            // zones light up as their slices land without a web change.
-            if zone.browse_supported {
-                div { class: "mt-3 border-t border-subtle pt-3",
-                    Link {
-                        class: "btn btn-ghost text-sm",
-                        to: Route::Library {
-                            source: zone.source.clone(),
-                            tab: None,
-                            path: None,
-                            zone: Some(zone.zone_id.clone()),
-                        },
-                        "Browse →"
-                    }
                 }
             }
         }

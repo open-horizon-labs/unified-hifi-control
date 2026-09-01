@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 /// List all available playback zones
 #[mcp_tool(
     name = "hifi_zones",
-    description = "List all available playback zones (Roon, LMS, OpenHome, UPnP, HQPlayer, Apple Music, Spotify, Music Assistant)",
+    description = "List all available playback zones (Roon, LMS, OpenHome, UPnP, HQPlayer)",
     read_only_hint = true
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]

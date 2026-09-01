@@ -64,7 +64,7 @@ else
         expected_version=${version_case#*:}
         output_spk="${test_tmp}/${input_version}.spk"
 
-        if ! "${SYNOLOGY_DIR}/build-spk.sh" "$input_version" x86_64 "$test_binary" "$test_binary" "$output_spk"; then
+        if ! "${SYNOLOGY_DIR}/build-spk.sh" "$input_version" x86_64 "$test_binary" "$output_spk"; then
             fail "build-spk.sh failed for version ${input_version}"
             continue
         fi
@@ -86,17 +86,15 @@ else
 
         tar -xOf "$output_spk" package.tgz | tar -tzf - | grep -q '^./port_conf/unified-hifi-control.sc$' \
             || fail "SPK must contain its DSM firewall protocol file"
-        tar -xOf "$output_spk" package.tgz | tar -tzf - | grep -q '^./uhc-hiphi-pair$' \
-            || fail "SPK must contain the HiPhi pairing helper"
     done
 
     arm_spk="${test_tmp}/armv8.spk"
-    "${SYNOLOGY_DIR}/build-spk.sh" 3.4.1 armv8 "$test_binary" "$test_binary" "$arm_spk" \
+    "${SYNOLOGY_DIR}/build-spk.sh" 3.4.1 armv8 "$test_binary" "$arm_spk" \
         || fail "build-spk.sh failed for armv8"
     arm_arch=$(tar -xOf "$arm_spk" INFO | sed -n 's/^arch="\([^"]*\)"$/\1/p')
     [[ "$arm_arch" == 'armv8' ]] || fail "ARM SPK arch is ${arm_arch}, expected armv8"
 
-    if "${SYNOLOGY_DIR}/build-spk.sh" 3.5.0-alpha.1 x86_64 "$test_binary" "$test_binary" "${test_tmp}/invalid.spk" 2>/dev/null; then
+    if "${SYNOLOGY_DIR}/build-spk.sh" 3.5.0-alpha.1 x86_64 "$test_binary" "${test_tmp}/invalid.spk" 2>/dev/null; then
         fail "build-spk.sh must reject prerelease formats without an explicit DSM ordering rule"
     fi
 fi

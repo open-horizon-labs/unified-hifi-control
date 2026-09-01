@@ -5,8 +5,7 @@
 
 use anyhow::Result;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::Instant;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -487,10 +486,7 @@ mod tests {
         }
     }
 
-    // Paused tokio time: sleeps auto-advance the virtual clock, so the gap
-    // assertions are exact instead of racing the CI scheduler (this test
-    // flaked at 112ms against a ~10ms expectation on a loaded runner).
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn test_backoff_reset_after_stable_run() {
         // Test that backoff resets after a stable run
         //

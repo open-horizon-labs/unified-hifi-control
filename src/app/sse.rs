@@ -19,11 +19,6 @@ pub struct ZonePayload {
     pub zone_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-pub struct ZoneDiscoveredPayload {
-    pub zone: crate::app::api::Zone,
-}
-
 /// Payload for LMS player events
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct LmsPlayerPayload {
@@ -38,18 +33,6 @@ pub struct VolumePayload {
     pub is_muted: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-pub struct ProviderAccountPayload {
-    pub provider: String,
-    pub account: Option<serde_json::Value>,
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-pub struct AdapterErrorPayload {
-    pub adapter: String,
-    pub error: String,
-}
-
 /// SSE event types from the server
 /// Server sends: {"type":"EventName","payload":{...}}
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -58,9 +41,6 @@ pub enum SseEvent {
     // Roon events
     RoonConnected,
     RoonDisconnected,
-    ZoneDiscovered {
-        payload: ZoneDiscoveredPayload,
-    },
     ZoneUpdated {
         payload: ZonePayload,
     },
@@ -72,12 +52,6 @@ pub enum SseEvent {
     },
     VolumeChanged {
         payload: VolumePayload,
-    },
-    ProviderAccountUpdated {
-        payload: ProviderAccountPayload,
-    },
-    AdapterError {
-        payload: AdapterErrorPayload,
     },
     SeekPositionChanged {
         payload: ZonePayload,
@@ -113,7 +87,6 @@ impl SseEvent {
     /// Extract zone_id from zone-related events
     pub fn zone_id(&self) -> Option<&str> {
         match self {
-            SseEvent::ZoneDiscovered { payload } => Some(&payload.zone.zone_id),
             SseEvent::ZoneUpdated { payload } => Some(&payload.zone_id),
             SseEvent::ZoneRemoved { payload } => Some(&payload.zone_id),
             SseEvent::NowPlayingChanged { payload } => Some(&payload.zone_id),
@@ -140,8 +113,7 @@ impl SseContext {
         matches!(
             self.last_event.read().as_ref(),
             Some(
-                SseEvent::ZoneDiscovered { .. }
-                    | SseEvent::ZoneUpdated { .. }
+                SseEvent::ZoneUpdated { .. }
                     | SseEvent::ZoneRemoved { .. }
                     | SseEvent::NowPlayingChanged { .. }
                     | SseEvent::SeekPositionChanged { .. }
@@ -150,8 +122,6 @@ impl SseContext {
                     | SseEvent::RoonDisconnected
                     | SseEvent::LmsConnected
                     | SseEvent::LmsDisconnected
-                    | SseEvent::ProviderAccountUpdated { .. }
-                    | SseEvent::AdapterError { .. }
             )
         )
     }
@@ -181,7 +151,6 @@ impl SseContext {
             Some(SseEvent::LmsConnected | SseEvent::LmsDisconnected) => true,
             // ZoneUpdated with lms: prefix indicates LMS player state change
             Some(SseEvent::ZoneUpdated { payload }) => payload.zone_id.starts_with("lms:"),
-            Some(SseEvent::ZoneDiscovered { payload }) => payload.zone.zone_id.starts_with("lms:"),
             _ => false,
         }
     }
@@ -192,13 +161,10 @@ impl SseContext {
             Some(
                 SseEvent::RoonConnected
                     | SseEvent::RoonDisconnected
-                    | SseEvent::ZoneDiscovered { .. }
                     | SseEvent::OpenHomeDeviceFound
                     | SseEvent::OpenHomeDeviceLost
                     | SseEvent::UpnpRendererFound
                     | SseEvent::UpnpRendererLost
-                    | SseEvent::ProviderAccountUpdated { .. }
-                    | SseEvent::AdapterError { .. }
             )
         )
     }
@@ -208,7 +174,6 @@ impl SseContext {
             self.last_event.read().as_ref(),
             Some(
                 SseEvent::ZoneUpdated { .. }
-                    | SseEvent::ZoneDiscovered { .. }
                     | SseEvent::ZoneRemoved { .. }
                     | SseEvent::RoonConnected
                     | SseEvent::RoonDisconnected
@@ -268,10 +233,8 @@ pub fn use_sse_provider() {
                 return;
             }
 
-            // Create EventSource connection to /events (base-path aware for
-            // ingress/subpath deployments, #581 -- identity in direct mode)
-            let events_url = crate::app::base_path::href("/events");
-            let es = match EventSource::new(&events_url) {
+            // Create EventSource connection to /events
+            let es = match EventSource::new("/events") {
                 Ok(es) => es,
                 Err(e) => {
                     web_sys::console::error_1(

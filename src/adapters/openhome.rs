@@ -1099,27 +1099,11 @@ impl OpenHomeAdapter {
 
     /// Fetch album art image
     pub async fn get_image(&self, image_url: &str) -> anyhow::Result<ImageData> {
-        self.get_image_with_limit(image_url, None).await
-    }
-
-    pub async fn get_image_bounded(
-        &self,
-        image_url: &str,
-        max_bytes: usize,
-    ) -> anyhow::Result<ImageData> {
-        self.get_image_with_limit(image_url, Some(max_bytes)).await
-    }
-
-    async fn get_image_with_limit(
-        &self,
-        image_url: &str,
-        max_bytes: Option<usize>,
-    ) -> anyhow::Result<ImageData> {
         if !image_url.starts_with("http://") && !image_url.starts_with("https://") {
             anyhow::bail!("Invalid image URL");
         }
 
-        let mut response = self.http.get(image_url).send().await?;
+        let response = self.http.get(image_url).send().await?;
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -1127,24 +1111,11 @@ impl OpenHomeAdapter {
             .unwrap_or("image/jpeg")
             .to_string();
 
-        if max_bytes.is_some_and(|limit| {
-            response
-                .content_length()
-                .is_some_and(|length| length > limit as u64)
-        }) {
-            anyhow::bail!("image exceeds the source byte limit");
-        }
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            if max_bytes.is_some_and(|limit| body.len().saturating_add(chunk.len()) > limit) {
-                anyhow::bail!("image exceeds the source byte limit");
-            }
-            body.extend_from_slice(&chunk);
-        }
+        let body = response.bytes().await?;
 
         Ok(ImageData {
             content_type,
-            data: body,
+            data: body.to_vec(),
         })
     }
 }
@@ -1188,8 +1159,6 @@ fn openhome_device_to_zone(device: &OpenHomeDevice) -> Zone {
             seek_position: None,
             duration: None,
             metadata: None,
-            repeat_mode: None,
-            shuffle: None,
         }),
         source: "openhome".to_string(),
         is_controllable: true,
@@ -1304,15 +1273,6 @@ impl AdapterLogic for OpenHomeAdapter {
                 return Ok(AdapterCommandResponse {
                     success: false,
                     error: Some("Mute not supported by OpenHome adapter".to_string()),
-                });
-            }
-            AdapterCommand::SetRepeat(_) | AdapterCommand::SetShuffle(_) => {
-                return Ok(AdapterCommandResponse {
-                    success: false,
-                    error: Some(
-                        "Repeat and shuffle are not implemented by the OpenHome adapter"
-                            .to_string(),
-                    ),
                 });
             }
         };

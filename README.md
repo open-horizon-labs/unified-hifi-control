@@ -55,49 +55,9 @@ https://raw.githubusercontent.com/open-horizon-labs/unified-hifi-control/v3/lms-
 ```
 Betas are less soaked than releases. Use one channel or the other, not both at once — LMS would see two entries for the same plugin.
 
-### Home Assistant Add-on
-
-Runs the bridge as a Supervisor-managed container on your Home Assistant box —
-no separate server, no Docker Compose, no terminal. In Home Assistant, go to
-**Settings → Add-ons → Add-on Store → ⋮ → Repositories** and add:
-
-```text
-https://github.com/open-horizon-labs/uhc-home-assistant-addon
-```
-
-Then install **Unified Hi-Fi Control** from the store. This is the Tier 1
-add-on: the UI opens in its own browser tab at `http://<your-ha-host>:8088`,
-not embedded in the HA dashboard (that's a separate, later "ingress" add-on).
-It runs with host networking, same as the Docker install above, for Roon/mDNS
-discovery. Full walkthrough, including where to find the one-time controller
-bootstrap token on first start, is in the
-[add-on repo's DOCS.md](https://github.com/open-horizon-labs/uhc-home-assistant-addon/blob/main/unified-hifi-control/DOCS.md).
-
 ### Binary Downloads
 
 Pre-built binaries available for Linux (x64, arm64, armv7), macOS (x64, arm64), and Windows from [Releases](https://github.com/open-horizon-labs/unified-hifi-control/releases).
-
-### Verifying Release Artifacts
-
-Every release ships a `SHA256SUMS` file covering all attached binaries and
-packages, plus keyless [cosign](https://docs.sigstore.dev/cosign/overview/)
-signatures on the Docker images (no key import needed - verified against
-GitHub's OIDC issuer). Once the project's GPG signing key is enrolled (see
-`docs/release-signing/gpg-public-key.asc`), releases also carry a detached
-`SHA256SUMS.asc` signature.
-
-```bash
-# Checksum a downloaded file
-sha256sum -c SHA256SUMS --ignore-missing
-
-# Verify Docker images
-cosign verify muness/unified-hifi-control:<version> \
-  --certificate-identity-regexp 'https://github.com/open-horizon-labs/unified-hifi-control/.*' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
-```
-
-Full verification steps (including GPG) and current per-platform signing
-status: [docs/gh-release.md#release-signing](docs/gh-release.md#release-signing).
 
 ## Quick Start (Docker)
 
@@ -167,54 +127,6 @@ If you route audio through HQPlayer for upsampling or filtering, this bridge let
 3. Link zones to HQPlayer instances — each zone can use a different HQPlayer
 4. Zone now-playing info will include HQPlayer pipeline status
 
-## Streaming Providers (Alpha)
-
-Beyond the always-on Roon/LMS/UPnP/OpenHome/HQPlayer adapters, three
-direct/peer streaming providers are available as opt-in, **Alpha**
-adapters. Enable each from **Settings**; expect rough edges while these
-mature:
-
-- **Spotify** — controls existing Spotify Connect devices via the
-  standard OAuth authorization-code flow. UHC does not act as a Connect
-  receiver itself.
-- **Apple Music** — pairs with the native iOS/macOS companion
-  (`companion/apple_music_ios`, `companion/apple_music`) to control a
-  `SystemMusicPlayer` session from UHC.
-- **Music Assistant** — an optional peer adapter for an existing Music
-  Assistant server, using its authenticated JSON API and a long-lived
-  access token.
-
-See [docs/streaming-adapters.md](docs/streaming-adapters.md) for the
-full provider-boundary and authorization details.
-
-## Home Assistant Integration (Alpha)
-
-Two independent, **Alpha** ways to reach Home Assistant, both opt-in from
-**Settings**:
-
-- **MQTT discovery publisher** — publishes every UHC zone (and any
-  paired knob) to HA over MQTT discovery: state `sensor`, `image`,
-  volume `number`, mute `switch`, and transport `button`s per zone, with
-  inbound HA commands routed back through UHC's adapters.
-- **[HACS custom integration](docs/home_assistant_integration.md)**
-  (`custom_components/unified_hifi_control`) — a native `media_player`
-  entity per zone with HA voice control and dashboard cards, installed
-  via [HACS](https://hacs.xyz/) by adding this repository as a custom
-  repository.
-
-Both are new; see
-[docs/home_assistant_integration.md](docs/home_assistant_integration.md)
-for setup and current limitations.
-
-There's also a Supervisor-managed **Home Assistant add-on** (Tier 1: its own
-tab, no ingress yet) for OS/Supervised/Home Assistant Green installs — no
-manual container setup required:
-
-[![Add add-on repository to my Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fopen-horizon-labs%2Fuhc-home-assistant-addon)
-
-See the [uhc-home-assistant-addon](https://github.com/open-horizon-labs/uhc-home-assistant-addon)
-repository for install details.
-
 ## Architecture
 
 ```
@@ -258,33 +170,20 @@ Control your hi-fi with natural language. The bridge includes an MCP server so C
 
 | Tool | Description |
 |------|-------------|
-| `hifi_zones` | List available zones (including Spotify Connect devices) |
+| `hifi_zones` | List available zones (Roon, LMS, OpenHome, UPnP) |
 | `hifi_now_playing` | Get current track, artist, album, play state |
 | `hifi_control` | Play, pause, next, previous, volume control |
-| `hifi_search` | Search provider catalogs *(Roon, LMS, Spotify)* |
-| `hifi_play` | Search and play/queue in one command *(Roon, LMS, Spotify)* |
-| `hifi_play_ref` | Play or queue an exact search result |
-| `hifi_queue` | Read the current provider queue |
-| `hifi_spotify` | Access Spotify playlists/liked tracks and create/edit playlists |
+| `hifi_search` | Search library, TIDAL, or Qobuz *(Roon, LMS)* |
+| `hifi_play` | Search and play/queue in one command *(Roon, LMS)* |
 | `hifi_status` | Overall bridge status |
 | `hifi_hqplayer_status` | HQPlayer Embedded status and pipeline |
 | `hifi_hqplayer_profiles` | List saved HQPlayer profiles |
 | `hifi_hqplayer_load_profile` | Switch HQPlayer profile |
 | `hifi_hqplayer_set_pipeline` | Change filter, shaper, dither settings |
 
-*Spotify is a controller for existing Spotify Connect devices, not a receiver. Spotify search, exact play/queue-add, queue read, playlists, liked tracks, repeat, and shuffle require the corresponding OAuth scopes. New Development Mode applications cannot use the removed categories, featured-playlists, or new-releases browse endpoints; UHC defaults to that mode. Existing Extended Quota applications can explicitly retain those legacy browse calls with `UHC_SPOTIFY_QUOTA_MODE=extended`. Spotify exposes no active-queue jump/reorder/remove/clear/transfer operations, and Transfer Playback selects one device rather than synchronizing a multiroom group. Transport controls work with all enabled adapters.*
+*Search and play work with Roon and LMS. Transport controls work with all adapters.*
 
 The MCP endpoint is unauthenticated like the rest of the bridge — see [Security and Network Exposure](#security-and-network-exposure).
-
-### WebMCP (alpha)
-
-UHC's web UI also exposes these same tools in-page via
-[WebMCP](https://blog.cloudflare.com/webmcp/) (`document.modelContext`), an
-emerging browser standard shipping *experimentally* in Chrome 146 at the time
-of writing. A WebMCP-capable browser agent visiting the web UI can discover
-and call the playback/content tools above with no MCP client configuration.
-Owner/admin operations are excluded by an explicit tool allowlist — see
-[docs/webmcp.md](docs/webmcp.md) for the bridge design and tool policy.
 
 ### Example Usage
 
@@ -332,7 +231,11 @@ cp scripts/pre-commit .git/hooks/
 ### Build & Run
 
 ```bash
-UHC_PORT=8088 make web-run   # Build matching server + WASM, then run
+make css                                              # Build Tailwind CSS
+dx build --release --platform web --features web      # Build server + WASM
+
+cd target/dx/unified-hifi-control/release/web
+PORT=8088 ./server                                    # Run at http://localhost:8088
 ```
 
 For hot reload during development:
@@ -347,8 +250,7 @@ cargo test --workspace
 cargo fmt --check && cargo clippy -- -D warnings
 ```
 
-**Note:** Never use `cargo run` for the web UI. `make web-run` is the only
-local runner: it always builds the server and its matching WASM bundle together.
+**Note:** Use `dx build`, not `cargo build` — the web UI requires the WASM bundle that only `dx` produces.
 
 </details>
 
@@ -356,6 +258,6 @@ local runner: it always builds the server and its matching WASM bundle together.
 
 As of v2.5.0, this project is licensed under the [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/) license.
 
-Versions up to and including v2.4.1-prior-license were released under a custom source-available license (see [docs/LICENSE-PRIOR.md](docs/LICENSE-PRIOR.md)).
+Versions up to and including v2.4.1-prior-license were released under a custom source-available license (see LICENSE-PRIOR).
 
 For commercial licensing inquiries, see [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).

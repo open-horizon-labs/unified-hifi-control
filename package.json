@@ -6,8 +6,7 @@
     "unified-hifi-control-mcp": "mcp/index.js"
   },
   "scripts": {
-    "mcp": "node mcp/index.js",
-    "test:webmcp": "node --test tests/webmcp_bridge.test.js"
+    "mcp": "node mcp/index.js"
   },
   "repository": {
     "type": "git",

@@ -139,15 +139,19 @@ git clone https://github.com/open-horizon-labs/unified-hifi-control.git
 cd unified-hifi-control
 git checkout v3
 
-# Build matching CSS, server, and WASM hydration bundle, then run it.
-UHC_PORT=8088 make web-run
+# Build CSS
+make css
+
+# Build the fullstack server and WASM hydration bundle
+dx build --release --platform web --features web
 ```
 
-`make web-run` invokes the Dioxus fullstack build and runs
-`target/dx/unified-hifi-control/release/web/server`; use that generated server
-for source development rather than `cargo run`, which does not produce the
-hydration bundle. Packaged releases embed those web assets in the installed
-binary.
+The runnable server and its hydration assets will be under
+`target/dx/unified-hifi-control/release/web/`. Start it with:
+
+```bash
+./target/dx/unified-hifi-control/release/web/server
+```
 
 ## RoPieee / AudioLinux Integration
 

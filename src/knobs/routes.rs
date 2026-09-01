@@ -22,16 +22,13 @@ use serde::{Deserialize, Serialize};
 
 use sha2::{Digest, Sha256};
 
-use crate::adapters::AdapterCommand;
-use crate::aggregator::ZoneAggregator;
 use crate::api::{
     dispatch_lms_runtime_command, dispatch_openhome_runtime_command, dispatch_roon_runtime_command,
     dispatch_upnp_runtime_command, lms_runtime_command_from_action,
     renderer_runtime_command_from_action, AppState,
 };
 use crate::bus::runtime::{
-    CommandDeadlines, CommandGateway, CommandLane, CommandRequest, CommandStatus,
-    HqpRuntimeCommand, RuntimeCommand,
+    CommandDeadlines, CommandLane, CommandRequest, CommandStatus, HqpRuntimeCommand, RuntimeCommand,
 };
 use crate::bus::{Command, PrefixedZoneId, VolumeControl};
 use crate::knobs::image::placeholder_svg;
@@ -109,18 +106,6 @@ pub struct ZoneInfo {
     pub volume_control: Option<VolumeControl>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dsp: Option<DspInfo>,
-    /// Whether `hifi_collections`/`/api/collections` implements this zone's
-    /// provider at all (#531). The web UI's `CollectionsBrowser` panel gates
-    /// on this instead of a hardcoded `musicassistant:` prefix check, so LMS
-    /// and Roon zones light up as their slices land, without a web change.
-    pub browse_supported: bool,
-    /// Which Library-page tabs this zone's provider serves (#573 defect 6):
-    /// a subset of `["browse", "playlists", "favorites", "radio"]`, derived
-    /// from the same capability facts `hifi_capabilities` reports (see
-    /// `crate::mcp::tools::collections::collections_tabs_for_zone`). The web
-    /// Library page hides tabs missing from this list instead of rendering
-    /// ones whose every call would be refused.
-    pub library_tabs: Vec<&'static str>,
 }
 
 /// GET /knob/zones response
@@ -183,10 +168,6 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
         .into_iter()
         .map(|z| ZoneInfo {
             dsp: get_dsp(&z.zone_id),
-            browse_supported: crate::mcp::tools::collections::zone_supports_hifi_collections(
-                &z.zone_id,
-            ),
-            library_tabs: crate::mcp::tools::collections::collections_tabs_for_zone(&z.zone_id),
             zone_id: z.zone_id,
             zone_name: z.zone_name,
             source: z.source,
@@ -438,8 +419,6 @@ pub struct ImageQuery {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub format: Option<String>,
-    pub scale: Option<String>,
-    pub crop_limit: Option<u8>,
 }
 
 // Image conversion is now handled by state.get_image()
@@ -455,45 +434,11 @@ pub async fn knob_image_handler(
     let target_width = params.width.unwrap_or(240);
     let target_height = params.height.unwrap_or(240);
     let format = params.format.as_deref();
-    let rgb565_requested = matches!(format, Some("rgb565" | "rgb565-smart"));
-    let eink_requested = format == Some("eink_acep6");
-    if eink_requested
-        && (target_width == 0
-            || target_height == 0
-            || u64::from(target_width) * u64::from(target_height) > 1_536_000)
-    {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Body::from("invalid e-ink artwork dimensions"))
-            .unwrap();
-    }
-    let resize_policy = match (format, params.scale.as_deref()) {
-        (Some("rgb565-smart" | "eink_acep6"), _) | (_, Some("smart")) => {
-            Some(crate::knobs::image::Rgb565ResizePolicy::SmartCover {
-                max_crop_percent: params.crop_limit.unwrap_or(10).min(25),
-            })
-        }
-        (_, Some("fit")) => Some(crate::knobs::image::Rgb565ResizePolicy::Fit),
-        _ => None,
-    };
 
     // Helper to return placeholder image in appropriate format
     let placeholder_response = || -> Response {
         let svg = placeholder_svg(target_width, target_height);
-        if eink_requested {
-            let bytes_per_row = target_width.div_ceil(2) as usize;
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/octet-stream")
-                .header("X-Image-Format", "eink_acep6")
-                .header("X-Image-Width", target_width.to_string())
-                .header("X-Image-Height", target_height.to_string())
-                .body(Body::from(vec![
-                    0x11;
-                    bytes_per_row * target_height as usize
-                ]))
-                .unwrap()
-        } else if rgb565_requested {
+        if format == Some("rgb565") {
             // Convert SVG placeholder to RGB565
             match svg_to_rgb565(svg.as_bytes(), target_width, target_height) {
                 Ok(rgb565) => Response::builder()
@@ -546,16 +491,13 @@ pub async fn knob_image_handler(
             Some(target_width),
             Some(target_height),
             format,
-            resize_policy,
         )
         .await
     {
         Ok(image_data) => {
             // If RGB565 was requested but conversion failed (content_type != octet-stream),
             // return the placeholder instead of misleading headers
-            if (rgb565_requested || eink_requested)
-                && image_data.content_type != "application/octet-stream"
-            {
+            if format == Some("rgb565") && image_data.content_type != "application/octet-stream" {
                 return placeholder_response();
             }
 
@@ -564,12 +506,7 @@ pub async fn knob_image_handler(
                 .header(header::CONTENT_TYPE, &image_data.content_type);
 
             // Add RGB565 metadata headers for ESP32 clients
-            if eink_requested {
-                response = response
-                    .header("X-Image-Format", "eink_acep6")
-                    .header("X-Image-Width", target_width.to_string())
-                    .header("X-Image-Height", target_height.to_string());
-            } else if rgb565_requested {
+            if format == Some("rgb565") {
                 response = response
                     .header("X-Image-Format", "rgb565")
                     .header("X-Image-Width", target_width.to_string())
@@ -626,28 +563,21 @@ pub async fn knob_control_handler(
 
     // Roon zone, or a legacy zone_id with no prefix at all.
     //
-    // A *prefixed* id that reached here names a backend this server does not route unless it is
-    // registered in the `AdapterRegistry` (streaming providers), and offering it to Roon is how a
-    // command for one zone silently became a command for another (or for none). Only the legacy
-    // unprefixed shape — which the Node.js server and older knob firmware still send — may mean
-    // Roon implicitly.
+    // A *prefixed* id that reached here names a backend this server does not route, and offering it
+    // to Roon is how a command for one zone silently became a command for another (or for none).
+    // Only the legacy unprefixed shape — which the Node.js server and older knob firmware still
+    // send — may mean Roon implicitly.
     if !req.zone_id.starts_with("roon:") && req.zone_id.contains(':') {
-        let prefix = req.zone_id.split(':').next().unwrap_or_default();
-        if state.adapter_registry.has_adapter(prefix).await {
-            return control_registry_provider(
-                &state,
-                prefix,
-                &req.zone_id,
-                &req.action,
-                req.value.as_ref(),
-                prefix,
-            )
-            .await;
-        }
+        let prefix = req
+            .zone_id
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_string();
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": format!("Unsupported zone source: {prefix}"),
+                "error": format!("Unsupported zone source: {}", prefix),
                 "error_code": "UNSUPPORTED_ZONE_SOURCE",
             })),
         ));
@@ -718,28 +648,6 @@ pub(crate) async fn dispatch_hqplayer_action(
     action: &str,
     value: Option<f64>,
 ) -> Result<(), HqpDispatchError> {
-    dispatch_hqplayer_action_via(
-        &state.aggregator,
-        state.reliable_commands.as_ref(),
-        zone_id,
-        instance,
-        action,
-        value,
-    )
-    .await
-}
-
-/// Same aggregator-gated routing as [`dispatch_hqplayer_action`], parameterized directly over the
-/// aggregator and reliable command gateway so callers without a full `AppState` - MQTT's inbound
-/// command router (#529) - reuse the identical dispatch path HTTP/knob/MCP use.
-pub(crate) async fn dispatch_hqplayer_action_via(
-    aggregator: &ZoneAggregator,
-    gateway: Option<&CommandGateway>,
-    zone_id: &str,
-    instance: &str,
-    action: &str,
-    value: Option<f64>,
-) -> Result<(), HqpDispatchError> {
     // The aggregator is the only state source consulted here.
     //
     // Its absence is decisive rather than merely inconvenient: the aggregator withdraws the zone when
@@ -749,9 +657,9 @@ pub(crate) async fn dispatch_hqplayer_action_via(
     // `{"ok":true}` — for a withdrawn zone whose instance still happened to exist in the manager's
     // map. Found by the review pass, pinned by
     // `transport_is_refused_for_a_zone_the_aggregator_has_withdrawn`.
-    let Some(zone) = aggregator.get_zone(zone_id).await else {
+    let Some(zone) = state.aggregator.get_zone(zone_id).await else {
         let target = PrefixedZoneId::hqplayer(instance);
-        let message = match gateway {
+        let message = match &state.reliable_commands {
             Some(gateway) if gateway.has_endpoint(&target) => {
                 format!("zone {zone_id} is not currently published")
             }
@@ -761,9 +669,8 @@ pub(crate) async fn dispatch_hqplayer_action_via(
     };
 
     let command = hqp_command_from_published_zone(&zone, action, value)?;
-    dispatch_hqplayer_runtime_command_via(
-        aggregator,
-        gateway,
+    dispatch_hqplayer_runtime_command(
+        state,
         instance,
         RuntimeCommand::Control(command),
         CommandLane::Interactive,
@@ -830,32 +737,10 @@ async fn dispatch_hqplayer_runtime_command(
     lane: CommandLane,
     confirmation_budget: std::time::Duration,
 ) -> Result<(), HqpDispatchError> {
-    dispatch_hqplayer_runtime_command_via(
-        &state.aggregator,
-        state.reliable_commands.as_ref(),
-        instance,
-        command,
-        lane,
-        confirmation_budget,
-    )
-    .await
-}
-
-/// Same aggregator-gated routing as [`dispatch_hqplayer_runtime_command`], parameterized directly
-/// over the aggregator and reliable command gateway so callers without a full `AppState` - MQTT's
-/// inbound command router (#529) - reuse the identical dispatch path HTTP/knob/MCP use.
-async fn dispatch_hqplayer_runtime_command_via(
-    aggregator: &ZoneAggregator,
-    gateway: Option<&CommandGateway>,
-    instance: &str,
-    command: RuntimeCommand,
-    lane: CommandLane,
-    confirmation_budget: std::time::Duration,
-) -> Result<(), HqpDispatchError> {
     let target = PrefixedZoneId::hqplayer(instance);
     let zone_id = target.to_string();
-    if aggregator.get_zone(&zone_id).await.is_none() {
-        let message = match gateway {
+    if state.aggregator.get_zone(&zone_id).await.is_none() {
+        let message = match &state.reliable_commands {
             Some(gateway) if gateway.has_endpoint(&target) => {
                 format!("zone {zone_id} is not currently published")
             }
@@ -863,7 +748,7 @@ async fn dispatch_hqplayer_runtime_command_via(
         };
         return Err(HqpDispatchError::NotFound(message));
     }
-    let Some(gateway) = gateway else {
+    let Some(gateway) = &state.reliable_commands else {
         return Err(HqpDispatchError::Backend(
             "HQPlayer reliable command runtime is unavailable".to_string(),
         ));
@@ -916,7 +801,7 @@ fn hqp_command_from_published_zone(
         "next" if zone.is_next_allowed => Ok(Command::Next),
         "previous" | "prev" if zone.is_previous_allowed => Ok(Command::Previous),
         "next" | "previous" | "prev" => Err(HqpDispatchError::BadRequest {
-            message: format!("{action} is not available in the zone's current state"),
+            message: format!("{} is not available in the zone's current state", action),
             code: "ACTION_NOT_ALLOWED",
         }),
         // Resolve at the serialized native endpoint. Concurrent requests can otherwise all observe
@@ -1013,68 +898,6 @@ async fn control_hqplayer(
         Err(HqpDispatchError::Backend(message)) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": message})),
-        )),
-    }
-}
-
-fn adapter_command_for_action(
-    provider: &str,
-    action: &str,
-    value: Option<&serde_json::Value>,
-) -> Result<AdapterCommand, String> {
-    match action {
-        "play" => Ok(AdapterCommand::Play),
-        "pause" => Ok(AdapterCommand::Pause),
-        "play_pause" | "playpause" => Ok(AdapterCommand::PlayPause),
-        "next" => Ok(AdapterCommand::Next),
-        "previous" | "prev" => Ok(AdapterCommand::Previous),
-        "stop" => Ok(AdapterCommand::Stop),
-        "vol_abs" | "volume" => Ok(AdapterCommand::VolumeAbsolute(
-            value.and_then(|v| v.as_f64()).unwrap_or(50.0) as i32,
-        )),
-        "vol_up" | "volume_up" => Ok(AdapterCommand::VolumeRelative(
-            value.and_then(|v| v.as_f64()).unwrap_or(1.0).round() as i32,
-        )),
-        "vol_down" | "volume_down" => Ok(AdapterCommand::VolumeRelative(
-            -(value.and_then(|v| v.as_f64()).unwrap_or(1.0).round() as i32),
-        )),
-        _ => Err(format!("Unknown {provider} action: {action}")),
-    }
-}
-
-async fn control_registry_provider(
-    state: &AppState,
-    prefix: &str,
-    zone_id: &str,
-    action: &str,
-    value: Option<&serde_json::Value>,
-    provider: &str,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let command = match adapter_command_for_action(provider, action, value) {
-        Ok(command) => command,
-        Err(error) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": error})),
-            ));
-        }
-    };
-
-    match state
-        .adapter_registry
-        .command(prefix, zone_id, command)
-        .await
-    {
-        Ok(response) if response.success => Ok(Json(serde_json::json!({"ok": true}))),
-        Ok(response) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": response.error.unwrap_or_else(|| format!("{provider} command failed"))
-            })),
-        )),
-        Err(error) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": error.to_string()})),
         )),
     }
 }
@@ -1384,25 +1207,6 @@ pub async fn knob_config_update_handler(
 pub async fn knob_devices_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let knobs = state.knobs.list().await;
     Json(serde_json::json!({ "knobs": knobs }))
-}
-
-/// DELETE /knob/devices/{knob_id} - Remove a registered knob (admin)
-///
-/// Callers that publish Home Assistant discovery for knobs (#523) observe
-/// this via the knob no longer appearing in the store and are responsible
-/// for retracting any retained discovery configs they previously published.
-pub async fn knob_remove_handler(
-    State(state): State<AppState>,
-    axum::extract::Path(knob_id): axum::extract::Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if state.knobs.remove(&knob_id).await {
-        Ok(Json(serde_json::json!({ "ok": true })))
-    } else {
-        Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "knob not found"})),
-        ))
-    }
 }
 
 /// GET /config/{knob_id} - Get knob configuration (path parameter format)
@@ -1737,8 +1541,6 @@ mod tests {
             state: "stopped".to_string(),
             volume_control: None,
             dsp: None,
-            browse_supported: false,
-            library_tabs: Vec::new(),
         }
     }
 
@@ -1881,17 +1683,5 @@ mod tests {
             sha_a, sha_b,
             "Special chars in names should not cause collision"
         );
-    }
-
-    #[test]
-    fn apple_music_web_controls_use_adapter_commands() {
-        assert!(matches!(
-            adapter_command_for_action("Apple Music", "pause", None),
-            Ok(AdapterCommand::Pause)
-        ));
-        assert!(matches!(
-            adapter_command_for_action("Apple Music", "next", None),
-            Ok(AdapterCommand::Next)
-        ));
     }
 }

@@ -56,13 +56,6 @@ pub struct KnobConfig {
     /// Volume step override (None = use adapter default)
     /// When set, substituted in /now_playing response instead of adapter's step
     pub volume_step_override: Option<f64>,
-
-    /// User-requested zone reassignment (None = device chooses its own zone).
-    /// Distinct from `KnobStatus::zone_id`, which reports the zone the knob is
-    /// *currently* controlling; this is the desired override synced down to
-    /// the device via `config_sha`, e.g. from a Home Assistant `select`
-    /// entity (#523).
-    pub assigned_zone_id: Option<String>,
 }
 
 impl Default for KnobConfig {
@@ -106,7 +99,6 @@ impl Default for KnobConfig {
             cpu_freq_scaling_enabled: false,
             sleep_poll_stopped_sec: 60,
             volume_step_override: None,
-            assigned_zone_id: None,
         }
     }
 }
@@ -313,9 +305,6 @@ impl KnobStore {
         if let Some(v) = updates.volume_step_override {
             knob.config.volume_step_override = if v > 0.0 { Some(v) } else { None };
         }
-        if let Some(v) = updates.assigned_zone_id {
-            knob.config.assigned_zone_id = if v.is_empty() { None } else { Some(v) };
-        }
 
         // Recompute config hash
         knob.config_sha = compute_sha(&knob.config, &knob.name);
@@ -353,32 +342,6 @@ impl KnobStore {
         let knobs = self.knobs.read().await;
         knobs.get(knob_id).map(|k| k.config_sha.clone())
     }
-
-    /// List every registered knob with its full record (config + status),
-    /// keyed by knob id. Used by the MQTT/Home Assistant publisher (#523),
-    /// which needs `KnobConfig` fields `list()`'s `KnobSummary` omits.
-    pub async fn list_full(&self) -> Vec<(String, Knob)> {
-        let knobs = self.knobs.read().await;
-        knobs
-            .iter()
-            .map(|(id, knob)| (id.clone(), knob.clone()))
-            .collect()
-    }
-
-    /// Remove a registered knob entirely. Returns `true` if a knob with this
-    /// id existed. Callers (e.g. the MQTT publisher) are responsible for
-    /// retracting any Home Assistant discovery configs they published for it.
-    pub async fn remove(&self, knob_id: &str) -> bool {
-        let removed = {
-            let mut knobs = self.knobs.write().await;
-            knobs.remove(knob_id).is_some()
-        };
-        if removed {
-            self.save_to_disk().await;
-            tracing::info!("Removed knob: {}", knob_id);
-        }
-        removed
-    }
 }
 
 /// Partial status update
@@ -409,9 +372,6 @@ pub struct KnobConfigUpdate {
     pub sleep_poll_stopped_sec: Option<u32>,
     /// Volume step override (0 or negative = clear override)
     pub volume_step_override: Option<f64>,
-    /// Zone reassignment override (empty string = clear override, device
-    /// chooses its own zone again)
-    pub assigned_zone_id: Option<String>,
 }
 
 /// Summary for listing knobs

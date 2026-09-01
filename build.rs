@@ -3,17 +3,6 @@
 //! Environment variables (set by CI or fall back to defaults):
 //! - UHC_VERSION: Version string (defaults to CARGO_PKG_VERSION)
 //! - UHC_GIT_SHA: Git commit SHA (defaults to "unknown" or git rev-parse)
-//!
-//! #572: when neither env var is set (the common local `make web-run` path),
-//! the SHA is computed once by shelling out to `git rev-parse`. Cargo only
-//! reruns a build script when a file/env dependency it declared changes, and
-//! the old version declared none tied to git state — so after the first
-//! build, `UHC_GIT_SHA` was frozen at whatever commit happened to be checked
-//! out the first time, and every later rebuild (new commits, checkouts,
-//! rebases) kept serving that stale SHA from `/status` even though nothing
-//! else about the build was cached. That sent a live diagnosis session
-//! chasing the wrong commit twice. Declaring `cargo:rerun-if-changed` on the
-//! files that move whenever HEAD moves closes the gap.
 
 use std::process::Command;
 
@@ -34,35 +23,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=UHC_VERSION");
     println!("cargo:rerun-if-env-changed=UHC_GIT_SHA");
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
-
-    // Rebuild whenever the checked-out commit moves, so a plain rebuild
-    // (with no env vars set) picks up the new SHA instead of the one that
-    // happened to be current the first time this crate compiled. `--git-path`
-    // resolves these correctly for linked worktrees too (where `.git` is a
-    // file, not a directory, and HEAD lives under `.git/worktrees/<name>/`).
-    for rel in ["HEAD", "logs/HEAD"] {
-        if let Some(path) = git_path(rel) {
-            println!("cargo:rerun-if-changed={}", path);
-        }
-    }
-}
-
-/// Resolve a path relative to the repo's (possibly worktree-specific) git
-/// directory via `git rev-parse --git-path`, e.g. `HEAD` or `logs/HEAD`.
-fn git_path(rel: &str) -> Option<String> {
-    Command::new("git")
-        .args(["rev-parse", "--git-path", rel])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            } else {
-                None
-            }
-        })
 }
 
 fn get_git_sha() -> String {

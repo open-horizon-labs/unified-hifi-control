@@ -1,7 +1,0 @@
-{
-  "error": {
-    "status": 429,
-    "message": "provider-internal-account-diagnostic-must-not-leak",
-    "reason": "QUOTA_EXCEEDED"
-  }
-}

@@ -94,26 +94,6 @@ pub const DEFAULT_CAPACITY: usize = 512;
 /// How long a ref remains resolvable after it is minted. Uniform across every
 /// provider and target kind -- see the module docs for why that is a
 /// deliberate choice, not an oversight.
-///
-/// # Measured against a real Roon Core (#616)
-///
-/// #616 asked whether this should instead track the lifetime of the Roon
-/// browse session a ref depends on. Measured read-only against the
-/// operator's production Core (Roon 2.x, 2026-08), by minting eleven
-/// independent deep browse refs at once and probing one per interval
-/// without touching the others:
-///
-/// | idle | result |
-/// |------|--------|
-/// | 30s, 90s, 180s, 300s, 480s, 660s, **840s** | resolves normally |
-/// | 1020s | gone -- **this TTL**, at 900s, not the Core |
-///
-/// So a Roon browse session outlives this TTL rather than the other way
-/// round: shortening it to "match Roon" would discard refs the Core is
-/// still perfectly willing to honour, and lengthening it is what
-/// [`RoonRefTarget::trail`] now makes safe rather than necessary. Left
-/// uniform and unchanged; the recovery path, not the clock, is what makes a
-/// stale key survivable.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(15 * 60);
 
 const TOKEN_PREFIX: &str = "ref_";
@@ -125,29 +105,10 @@ const TOKEN_PREFIX: &str = "ref_";
 /// private session per call and the item keys it returns are scoped to that
 /// session (see `src/adapters/roon.rs::search_with_session`); resolution must
 /// re-enter that exact session (`RoonAdapter::play_ref`), never a fresh one.
-/// # Why the pair alone is not enough (#616)
-///
-/// An `(item_key, multi_session_key)` pair is only meaningful while the Core
-/// still holds that session. When it does not -- the extension reconnected,
-/// the Core restarted, or the session aged out -- the pair is unrecoverable
-/// on its own: nothing in it says *what* the key pointed at, so the only
-/// answer left is to tell the human to browse again. That is the error
-/// reported in #616, and asking the user to redo a walk we could redo
-/// ourselves is the part they feel.
-///
-/// [`Self::trail`] is what makes recovery possible: the titles from the
-/// browse root down to this item, accumulated as the user descends. Given
-/// the trail, `RoonAdapter::resolve_trail` can re-walk it in a fresh session
-/// and mint an equivalent key, so a rejected ref becomes a retry rather than
-/// an apology. It is best-effort: an empty trail simply means no recovery is
-/// possible for that ref, exactly as before.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoonRefTarget {
     pub item_key: String,
     pub multi_session_key: String,
-    /// Titles from the browse root down to and including this item. Empty
-    /// when the minting surface could not supply one.
-    pub trail: Vec<String>,
 }
 
 /// What a ref resolves to, independent of the opaque token a client holds.
@@ -161,50 +122,6 @@ pub enum RefTarget {
         target: LmsPlayTarget,
         title: String,
     },
-    Spotify {
-        uri: String,
-        title: String,
-    },
-    /// A durable Music Assistant media URI. The token keeps that URI out of
-    /// client-side control flow and binds it to the provider that searched it.
-    MusicAssistant {
-        uri: String,
-        title: String,
-    },
-    /// A Music Assistant browse continuation. This is deliberately a separate
-    /// target from playable media: the MA path remains server-side and this
-    /// token is only accepted by `hifi_collections`, never `hifi_play_ref`.
-    MusicAssistantBrowse {
-        path: String,
-        title: String,
-    },
-    /// An LMS browse continuation (#531): a server-side collection path
-    /// (`"albums"`, `"album:<id>"`, ...), never a raw entity id handed to a
-    /// client. Only accepted by `hifi_collections`, never `hifi_play_ref` --
-    /// same split as [`Self::MusicAssistantBrowse`].
-    LmsBrowse {
-        path: String,
-        title: String,
-    },
-    /// A Roon browse continuation (#531): the `item_key` **and**
-    /// `multi_session_key` a collection list was loaded under, so resuming it
-    /// re-enters that exact session -- same pairing requirement as
-    /// [`Self::Roon`], for the same reason (see [`RoonRefTarget`]'s docs).
-    /// Only accepted by `hifi_collections`, never `hifi_play_ref`.
-    RoonBrowse {
-        target: RoonRefTarget,
-        title: String,
-    },
-    /// An Apple Music catalog/library identifier resolved by the paired native
-    /// companion. Clients only receive the opaque token.
-    AppleMusic {
-        /// The execution-owner suffix of the applemusic zone that minted it.
-        /// Apple library/catalog IDs are not portable across companions.
-        companion_id: String,
-        /// A companion-minted content handle, never a raw Apple ID or URI.
-        handle: String,
-        title: String,
-    },
 }
 
 impl RefTarget {
@@ -214,12 +131,6 @@ impl RefTarget {
         match self {
             Self::Roon { .. } => Provider::Roon,
             Self::Lms { .. } => Provider::Lms,
-            Self::Spotify { .. } => Provider::Spotify,
-            Self::MusicAssistant { .. } => Provider::MusicAssistant,
-            Self::MusicAssistantBrowse { .. } => Provider::MusicAssistant,
-            Self::LmsBrowse { .. } => Provider::Lms,
-            Self::RoonBrowse { .. } => Provider::Roon,
-            Self::AppleMusic { .. } => Provider::AppleMusic,
         }
     }
 
@@ -227,14 +138,7 @@ impl RefTarget {
     /// resolution does not re-derive it from the (possibly stale) backend.
     pub fn title(&self) -> &str {
         match self {
-            Self::Roon { title, .. }
-            | Self::Lms { title, .. }
-            | Self::Spotify { title, .. }
-            | Self::MusicAssistant { title, .. }
-            | Self::MusicAssistantBrowse { title, .. }
-            | Self::LmsBrowse { title, .. }
-            | Self::RoonBrowse { title, .. }
-            | Self::AppleMusic { title, .. } => title,
+            Self::Roon { title, .. } | Self::Lms { title, .. } => title,
         }
     }
 }
@@ -377,127 +281,6 @@ fn generate_token() -> String {
     format!("{TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes))
 }
 
-/// What an image ref resolves to (#549): the zone whose provider serves the
-/// artwork, and the provider-native image handle to fetch through that
-/// provider's `AppState::get_image` dispatch -- the same handle a Roon
-/// `image_key`, an LMS coverid/URL, or a Music Assistant `image_url` already
-/// is, just minted here instead of handed to a client.
-///
-/// A deliberately separate table from [`RefTable`], not a new [`RefTarget`]
-/// variant: an image ref is resolved only by the collections image-proxy
-/// route (`src/api/mod.rs::collections_image_handler`), never by
-/// `hifi_play_ref`. Folding it into `RefTarget` would drag it through every
-/// `(LibraryRoute, RefTarget)` pairing in
-/// `src/mcp/tools/library.rs::handle_play_ref`'s exhaustive dispatch for a
-/// variant that dispatch can never validly reach -- a lot of churn for a
-/// combination that should simply never arise.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImageRef {
-    pub zone_id: String,
-    pub image_key: String,
-}
-
-struct ImageRecord {
-    target: ImageRef,
-    minted_at: Instant,
-}
-
-struct ImageInner {
-    entries: HashMap<String, ImageRecord>,
-    order: VecDeque<String>,
-    capacity: usize,
-    ttl: Duration,
-}
-
-impl ImageInner {
-    /// Same eviction policy as [`Inner::evict_to_capacity`]: insertion-order,
-    /// draining already-expired fronts opportunistically. See that method's
-    /// docs for why the loop checks both `entries` and `order`.
-    fn evict_to_capacity(&mut self) {
-        while self.entries.len() >= self.capacity || self.order.len() >= self.capacity {
-            match self.order.pop_front() {
-                Some(oldest) => {
-                    self.entries.remove(&oldest);
-                }
-                None => break,
-            }
-        }
-    }
-}
-
-/// The server-side table an `hifi_collections`/`/api/collections` item's
-/// `image` field resolves through. Same opaque-token, bounded-size,
-/// uniform-TTL design as [`RefTable`] -- see its module docs -- kept as its
-/// own type rather than a case of that one (see [`ImageRef`]'s docs).
-#[derive(Clone)]
-pub struct ImageRefTable {
-    inner: Arc<Mutex<ImageInner>>,
-}
-
-impl Default for ImageRefTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ImageRefTable {
-    /// A table with [`DEFAULT_CAPACITY`] and [`DEFAULT_TTL`].
-    pub fn new() -> Self {
-        Self::with_capacity_and_ttl(DEFAULT_CAPACITY, DEFAULT_TTL)
-    }
-
-    /// A table with an explicit capacity and TTL, for tests that need to
-    /// force eviction or expiry without waiting on the production defaults.
-    pub fn with_capacity_and_ttl(capacity: usize, ttl: Duration) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(ImageInner {
-                entries: HashMap::new(),
-                order: VecDeque::new(),
-                capacity,
-                ttl,
-            })),
-        }
-    }
-
-    /// Mint an opaque token for `target`, evicting the oldest entry first if
-    /// the table is already at capacity.
-    pub async fn mint(&self, target: ImageRef) -> String {
-        let token = generate_token();
-        let mut inner = self.inner.lock().await;
-        inner.evict_to_capacity();
-        inner.order.push_back(token.clone());
-        inner.entries.insert(
-            token.clone(),
-            ImageRecord {
-                target,
-                minted_at: Instant::now(),
-            },
-        );
-        token
-    }
-
-    /// Resolve a token to its target, or `None` if it is unknown, mangled,
-    /// expired, or evicted -- all four collapse to the same answer, exactly
-    /// as [`RefTable::resolve`] does.
-    pub async fn resolve(&self, token: &str) -> Option<ImageRef> {
-        let mut inner = self.inner.lock().await;
-        let expired = match inner.entries.get(token) {
-            Some(record) => record.minted_at.elapsed() > inner.ttl,
-            None => return None,
-        };
-        if expired {
-            inner.entries.remove(token);
-            return None;
-        }
-        inner.entries.get(token).map(|r| r.target.clone())
-    }
-
-    #[cfg(test)]
-    async fn len(&self) -> usize {
-        self.inner.lock().await.entries.len()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,7 +291,6 @@ mod tests {
             target: RoonRefTarget {
                 item_key: item_key.to_string(),
                 multi_session_key: session.to_string(),
-                trail: vec![title.to_string()],
             },
             title: title.to_string(),
         }
@@ -520,14 +302,6 @@ mod tests {
                 kind: LmsSearchResultType::Album,
                 id,
             },
-            title: title.to_string(),
-        }
-    }
-
-    fn apple_target(companion_id: &str, handle: &str, title: &str) -> RefTarget {
-        RefTarget::AppleMusic {
-            companion_id: companion_id.to_string(),
-            handle: handle.to_string(),
             title: title.to_string(),
         }
     }
@@ -807,9 +581,6 @@ mod tests {
         let table = RefTable::new();
         let roon_token = table.mint(roon_target("1:1", "s", "R")).await;
         let lms_token = table.mint(lms_target(1, "L")).await;
-        let apple_token = table
-            .mint(apple_target("iphone", "companion-handle-123", "A"))
-            .await;
 
         assert_eq!(
             table.resolve(&roon_token).await.unwrap().provider(),
@@ -819,109 +590,5 @@ mod tests {
             table.resolve(&lms_token).await.unwrap().provider(),
             Provider::Lms
         );
-        let apple = table.resolve(&apple_token).await.unwrap();
-        assert_eq!(apple.provider(), Provider::AppleMusic);
-        assert_eq!(apple.title(), "A");
-        assert!(matches!(
-            apple,
-            RefTarget::AppleMusic { companion_id, handle, .. }
-                if companion_id == "iphone" && handle == "companion-handle-123"
-        ));
-    }
-
-    #[tokio::test]
-    async fn apple_refs_are_opaque_and_companion_scoped_in_the_table() {
-        let table = RefTable::new();
-        let token = table
-            .mint(apple_target(
-                "iphone",
-                "apple-catalog-id-should-not-leak",
-                "Song",
-            ))
-            .await;
-        assert!(!token.contains("apple-catalog-id-should-not-leak"));
-        let target = table.resolve(&token).await.unwrap();
-        assert!(matches!(
-            target,
-            RefTarget::AppleMusic { companion_id, .. } if companion_id == "iphone"
-        ));
-    }
-
-    // =========================================================================
-    // ImageRefTable (#549): opaque, same as RefTable, but a separate table
-    // so hifi_play_ref's dispatch never has to consider an image ref.
-    // =========================================================================
-
-    #[tokio::test]
-    async fn image_ref_mints_and_resolves_to_its_zone_and_key() {
-        let table = ImageRefTable::new();
-        let token = table
-            .mint(ImageRef {
-                zone_id: "roon:zone1".to_string(),
-                image_key: "abc123".to_string(),
-            })
-            .await;
-        assert!(token.starts_with(TOKEN_PREFIX));
-        let resolved = table.resolve(&token).await.unwrap();
-        assert_eq!(resolved.zone_id, "roon:zone1");
-        assert_eq!(resolved.image_key, "abc123");
-    }
-
-    #[tokio::test]
-    async fn image_ref_token_carries_no_verbatim_image_key() {
-        let table = ImageRefTable::new();
-        let token = table
-            .mint(ImageRef {
-                zone_id: "lms:player1".to_string(),
-                image_key: "a-very-long-and-distinctive-coverid-value-123456".to_string(),
-            })
-            .await;
-        assert!(!token.contains("a-very-long-and-distinctive-coverid-value-123456"));
-    }
-
-    #[tokio::test]
-    async fn unknown_image_token_resolves_to_none() {
-        let table = ImageRefTable::new();
-        assert!(table.resolve("ref_does-not-exist").await.is_none());
-    }
-
-    #[tokio::test]
-    async fn image_ref_expires_after_its_ttl() {
-        let table =
-            ImageRefTable::with_capacity_and_ttl(DEFAULT_CAPACITY, Duration::from_millis(20));
-        let token = table
-            .mint(ImageRef {
-                zone_id: "musicassistant:zone1".to_string(),
-                image_key: "https://example.invalid/art.jpg".to_string(),
-            })
-            .await;
-        assert!(table.resolve(&token).await.is_some());
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        assert!(table.resolve(&token).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn image_ref_table_stays_bounded_by_evicting_the_oldest() {
-        let table = ImageRefTable::with_capacity_and_ttl(2, DEFAULT_TTL);
-        let first = table
-            .mint(ImageRef {
-                zone_id: "roon:z".to_string(),
-                image_key: "one".to_string(),
-            })
-            .await;
-        table
-            .mint(ImageRef {
-                zone_id: "roon:z".to_string(),
-                image_key: "two".to_string(),
-            })
-            .await;
-        table
-            .mint(ImageRef {
-                zone_id: "roon:z".to_string(),
-                image_key: "three".to_string(),
-            })
-            .await;
-        assert!(table.resolve(&first).await.is_none(), "oldest is evicted");
-        assert_eq!(table.len().await, 2);
     }
 }

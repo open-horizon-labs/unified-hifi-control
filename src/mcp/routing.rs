@@ -36,10 +36,14 @@
 //! it should reach has the whole surface (`play`, `pause`, `next`, `previous`,
 //! `set_volume`, `volume_up`/`down`, `seek`).
 //!
-//! HQPlayer zones now route through the managed `HqpInstanceManager` runtime. The
-//! instance name is taken from `hqplayer:<instance_name>`; an absent configuration
-//! is reported as a backend error by the control tool, while content operations
-//! remain separately tracked in #209.
+//! #398 recognised the prefix and reported the gap honestly ([`HqPlayer`] routed
+//! to `Refused`, and the tools classified it as `not_implemented` tracked by
+//! #328). **#328 wires it.** The zone id is `hqplayer:<instance_name>`, so
+//! transport and volume resolve it through `HqpInstanceManager` rather than
+//! through a single shared adapter — see
+//! `crate::mcp::tools::transport::handle_hqplayer_control`, the one place that
+//! resolution happens. Library operations stay refused: HQPlayer's XML control
+//! protocol has no verified content surface, tracked separately by #209.
 //!
 //! [`HqPlayer`]: ZoneTarget::HqPlayer
 //!
@@ -51,12 +55,12 @@
 //! | zone id        | transport ([`Self::for_transport`]) | volume ([`Self::for_volume`]) | library ([`Self::for_library`]) |
 //! |----------------|-------------------------------------|-------------------------------|---------------------------------|
 //! | `roon:x`       | Roon                                | Roon                          | Roon                            |
-//! | `lms:x`        | LMS                                 | LMS                           | LMS                             |
-//! | `openhome:x`   | OpenHome                            | OpenHome (#398 wired it)      | **refused**                     |
-//! | `upnp:x`       | UPnP                                | UPnP (#398 wired it)          | **refused**                     |
-//! | `hqplayer:x`   | **refused**                         | **refused**                   | **refused**                     |
-//! | `x` (bare)     | **refused** (#398)                  | **refused** (#398)            | **refused** (#398)              |
-//! | `sonos:x`      | **refused** (#398)                  | **refused**                   | **refused** (#398)              |
+//! | `lms:x`        | LMS                                  | LMS                           | LMS                             |
+//! | `openhome:x`   | OpenHome                             | OpenHome (#398 wired it)      | **refused**                     |
+//! | `upnp:x`       | UPnP                                 | UPnP (#398 wired it)          | **refused**                     |
+//! | `hqplayer:x`   | HQPlayer (#328 wired it)             | HQPlayer (#328 wired it)      | **refused**                     |
+//! | `x` (bare)     | **refused** (#398)                   | **refused** (#398)            | **refused** (#398)              |
+//! | `sonos:x`      | **refused** (#398)                   | **refused**                   | **refused** (#398)              |
 //!
 //! A single `is_lms()`-style predicate cannot express that. Any attempt to unify
 //! these into one rule changes behavior; `tests/mcp_contract.rs`
@@ -89,12 +93,6 @@ pub enum ZoneTarget {
     /// `hqplayer:` prefix — a real zone type `hifi_zones` lists. See the module
     /// docs: recognised by #398, not yet wired to a control path.
     HqPlayer,
-    /// `applemusic:` prefix — native MusicKit companion session.
-    AppleMusic,
-    /// `spotify:` prefix — Spotify Connect controller.
-    Spotify,
-    /// `musicassistant:` prefix — optional MA peer adapter.
-    MusicAssistant,
     /// No `:` at all. Was Roon until #398; now refused with the prefix list.
     Unprefixed,
     /// A prefix that matches no adapter, e.g. `sonos:x`.
@@ -116,9 +114,6 @@ impl ZoneTarget {
         Self::OpenHome,
         Self::Upnp,
         Self::HqPlayer,
-        Self::AppleMusic,
-        Self::Spotify,
-        Self::MusicAssistant,
     ];
 
     /// Classify a zone id by prefix.
@@ -133,12 +128,6 @@ impl ZoneTarget {
             Self::Upnp
         } else if zone_id.starts_with("hqplayer:") {
             Self::HqPlayer
-        } else if zone_id.starts_with("applemusic:") {
-            Self::AppleMusic
-        } else if zone_id.starts_with("spotify:") {
-            Self::Spotify
-        } else if zone_id.starts_with("musicassistant:") {
-            Self::MusicAssistant
         } else if zone_id.contains(':') {
             Self::Unknown
         } else {
@@ -165,9 +154,6 @@ impl ZoneTarget {
             Self::OpenHome => "openhome:",
             Self::Upnp => "upnp:",
             Self::HqPlayer => "hqplayer:",
-            Self::AppleMusic => "applemusic:",
-            Self::Spotify => "spotify:",
-            Self::MusicAssistant => "musicassistant:",
             Self::Unprefixed | Self::Unknown => return None,
         })
     }
@@ -180,9 +166,6 @@ impl ZoneTarget {
             Self::OpenHome => "openhome",
             Self::Upnp => "upnp",
             Self::HqPlayer => "hqplayer",
-            Self::AppleMusic => "applemusic",
-            Self::Spotify => "spotify",
-            Self::MusicAssistant => "musicassistant",
             Self::Unprefixed => "unprefixed",
             Self::Unknown => "unknown",
         }
@@ -197,10 +180,13 @@ pub enum TransportRoute {
     Lms,
     OpenHome,
     Upnp,
+    /// `hqplayer:<instance_name>` — resolved through `HqpInstanceManager`, not a
+    /// single shared adapter like the other four. #328 wired this; the resolution
+    /// and dispatch live in `crate::mcp::tools::transport::handle_hqplayer_control`,
+    /// the one caller that acts on this variant. It exists here so
+    /// [`crate::mcp::capabilities`] can ask "is this routed" without duplicating
+    /// that lookup.
     HqPlayer,
-    AppleMusic,
-    Spotify,
-    MusicAssistant,
     /// No transport path for this zone id. Carries the target so the caller can
     /// tell "not wired for this provider" from "not a zone id UHC understands".
     Refused(ZoneTarget),
@@ -210,32 +196,28 @@ pub enum TransportRoute {
 ///
 /// #398 added the OpenHome and UPnP arms: both adapters implement `vol_abs` and
 /// `vol_rel` and `POST /{openhome,upnp}/control` has exposed them over HTTP all
-/// along — only this path declined to call them.
+/// along — only this path declined to call them. #328 added `HqPlayer`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VolumeRoute {
     Roon,
     Lms,
     OpenHome,
     Upnp,
+    /// `hqplayer:<instance_name>`, decimal-dB, clamped to the zone's observed
+    /// range. See [`TransportRoute::HqPlayer`].
     HqPlayer,
-    AppleMusic,
-    Spotify,
-    MusicAssistant,
     /// No volume path for this zone id.
     Refused(ZoneTarget),
 }
 
 /// Where a library operation (`hifi_search` / `hifi_play`) is sent.
 ///
-/// Roon, LMS, Spotify, Apple Music, and Music Assistant expose library/content
-/// surfaces; OpenHome and UPnP zones are renderers.
+/// Only Roon and LMS have a library at all; OpenHome and UPnP zones are
+/// renderers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LibraryRoute {
     Roon,
     Lms,
-    Spotify,
-    AppleMusic,
-    MusicAssistant,
     /// No library path for this zone id.
     Refused(ZoneTarget),
 }
@@ -259,16 +241,7 @@ pub enum LibraryRoute {
 ///
 /// It is not a zone id UHC ever emits (`src/bus/events.rs` prefixes every one),
 /// and since #398 it is refused. Every value listed here works as a prefix.
-pub const ACCEPTED_ZONE_PREFIXES: &[&str] = &[
-    "roon:",
-    "lms:",
-    "openhome:",
-    "upnp:",
-    "hqplayer:",
-    "applemusic:",
-    "spotify:",
-    "musicassistant:",
-];
+pub const ACCEPTED_ZONE_PREFIXES: &[&str] = &["roon:", "lms:", "openhome:", "upnp:", "hqplayer:"];
 
 /// Every `hifi_control` action, in the order the tool's description lists them.
 ///
@@ -291,11 +264,6 @@ pub const CONTROL_ACTIONS: &[&str] = &[
     "volume_set",
     "volume_up",
     "volume_down",
-    "repeat_off",
-    "repeat_context",
-    "repeat_track",
-    "shuffle_on",
-    "shuffle_off",
 ];
 
 /// The transport subset of [`CONTROL_ACTIONS`], for "what can this zone do
@@ -313,10 +281,8 @@ impl ZoneTarget {
             Self::Lms => TransportRoute::Lms,
             Self::OpenHome => TransportRoute::OpenHome,
             Self::Upnp => TransportRoute::Upnp,
-            Self::AppleMusic => TransportRoute::AppleMusic,
-            Self::Spotify => TransportRoute::Spotify,
-            Self::MusicAssistant => TransportRoute::MusicAssistant,
-            // Recognised and dispatched through the managed instance runtime.
+            // #328: HqpInstanceManager resolution, dispatched by
+            // `tools::transport::handle_hqplayer_control`.
             Self::HqPlayer => TransportRoute::HqPlayer,
             // #398: was Roon for both of these.
             Self::Unprefixed | Self::Unknown => TransportRoute::Refused(self),
@@ -331,9 +297,7 @@ impl ZoneTarget {
             // #398 wired both: the adapters implement vol_abs/vol_rel.
             Self::OpenHome => VolumeRoute::OpenHome,
             Self::Upnp => VolumeRoute::Upnp,
-            Self::AppleMusic => VolumeRoute::AppleMusic,
-            Self::Spotify => VolumeRoute::Spotify,
-            Self::MusicAssistant => VolumeRoute::MusicAssistant,
+            // #328: decimal-dB, dispatched by the same hqplayer control path.
             Self::HqPlayer => VolumeRoute::HqPlayer,
             Self::Unprefixed | Self::Unknown => VolumeRoute::Refused(self),
         }
@@ -344,12 +308,9 @@ impl ZoneTarget {
         match self {
             Self::Roon => LibraryRoute::Roon,
             Self::Lms => LibraryRoute::Lms,
-            Self::Spotify => LibraryRoute::Spotify,
-            Self::AppleMusic => LibraryRoute::AppleMusic,
             // OpenHome and UPnP zones are renderers with no library; before #398
             // both were sent to Roon, which searched a library the zone could not
             // play from.
-            Self::MusicAssistant => LibraryRoute::MusicAssistant,
             Self::OpenHome | Self::Upnp | Self::HqPlayer => LibraryRoute::Refused(self),
             Self::Unprefixed | Self::Unknown => LibraryRoute::Refused(self),
         }
@@ -376,9 +337,6 @@ impl ZoneTarget {
             Self::OpenHome => Provider::OpenHome,
             Self::Upnp => Provider::Upnp,
             Self::HqPlayer => Provider::HqPlayer,
-            Self::AppleMusic => Provider::AppleMusic,
-            Self::Spotify => Provider::Spotify,
-            Self::MusicAssistant => Provider::MusicAssistant,
             Self::Unprefixed | Self::Unknown => Provider::Unknown,
         }
     }
@@ -528,7 +486,7 @@ mod tests {
             ZoneTarget::classify("upnp:x").for_transport(),
             TransportRoute::Upnp
         );
-        // Direct HQPlayer control is wired through the managed instance runtime.
+        // #328 wired this: HqpInstanceManager resolution, not a refusal.
         assert_eq!(
             ZoneTarget::classify("hqplayer:x").for_transport(),
             TransportRoute::HqPlayer
@@ -551,12 +509,18 @@ mod tests {
             ZoneTarget::classify("upnp:x").for_volume(),
             VolumeRoute::Upnp
         );
+        // #328 wired this too, on the same HqpInstanceManager resolution as
+        // transport.
+        assert_eq!(
+            ZoneTarget::classify("hqplayer:x").for_volume(),
+            VolumeRoute::HqPlayer
+        );
     }
 
     /// Volume and transport still differ, and the difference has moved: it used
     /// to be OpenHome/UPnP, and now it is only the library rule that narrows.
     #[test]
-    fn library_routes_each_provider_with_a_catalog_to_its_own_adapter() {
+    fn library_routes_only_roon_and_lms() {
         assert_eq!(
             ZoneTarget::classify("roon:x").for_library(),
             LibraryRoute::Roon
@@ -564,14 +528,6 @@ mod tests {
         assert_eq!(
             ZoneTarget::classify("lms:x").for_library(),
             LibraryRoute::Lms
-        );
-        assert_eq!(
-            ZoneTarget::classify("spotify:x").for_library(),
-            LibraryRoute::Spotify
-        );
-        assert_eq!(
-            ZoneTarget::classify("musicassistant:x").for_library(),
-            LibraryRoute::MusicAssistant
         );
         for zone_id in ["openhome:x", "upnp:x", "hqplayer:x"] {
             assert!(

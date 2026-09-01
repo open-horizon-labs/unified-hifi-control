@@ -1288,8 +1288,6 @@ fn upnp_renderer_to_zone(renderer: &UPnPRenderer) -> Zone {
                 seek_position: None,
                 duration: None,
                 metadata: None,
-                repeat_mode: None,
-                shuffle: None,
             }),
         source: "upnp".to_string(),
         is_controllable: renderer.av_transport_url.is_some(),
@@ -1417,14 +1415,6 @@ impl AdapterLogic for UPnPAdapter {
             AdapterCommand::Mute(mute) => {
                 self.control(uuid, "mute", Some(if mute { 1 } else { 0 }))
                     .await
-            }
-            AdapterCommand::SetRepeat(_) | AdapterCommand::SetShuffle(_) => {
-                return Ok(AdapterCommandResponse {
-                    success: false,
-                    error: Some(
-                        "Repeat and shuffle are not implemented by the UPnP adapter".to_string(),
-                    ),
-                });
             }
         };
 

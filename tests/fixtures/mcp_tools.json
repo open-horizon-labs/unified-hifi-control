@@ -1,102 +1,4 @@
 {
-  "hifi_apple_music": {
-    "description": "Apple Music catalog, library, playlist, feedback, and bounded adaptation context through a paired native companion. Actions include catalog_search, library, playlists, playlist_tracks, recent, recommendations, favorites, queue_plan, queue_append, play_next, context, clear_feedback, playlist_create, playlist_update, playlist_add, playlist_remove, favorite_add/remove, and feedback. Feedback accepts explicit user signals only; skips and manual changes are not inferred as dislike. Apple authorization stays on the companion; operations are limited to documented MusicKit capabilities and may be refused when the companion or account cannot perform them. Use hifi_search/hifi_play for exact content selection and playback.",
-    "inputSchema": {
-      "properties": {
-        "action": {
-          "description": "Operation to perform.",
-          "type": "string"
-        },
-        "confirm": {
-          "description": "Explicit confirmation for destructive account mutations.",
-          "nullable": true,
-          "type": "boolean"
-        },
-        "description": {
-          "description": "Optional playlist description for playlist operations.",
-          "nullable": true,
-          "type": "string"
-        },
-        "id": {
-          "description": "Provider content or playlist identifier, held server-side where possible.",
-          "nullable": true,
-          "type": "string"
-        },
-        "idempotency_key": {
-          "description": "Stable retry key required for Apple Music account mutations.",
-          "nullable": true,
-          "type": "string"
-        },
-        "items": {
-          "description": "Ordered short-lived opaque refs for queue_plan or queue_append.",
-          "items": {
-            "type": "string"
-          },
-          "nullable": true,
-          "type": "array"
-        },
-        "limit": {
-          "description": "Maximum number of entries to return.",
-          "nullable": true,
-          "type": "integer"
-        },
-        "name": {
-          "description": "Optional user-facing name/description for playlist operations.",
-          "nullable": true,
-          "type": "string"
-        },
-        "offset": {
-          "description": "Number of entries to skip for paged library, playlist, history, and\nrecommendation retrieval.",
-          "nullable": true,
-          "type": "integer"
-        },
-        "precondition": {
-          "description": "Read-before-write revision or ownership precondition.",
-          "nullable": true,
-          "type": "unknown"
-        },
-        "query": {
-          "description": "Search/query text.",
-          "nullable": true,
-          "type": "string"
-        },
-        "rating": {
-          "description": "Rating value from 1 through 5 when signal is rating.",
-          "nullable": true,
-          "type": "integer"
-        },
-        "reason": {
-          "description": "Optional human-provided reason for explicit feedback.",
-          "nullable": true,
-          "type": "string"
-        },
-        "signal": {
-          "description": "Explicit feedback signal: favorite, unfavorite, rating, skip,\nmore_like_this, or less_like_this.",
-          "nullable": true,
-          "type": "string"
-        },
-        "source": {
-          "description": "Provenance of the signal; feedback_record accepts user only for now.",
-          "nullable": true,
-          "type": "string"
-        },
-        "uri": {
-          "description": "Opaque Apple Music ref or provider URI for a content operation.",
-          "nullable": true,
-          "type": "string"
-        },
-        "zone_id": {
-          "description": "Optional target execution-owner zone.",
-          "nullable": true,
-          "type": "string"
-        }
-      },
-      "required": [
-        "action"
-      ],
-      "type": "object"
-    }
-  },
   "hifi_capabilities": {
     "annotations": {
       "readOnlyHint": true
@@ -113,52 +15,12 @@
       "type": "object"
     }
   },
-  "hifi_collections": {
-    "description": "Alpha capability: expect refinement across releases. Browse a provider library or list saved playlists and favorites. Results are paged with limit/offset and playable entries include a short-lived opaque ref for hifi_play_ref. Use path from a browse entry to continue into that collection. Implemented for lms and roon zones; Music Assistant zones (see hifi_queue's provider notes); Spotify and Apple Music are reachable via hifi_spotify and the Apple Music tools today, not yet through this one.",
-    "inputSchema": {
-      "properties": {
-        "action": {
-          "description": "browse, playlists, or favorites.",
-          "type": "string"
-        },
-        "limit": {
-          "description": "Maximum entries to return (1-50; default 20).",
-          "nullable": true,
-          "type": "integer"
-        },
-        "media_type": {
-          "description": "Media type when listing favorites (tracks by default).",
-          "nullable": true,
-          "type": "string"
-        },
-        "offset": {
-          "description": "Zero-based page offset (default 0).",
-          "nullable": true,
-          "type": "integer"
-        },
-        "path": {
-          "description": "Opaque collection path returned by a preceding browse call.",
-          "nullable": true,
-          "type": "string"
-        },
-        "zone_id": {
-          "description": "Zone ID whose provider library is queried.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "zone_id",
-        "action"
-      ],
-      "type": "object"
-    }
-  },
   "hifi_control": {
-    "description": "Control playback and volume: play, pause, playpause (toggle), next, previous, repeat_off/repeat_context/repeat_track, shuffle_on/shuffle_off, volume_set, volume_up, volume_down. HQPlayer zones use the managed instance runtime and also support stop, seek, and mute.",
+    "description": "Control playback and volume. Common actions: play, pause, playpause, next, previous, volume_set, volume_up, volume_down. HQPlayer also supports stop, seek, and mute.",
     "inputSchema": {
       "properties": {
         "action": {
-          "description": "Action: play, pause, playpause, next, previous, repeat_off, repeat_context, repeat_track, shuffle_on, shuffle_off, volume_set, volume_up, or volume_down. HQPlayer also accepts stop, seek, and mute.",
+          "description": "Common action: play, pause, playpause, next, previous, volume_set, volume_up, or volume_down. HQPlayer also accepts stop, seek, and mute.",
           "type": "string"
         },
         "value": {
@@ -277,7 +139,7 @@
     }
   },
   "hifi_play": {
-    "description": "Search and play music. Searches and plays or queues the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; Spotify supports play and queue for Spotify Connect zones. Apple Music play/queue uses a paired iPhone companion and owner-scoped opaque refs; physical validation remains tracked in #465. Music Assistant supports play and queue against its active player queue. To act on a specific hifi_search result rather than the first match for a title, use hifi_play_ref with that result's `ref` instead.",
+    "description": "Search and play music. Searches and plays, queues, or starts radio from the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; LMS searches all providers. To act on a specific hifi_search result rather than the first match for a title, use hifi_play_ref with that result's `ref` instead.",
     "inputSchema": {
       "properties": {
         "action": {
@@ -310,7 +172,7 @@
     "annotations": {
       "readOnlyHint": false
     },
-    "description": "Play or queue a specific hifi_search result using its `ref` — the opaque token returned alongside a result, not a title. Refs are short-lived; call hifi_search again if one expires. zone_id must belong to the same provider (Roon, LMS, Spotify, Music Assistant, or a paired Apple Music companion) the ref was minted for. Music Assistant refs support play and queue against its active player queue. Apple Music refs and play/queue use the paired iPhone companion; physical validation remains tracked in #465.",
+    "description": "Play, queue, or play-next a specific hifi_search result using its `ref` — the opaque token returned alongside a result, not a title. Use this instead of hifi_play when you need the exact result you found (e.g. the third one, or one of two same-titled albums), rather than whatever hifi_play's own search matches first. Refs are short-lived: hold one only within the current conversation. If this call is refused because the ref is unknown or expired, call hifi_search again for a fresh one — never guess or reuse an old one. zone_id must belong to the same provider (Roon or LMS) the ref was minted for.",
     "inputSchema": {
       "properties": {
         "action": {
@@ -334,46 +196,11 @@
       "type": "object"
     }
   },
-  "hifi_queue": {
-    "description": "Read or edit a playback queue. action='read' is the default. Music Assistant supports jump, reorder, remove, clear, and transfer against its active queue; each mutation returns a fresh queue readback. transfer (Alpha capability: expect refinement across releases) moves the active queue from zone_id to target_zone_id (both must be Music Assistant zones). Queue add is hifi_play action='queue'.",
-    "inputSchema": {
-      "properties": {
-        "action": {
-          "description": "read (default), jump, reorder, remove, clear, or transfer.",
-          "type": "string"
-        },
-        "item_id": {
-          "description": "Queue item id for jump, reorder, or remove.",
-          "nullable": true,
-          "type": "string"
-        },
-        "position": {
-          "description": "Target zero-based position for reorder.",
-          "nullable": true,
-          "type": "integer"
-        },
-        "target_zone_id": {
-          "description": "Destination zone ID for transfer. Must belong to the same provider as zone_id.",
-          "nullable": true,
-          "type": "string"
-        },
-        "zone_id": {
-          "description": "Zone ID from hifi_zones.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "zone_id",
-        "action"
-      ],
-      "type": "object"
-    }
-  },
   "hifi_search": {
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "Search for tracks, albums, or artists. Roon: searches Library, TIDAL, or Qobuz (use source param). LMS: searches all installed providers including streaming plugins. Spotify: searches the Spotify catalog for a Spotify Connect zone. Apple Music: searches through a paired iPhone companion and returns owner-scoped opaque refs; physical companion validation remains tracked in #465. Music Assistant searches its configured catalog for a Music Assistant zone. Each result may carry a short-lived `ref` token; hold it and pass it to hifi_play_ref to play or queue that exact result.",
+    "description": "Search for tracks, albums, or artists. Roon: searches Library, TIDAL, or Qobuz (use source param). LMS: searches all installed providers including streaming plugins (zone_id recommended as different players may have different sources configured). Each result may carry a short-lived `ref` token; hold it and pass it to hifi_play_ref to play, queue, or start radio from that exact result instead of hifi_play's first-match search. A result with no `ref` has no safe way to be addressed later — use hifi_play's query for it.",
     "inputSchema": {
       "properties": {
         "query": {
@@ -397,61 +224,6 @@
       "type": "object"
     }
   },
-  "hifi_spotify": {
-    "description": "Spotify personal-library access. Actions: playlists, playlist_tracks, saved_tracks, saved_tracks_check, saved_tracks_add/remove, create_playlist, update_playlist, playlist_add/replace/remove. Extended Quota apps configured with UHC_SPOTIFY_QUOTA_MODE=extended may also use browse_categories, browse_category_playlists, browse_featured_playlists, and browse_new_releases; those actions are unavailable by default because Spotify removed them from the February 2026 Development Mode API. Use hifi_search and hifi_play for catalog search, playback, and queue-add. The Web API can read/add to the active queue but cannot jump, reorder, remove, clear, or transfer queue contents. Transfer Playback selects one device; it is not multiroom synchronization. Playlist/library writes require the corresponding Spotify scopes.",
-    "inputSchema": {
-      "properties": {
-        "action": {
-          "description": "Operation to perform.",
-          "type": "string"
-        },
-        "category_id": {
-          "description": "Spotify browse category id. Extended Quota mode only.",
-          "nullable": true,
-          "type": "string"
-        },
-        "description": {
-          "description": "Playlist description for create/update.",
-          "nullable": true,
-          "type": "string"
-        },
-        "limit": {
-          "description": "Maximum number of entries to return.",
-          "nullable": true,
-          "type": "integer"
-        },
-        "name": {
-          "description": "Playlist name for create/update.",
-          "nullable": true,
-          "type": "string"
-        },
-        "playlist_id": {
-          "description": "Playlist id for playlist_tracks, update_playlist, or playlist_add.",
-          "nullable": true,
-          "type": "string"
-        },
-        "public": {
-          "description": "Public visibility for create/update.",
-          "nullable": true,
-          "type": "boolean"
-        },
-        "track_id": {
-          "description": "Track id for saved-library membership or mutation.",
-          "nullable": true,
-          "type": "string"
-        },
-        "uri": {
-          "description": "Track URI for playlist_add.",
-          "nullable": true,
-          "type": "string"
-        }
-      },
-      "required": [
-        "action"
-      ],
-      "type": "object"
-    }
-  },
   "hifi_status": {
     "annotations": {
       "readOnlyHint": true
@@ -462,49 +234,11 @@
       "type": "object"
     }
   },
-  "hifi_zone_group": {
-    "description": "Alpha capability: expect refinement across releases. Inspect or change multiroom zone groups for any provider that supports synchronised playback (Roon, LMS, Music Assistant). action=status is read-only: pass zone_id to scope it to one provider, or omit zone_id to aggregate every provider's groups (a provider that cannot be reached is reported in `errors` rather than failing the whole read). join and leave require confirm=true because grouping changes playback topology, and every zone id involved (leader plus every member) must belong to the same provider -- cross-provider groups are refused. Two provider-specific member conventions: Roon retires a grouped zone's own id and reports/accepts its members as roon:<output_id>; LMS sync groups are leaderless, so leader_zone_id there is UHC's stable-but-arbitrary pick of the first member id, not an LMS fact.",
-    "inputSchema": {
-      "properties": {
-        "action": {
-          "description": "status, join, or leave.",
-          "type": "string"
-        },
-        "confirm": {
-          "description": "Required true for topology-changing join and leave actions.",
-          "nullable": true,
-          "type": "boolean"
-        },
-        "leader_zone_id": {
-          "description": "Leader zone for join. Must be the same provider as every member_zone_id.",
-          "nullable": true,
-          "type": "string"
-        },
-        "member_zone_ids": {
-          "description": "Member zones to add (join) or remove (leave). Must all share one\nprovider, matching leader_zone_id for join.",
-          "items": {
-            "type": "string"
-          },
-          "nullable": true,
-          "type": "array"
-        },
-        "zone_id": {
-          "description": "Scopes action=status to one provider. Omit to aggregate every\nmultiroom-capable provider's groups.",
-          "nullable": true,
-          "type": "string"
-        }
-      },
-      "required": [
-        "action"
-      ],
-      "type": "object"
-    }
-  },
   "hifi_zones": {
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "List all available playback zones (Roon, LMS, OpenHome, UPnP, HQPlayer, Apple Music, Spotify, Music Assistant)",
+    "description": "List all available playback zones (Roon, LMS, OpenHome, UPnP, HQPlayer)",
     "inputSchema": {
       "properties": {},
       "type": "object"

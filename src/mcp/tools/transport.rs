@@ -31,9 +31,7 @@
 //! - **An unplaceable zone id is refused instead of routed to Roon**, for both
 //!   transport and volume, instead of being sent to Roon. An `hqplayer:` zone was
 //!   refused this way too, tracked by #328 — #328 itself now wires it instead,
-//!   through [`handle_hqplayer_control`], its own dispatch below, using the managed
-//!   HQPlayer instance runtime so missing configuration is reported as a backend
-//!   error rather than as an unsupported capability.
+//!   through [`handle_hqplayer_control`], its own dispatch below.
 //!
 //! `operation` still reports the *normalized* action, so `prev` surfaces as
 //! `previous` and `playpause` as `play_pause`; `params.value` still reports the
@@ -53,7 +51,6 @@
 //! refusal and `hifi_capabilities`' report cannot describe the same gap two
 //! different ways.
 
-use crate::adapters::AdapterCommand;
 use crate::api::{
     dispatch_lms_runtime_command, dispatch_openhome_runtime_command, dispatch_roon_runtime_command,
     dispatch_upnp_runtime_command, lms_runtime_command_from_action,
@@ -73,16 +70,16 @@ use rust_mcp_sdk::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Control playback across the shared adapters, including direct HQPlayer zones.
+/// Control playback
 #[mcp_tool(
     name = "hifi_control",
-    description = "Control playback and volume: play, pause, playpause (toggle), next, previous, repeat_off/repeat_context/repeat_track, shuffle_on/shuffle_off, volume_set, volume_up, volume_down. HQPlayer zones use the managed instance runtime and also support stop, seek, and mute."
+    description = "Control playback and volume. Common actions: play, pause, playpause, next, previous, volume_set, volume_up, volume_down. HQPlayer also supports stop, seek, and mute."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiControlTool {
     /// The zone ID to control
     pub zone_id: String,
-    /// Action: play, pause, playpause, next, previous, repeat_off, repeat_context, repeat_track, shuffle_on, shuffle_off, volume_set, volume_up, or volume_down. HQPlayer also accepts stop, seek, and mute.
+    /// Common action: play, pause, playpause, next, previous, volume_set, volume_up, or volume_down. HQPlayer also accepts stop, seek, and mute.
     pub action: String,
     /// For seek, the position in seconds. For volume: 0-100 for normalized providers, or decimal dB for HQPlayer; relative amounts use the provider's scale.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -97,11 +94,11 @@ pub async fn handle_control(
     args: HifiControlTool,
 ) -> Result<CallToolResult, CallToolError> {
     // A direct HQPlayer zone is resolved through `HqpInstanceManager`, not the
-    // shared adapter path the other providers use, and it accepts a wider
+    // single shared adapter the other four providers use, and it accepts a wider
     // action vocabulary (stop/seek/mute, #328) than `CONTROL_ACTIONS` — so it is
     // its own dispatch, branched before the closed-set check below rather than
     // folded into it. `ZoneTarget::classify` is pure and does no I/O, so checking
-    // it first costs nothing on the other providers' path.
+    // it first costs nothing on the other four providers' path.
     if ZoneTarget::classify(&args.zone_id) == ZoneTarget::HqPlayer {
         return handle_hqplayer_control(state, args).await;
     }
@@ -159,9 +156,6 @@ pub async fn handle_control(
             // Negated: the same relative call, opposite direction.
             return set_volume(state, &args.zone_id, -delta, true).await;
         }
-        "repeat_off" | "repeat_context" | "repeat_track" | "shuffle_on" | "shuffle_off" => {
-            args.action.as_str()
-        }
         // Unreachable: CONTROL_ACTIONS gates this whole match, and
         // `routing::tests::control_actions_cover_the_documented_set` proves the
         // two lists agree. Refused rather than forwarded, because forwarding is
@@ -175,15 +169,6 @@ pub async fn handle_control(
     let env = Envelope::write("hifi_control", backend_action)
         .param("zone_id", &*args.zone_id)
         .param("action", &*args.action);
-
-    if let Some(capability) = mode_capability(backend_action) {
-        if !matches!(
-            support(target, capability),
-            crate::mcp::capabilities::Support::Supported
-        ) {
-            return refuse_zone(state, env, &args.zone_id, target, capability).await;
-        }
-    }
 
     let route = target.for_transport();
     if let TransportRoute::Refused(refused) = route {
@@ -216,15 +201,6 @@ pub async fn handle_control(
             Ok(command) => dispatch_roon_runtime_command(state, &args.zone_id, command).await,
             Err(error) => Err(error),
         },
-        TransportRoute::AppleMusic | TransportRoute::Spotify | TransportRoute::MusicAssistant => {
-            dispatch_adapter_command(
-                state,
-                target.label(),
-                &args.zone_id,
-                transport_command(backend_action),
-            )
-            .await
-        }
         // Handled above; kept exhaustive rather than caught by a wildcard so a
         // new route variant fails to compile instead of falling through.
         TransportRoute::Refused(_) => unreachable_refused(),
@@ -300,7 +276,7 @@ const HQPLAYER_CONTROL_ACTIONS: &[&str] = &[
 /// Its own dispatch rather than a branch inside the shared match above, for two
 /// reasons #328 could not fold into it:
 ///
-/// - The zone id names an `HqpInstanceManager` instance, not one of the shared
+/// - The zone id names an `HqpInstanceManager` instance, not one of the four
 ///   providers' single shared adapter — resolution is a name lookup, not a
 ///   route.
 /// - The action vocabulary is wider ([`HQPLAYER_CONTROL_ACTIONS`]), and volume
@@ -463,13 +439,9 @@ async fn set_volume(
         VolumeRoute::OpenHome | VolumeRoute::Upnp => env.param("value", integer_volume),
         // Nothing is sent on a refusal, so the client's resolved request is the
         // honest value to report.
-        VolumeRoute::AppleMusic
-        | VolumeRoute::Spotify
-        | VolumeRoute::MusicAssistant
-        | VolumeRoute::Lms
-        | VolumeRoute::Roon
-        | VolumeRoute::HqPlayer
-        | VolumeRoute::Refused(_) => env.param("value", value),
+        VolumeRoute::Lms | VolumeRoute::Roon | VolumeRoute::Refused(_) | VolumeRoute::HqPlayer => {
+            env.param("value", value)
+        }
     };
 
     if let VolumeRoute::Refused(refused) = route {
@@ -538,19 +510,6 @@ async fn set_volume(
             };
             dispatch_upnp_runtime_command(state, zone_id, command).await
         }
-        VolumeRoute::AppleMusic | VolumeRoute::Spotify | VolumeRoute::MusicAssistant => {
-            dispatch_adapter_command(
-                state,
-                target.label(),
-                zone_id,
-                if relative {
-                    AdapterCommand::VolumeRelative(integer_volume)
-                } else {
-                    AdapterCommand::VolumeAbsolute(integer_volume)
-                },
-            )
-            .await
-        }
         VolumeRoute::Refused(_) => unreachable_refused(),
         // `handle_control` returns through `handle_hqplayer_control` for every
         // `ZoneTarget::HqPlayer` zone id before this function is ever called.
@@ -572,50 +531,6 @@ async fn set_volume(
             )))
         }
         Err(e) => env.failed(format!("Volume error: {}", e)),
-    }
-}
-
-fn transport_command(action: &str) -> AdapterCommand {
-    match action {
-        "play" => AdapterCommand::Play,
-        "pause" => AdapterCommand::Pause,
-        "play_pause" => AdapterCommand::PlayPause,
-        "stop" => AdapterCommand::Stop,
-        "next" => AdapterCommand::Next,
-        "previous" => AdapterCommand::Previous,
-        "repeat_off" => AdapterCommand::SetRepeat(crate::bus::RepeatMode::Off),
-        "repeat_context" => AdapterCommand::SetRepeat(crate::bus::RepeatMode::All),
-        "repeat_track" => AdapterCommand::SetRepeat(crate::bus::RepeatMode::One),
-        "shuffle_on" => AdapterCommand::SetShuffle(true),
-        "shuffle_off" => AdapterCommand::SetShuffle(false),
-        _ => unreachable!("validated transport action: {action}"),
-    }
-}
-
-fn mode_capability(action: &str) -> Option<Capability> {
-    match action {
-        "repeat_off" | "repeat_context" | "repeat_track" => Some(Capability::RepeatMode),
-        "shuffle_on" | "shuffle_off" => Some(Capability::ShuffleMode),
-        _ => None,
-    }
-}
-
-async fn dispatch_adapter_command(
-    state: &AppState,
-    prefix: &str,
-    zone_id: &str,
-    command: AdapterCommand,
-) -> anyhow::Result<()> {
-    let response = state
-        .adapter_registry
-        .command(prefix, zone_id, command)
-        .await?;
-    if response.success {
-        Ok(())
-    } else {
-        anyhow::bail!(response
-            .error
-            .unwrap_or_else(|| format!("{prefix} adapter rejected command")))
     }
 }
 

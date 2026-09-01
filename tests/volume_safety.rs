@@ -22,7 +22,6 @@ fn db_output() -> Output {
             is_muted: Some(false),
             step: Some(1.0),
         }),
-        can_group_with_output_ids: Vec::new(),
     }
 }
 
@@ -72,7 +71,6 @@ fn pct_output() -> Output {
             is_muted: Some(false),
             step: Some(1.0),
         }),
-        can_group_with_output_ids: Vec::new(),
     }
 }
 
@@ -115,7 +113,6 @@ fn missing_volume_uses_safe_defaults() {
         output_id: "no-vol".to_string(),
         display_name: "No Volume".to_string(),
         volume: None,
-        can_group_with_output_ids: Vec::new(),
     };
     let (min, max) = get_volume_range(Some(&output));
     assert_eq!(min, 0.0);

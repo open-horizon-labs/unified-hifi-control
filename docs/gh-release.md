@@ -28,7 +28,6 @@ Add labels to your PR to enable optional builds:
 | `build:docker` | Docker x64 image |
 | `build:linux-arm` | Linux arm64 + armv7 binaries |
 | `build:macos` | macOS universal binary |
-| `build:applemusic-macos` | Apple Music companion DMG (macOS arm64 only) |
 | `build:windows` | Windows exe |
 | `build:linux-packages` | deb/rpm packages |
 | `build:all` | Everything |
@@ -255,42 +254,6 @@ The QDK 2.5.3 release assets used here are:
 - `qdk_2.5.3_amd64.deb`: `17b3841b7d4590a4ee025844ba583304b5e3c497d9fa8934d5175131d3908022`
 - `qdk_2.5.3_arm64.deb`: `4b00c009cb48c0ffa7e4b7b00c5a6a1982a0955d663c0c6ec57020353e68eeb9` (available from the release, not used by CI)
 
-### Apple Music Companion DMG
-
-`build-applemusic-companion-dmg` builds the macOS companion app
-(`companion/apple_music/XcodeMac/AppleMusicCompanionMac.xcworkspace`) with
-`xcodebuild`, forcing `ARCHS=arm64` — Apple Silicon only, no x86_64 or
-universal build, by explicit project decision. The job runs
-`companion/apple_music/build-dmg.sh`, which also verifies the built
-executable is arm64-only (via `lipo -archs`) before wrapping it with
-`hdiutil create` into a `.dmg` containing the `.app` and an `Applications`
-symlink.
-
-No code-signing identity is available in CI, so the DMG ships **unsigned**
-(ad-hoc signed with `codesign --sign -`). Notarization is tracked as a
-follow-up, not a blocker (see issue #535). Because the app is unsigned,
-Gatekeeper quarantines it on download; users must either right-click the
-`.app` and choose **Open** (confirming the dialog) on first launch, or run:
-
-```sh
-xattr -dr com.apple.quarantine "/Applications/AppleMusicCompanionMac.app"
-```
-
-This is documented in `companion/apple_music/README.md` and linked from the
-release notes' Download Guide.
-
-To reproduce the CI artifact locally on Apple Silicon:
-
-```sh
-make companion-apple-music-dmg
-# or directly:
-VERSION=0.1.0 companion/apple_music/build-dmg.sh
-```
-
-The DMG lands in `companion/apple_music/dist/`. Set `CODE_SIGN_IDENTITY` (and
-`DEVELOPMENT_TEAM`) to build with a local Developer ID or Apple Development
-identity instead of the unsigned default.
-
 ## Build Matrix
 
 | Target | Caching | Build Tool | Default | Label |
@@ -301,7 +264,6 @@ identity instead of the unsigned default.
 | Linux aarch64-musl | rust-cache | cargo-zigbuild | Release | `build:linux-arm` |
 | Linux armv7-musl | rust-cache | cargo-zigbuild | Release | `build:linux-arm` |
 | macOS universal | sccache + rust-cache | cargo + lipo | Release | `build:macos` |
-| Apple Music companion DMG (macOS arm64) | N/A | xcodebuild + hdiutil | Release | `build:applemusic-macos` |
 | Windows x86_64 | sccache + rust-cache | cargo | Release | `build:windows` |
 | Docker x64 | N/A | pre-built binary | Release | `build:docker` |
 | Docker multi-arch | N/A | pre-built binaries | Release | - |
@@ -331,150 +293,3 @@ This adds ~14s but catches ABI issues, missing linkage, and startup crashes befo
 ## LMS Plugin
 
 See [lms-plugin.md](lms-plugin.md) for LMS plugin distribution modes (bootstrap vs full ZIPs) and testing instructions.
-
-## Release Signing
-
-Tracked as issue #561, worked cheapest-first. Each platform activates
-independently once its GitHub Actions secrets exist - nothing here is
-all-or-nothing.
-
-### Status
-
-| Platform | State | Secrets required |
-|----------|-------|-------------------|
-| SHA256SUMS (all binaries/packages) | **Active** | none - always generated |
-| SHA256SUMS.asc (GPG detached signature) | Gated | `GPG_PRIVATE_KEY`, `GPG_PASSPHRASE` |
-| Docker images (cosign/sigstore keyless) | **Active** | none - uses GitHub OIDC |
-| QNAP QPKG (x64 + arm64) | Prepared, not implemented | `QNAP_SIGNING_CERT`, `QNAP_SIGNING_KEY` (fails loudly if set, since the actual QDK signing call isn't wired up yet) |
-| macOS companion DMG (codesign) | Gated | `APPLE_DEVELOPER_ID_CERT_P12`, `APPLE_DEVELOPER_ID_CERT_PASSWORD`, `APPLE_DEVELOPMENT_TEAM_ID` |
-| macOS companion DMG (notarize + staple) | Gated (requires codesign above) | `APPLE_NOTARY_KEY_P8`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_KEY_ISSUER_ID` |
-| Windows binary (Authenticode/signtool) | Prepared, disabled | `WINDOWS_SIGNING_CERT_BASE64`, `WINDOWS_SIGNING_CERT_PASSWORD` (deferred until Windows matters commercially) |
-| Synology SPK | Not signable | n/a - Synology does not support self-signed packages; DSM 7 shows an "unrecognized publisher" warning by design (see README) |
-
-Every gated step is written to skip cleanly (or, for QNAP, fail with a clear
-message) when its secrets are absent, so adding platforms later never
-requires touching the workflow's control flow - only adding secrets.
-
-### Free tier (active now)
-
-**SHA256SUMS + GPG signature.** The `upload-release` job in
-`.github/workflows/build.yml` runs `sha256sum *` over every file in the
-release (binaries, packages, DMG, zips) and writes `SHA256SUMS`. If the
-`GPG_PRIVATE_KEY` secret is set, it imports that key and produces a detached,
-armored signature at `SHA256SUMS.asc`; if not, the release still ships,
-just without the `.asc` file. See
-[docs/release-signing/gpg-public-key.asc](release-signing/gpg-public-key.asc)
-for exactly how to generate and install that key - it's currently a
-placeholder because generating a long-lived signing key isn't something CI
-(or an automated change) should do on the owner's behalf.
-
-**cosign (sigstore keyless) for Docker images.** The `docker-manifest` job
-signs every tag it publishes (`muness/unified-hifi-control` and the legacy
-`muness/roon-extension-knob` alias) with `cosign sign --yes <tag>`. This uses
-GitHub Actions' OIDC identity token to get a short-lived certificate from
-Sigstore's public-good Fulcio CA and records the signature in the public
-Rekor transparency log - no secret, no enrollment, no long-lived key. It's
-already active on every tagged release.
-
-### Verifying a release
-
-Given a downloaded release asset (say `unified-hifi-linux-x64`) and the
-`SHA256SUMS`/`SHA256SUMS.asc` files from the same release:
-
-```sh
-# 1. Checksum: does the file match what CI produced?
-sha256sum -c SHA256SUMS --ignore-missing
-
-# 2. Signature: was SHA256SUMS itself signed by the project's key?
-#    (one-time) import the project's public key:
-gpg --import gpg-public-key.asc   # from docs/release-signing/gpg-public-key.asc
-gpg --verify SHA256SUMS.asc SHA256SUMS
-```
-
-For Docker images:
-
-```sh
-cosign verify muness/unified-hifi-control:<version> \
-  --certificate-identity-regexp 'https://github.com/open-horizon-labs/unified-hifi-control/.*' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
-```
-
-If `SHA256SUMS.asc` is missing from a release, GPG signing wasn't active yet
-for that build - the checksum file itself is still valid, just unsigned.
-
-### Gated platforms (prepared, waiting on owner-supplied secrets)
-
-**QNAP QPKG.** `build-qnap-x64` and `build-qnap-arm` each have a signing step
-gated on `QNAP_SIGNING_CERT`/`QNAP_SIGNING_KEY`. Unlike the other gated
-steps, this one is intentionally not a silent no-op if the secrets exist:
-QNAP's actual QDK signing call (`codesign_pkg` or equivalent) isn't
-implemented yet, so the step fails loudly rather than claim a package is
-signed when it isn't. Wire up the real signing call before setting these
-secrets in CI.
-
-**macOS companion DMG.** `build-applemusic-companion-dmg` imports a
-"Developer ID Application" certificate from `APPLE_DEVELOPER_ID_CERT_P12` /
-`APPLE_DEVELOPER_ID_CERT_PASSWORD` into a temporary keychain, builds with
-that identity (`APPLE_DEVELOPMENT_TEAM_ID`), and - if the three
-`APPLE_NOTARY_KEY_*` secrets (an App Store Connect API key) are also set -
-submits the DMG to `notarytool` and staples the ticket. Any subset missing
-falls back to today's unsigned/ad-hoc build; once all six secrets exist, the
-`companion/apple_music/README.md` "unsigned app" workaround and the matching
-note in `.github/RELEASE_TEMPLATE.md`/README should be removed.
-
-**Windows Authenticode.** `build-windows` has a `signtool` step gated on
-`WINDOWS_SIGNING_CERT_BASE64`/`WINDOWS_SIGNING_CERT_PASSWORD` (a base64 PFX +
-password). Deferred by design until Windows matters commercially per issue
-#561. When ready, either populate those two secrets, or replace the step
-with `azure/trusted-signing-action` and its `AZURE_TRUSTED_SIGNING_*` secrets
-if using Azure Trusted Signing instead of a traditional OV certificate -
-both are supported paths, pick whichever the owner buys.
-
-### Secret names, all in one place
-
-| Secret | Used by | Purpose |
-|--------|---------|---------|
-| `GPG_PRIVATE_KEY` | `upload-release` | ASCII-armored private key, imported at sign time |
-| `GPG_PASSPHRASE` | `upload-release` | Passphrase for the key above (may be empty-string key, see placeholder doc) |
-| `QNAP_SIGNING_CERT` | `build-qnap-x64`, `build-qnap-arm` | QNAP developer program signing certificate |
-| `QNAP_SIGNING_KEY` | `build-qnap-x64`, `build-qnap-arm` | QNAP developer program signing key |
-| `APPLE_DEVELOPER_ID_CERT_P12` | `build-applemusic-companion-dmg` | base64 "Developer ID Application" .p12 export |
-| `APPLE_DEVELOPER_ID_CERT_PASSWORD` | `build-applemusic-companion-dmg` | Password for the .p12 above |
-| `APPLE_DEVELOPMENT_TEAM_ID` | `build-applemusic-companion-dmg` | 10-character Apple Developer Team ID |
-| `APPLE_NOTARY_KEY_P8` | `build-applemusic-companion-dmg` | base64 App Store Connect API key (.p8) |
-| `APPLE_NOTARY_KEY_ID` | `build-applemusic-companion-dmg` | Key ID for the API key above |
-| `APPLE_NOTARY_KEY_ISSUER_ID` | `build-applemusic-companion-dmg` | Issuer ID for the API key above |
-| `WINDOWS_SIGNING_CERT_BASE64` | `build-windows` | base64 PFX code-signing certificate (deferred) |
-| `WINDOWS_SIGNING_CERT_PASSWORD` | `build-windows` | Password for the PFX above (deferred) |
-
-None of these are committed anywhere; the workflow only ever imports them
-from GitHub Actions secrets at build time.
-
-## Home Assistant Add-on Version Bumps
-
-The [Home Assistant add-on](https://github.com/open-horizon-labs/uhc-home-assistant-addon)
-lives in its own repository — it isn't built by this repo's CI. It's a thin
-wrapper: `unified-hifi-control/build.yaml` pins a specific `muness/unified-hifi-control`
-Docker Hub tag as `build_from`, and the Home Assistant Supervisor builds the
-add-on image locally on the user's box from that base at install/update time.
-
-After cutting a release here that you want the add-on to track:
-
-1. In the `uhc-home-assistant-addon` repo, edit `unified-hifi-control/build.yaml`:
-   bump both `build_from.amd64` and `build_from.aarch64` to the new version tag
-   (e.g. `docker.io/muness/unified-hifi-control:3.7.0`). Both arches use the
-   same tag — the published image is already a multi-arch manifest, so Docker
-   resolves the right platform layer.
-2. Bump `version` in `unified-hifi-control/config.yaml` to match (Home
-   Assistant's add-on store uses this field to show/offer the update — it
-   must change or users won't see an update available).
-3. Commit and push directly to `main` (that repo has no release process of
-   its own; the add-on version *is* the tracked UHC version).
-4. The repo's `Lint` GitHub Actions workflow (`frenck/action-addon-linter`)
-   validates the config schema on push — confirm it's green before telling
-   anyone to update.
-
-There's no automation wiring this to this repo's own release workflow yet;
-it's a manual two-field bump after you're satisfied a release is stable
-enough to push to Home Assistant users (skip beta/rc tags — point the add-on
-at stable releases only).
