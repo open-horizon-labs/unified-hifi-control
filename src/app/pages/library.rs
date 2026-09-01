@@ -317,6 +317,16 @@ struct LevelError {
     unreachable: bool,
 }
 
+/// Roon browse item keys belong to a Core-side session. A Core reconnect can
+/// invalidate that session while UHC is still running, leaving a bookmarked
+/// or already-open library URL pointing at keys Roon will reject. Keep that
+/// provider detail out of the UI; the page can return to a fresh root instead.
+fn is_expired_roon_browse(message: &str, source: Option<&str>) -> bool {
+    source == Some("roon")
+        && (message.contains("no longer valid in this browse session")
+            || message.contains("InvalidItemKey"))
+}
+
 /// Fetch one page of the current level and apply it.
 #[allow(clippy::too_many_arguments)]
 async fn load_page(
@@ -964,12 +974,15 @@ pub fn Library(
             }
         }
     } else if let Some(level_error) = current_error.clone() {
-        let retry_source = current_source.clone();
+        let roon_session_expired =
+            is_expired_roon_browse(&level_error.message, current_source.as_deref());
         // #573 visual pass V3: unreachability copy is reserved for actual
         // network failures; a genuine refusal (a capability gap, an expired
         // path) renders its own reason instead of claiming the provider is
         // down.
-        let heading = if level_error.unreachable {
+        let heading = if roon_session_expired {
+            "Roon refreshed; this browse page expired.".to_string()
+        } else if level_error.unreachable {
             format!(
                 "{} isn't reachable right now.",
                 source_label(current_source.as_deref().unwrap_or("this source"))
@@ -977,18 +990,22 @@ pub fn Library(
         } else {
             "This view isn't available.".to_string()
         };
+        let detail = if roon_session_expired {
+            "Your library connection changed, so we’ll reload this from the beginning.".to_string()
+        } else {
+            level_error.message.clone()
+        };
         rsx! {
             div { class: "library-provider-down",
                 p { "{heading}" }
-                p { class: "text-sm text-muted", "{level_error.message}" }
+                p { class: "text-sm text-muted", "{detail}" }
                 button {
                     class: "btn btn-outline",
                     r#type: "button",
                     onclick: move |_| {
-                        let _ = retry_source.clone();
                         refresh(false);
                     },
-                    "Retry"
+                    if roon_session_expired { "Refresh library" } else { "Retry" }
                 }
             }
         }
@@ -1671,6 +1688,19 @@ mod loop_regression_tests {
 #[cfg(test)]
 mod library_defect_pins {
     use super::*;
+
+    #[test]
+    fn roon_session_rejection_is_classified_for_recovery() {
+        assert!(is_expired_roon_browse(
+            "Roon Core rejected the item key: it is no longer valid in this browse session",
+            Some("roon")
+        ));
+        assert!(!is_expired_roon_browse("connection refused", Some("roon")));
+        assert!(!is_expired_roon_browse(
+            "Roon Core rejected the item key: it is no longer valid in this browse session",
+            Some("lms")
+        ));
+    }
 
     /// Defect 2 pin: the API's `image` field is the complete `<img src>`
     /// value. It must be used verbatim -- prefixing it again
