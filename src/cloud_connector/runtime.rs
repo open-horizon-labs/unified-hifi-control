@@ -9,14 +9,13 @@
 use futures::{SinkExt, StreamExt};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio_tungstenite::{
     connect_async_with_config,
     tungstenite::{
         client::IntoClientRequest as _,
         http::{header::AUTHORIZATION, HeaderValue},
-        protocol::WebSocketConfig,
+        protocol::{frame::coding::CloseCode, CloseFrame, WebSocketConfig},
         Message,
     },
 };
@@ -45,6 +44,7 @@ const ARTWORK_CONCURRENCY: usize = super::artwork::MAX_CONCURRENT;
 const ARTWORK_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const ARTWORK_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 const MAX_SESSION_GRANT_RESPONSE_BYTES: usize = 16 * 1024;
+const SHUTDOWN_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,33 +58,152 @@ struct GrantResponse {
 enum ConnectionExit {
     Disconnected,
     Revoked,
+    Shutdown,
 }
 
-pub fn spawn_from_env(
-    state: crate::api::AppState,
-    config_dir: impl Into<std::path::PathBuf>,
-) -> anyhow::Result<Option<JoinHandle<()>>> {
-    let Some(config) = CloudConnectorConfig::from_env(config_dir)? else {
-        return Ok(None);
-    };
-    let identity = if config.key_path.exists() {
-        InstallationIdentity::load(&config.key_path, config.installation_id.clone())?
-    } else {
-        let identity = InstallationIdentity::generate(config.installation_id.clone())?;
-        if let Some(parent) = config.key_path.parent() {
-            std::fs::create_dir_all(parent)?;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorPhase {
+    Unconfigured,
+    Offline,
+    Connecting,
+    Online,
+    Revoked,
+}
+
+impl ConnectorPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unconfigured => "unconfigured",
+            Self::Offline => "offline",
+            Self::Connecting => "connecting",
+            Self::Online => "online",
+            Self::Revoked => "revoked",
         }
-        identity.save(&config.key_path)?;
-        identity
-    };
-    Ok(Some(tokio::spawn(run(state, config, identity))))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorStatus {
+    pub configured: bool,
+    pub installation_id: Option<String>,
+    pub phase: ConnectorPhase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorStart {
+    NotConfigured,
+    Started,
+    AlreadyRunning,
+}
+
+#[derive(Default)]
+struct SupervisorState {
+    active: bool,
+    generation: u64,
+    installation_id: Option<String>,
+    phase: Option<ConnectorPhase>,
+}
+
+/// Owns the single outbound connector task for this UHC process. Pairing can
+/// activate it immediately, while startup reconstructs the same state from the
+/// owner-only persisted binding without relying on a package launcher.
+#[derive(Clone, Default)]
+pub struct ConnectorSupervisor {
+    inner: std::sync::Arc<Mutex<SupervisorState>>,
+}
+
+#[derive(Clone, Copy)]
+struct ConnectionLifecycle<'a> {
+    supervisor: &'a ConnectorSupervisor,
+    generation: u64,
+}
+
+impl ConnectorSupervisor {
+    pub async fn start_from_runtime(
+        &self,
+        state: crate::api::AppState,
+        config_dir: impl Into<std::path::PathBuf>,
+    ) -> anyhow::Result<ConnectorStart> {
+        let Some(config) = CloudConnectorConfig::from_runtime(config_dir)? else {
+            return Ok(ConnectorStart::NotConfigured);
+        };
+        let identity = InstallationIdentity::load(&config.key_path, config.installation_id.clone())
+            .map_err(|error| {
+                anyhow::anyhow!("paired HiPhi installation key is unavailable: {error}")
+            })?;
+
+        let generation = {
+            let mut inner = self.inner.lock().await;
+            if inner.active {
+                if inner.installation_id.as_deref() == Some(config.installation_id.as_str()) {
+                    return Ok(ConnectorStart::AlreadyRunning);
+                }
+                anyhow::bail!("a different HiPhi connector task is already active");
+            }
+            inner.generation = inner.generation.saturating_add(1);
+            inner.active = true;
+            inner.installation_id = Some(config.installation_id.clone());
+            inner.phase = Some(ConnectorPhase::Connecting);
+            inner.generation
+        };
+
+        let supervisor = self.clone();
+        tokio::spawn(async move {
+            let final_phase = run(state, config, identity, supervisor.clone(), generation).await;
+            supervisor.finish(generation, final_phase).await;
+        });
+        Ok(ConnectorStart::Started)
+    }
+
+    pub async fn status_from_runtime(
+        &self,
+        config_dir: impl Into<std::path::PathBuf>,
+    ) -> anyhow::Result<ConnectorStatus> {
+        let Some(config) = CloudConnectorConfig::from_runtime(config_dir)? else {
+            return Ok(ConnectorStatus {
+                configured: false,
+                installation_id: None,
+                phase: ConnectorPhase::Unconfigured,
+            });
+        };
+        let inner = self.inner.lock().await;
+        let phase = if inner.active
+            && inner.installation_id.as_deref() == Some(config.installation_id.as_str())
+        {
+            inner.phase.unwrap_or(ConnectorPhase::Offline)
+        } else {
+            ConnectorPhase::Offline
+        };
+        Ok(ConnectorStatus {
+            configured: true,
+            installation_id: Some(config.installation_id),
+            phase,
+        })
+    }
+
+    async fn set_phase(&self, generation: u64, phase: ConnectorPhase) {
+        let mut inner = self.inner.lock().await;
+        if inner.active && inner.generation == generation {
+            inner.phase = Some(phase);
+        }
+    }
+
+    async fn finish(&self, generation: u64, phase: ConnectorPhase) {
+        let mut inner = self.inner.lock().await;
+        if inner.generation == generation {
+            inner.active = false;
+            inner.phase = Some(phase);
+        }
+    }
 }
 
 async fn run(
     state: crate::api::AppState,
     config: CloudConnectorConfig,
     identity: InstallationIdentity,
-) {
+    supervisor: ConnectorSupervisor,
+    generation: u64,
+) -> ConnectorPhase {
     let mut backoff = super::transport::Backoff::default();
     let shutdown = state.shutdown.clone();
     let mut store = StateStore::default();
@@ -92,31 +211,31 @@ async fn run(
         Ok(guard) => guard,
         Err(error) => {
             tracing::error!("HiPhi Cloud epoch state is unavailable: {error}");
-            return;
+            return ConnectorPhase::Offline;
         }
     };
     let mut ledger = CommandLedger::default();
+    let mut final_phase = ConnectorPhase::Offline;
     loop {
+        supervisor
+            .set_phase(generation, ConnectorPhase::Connecting)
+            .await;
         let delay = backoff.next_delay();
         tokio::select! { _ = shutdown.cancelled() => break, _ = tokio::time::sleep(delay) => {} }
-        let grant = match request_session_grant(&config, &identity).await {
+        let grant = match tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            grant = request_session_grant(&config, &identity) => grant,
+        } {
             Ok(grant) => grant,
             Err(error) => {
                 tracing::debug!("HiPhi Cloud session grant unavailable: {error}");
                 continue;
             }
         };
-        let issuer_key = match issuer_verifying_key(&config) {
-            Ok(key) => key,
-            Err(error) => {
-                tracing::error!("HiPhi Cloud issuer key is invalid: {error}");
-                break;
-            }
-        };
         let verified_grant = match verify_installation_session_grant(
             &grant,
-            &config.issuer_key_id,
-            &issuer_key,
+            &config.session_issuer_keys,
             &identity,
             config.endpoint.as_str(),
             now_ms(),
@@ -139,12 +258,15 @@ async fn run(
                 break;
             }
         };
-        match tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            connect_async_with_config(request, Some(websocket_limits), false),
-        )
-        .await
-        {
+        let connection = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            connection = tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                connect_async_with_config(request, Some(websocket_limits), false),
+            ) => connection,
+        };
+        match connection {
             Ok(Ok((socket, _))) => {
                 match run_connection(
                     &state,
@@ -155,6 +277,10 @@ async fn run(
                     &mut store,
                     &mut epoch_guard,
                     &mut ledger,
+                    ConnectionLifecycle {
+                        supervisor: &supervisor,
+                        generation,
+                    },
                     socket,
                 )
                 .await
@@ -162,15 +288,30 @@ async fn run(
                     // Reset only after the authenticated session completed its
                     // challenge/proof ceremony.  A socket that accepts TCP
                     // and then rejects the protocol must still back off.
-                    Ok(ConnectionExit::Disconnected) => backoff.reset(),
-                    Ok(ConnectionExit::Revoked) => break,
-                    Err(error) => tracing::warn!("HiPhi Cloud relay disconnected: {error}"),
+                    Ok(ConnectionExit::Disconnected) => {
+                        supervisor
+                            .set_phase(generation, ConnectorPhase::Offline)
+                            .await;
+                        backoff.reset();
+                    }
+                    Ok(ConnectionExit::Revoked) => {
+                        final_phase = ConnectorPhase::Revoked;
+                        break;
+                    }
+                    Ok(ConnectionExit::Shutdown) => break,
+                    Err(error) => {
+                        supervisor
+                            .set_phase(generation, ConnectorPhase::Offline)
+                            .await;
+                        tracing::warn!("HiPhi Cloud relay disconnected: {error}");
+                    }
                 }
             }
             Ok(Err(error)) => tracing::debug!("HiPhi Cloud relay unavailable: {error}"),
             Err(_) => tracing::debug!("HiPhi Cloud relay connect timed out"),
         }
     }
+    final_phase
 }
 
 async fn request_session_grant(
@@ -259,11 +400,16 @@ async fn run_connection<S>(
     store: &mut StateStore,
     epoch_guard: &mut SessionEpochGuard,
     ledger: &mut CommandLedger,
+    lifecycle: ConnectionLifecycle<'_>,
     mut socket: tokio_tungstenite::WebSocketStream<S>,
 ) -> anyhow::Result<ConnectionExit>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    if state.shutdown.is_cancelled() {
+        close_socket_for_shutdown(&mut socket).await;
+        return Ok(ConnectionExit::Shutdown);
+    }
     let challenge = match tokio::time::timeout(
         std::time::Duration::from_secs(10),
         next_relay_message(&mut socket),
@@ -295,7 +441,7 @@ where
     epoch_guard.accept_at(epoch, now_ms().try_into().unwrap_or_default())?;
 
     let projection = snapshot_from_aggregator(
-        &state.aggregator,
+        state,
         store,
         config.installation_id.clone(),
         epoch,
@@ -334,8 +480,11 @@ where
         now_playing: projection.now_playing,
     });
     send_json(&mut socket, &snapshot).await?;
+    lifecycle
+        .supervisor
+        .set_phase(lifecycle.generation, ConnectorPhase::Online)
+        .await;
 
-    let issuer_key = issuer_verifying_key(config)?;
     let mut verifier = CommandGrantVerifier::new(
         "hiphi-command-authorization",
         UHC_AUDIENCE,
@@ -343,7 +492,9 @@ where
         epoch,
         grant_generation,
     );
-    verifier.pin_key(config.issuer_key_id.clone(), issuer_key);
+    for (key_id, key) in config.command_issuer_keys.iter() {
+        verifier.pin_key(key_id.to_owned(), *key);
+    }
     let (artwork_tx, mut artwork_rx) = mpsc::channel(ARTWORK_QUEUE_CAPACITY);
     let artwork_slots =
         std::sync::Arc::new(Semaphore::new(ARTWORK_QUEUE_CAPACITY + ARTWORK_CONCURRENCY));
@@ -355,6 +506,10 @@ where
     loop {
         let message = tokio::select! {
             biased;
+            _ = state.shutdown.cancelled() => {
+                close_socket_for_shutdown(&mut socket).await;
+                return Ok(ConnectionExit::Shutdown);
+            }
             message = socket.next() => {
                 let Some(message) = message else { break; };
                 message?
@@ -367,7 +522,7 @@ where
                 continue;
             }
             _ = refresh.tick() => {
-                let projection = snapshot_from_aggregator(&state.aggregator, store, config.installation_id.clone(), epoch, store.latest().map_or(1, |p| p.revision.saturating_add(1)), now_ms() as u64).await?;
+                let projection = snapshot_from_aggregator(state, store, config.installation_id.clone(), epoch, store.latest().map_or(1, |p| p.revision.saturating_add(1)), now_ms() as u64).await?;
                 send_json(&mut socket, &ConnectorMessage::Snapshot(StateSnapshot { protocol_version: PROTOCOL_VERSION, message_id: message_id(), installation_id: projection.installation_id, epoch: projection.epoch, revision: projection.revision, observed_at: projection.observed_at as i64, expires_at: projection.expires_at as i64, zones: projection.zones, now_playing: projection.now_playing })).await?;
                 continue;
             }
@@ -380,6 +535,10 @@ where
                 continue;
             }
         };
+        if state.shutdown.is_cancelled() {
+            close_socket_for_shutdown(&mut socket).await;
+            return Ok(ConnectionExit::Shutdown);
+        }
         match message {
             Message::Text(text) if text.len() > MAX_COMMAND_BYTES => {
                 anyhow::bail!("relay command frame exceeds the command bound");
@@ -557,6 +716,25 @@ where
         .await
         .map_err(|_| anyhow::anyhow!("relay write timed out"))??;
     Ok(())
+}
+
+async fn close_socket_for_shutdown<S>(socket: &mut tokio_tungstenite::WebSocketStream<S>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let close = Message::Close(Some(CloseFrame {
+        code: CloseCode::Away,
+        reason: "connector shutdown".into(),
+    }));
+    let _ = tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, socket.send(close)).await;
+    let _ = tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, async {
+        while let Some(message) = socket.next().await {
+            if matches!(message, Ok(Message::Close(_)) | Err(_)) {
+                break;
+            }
+        }
+    })
+    .await;
 }
 async fn send_artwork_message<S>(
     socket: &mut tokio_tungstenite::WebSocketStream<S>,
@@ -800,18 +978,6 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-fn issuer_verifying_key(
-    config: &CloudConnectorConfig,
-) -> anyhow::Result<ed25519_dalek::VerifyingKey> {
-    Ok(ed25519_dalek::VerifyingKey::from_bytes(
-        config
-            .issuer_public_key
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("issuer key must be 32 bytes"))?,
-    )?)
-}
-
 fn websocket_upgrade_request(
     endpoint: &str,
     grant: &str,
@@ -828,8 +994,8 @@ fn websocket_upgrade_request(
 mod tests {
     use super::{
         request_session_grant_at, run_connection, session_grant_client, validate_challenge,
-        websocket_upgrade_request, CommandLedger, ConnectionExit, RelayMessage, StateStore,
-        MAX_SESSION_GRANT_RESPONSE_BYTES,
+        websocket_upgrade_request, CommandLedger, ConnectionExit, ConnectionLifecycle,
+        ConnectorSupervisor, RelayMessage, StateStore, MAX_SESSION_GRANT_RESPONSE_BYTES,
     };
     use crate::{
         adapters::{
@@ -844,11 +1010,11 @@ mod tests {
         api::AppState,
         bus::create_bus,
         cloud_connector::{
-            config::CloudConnectorConfig,
+            config::{CloudConnectorConfig, IssuerVerifyingKeyRing},
             identity::InstallationIdentity,
             protocol::{
-                CommandAction, CommandPayload, ConnectorMessage, SessionChallengeMessage,
-                PROTOCOL_VERSION,
+                CommandAction, CommandEnvelope, CommandGrantClaims, CommandPayload,
+                ConnectorMessage, SessionChallengeMessage, PROTOCOL_VERSION,
             },
             state::{ControlEligibility, SemanticStateInput, SemanticZoneInput},
             transport::{RelayEndpoint, SessionEpochGuard},
@@ -857,7 +1023,8 @@ mod tests {
         coordinator::AdapterCoordinator,
         knobs::KnobStore,
     };
-    use ed25519_dalek::SigningKey;
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer as _, SigningKey};
     use futures::{SinkExt as _, StreamExt as _};
     use std::{
         sync::{
@@ -891,6 +1058,65 @@ mod tests {
         }
     }
 
+    fn signed_command(
+        key_id: &str,
+        key: &SigningKey,
+        installation_id: &str,
+        epoch: u64,
+        generation: u64,
+        now: i64,
+    ) -> crate::cloud_connector::protocol::CommandEnvelope {
+        let control_node_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let idempotency_key = Uuid::new_v4();
+        let payload = CommandPayload {
+            zone_handle: "zone_distinct_authority_test".into(),
+            action: CommandAction::Next,
+        };
+        let claims = CommandGrantClaims {
+            protocol_version: PROTOCOL_VERSION,
+            issuer: "hiphi-command-authorization".into(),
+            audience: super::UHC_AUDIENCE.into(),
+            installation_id: installation_id.into(),
+            control_node_id,
+            request_id,
+            idempotency_key,
+            scope: payload.action.scope().into(),
+            payload_sha256: payload.canonical_hash().unwrap(),
+            epoch,
+            issued_at: now - 100,
+            expires_at: now + 5_000,
+            grant_generation: generation,
+        };
+        let encoded_header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "alg": "EdDSA",
+                "kid": key_id,
+            }))
+            .unwrap(),
+        );
+        let encoded_claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).unwrap());
+        let signature = key.sign(format!("{encoded_header}.{encoded_claims}").as_bytes());
+        let grant = format!(
+            "{encoded_header}.{encoded_claims}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        );
+        CommandEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            installation_id: installation_id.into(),
+            control_node_id,
+            epoch,
+            message_id: "message_distinct_authority_test".into(),
+            request_id,
+            idempotency_key,
+            created_at: claims.issued_at,
+            expires_at: claims.expires_at,
+            payload,
+            grant,
+        }
+    }
+
     async fn empty_app_state() -> AppState {
         let bus = create_bus();
         let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
@@ -918,6 +1144,98 @@ mod tests {
             Instant::now(),
             CancellationToken::new(),
         )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persisted_pairing_survives_restart_and_supervisor_is_duplicate_safe() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let installation_id = Uuid::new_v4().to_string();
+        let session_issuer = SigningKey::from_bytes(&[41; 32]);
+        let command_issuer = SigningKey::from_bytes(&[42; 32]);
+        let session_keys = serde_json::json!({
+            "version": 1,
+            "keys": [{
+                "kid": "session-v1",
+                "key": base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(session_issuer.verifying_key().to_bytes()),
+            }],
+        });
+        let command_keys = serde_json::json!({
+            "version": 1,
+            "keys": [{
+                "kid": "command-v1",
+                "key": base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(command_issuer.verifying_key().to_bytes()),
+            }],
+        });
+        let environment_path = directory.path().join("hiphi.env");
+        std::fs::write(
+            &environment_path,
+            format!(
+                "UHC_HIPHI_RELAY_URL=wss://cloud.invalid/v1/relay/connect\n\
+                 UHC_HIPHI_INSTALLATION_ID={installation_id}\n\
+                 UHC_HIPHI_SESSION_ISSUER_KEYS={session_keys}\n\
+                 UHC_HIPHI_COMMAND_ISSUER_KEYS={command_keys}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&environment_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+
+        let supervisor = ConnectorSupervisor::default();
+        let status = supervisor
+            .status_from_runtime(directory.path())
+            .await
+            .unwrap();
+        assert!(status.configured);
+        assert_eq!(
+            status.installation_id.as_deref(),
+            Some(installation_id.as_str())
+        );
+        assert_eq!(status.phase, super::ConnectorPhase::Offline);
+
+        let state = empty_app_state().await;
+        assert!(
+            supervisor
+                .start_from_runtime(state.clone(), directory.path())
+                .await
+                .is_err(),
+            "a persisted binding must not replace a missing private key"
+        );
+
+        let identity = InstallationIdentity::generate(installation_id.clone()).unwrap();
+        identity
+            .save(&directory.path().join("hiphi-installation.key"))
+            .unwrap();
+        assert_eq!(
+            supervisor
+                .start_from_runtime(state.clone(), directory.path())
+                .await
+                .unwrap(),
+            super::ConnectorStart::Started
+        );
+        assert_eq!(
+            supervisor
+                .start_from_runtime(state.clone(), directory.path())
+                .await
+                .unwrap(),
+            super::ConnectorStart::AlreadyRunning
+        );
+
+        state.shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if !supervisor.inner.lock().await.active {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connector should stop on process shutdown");
     }
 
     #[derive(Default)]
@@ -1254,10 +1572,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_run_connection_sends_hello_snapshot_then_honors_revocation() {
+    async fn production_connection_uses_distinct_command_authority_then_honors_revocation() {
         let installation_id = Uuid::new_v4().to_string();
         let identity = InstallationIdentity::generate(installation_id.clone()).unwrap();
-        let issuer = SigningKey::from_bytes(&[31; 32]);
+        let previous_session_issuer = SigningKey::from_bytes(&[28; 32]);
+        let session_issuer = SigningKey::from_bytes(&[30; 32]);
+        let previous_command_issuer = SigningKey::from_bytes(&[29; 32]);
+        let command_issuer = SigningKey::from_bytes(&[31; 32]);
         let temp = tempfile::tempdir().unwrap();
         let endpoint = "wss://cloud.invalid/v1/relay/connect";
         let config = CloudConnectorConfig {
@@ -1265,8 +1586,22 @@ mod tests {
             installation_id: installation_id.clone(),
             key_path: temp.path().join("installation.key"),
             epoch_path: temp.path().join("epoch"),
-            issuer_key_id: "issuer-1".into(),
-            issuer_public_key: issuer.verifying_key().to_bytes().to_vec(),
+            session_issuer_keys: IssuerVerifyingKeyRing::from_entries([
+                (
+                    "session-issuer-1".into(),
+                    previous_session_issuer.verifying_key(),
+                ),
+                ("session-issuer-2".into(), session_issuer.verifying_key()),
+            ])
+            .unwrap(),
+            command_issuer_keys: IssuerVerifyingKeyRing::from_entries([
+                (
+                    "command-issuer-1".into(),
+                    previous_command_issuer.verifying_key(),
+                ),
+                ("command-issuer-2".into(), command_issuer.verifying_key()),
+            ])
+            .unwrap(),
         };
         let state = empty_app_state().await;
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
@@ -1281,6 +1616,14 @@ mod tests {
             expires_at: now + 30_000,
         });
         let epoch = u64::try_from(now).unwrap();
+        let command = signed_command(
+            "command-issuer-2",
+            &command_issuer,
+            &installation_id,
+            epoch,
+            0,
+            now,
+        );
         let server_task = tokio::spawn(async move {
             server
                 .send(Message::Text(
@@ -1316,6 +1659,19 @@ mod tests {
                 if value.installation_id == installation_id && value.epoch == epoch));
             server
                 .send(Message::Text(
+                    serde_json::to_string(&RelayMessage::Command(command))
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let Message::Text(result) = server.next().await.unwrap().unwrap() else {
+                panic!("expected command result")
+            };
+            let result: ConnectorMessage = serde_json::from_str(&result).unwrap();
+            assert!(matches!(result, ConnectorMessage::CommandResult(_)));
+            server
+                .send(Message::Text(
                     serde_json::to_string(&RelayMessage::Revoke {
                         reason_code: "owner_revoked".into(),
                     })
@@ -1328,6 +1684,7 @@ mod tests {
         let mut store = StateStore::default();
         let mut epoch_guard = SessionEpochGuard::load(&config.epoch_path).unwrap();
         let mut ledger = CommandLedger::default();
+        let supervisor = ConnectorSupervisor::default();
         let exit = run_connection(
             &state,
             &config,
@@ -1337,11 +1694,152 @@ mod tests {
             &mut store,
             &mut epoch_guard,
             &mut ledger,
+            ConnectionLifecycle {
+                supervisor: &supervisor,
+                generation: 1,
+            },
             client,
         )
         .await
         .unwrap();
         assert_eq!(exit, ConnectionExit::Revoked);
+        assert_eq!(ledger.len(), 1, "the command authority grant was accepted");
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_connection_closes_without_executing_or_reconnecting_on_shutdown() {
+        let installation_id = Uuid::new_v4().to_string();
+        let identity = InstallationIdentity::generate(installation_id.clone()).unwrap();
+        let session_issuer = SigningKey::from_bytes(&[50; 32]);
+        let command_issuer = SigningKey::from_bytes(&[51; 32]);
+        let temp = tempfile::tempdir().unwrap();
+        let endpoint = "wss://cloud.invalid/v1/relay/connect";
+        let config = CloudConnectorConfig {
+            endpoint: RelayEndpoint::parse(endpoint).unwrap(),
+            installation_id: installation_id.clone(),
+            key_path: temp.path().join("installation.key"),
+            epoch_path: temp.path().join("epoch"),
+            session_issuer_keys: IssuerVerifyingKeyRing::from_entries([(
+                "session-issuer-1".into(),
+                session_issuer.verifying_key(),
+            )])
+            .unwrap(),
+            command_issuer_keys: IssuerVerifyingKeyRing::from_entries([(
+                "command-issuer-1".into(),
+                command_issuer.verifying_key(),
+            )])
+            .unwrap(),
+        };
+        let state = empty_app_state().await;
+        let shutdown = state.shutdown.clone();
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let now = super::now_ms();
+        let challenge = RelayMessage::Challenge(SessionChallengeMessage {
+            protocol_version: PROTOCOL_VERSION,
+            challenge_id: Uuid::new_v4(),
+            endpoint: endpoint.into(),
+            nonce: "nonce_012345678901234567890123456789".into(),
+            expires_at: now + 30_000,
+        });
+        let epoch = u64::try_from(now).unwrap();
+        let command = signed_command(
+            "command-issuer-1",
+            &command_issuer,
+            &installation_id,
+            epoch,
+            0,
+            now,
+        );
+        let (authenticated_tx, authenticated_rx) = tokio::sync::oneshot::channel();
+        let (send_after_shutdown_tx, send_after_shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&challenge).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                server.next().await.unwrap().unwrap(),
+                Message::Text(_)
+            ));
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&RelayMessage::SessionEstablished { epoch })
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                server.next().await.unwrap().unwrap(),
+                Message::Text(_)
+            ));
+            assert!(matches!(
+                server.next().await.unwrap().unwrap(),
+                Message::Text(_)
+            ));
+            authenticated_tx.send(()).unwrap();
+            send_after_shutdown_rx.await.unwrap();
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&RelayMessage::Command(command))
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), server.next())
+                .await
+                .expect("connector must terminate the active socket within the shutdown bound")
+                .expect("connector must send a WebSocket close frame")
+                .expect("close frame must be readable")
+        });
+        let client_task = tokio::spawn(async move {
+            let mut store = StateStore::default();
+            let mut epoch_guard = SessionEpochGuard::load(&config.epoch_path).unwrap();
+            let mut ledger = CommandLedger::default();
+            let supervisor = ConnectorSupervisor::default();
+            let exit = run_connection(
+                &state,
+                &config,
+                &identity,
+                "test.session.grant",
+                0,
+                &mut store,
+                &mut epoch_guard,
+                &mut ledger,
+                ConnectionLifecycle {
+                    supervisor: &supervisor,
+                    generation: 1,
+                },
+                client,
+            )
+            .await;
+            (exit, ledger)
+        });
+
+        authenticated_rx.await.unwrap();
+        shutdown.cancel();
+        send_after_shutdown_tx.send(()).unwrap();
+        let (exit, ledger) = tokio::time::timeout(std::time::Duration::from_secs(1), client_task)
+            .await
+            .expect("connector shutdown must be bounded")
+            .unwrap();
+        assert_eq!(exit.unwrap(), ConnectionExit::Shutdown);
+        assert_eq!(
+            ledger.len(),
+            0,
+            "shutdown must win before command verification"
+        );
+        let close = server_task.await.unwrap();
+        assert!(matches!(
+            close,
+            Message::Close(Some(frame))
+                if frame.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Away
+        ));
     }
 }

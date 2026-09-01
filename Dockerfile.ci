@@ -11,7 +11,8 @@ RUN apk add --no-cache ca-certificates openssh-client
 # Copy pre-built binary (web assets are embedded)
 ARG TARGETARCH
 COPY binaries/unified-hifi-linux-${TARGETARCH} /app/unified-hifi-control
-RUN chmod +x /app/unified-hifi-control
+COPY binaries/uhc-hiphi-pair-${TARGETARCH} /app/uhc-hiphi-pair
+RUN chmod +x /app/unified-hifi-control /app/uhc-hiphi-pair
 
 # Home Assistant custom integration (#613) - see Dockerfile.release. Kept
 # identical here so branch/PR images behave like release images when the

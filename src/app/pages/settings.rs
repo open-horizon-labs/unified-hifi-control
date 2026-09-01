@@ -5,18 +5,21 @@
 use dioxus::prelude::*;
 
 use crate::app::api::{
-    source_label, AppSettings, AppleBridgeStatus, HqpStatus, LmsConfig, ManagedZone,
-    ManagedZonesResponse, MoveDirection, MqttConfigureRequest, MqttStatusResponse,
-    MusicAssistantConfigureRequest, MusicAssistantStatusResponse, ProviderAuthResponse,
-    ProviderOAuthStart, RoonStatus, SpotifyAccountResponse, SpotifyConfigureRequest,
-    SpotifyConfigureResponse, SpotifyTunnelStatus, ZoneNameRequest, ZoneOrderRequest,
-    ZoneVisibilityRequest, ZonesResponse,
+    source_label, AppSettings, AppleBridgeStatus, HiphiCompleteRequest, HiphiCompleteResponse,
+    HiphiEnrollmentHandoff, HiphiInitiateRequest, HiphiInitiateResponse, HiphiPairingStatus,
+    HiphiPrepareResponse, HqpStatus, LmsConfig, ManagedZone, ManagedZonesResponse, MoveDirection,
+    MqttConfigureRequest, MqttStatusResponse, MusicAssistantConfigureRequest,
+    MusicAssistantStatusResponse, ProviderAuthResponse, ProviderOAuthStart, RoonStatus,
+    SpotifyAccountResponse, SpotifyConfigureRequest, SpotifyConfigureResponse, SpotifyTunnelStatus,
+    ZoneNameRequest, ZoneOrderRequest, ZoneVisibilityRequest, ZonesResponse,
 };
 use crate::app::components::{ErrorAlert, Layout};
 use crate::app::settings_context::{initial_app_settings, use_settings};
 use crate::app::sse::use_sse;
 use crate::app::theme::{use_theme, Theme};
 use crate::app::{McpEndpoint, Route};
+
+const HIPHI_STATUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// OpenHome status response
 #[derive(Clone, Debug, Default, serde::Deserialize, PartialEq)]
@@ -102,6 +105,250 @@ fn copy_to_clipboard(value: String, state: Signal<CopyState>) {
     {
         // Event handlers run in the hydrated WASM client, never during SSR.
         let _ = (value, state);
+    }
+}
+
+#[component]
+fn HiphiCloudPairing() -> Element {
+    let mut action = use_signal(ProviderActionState::default);
+    let mut error = use_signal(|| None::<String>);
+    let mut prepared = use_signal(|| None::<HiphiPrepareResponse>);
+    let mut handoff = use_signal(|| None::<HiphiEnrollmentHandoff>);
+    let mut initiated = use_signal(|| None::<HiphiInitiateResponse>);
+    let mut account_id = use_signal(String::new);
+    let mut completed = use_signal(|| None::<HiphiCompleteResponse>);
+    let public_key_copy = use_signal(CopyState::default);
+    let pairing_id_copy = use_signal(CopyState::default);
+    let pairing_secret_copy = use_signal(CopyState::default);
+    let mut pairing_status = use_resource(|| async {
+        crate::app::api::fetch_json::<HiphiPairingStatus>("/api/hiphi/pairing/status").await
+    });
+
+    // Pairing is durable, but relay presence changes independently of page
+    // navigation. Refresh only this small status resource so a page opened
+    // while online cannot keep claiming connectivity after a disconnect (or
+    // stay on "connecting" after recovery).
+    use_effect(move || {
+        spawn(async move {
+            loop {
+                dioxus_sdk_time::sleep(HIPHI_STATUS_POLL_INTERVAL).await;
+                pairing_status.restart();
+            }
+        });
+    });
+
+    let prepare = move |_| {
+        action.set(ProviderActionState::Loading);
+        error.set(None);
+        spawn(async move {
+            match crate::app::api::post_json::<serde_json::Value, HiphiPrepareResponse>(
+                "/api/hiphi/pairing/prepare",
+                &serde_json::json!({}),
+            )
+            .await
+            {
+                Ok(response) => {
+                    prepared.set(Some(response));
+                    action.set(ProviderActionState::Success);
+                }
+                Err(message) => {
+                    action.set(ProviderActionState::Failed);
+                    error.set(crate::app::api::suppress_controller_unauthorized(message));
+                }
+            }
+        });
+    };
+
+    let start_pairing = move |_| {
+        let Some(enrollment) = handoff() else {
+            error.set(Some(
+                "Choose the enrollment file downloaded from HiPhi Cloud first.".to_string(),
+            ));
+            return;
+        };
+        action.set(ProviderActionState::Loading);
+        error.set(None);
+        spawn(async move {
+            let request = HiphiInitiateRequest { enrollment };
+            match crate::app::api::post_json::<HiphiInitiateRequest, HiphiInitiateResponse>(
+                "/api/hiphi/pairing/initiate",
+                &request,
+            )
+            .await
+            {
+                Ok(response) => {
+                    initiated.set(Some(response));
+                    action.set(ProviderActionState::Success);
+                }
+                Err(message) => {
+                    action.set(ProviderActionState::Failed);
+                    error.set(crate::app::api::suppress_controller_unauthorized(message));
+                }
+            }
+        });
+    };
+
+    let complete_pairing = move |_| {
+        let account = account_id().trim().to_string();
+        if account.is_empty() {
+            error.set(Some(
+                "Paste the account ID shown after confirming the installation in HiPhi Cloud."
+                    .to_string(),
+            ));
+            return;
+        }
+        action.set(ProviderActionState::Loading);
+        error.set(None);
+        spawn(async move {
+            match crate::app::api::post_json::<HiphiCompleteRequest, HiphiCompleteResponse>(
+                "/api/hiphi/pairing/complete",
+                &HiphiCompleteRequest {
+                    account_id: account,
+                },
+            )
+            .await
+            {
+                Ok(response) if response.paired => {
+                    completed.set(Some(response));
+                    pairing_status.restart();
+                    action.set(ProviderActionState::Success);
+                }
+                Ok(_) => {
+                    action.set(ProviderActionState::Failed);
+                    error.set(Some("HiPhi Cloud did not confirm pairing.".to_string()));
+                }
+                Err(message) => {
+                    action.set(ProviderActionState::Failed);
+                    error.set(crate::app::api::suppress_controller_unauthorized(message));
+                }
+            }
+        });
+    };
+
+    let status_snapshot = pairing_status.read().as_ref().cloned();
+    let status_pending = status_snapshot.is_none();
+    let paired_status = status_snapshot
+        .and_then(Result::ok)
+        .filter(|status| status.paired);
+
+    rsx! {
+        section { class: "mb-8", aria_labelledby: "hiphi-cloud-heading",
+            div { class: "mb-4",
+                h2 { id: "hiphi-cloud-heading", class: "text-xl font-semibold", "Connect HiPhi Cloud" }
+                p { class: "text-muted text-sm",
+                    "HiPhi Cloud adds secure remote and Garmin control while local listening stays local. "
+                    a { href: "https://hiphi.audio/#cloud", target: "_blank", rel: "noopener noreferrer", "Why sign up?" }
+                }
+            }
+            div { class: "card p-5 sm:p-6 space-y-6",
+                if status_pending {
+                    p { class: "text-sm text-secondary", "Checking this installation’s HiPhi Cloud connection…" }
+                } else if let Some(status) = paired_status {
+                    div { class: "status-ok", role: "status",
+                        p { class: "font-medium", "This UHC installation is paired." }
+                        p { class: "mt-1", "{status.display_state()}" }
+                        if let Some(installation_id) = status.installation_id {
+                            p { class: "mt-2 text-xs text-muted break-all", "Installation ID: {installation_id}" }
+                        }
+                    }
+                } else {
+                div {
+                    h3 { class: "font-semibold", "1. Prepare this UHC installation" }
+                    p { class: "mt-1 text-sm text-secondary", "The private installation key stays with this UHC installation. Only its public key is shown." }
+                    button {
+                        r#type: "button",
+                        class: "btn-primary mt-3",
+                        disabled: matches!(action(), ProviderActionState::Loading),
+                        onclick: prepare,
+                        if prepared().is_some() { "Show installation identity" } else { "Prepare installation identity" }
+                    }
+                    if let Some(identity) = prepared() {
+                        div { class: "mt-4 rounded-md border border-default bg-elevated p-4",
+                            label { class: "text-sm font-medium", "Installation public key" }
+                            div { class: "mt-2 flex flex-col gap-2 sm:flex-row",
+                                code { class: "min-w-0 flex-1 break-all", "{identity.installation_public_key}" }
+                                button {
+                                    r#type: "button", class: "btn-secondary shrink-0",
+                                    onclick: move |_| copy_to_clipboard(identity.installation_public_key.clone(), public_key_copy),
+                                    "{public_key_copy().label(\"Copy public key\")}"
+                                }
+                            }
+                            p { class: "mt-3 text-xs text-muted", "Fingerprint: {identity.installation_fingerprint}" }
+                            a { class: "btn-primary mt-4 inline-block", href: "https://app.hiphi.audio/", target: "_blank", rel: "noopener noreferrer", "Open HiPhi Cloud" }
+                        }
+                    }
+                }
+
+                div { class: "border-t border-default pt-6",
+                    h3 { class: "font-semibold", "2. Import the one-use handoff" }
+                    p { class: "mt-1 text-sm text-secondary", "In HiPhi Cloud, paste the public key above and download the enrollment file. It expires after five minutes." }
+                    label { class: "mt-3 block text-sm font-medium", r#for: "hiphi-enrollment-file", "Choose enrollment file" }
+                    input {
+                        id: "hiphi-enrollment-file",
+                        r#type: "file",
+                        accept: "application/json,.json",
+                        class: "mt-2 block w-full text-sm",
+                        onchange: move |event| {
+                            let Some(file) = event.files().into_iter().next() else { return; };
+                            if file.size() > 4096 {
+                                error.set(Some("The enrollment file is larger than the supported contract.".to_string()));
+                                return;
+                            }
+                            spawn(async move {
+                                match file.read_string().await
+                                    .map_err(|read_error| read_error.to_string())
+                                    .and_then(|contents| serde_json::from_str::<HiphiEnrollmentHandoff>(&contents).map_err(|parse_error| parse_error.to_string()))
+                                {
+                                    Ok(enrollment) => { handoff.set(Some(enrollment)); error.set(None); }
+                                    Err(message) => { handoff.set(None); error.set(Some(format!("That is not a valid HiPhi enrollment file: {message}"))); }
+                                }
+                            });
+                        }
+                    }
+                    button {
+                        r#type: "button",
+                        class: "btn-primary mt-3",
+                        disabled: handoff().is_none() || matches!(action(), ProviderActionState::Loading),
+                        onclick: start_pairing,
+                        "Start pairing"
+                    }
+                    if let Some(pairing) = initiated() {
+                        div { class: "mt-4 rounded-md border border-default bg-elevated p-4 space-y-3",
+                            p { class: "font-medium", "Return to HiPhi Cloud and claim this pending UHC installation." }
+                            label { class: "text-sm font-medium", "Pairing ID" }
+                            div { class: "flex flex-col gap-2 sm:flex-row",
+                                code { class: "min-w-0 flex-1 break-all", "{pairing.pairing_id}" }
+                                button { r#type: "button", class: "btn-secondary shrink-0", onclick: move |_| copy_to_clipboard(pairing.pairing_id.clone(), pairing_id_copy), "{pairing_id_copy().label(\"Copy ID\")}" }
+                            }
+                            label { class: "text-sm font-medium", "One-time pairing secret" }
+                            div { class: "flex flex-col gap-2 sm:flex-row",
+                                code { class: "min-w-0 flex-1 break-all", "{pairing.pairing_secret}" }
+                                button { r#type: "button", class: "btn-secondary shrink-0", onclick: move |_| copy_to_clipboard(pairing.pairing_secret.clone(), pairing_secret_copy), "{pairing_secret_copy().label(\"Copy secret\")}" }
+                            }
+                            p { class: "text-sm font-medium", "Pairing fingerprint" }
+                            code { class: "block break-all", "{pairing.installation_fingerprint}" }
+                        }
+                    }
+                }
+
+                div { class: "border-t border-default pt-6",
+                    h3 { class: "font-semibold", "3. Complete pairing" }
+                    p { class: "mt-1 text-sm text-secondary", "After confirming the exact fingerprint in HiPhi Cloud, paste the account ID it shows." }
+                    label { class: "mt-3 block text-sm font-medium", r#for: "hiphi-account-id", "HiPhi account ID" }
+                    input { id: "hiphi-account-id", class: "input mt-2 w-full", value: "{account_id}", oninput: move |event| account_id.set(event.value()) }
+                    button { r#type: "button", class: "btn-primary mt-3", disabled: initiated().is_none() || matches!(action(), ProviderActionState::Loading), onclick: complete_pairing, "Complete pairing" }
+                    if let Some(result) = completed() {
+                        div { class: "mt-4 status-ok", role: "status",
+                            p { class: "font-medium", "This UHC installation is paired." }
+                            if result.restart_required { p { class: "mt-1", "The connector could not start automatically. Restart Unified Hi-Fi Control using this installation’s normal restart control." } }
+                        }
+                    }
+                }
+
+                if let Some(message) = error() { p { class: "status-err", role: "alert", "{message}" } }
+                }
+            }
+        }
     }
 }
 
@@ -1654,6 +1901,8 @@ pub fn Settings() -> Element {
             hide_knobs: hide_knobs(),
 
             h1 { class: "text-2xl font-bold mb-6", "Settings" }
+
+            HiphiCloudPairing {}
 
             // Features section (adapters + page visibility)
             section { class: "mb-8",

@@ -465,6 +465,18 @@ pub fn canonical_json(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::
             serde_json::Value::Array(values) => {
                 serde_json::Value::Array(values.iter().map(normalize).collect())
             }
+            serde_json::Value::Number(number) if number.is_f64() => {
+                if let Some(value) = number.as_f64() {
+                    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+                    if value.fract() == 0.0 && value.abs() <= MAX_SAFE_INTEGER {
+                        serde_json::Value::Number(serde_json::Number::from(value as i64))
+                    } else {
+                        value.into()
+                    }
+                } else {
+                    serde_json::Value::Number(number.clone())
+                }
+            }
             other => other.clone(),
         }
     }

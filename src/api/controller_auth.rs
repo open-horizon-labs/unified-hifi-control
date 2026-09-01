@@ -331,6 +331,9 @@ fn is_native_bridge(path: &str) -> bool {
 }
 
 fn is_protected(path: &str, method: &axum::http::Method) -> bool {
+    if path.starts_with("/api/hiphi/pairing/") {
+        return true;
+    }
     if path.starts_with("/api/providers/") && path != "/api/providers/spotify/oauth/callback"
         || path == "/mcp"
     {

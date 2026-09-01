@@ -13,9 +13,10 @@ RUN apk add --no-cache ca-certificates openssh-client
 
 # Copy pre-built binary (web assets are embedded)
 COPY dist/unified-hifi-control /app/
+COPY dist/uhc-hiphi-pair /app/
 
 # Make binary executable
-RUN chmod +x /app/unified-hifi-control
+RUN chmod +x /app/unified-hifi-control /app/uhc-hiphi-pair
 
 # Home Assistant custom integration (#613). The add-on image is built FROM
 # this one, and its run.sh copies this directory into Home Assistant's

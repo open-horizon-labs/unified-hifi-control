@@ -18,7 +18,7 @@ mod command {
     use serde::{Deserialize, Serialize};
     use unified_hifi_control::cloud_connector::{
         pairing::{enrollment_possession_message, possession_message},
-        InstallationIdentity,
+        CloudConnectorConfig, InstallationIdentity,
     };
     use url::Url;
     use uuid::Uuid;
@@ -63,6 +63,8 @@ mod command {
     struct CompletionResponse {
         installation_id: Uuid,
         relay_endpoint: String,
+        session_issuer_keys: serde_json::Value,
+        command_issuer_keys: serde_json::Value,
     }
 
     pub async fn run() -> anyhow::Result<()> {
@@ -105,7 +107,7 @@ mod command {
         let config_dir = unified_hifi_control::config::get_config_dir();
         fs::create_dir_all(&config_dir)?;
         let key_path = config_dir.join("hiphi-installation.key");
-        if key_path.exists() && std::env::var_os("UHC_HIPHI_INSTALLATION_ID").is_some() {
+        if CloudConnectorConfig::from_runtime(&config_dir)?.is_some() {
             anyhow::bail!("this UHC is already configured with a HiPhi installation identity");
         }
         let identity = load_or_create_identity(&key_path)?;
@@ -132,7 +134,7 @@ mod command {
                 pending_path.display()
             );
         }
-        if key_path.exists() && std::env::var_os("UHC_HIPHI_INSTALLATION_ID").is_some() {
+        if CloudConnectorConfig::from_runtime(&config_dir)?.is_some() {
             anyhow::bail!("this UHC is already configured with a HiPhi installation identity");
         }
         let identity =
@@ -236,14 +238,29 @@ mod command {
         if response.installation_id != pending.installation_id {
             anyhow::bail!("cloud completed a different installation");
         }
-        let relay = unified_hifi_control::cloud_connector::transport::RelayEndpoint::parse(
+        let session_keys = serde_json::to_string(&response.session_issuer_keys)?;
+        let command_keys = serde_json::to_string(&response.command_issuer_keys)?;
+        let connector = unified_hifi_control::cloud_connector::CloudConnectorConfig::from_values(
+            config_dir.clone(),
             &response.relay_endpoint,
+            &response.installation_id.to_string(),
+            &session_keys,
+            &command_keys,
+        )?;
+        let environment_path = config_dir.join("hiphi.env");
+        persist_connector_environment(
+            &environment_path,
+            connector.endpoint.as_str(),
+            &response.installation_id.to_string(),
+            &session_keys,
+            &command_keys,
         )?;
         fs::remove_file(&pending_path)?;
         println!("pairing_complete=true");
         println!("UHC_HIPHI_INSTALLATION_ID={}", response.installation_id);
-        println!("UHC_HIPHI_RELAY_URL={}", relay.as_str());
-        println!("issuer_public_key_configuration_required=true");
+        println!("UHC_HIPHI_RELAY_URL={}", connector.endpoint.as_str());
+        println!("connector_environment_path={}", environment_path.display());
+        println!("connector_restart_required=true");
         Ok(())
     }
 
@@ -434,6 +451,43 @@ mod command {
         Ok(())
     }
 
+    fn persist_connector_environment(
+        path: &Path,
+        relay_endpoint: &str,
+        installation_id: &str,
+        session_keys: &str,
+        command_keys: &str,
+    ) -> anyhow::Result<()> {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let parent = path
+            .parent()
+            .context("connector environment has no parent")?;
+        fs::create_dir_all(parent)?;
+        let temporary = parent.join(format!(".hiphi.env.{}.tmp", Uuid::new_v4().simple()));
+        let bytes = format!(
+            "UHC_HIPHI_RELAY_URL={relay_endpoint}\nUHC_HIPHI_INSTALLATION_ID={installation_id}\nUHC_HIPHI_SESSION_ISSUER_KEYS={session_keys}\nUHC_HIPHI_COMMAND_ISSUER_KEYS={command_keys}\n"
+        );
+        let write_result = (|| -> anyhow::Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            file.write_all(bytes.as_bytes())?;
+            file.sync_all()?;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+            fs::rename(&temporary, path)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        write_result
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -544,6 +598,64 @@ mod command {
                 serde_json::json!({"ok": true, "authority": "extra"})
             )
             .is_err());
+
+            let completion = serde_json::json!({
+                "installation_id": Uuid::from_u128(2),
+                "relay_endpoint": "wss://cloud.example/v1/relay/connect",
+                "session_issuer_keys": {
+                    "version": 1,
+                    "keys": [{"kid": "session-v1", "key": URL_SAFE_NO_PAD.encode([3_u8; 32])}],
+                },
+                "command_issuer_keys": {
+                    "version": 1,
+                    "keys": [{"kid": "command-v1", "key": URL_SAFE_NO_PAD.encode([4_u8; 32])}],
+                },
+            });
+            assert!(serde_json::from_value::<CompletionResponse>(completion.clone()).is_ok());
+            let mut incomplete = completion;
+            incomplete
+                .as_object_mut()
+                .unwrap()
+                .remove("command_issuer_keys");
+            assert!(serde_json::from_value::<CompletionResponse>(incomplete).is_err());
+        }
+
+        #[test]
+        fn completed_pairing_environment_is_atomic_private_and_complete() {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("hiphi.env");
+            persist_connector_environment(
+                &path,
+                "wss://cloud.example/v1/relay/connect",
+                "11111111-1111-4111-8111-111111111111",
+                r#"{"version":1,"keys":[{"kid":"session-v1","key":"session-public-key"}]}"#,
+                r#"{"version":1,"keys":[{"kid":"command-v1","key":"command-public-key"}]}"#,
+            )
+            .unwrap();
+
+            let content = fs::read_to_string(&path).unwrap();
+            for key in [
+                "UHC_HIPHI_RELAY_URL=",
+                "UHC_HIPHI_INSTALLATION_ID=",
+                "UHC_HIPHI_SESSION_ISSUER_KEYS=",
+                "UHC_HIPHI_COMMAND_ISSUER_KEYS=",
+            ] {
+                assert!(content.contains(key));
+            }
+            assert_eq!(content.lines().count(), 4);
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            }));
         }
 
         #[test]

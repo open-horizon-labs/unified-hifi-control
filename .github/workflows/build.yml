@@ -637,15 +637,19 @@ jobs:
         run: |
           # Force rebuild of main crate to pick up version env vars and embedded assets
           cargo clean -p unified-hifi-control 2>/dev/null || true
-          cargo zigbuild --release --target x86_64-unknown-linux-musl
+          cargo zigbuild --release --target x86_64-unknown-linux-musl \
+            --bin unified-hifi-control --bin uhc-hiphi-pair
 
       - name: Rename binary
         run: |
           mkdir -p dist/bin
           cp target/x86_64-unknown-linux-musl/release/unified-hifi-control dist/bin/unified-hifi-linux-x64
+          cp target/x86_64-unknown-linux-musl/release/uhc-hiphi-pair dist/bin/uhc-hiphi-pair-x64
 
       - name: Verify ELF hardening
-        run: scripts/check-elf-hardening.sh dist/bin/unified-hifi-linux-x64
+        run: |
+          scripts/check-elf-hardening.sh dist/bin/unified-hifi-linux-x64
+          scripts/check-elf-hardening.sh dist/bin/uhc-hiphi-pair-x64
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
@@ -865,7 +869,8 @@ jobs:
         run: |
           # Force rebuild of main crate to pick up version env vars and embedded assets
           cargo clean -p unified-hifi-control 2>/dev/null || true
-          cargo zigbuild --release --target ${{ matrix.target }}
+          cargo zigbuild --release --target ${{ matrix.target }} \
+            --bin unified-hifi-control --bin uhc-hiphi-pair
 
       - name: Smoke test armv7 binary
         if: matrix.target == 'armv7-unknown-linux-musleabihf'
@@ -877,9 +882,12 @@ jobs:
         run: |
           mkdir -p dist/bin
           cp target/${{ matrix.target }}/release/unified-hifi-control dist/bin/${{ matrix.output }}
+          cp target/${{ matrix.target }}/release/uhc-hiphi-pair dist/bin/uhc-hiphi-pair-${{ matrix.arch }}
 
       - name: Verify ELF hardening
-        run: scripts/check-elf-hardening.sh dist/bin/${{ matrix.output }}
+        run: |
+          scripts/check-elf-hardening.sh dist/bin/${{ matrix.output }}
+          scripts/check-elf-hardening.sh dist/bin/uhc-hiphi-pair-${{ matrix.arch }}
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
@@ -941,7 +949,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: binary-macos-x64
-          path: target/x86_64-apple-darwin/release/unified-hifi-control
+          path: |
+            target/x86_64-apple-darwin/release/unified-hifi-control
+            target/x86_64-apple-darwin/release/uhc-hiphi-pair
           retention-days: 5
 
   build-macos-arm64:
@@ -997,7 +1007,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: binary-macos-arm64
-          path: target/aarch64-apple-darwin/release/unified-hifi-control
+          path: |
+            target/aarch64-apple-darwin/release/unified-hifi-control
+            target/aarch64-apple-darwin/release/uhc-hiphi-pair
           retention-days: 5
 
   build-macos-universal:
@@ -1029,7 +1041,12 @@ jobs:
             x64/unified-hifi-control \
             arm64/unified-hifi-control \
             -output dist/bin/unified-hifi-macos-universal
+          lipo -create \
+            x64/uhc-hiphi-pair \
+            arm64/uhc-hiphi-pair \
+            -output dist/bin/uhc-hiphi-pair-macos-universal
           file dist/bin/unified-hifi-macos-universal
+          file dist/bin/uhc-hiphi-pair-macos-universal
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
@@ -1214,6 +1231,7 @@ jobs:
         run: |
           mkdir -p dist/bin
           cp target/release/unified-hifi-control.exe dist/bin/unified-hifi-win64.exe
+          cp target/release/uhc-hiphi-pair.exe dist/bin/uhc-hiphi-pair-win64.exe
 
       # Windows Authenticode signing (issue #561): deferred until Windows
       # matters commercially. Prepared but inactive - gated on
@@ -1223,7 +1241,7 @@ jobs:
       # populate those two secrets for a traditional PFX cert, or swap this
       # step for azure/trusted-signing-action and its AZURE_TRUSTED_SIGNING_*
       # secrets - both are viable, pick whichever the owner buys.
-      - name: Sign Windows binary (Authenticode)
+      - name: Sign Windows binaries (Authenticode)
         if: ${{ env.HAS_WINDOWS_CERT == 'true' }}
         shell: bash
         env:
@@ -1237,7 +1255,9 @@ jobs:
             exit 1
           fi
           "$SIGNTOOL" sign /f cert.pfx /p "$CERT_PASSWORD" /tr http://timestamp.digicert.com /td sha256 /fd sha256 dist/bin/unified-hifi-win64.exe
+          "$SIGNTOOL" sign /f cert.pfx /p "$CERT_PASSWORD" /tr http://timestamp.digicert.com /td sha256 /fd sha256 dist/bin/uhc-hiphi-pair-win64.exe
           "$SIGNTOOL" verify /pa dist/bin/unified-hifi-win64.exe
+          "$SIGNTOOL" verify /pa dist/bin/uhc-hiphi-pair-win64.exe
           rm -f cert.pfx
 
       - name: Note unsigned Windows binary
@@ -1326,26 +1346,35 @@ jobs:
           # All use same name so LMS findBin('unified-hifi-control') works
           if [ -f ../binaries/unified-hifi-linux-x64 ]; then
             cp ../binaries/unified-hifi-linux-x64 Bin/x86_64-linux/unified-hifi-control
+            cp ../binaries/uhc-hiphi-pair-x64 Bin/x86_64-linux/uhc-hiphi-pair
             chmod +x Bin/x86_64-linux/unified-hifi-control
+            chmod +x Bin/x86_64-linux/uhc-hiphi-pair
           fi
 
           if [ -f ../binaries/unified-hifi-linux-arm64 ]; then
             cp ../binaries/unified-hifi-linux-arm64 Bin/aarch64-linux/unified-hifi-control
+            cp ../binaries/uhc-hiphi-pair-arm64 Bin/aarch64-linux/uhc-hiphi-pair
             chmod +x Bin/aarch64-linux/unified-hifi-control
+            chmod +x Bin/aarch64-linux/uhc-hiphi-pair
           fi
 
           if [ -f ../binaries/unified-hifi-linux-armv7 ]; then
             cp ../binaries/unified-hifi-linux-armv7 Bin/arm-linux/unified-hifi-control
+            cp ../binaries/uhc-hiphi-pair-armv7 Bin/arm-linux/uhc-hiphi-pair
             chmod +x Bin/arm-linux/unified-hifi-control
+            chmod +x Bin/arm-linux/uhc-hiphi-pair
           fi
 
           if [ -f ../binaries/unified-hifi-macos-universal ]; then
             cp ../binaries/unified-hifi-macos-universal Bin/darwin/unified-hifi-control
+            cp ../binaries/uhc-hiphi-pair-macos-universal Bin/darwin/uhc-hiphi-pair
             chmod +x Bin/darwin/unified-hifi-control
+            chmod +x Bin/darwin/uhc-hiphi-pair
           fi
 
           if [ -f ../binaries/unified-hifi-win64.exe ]; then
             cp ../binaries/unified-hifi-win64.exe Bin/MSWin32-x64-multi-thread/unified-hifi-control.exe
+            cp ../binaries/uhc-hiphi-pair-win64.exe Bin/MSWin32-x64-multi-thread/uhc-hiphi-pair.exe
           fi
 
           # Note: Web assets are embedded in the binary (ADR 002)
@@ -1402,10 +1431,12 @@ jobs:
             cpu_arch: x86_64
             target: x86_64-unknown-linux-musl
             binary: unified-hifi-linux-x64
+            pairing_helper: uhc-hiphi-pair-x64
           - arch: armv8
             cpu_arch: armv8
             target: aarch64-unknown-linux-musl
             binary: unified-hifi-linux-arm64
+            pairing_helper: uhc-hiphi-pair-arm64
     steps:
       - uses: actions/checkout@v6
 
@@ -1430,6 +1461,7 @@ jobs:
             "${{ needs.plan.outputs.version }}" \
             "${{ matrix.arch }}" \
             "dist/synology-binary/${{ matrix.binary }}" \
+            "dist/synology-binary/${{ matrix.pairing_helper }}" \
             "dist/installers/${SPK_NAME}"
 
       - name: Upload Synology package
@@ -1467,7 +1499,9 @@ jobs:
         run: |
           mkdir -p qnap-build/shared
           cp dist/bin/unified-hifi-linux-x64 qnap-build/shared/unified-hifi-control
+          cp dist/bin/uhc-hiphi-pair-x64 qnap-build/shared/uhc-hiphi-pair
           chmod +x qnap-build/shared/unified-hifi-control
+          chmod +x qnap-build/shared/uhc-hiphi-pair
           cp build/qnap/shared/*.sh qnap-build/shared/
           chmod +x qnap-build/shared/*.sh
           cp -r build/qnap/shared/icons qnap-build/
@@ -1548,7 +1582,9 @@ jobs:
         run: |
           mkdir -p qnap-build/shared
           cp dist/bin/unified-hifi-linux-arm64 qnap-build/shared/unified-hifi-control
+          cp dist/bin/uhc-hiphi-pair-arm64 qnap-build/shared/uhc-hiphi-pair
           chmod +x qnap-build/shared/unified-hifi-control
+          chmod +x qnap-build/shared/uhc-hiphi-pair
           cp build/qnap/shared/*.sh qnap-build/shared/
           chmod +x qnap-build/shared/*.sh
           cp -r build/qnap/shared/icons qnap-build/
@@ -1618,6 +1654,7 @@ jobs:
       - name: Prepare binary
         run: |
           mv binaries/unified-hifi-linux-x64 binaries/unified-hifi-linux-amd64
+          mv binaries/uhc-hiphi-pair-x64 binaries/uhc-hiphi-pair-amd64
           chmod +x binaries/*
           ls -la binaries/
 
@@ -1668,14 +1705,17 @@ jobs:
             target: x86_64-unknown-linux-musl
             binary: unified-hifi-linux-x64
             arch: amd64
+            pairing_helper: uhc-hiphi-pair-x64
           - platform: linux/arm64
             target: aarch64-unknown-linux-musl
             binary: unified-hifi-linux-arm64
             arch: arm64
+            pairing_helper: uhc-hiphi-pair-arm64
           - platform: linux/arm/v7
             target: armv7-unknown-linux-musleabihf
             binary: unified-hifi-linux-armv7
             arch: armv7
+            pairing_helper: uhc-hiphi-pair-armv7
     steps:
       - uses: actions/checkout@v6
 
@@ -1688,7 +1728,8 @@ jobs:
       - name: Prepare binary
         run: |
           mv dist/${{ matrix.binary }} dist/unified-hifi-control
-          chmod +x dist/unified-hifi-control
+          mv dist/${{ matrix.pairing_helper }} dist/uhc-hiphi-pair
+          chmod +x dist/unified-hifi-control dist/uhc-hiphi-pair
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -1835,6 +1876,7 @@ jobs:
             -a amd64 \
             --after-install build/linux/postinst.sh \
             dist/bin/unified-hifi-linux-x64=/usr/bin/unified-hifi-control \
+            dist/bin/uhc-hiphi-pair-x64=/usr/bin/uhc-hiphi-pair \
             build/linux/unified-hifi-control.service=/etc/systemd/system/unified-hifi-control.service
 
       - name: Build rpm package (x64)
@@ -1848,6 +1890,7 @@ jobs:
             -a x86_64 \
             --after-install build/linux/postinst.sh \
             dist/bin/unified-hifi-linux-x64=/usr/bin/unified-hifi-control \
+            dist/bin/uhc-hiphi-pair-x64=/usr/bin/uhc-hiphi-pair \
             build/linux/unified-hifi-control.service=/etc/systemd/system/unified-hifi-control.service
 
       - name: Build deb package (arm64)
@@ -1862,6 +1905,7 @@ jobs:
             -a arm64 \
             --after-install build/linux/postinst.sh \
             dist/bin/unified-hifi-linux-arm64=/usr/bin/unified-hifi-control \
+            dist/bin/uhc-hiphi-pair-arm64=/usr/bin/uhc-hiphi-pair \
             build/linux/unified-hifi-control.service=/etc/systemd/system/unified-hifi-control.service
 
       - name: Build deb package (armv7/armhf)
@@ -1876,6 +1920,7 @@ jobs:
             -a armhf \
             --after-install build/linux/postinst.sh \
             dist/bin/unified-hifi-linux-armv7=/usr/bin/unified-hifi-control \
+            dist/bin/uhc-hiphi-pair-armv7=/usr/bin/uhc-hiphi-pair \
             build/linux/unified-hifi-control.service=/etc/systemd/system/unified-hifi-control.service
 
       - name: Upload Linux packages

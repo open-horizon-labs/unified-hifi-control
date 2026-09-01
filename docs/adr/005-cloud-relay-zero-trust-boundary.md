@@ -40,7 +40,30 @@ its local key, and consumes the handoff after successful initiation. The UHC
 pairing CLI never accepts, stores, or forwards the owner's bearer token.
 
 Every command is independently authorized by a compact Ed25519 JWS grant. UHC
-pins issuer keys by `key_id` and verifies issuer, audience, installation,
+pins the session-grant and command-grant authorities independently. The
+session authority may authenticate a short-lived relay session but cannot mint
+a command UHC accepts; the command authority may authorize an exact command
+but cannot authenticate a relay session. UHC rejects connector configuration
+that reuses either the same key ID or the same public key for both roles.
+
+Operators configure the split trust roots with the versioned JSON rings
+`UHC_HIPHI_SESSION_ISSUER_KEYS` and `UHC_HIPHI_COMMAND_ISSUER_KEYS`. Each ring
+contains one to eight key-ID and unpadded URL-safe base64 Ed25519 public-key
+pairs. UHC rejects malformed, empty, oversized, duplicate, weak-key, or
+cross-authority rings before connecting. This bounded overlap allows a new key
+to be published before its signer becomes active and the previous verifier to
+remain until every grant it signed has expired. The old single-key
+`UHC_HIPHI_*_ISSUER_KEY_ID` / `*_PUBLIC_KEY` settings and the still older
+combined `UHC_HIPHI_ISSUER_*` pair are deliberately not fallbacks: accepting
+multiple configuration shapes would make the active trust roots ambiguous.
+The complete publish, switch, wait, and retire sequence is documented in
+[`../hiphi-cloud-issuer-key-rotation.md`](../hiphi-cloud-issuer-key-rotation.md).
+The public attacker model, runtime data classification, release invariants, and
+known residual risks are documented in
+[`../hiphi-cloud-threat-model.md`](../hiphi-cloud-threat-model.md).
+
+For every command, UHC pins the command issuer by `key_id` and verifies issuer,
+audience, installation,
 control node, request, epoch, scope, exact canonical payload hash, expiry, and
 grant generation before dispatch. The control-node identity is carried in the
 signed grant and the command envelope, allowing one installation to serve
@@ -53,11 +76,16 @@ reuse with a different payload is rejected. A lost terminal result is
 Artwork is a bounded, low-priority request/response lane. Capabilities are
 opaque, short-lived, installation-scoped, and single-use (except an identical
 idempotent retry). UHC returns bytes only; the cloud validates and serves the
-image, and capability values are never logged or placed in URLs.
+image. The cloud façade places the opaque capability in the exact
+`/v1/garmin/artwork/<capability>` path because Garmin fetches artwork without
+the watch bearer. Neither UHC nor the cloud logs that path or capability, and
+the relay protocol itself carries no arbitrary URL.
 
 ## Consequences
 
 - Open-source UHC can be audited without exposing a cloud signing secret.
+- Compromise or misuse of one cloud signing role does not automatically grant
+  the other role.
 - HiPhi Cloud can provide account, entitlement, and façade policy without
   gaining LAN access or provider credential authority.
 - The connector requires a direct Ed25519 dependency when wired into the

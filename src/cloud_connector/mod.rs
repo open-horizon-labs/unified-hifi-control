@@ -16,7 +16,7 @@ pub mod transport;
 
 pub use artwork::{ArtLane, ArtRequest, ArtResponse};
 pub use commands::{CommandGrantVerifier, CommandLedger, CommandOutcome, VerifiedCommand};
-pub use config::{CloudConnectorConfig, ConfigError};
+pub use config::{CloudConnectorConfig, ConfigError, IssuerVerifyingKeyRing, MAX_ISSUER_KEYS};
 pub use identity::{InstallationIdentity, ZoneHandleMap};
 pub use protocol::{
     parse_relay_message, AllowedAction, ArtworkChunk, ArtworkRelayRequest, ArtworkRelayResponse,

@@ -44,6 +44,16 @@ assert_contains "${QNAP_DIR}/shared/install.sh" 'chmod 700 .*QPKG_ROOT.*/config'
     "QNAP config directory must be owner-only"
 assert_contains "${QNAP_DIR}/shared/unified-hifi-control.sh" 'UHC_CONFIG_DIR=.*QPKG_ROOT.*/config' \
     "QNAP service must default UHC_CONFIG_DIR to the package config directory"
+assert_contains "${QNAP_DIR}/shared/install.sh" 'touch .*QPKG_ROOT.*/config/hiphi.env' \
+    "QNAP install must create the persistent HiPhi connector environment"
+assert_contains "${QNAP_DIR}/shared/install.sh" 'chmod 600 .*QPKG_ROOT.*/config/hiphi.env' \
+    "QNAP HiPhi connector environment must be owner-only"
+assert_contains "${QNAP_DIR}/shared/unified-hifi-control.sh" 'HIPHI_ENV_FILE=.*UHC_CONFIG_DIR.*/hiphi.env' \
+    "QNAP service must load persistent HiPhi connector settings"
+assert_contains "${QNAP_DIR}/shared/unified-hifi-control.sh" 'UHC_HIPHI_SESSION_ISSUER_KEYS' \
+    "QNAP service must load the dedicated session verifier ring"
+assert_contains "${QNAP_DIR}/shared/unified-hifi-control.sh" 'UHC_HIPHI_COMMAND_ISSUER_KEYS' \
+    "QNAP service must load the dedicated command verifier ring"
 
 for script in "${QNAP_DIR}/shared"/*.sh; do
     [[ -f "$script" ]] || continue
@@ -58,6 +68,8 @@ assert_contains "$WORKFLOW" 'name: binary-x86_64-unknown-linux-musl' \
     "QNAP x86_64 must download the x86_64 musl artifact"
 assert_contains "$WORKFLOW" 'cp dist/bin/unified-hifi-linux-x64 qnap-build/shared/unified-hifi-control' \
     "QNAP x86_64 must package the Linux x64 binary"
+assert_contains "$WORKFLOW" 'cp dist/bin/uhc-hiphi-pair-x64 qnap-build/shared/uhc-hiphi-pair' \
+    "QNAP x86_64 must package the local HiPhi pairing helper"
 assert_contains "$WORKFLOW" 'docker run --rm --platform linux/amd64' \
     "QDK must run with an explicit amd64 builder platform"
 assert_contains "$WORKFLOW" 'unified-hifi-control_\$\{\{ needs\.plan\.outputs\.version \}\}_x86_64\.qpkg' \

@@ -21,6 +21,7 @@ GET /api/bridges/applemusic/content
 GET /api/bridges/applemusic/status
 GET /api/collections/image
 GET /api/controller/status
+GET /api/hiphi/pairing/status
 GET /api/home-assistant/integration
 GET /api/mqtt/status
 GET /api/providers/musicassistant/status
@@ -85,6 +86,9 @@ POST /api/bridges/applemusic/revoke
 POST /api/bridges/applemusic/state
 POST /api/collections
 POST /api/controller/bootstrap
+POST /api/hiphi/pairing/complete
+POST /api/hiphi/pairing/initiate
+POST /api/hiphi/pairing/prepare
 POST /api/mqtt/configure
 POST /api/play_ref
 POST /api/providers/spotify/tunnel/start
