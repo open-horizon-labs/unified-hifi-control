@@ -1486,6 +1486,15 @@ fn build_codex_input(transcript: &str, context: &VoiceTurnContext) -> Result<Str
     ))
 }
 
+fn codex_mcp_override(port: &str, configured_url: Option<&str>) -> String {
+    let url = configured_url
+        .filter(|value| !value.trim().is_empty())
+        .map(str::trim)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("http://127.0.0.1:{port}/mcp"));
+    format!("mcp_servers.unified-hifi-control={{url=\"{url}\",enabled=true}}")
+}
+
 struct CodexVoiceAgent {
     child: Child,
     stdin: ChildStdin,
@@ -1497,9 +1506,8 @@ struct CodexVoiceAgent {
 impl CodexVoiceAgent {
     async fn start() -> Result<Self, String> {
         let port = std::env::var("UHC_PORT").unwrap_or_else(|_| "8088".to_string());
-        let mcp_override = format!(
-            "mcp_servers.unified-hifi-control={{url=\"http://127.0.0.1:{port}/mcp\",enabled=true}}"
-        );
+        let configured_mcp_url = std::env::var("KIZZ_MCP_URL").ok();
+        let mcp_override = codex_mcp_override(&port, configured_mcp_url.as_deref());
         let mut child = Command::new("codex")
             .args([
                 "app-server",
@@ -1968,6 +1976,18 @@ mod tests {
         assert!(!input.contains("title"));
         assert!(!input.contains("artist"));
         assert!(!input.contains("album"));
+    }
+
+    #[test]
+    fn codex_mcp_override_can_delegate_to_the_existing_uhc() {
+        assert_eq!(
+            codex_mcp_override("8088", None),
+            "mcp_servers.unified-hifi-control={url=\"http://127.0.0.1:8088/mcp\",enabled=true}"
+        );
+        assert_eq!(
+            codex_mcp_override("8088", Some("http://127.0.0.1:18088/mcp")),
+            "mcp_servers.unified-hifi-control={url=\"http://127.0.0.1:18088/mcp\",enabled=true}"
+        );
     }
 
     #[test]
