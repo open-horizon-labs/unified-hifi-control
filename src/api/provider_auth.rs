@@ -1936,6 +1936,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn oauth_start_requires_a_paired_hiphi_installation_even_if_a_legacy_tunnel_is_live() {
         let (state, _dir) = tunnel_test_state(&callback_of(TUNNEL_A), TUNNEL_A).await;
         start_tunnel_and_wait_active(&state).await;
