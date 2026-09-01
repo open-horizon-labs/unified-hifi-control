@@ -441,7 +441,7 @@ where
     epoch_guard.accept_at(epoch, now_ms().try_into().unwrap_or_default())?;
 
     let projection = snapshot_from_aggregator(
-        &state.aggregator,
+        state,
         store,
         config.installation_id.clone(),
         epoch,
@@ -522,7 +522,7 @@ where
                 continue;
             }
             _ = refresh.tick() => {
-                let projection = snapshot_from_aggregator(&state.aggregator, store, config.installation_id.clone(), epoch, store.latest().map_or(1, |p| p.revision.saturating_add(1)), now_ms() as u64).await?;
+                let projection = snapshot_from_aggregator(state, store, config.installation_id.clone(), epoch, store.latest().map_or(1, |p| p.revision.saturating_add(1)), now_ms() as u64).await?;
                 send_json(&mut socket, &ConnectorMessage::Snapshot(StateSnapshot { protocol_version: PROTOCOL_VERSION, message_id: message_id(), installation_id: projection.installation_id, epoch: projection.epoch, revision: projection.revision, observed_at: projection.observed_at as i64, expires_at: projection.expires_at as i64, zones: projection.zones, now_playing: projection.now_playing })).await?;
                 continue;
             }

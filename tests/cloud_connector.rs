@@ -384,6 +384,20 @@ fn opaque_handles_round_trip_locally_without_provider_id_in_projection() {
 }
 
 #[test]
+fn runtime_cloud_projection_uses_the_canonical_visible_zone_policy() {
+    let state_source = include_str!("../src/cloud_connector/state.rs");
+
+    assert!(
+        state_source.contains("crate::zone_list::visible_zones(state).await"),
+        "cloud projection must apply the same hidden-zone, adapter, rename, and ordering policy as every other zone list"
+    );
+    assert!(
+        !state_source.contains("aggregator.get_zones().await"),
+        "reading the aggregator directly leaks hidden zones and restores nondeterministic ordering"
+    );
+}
+
+#[test]
 fn spotify_projection_keeps_identity_credentials_urls_and_raw_artwork_local() {
     use cloud_connector::state::{
         ControlEligibility, NowPlayingInput, SemanticZoneInput, VolumeInput,

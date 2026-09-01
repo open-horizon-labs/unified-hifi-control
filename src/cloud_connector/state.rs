@@ -18,14 +18,14 @@ pub enum StateError {
 /// provider image key is reduced to a revision digest; the key itself never
 /// enters the semantic snapshot.
 pub async fn snapshot_from_aggregator(
-    aggregator: &crate::aggregator::ZoneAggregator,
+    state: &crate::api::AppState,
     store: &mut StateStore,
     installation_id: String,
     epoch: u64,
     revision: u64,
     now_ms: u64,
 ) -> Result<StateProjection, StateError> {
-    let zones = aggregator.get_zones().await;
+    let zones = crate::zone_list::visible_zones(state).await;
     let input = SemanticStateInput {
         installation_id,
         epoch,
