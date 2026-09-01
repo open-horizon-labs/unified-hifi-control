@@ -341,15 +341,21 @@ fn canonical_payload_hash_is_key_order_independent() {
 }
 
 #[test]
-fn canonical_payload_hash_normalizes_integral_f64_like_javascript_json() {
-    let wire = json!({"action":"volume.absolute","value":39,"zone_handle":"zone_demo_lounge"});
-    let typed: CommandPayload = serde_json::from_value(wire.clone()).unwrap();
-    let typed_value = serde_json::to_value(&typed).unwrap();
+fn canonical_payload_hash_matches_javascript_for_fractional_and_negative_volume() {
+    for value in [json!(39), json!(-30), json!(0.5), json!(-24.5)] {
+        let wire = json!({
+            "action": "volume.absolute",
+            "value": value,
+            "zone_handle": "zone_demo_lounge"
+        });
+        let typed: CommandPayload = serde_json::from_value(wire.clone()).unwrap();
+        let typed_value = serde_json::to_value(&typed).unwrap();
 
-    assert_eq!(
-        canonical_json(&typed_value).unwrap(),
-        canonical_json(&wire).unwrap()
-    );
+        assert_eq!(
+            canonical_json(&typed_value).unwrap(),
+            canonical_json(&wire).unwrap()
+        );
+    }
 }
 
 #[test]
