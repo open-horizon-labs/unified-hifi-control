@@ -558,7 +558,7 @@ jobs:
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
         run: |
           # Version is fetched from server at runtime, no need to bake into WASM
-          dx build --fullstack --release @client --no-default-features --features web @server --features server
+          dx build --fullstack=false --release --platform web --no-default-features --features web
           echo "Generated assets:"
           find target/dx -name "*.wasm" -o -name "*.js" | head -10
 
