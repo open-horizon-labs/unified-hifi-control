@@ -780,4 +780,189 @@ mod mock_server_tests {
         adapter.stop().await;
         mock.stop().await;
     }
+
+    // -------------------------------------------------------------------------
+    // LMS sync groups (#510): multiroom_status / set_group_members /
+    // ungroup_members over the mock server's `sync` / `syncgroups ?` support.
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    #[serial_test::serial(lms_config)]
+    async fn lms_multiroom_status_reports_no_groups_before_syncing() {
+        let mock = MockLmsServer::start().await;
+        mock.add_player("aa:bb:cc:dd:ee:ff", "Living Room").await;
+        mock.add_player("11:22:33:44:55:66", "Kitchen").await;
+
+        let (bus, _rx) = test_bus();
+        let adapter = LmsAdapter::new(bus);
+        adapter
+            .configure(
+                mock.addr().ip().to_string(),
+                Some(mock.addr().port()),
+                None,
+                None,
+            )
+            .await;
+        adapter.start().await.unwrap();
+
+        let status = adapter.multiroom_status().await.unwrap();
+        assert_eq!(
+            status["groups"].as_array().unwrap().len(),
+            0,
+            "no players are synced yet"
+        );
+
+        adapter.stop().await;
+        mock.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(lms_config)]
+    async fn lms_multiroom_set_members_syncs_member_into_leaders_group() {
+        let mock = MockLmsServer::start().await;
+        let leader = "aa:bb:cc:dd:ee:ff";
+        let member = "11:22:33:44:55:66";
+        mock.add_player(leader, "Living Room").await;
+        mock.add_player(member, "Kitchen").await;
+
+        let (bus, _rx) = test_bus();
+        let adapter = LmsAdapter::new(bus);
+        adapter
+            .configure(
+                mock.addr().ip().to_string(),
+                Some(mock.addr().port()),
+                None,
+                None,
+            )
+            .await;
+        adapter.start().await.unwrap();
+        mock.clear_commands().await;
+
+        let leader_zone = PrefixedZoneId::lms(leader).to_string();
+        let member_zone = PrefixedZoneId::lms(member).to_string();
+        let result = adapter
+            .set_group_members(&leader_zone, &[member_zone.clone()], &[])
+            .await
+            .expect("set_group_members should succeed");
+
+        let groups = result["groups"].as_array().expect("groups array");
+        assert_eq!(groups.len(), 1, "one group after syncing one member");
+        assert_eq!(groups[0]["leader_zone_id"], serde_json::json!(leader_zone));
+        assert_eq!(
+            groups[0]["member_zone_ids"],
+            serde_json::json!([member_zone])
+        );
+        assert_eq!(groups[0]["can_set_members"], serde_json::json!(true));
+
+        // The leader is addressed, the member is the argument -- verified live
+        // (#403) to make the *addressed* player the sync master and keep its
+        // queue, which is why the leader (not the member) issues the command.
+        let leader_commands = mock.write_commands(leader).await;
+        assert!(
+            leader_commands.contains(&vec!["sync".to_string(), member.to_string()]),
+            "expected `sync {member}` addressed to the leader, got {leader_commands:?}"
+        );
+
+        assert_eq!(
+            mock.sync_groups().await,
+            vec![vec![leader.to_string(), member.to_string()]]
+        );
+
+        adapter.stop().await;
+        mock.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(lms_config)]
+    async fn lms_multiroom_ungroup_unsyncs_member() {
+        let mock = MockLmsServer::start().await;
+        let leader = "aa:bb:cc:dd:ee:ff";
+        let member = "11:22:33:44:55:66";
+        mock.add_player(leader, "Living Room").await;
+        mock.add_player(member, "Kitchen").await;
+
+        let (bus, _rx) = test_bus();
+        let adapter = LmsAdapter::new(bus);
+        adapter
+            .configure(
+                mock.addr().ip().to_string(),
+                Some(mock.addr().port()),
+                None,
+                None,
+            )
+            .await;
+        adapter.start().await.unwrap();
+
+        let leader_zone = PrefixedZoneId::lms(leader).to_string();
+        let member_zone = PrefixedZoneId::lms(member).to_string();
+        adapter
+            .set_group_members(&leader_zone, &[member_zone.clone()], &[])
+            .await
+            .expect("initial sync should succeed");
+        mock.clear_commands().await;
+
+        let result = adapter
+            .ungroup_members(&[member_zone])
+            .await
+            .expect("ungroup_members should succeed");
+        assert_eq!(
+            result["groups"].as_array().unwrap().len(),
+            0,
+            "the group dissolves once its only member leaves"
+        );
+
+        let member_commands = mock.write_commands(member).await;
+        assert_eq!(
+            member_commands,
+            vec![vec!["sync".to_string(), "-".to_string()]],
+            "the member is addressed directly to unsync itself"
+        );
+
+        assert!(
+            mock.sync_groups().await.is_empty(),
+            "server-side group state must also be gone"
+        );
+
+        adapter.stop().await;
+        mock.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(lms_config)]
+    async fn lms_multiroom_set_members_rejects_unknown_player_before_any_sync_call() {
+        let mock = MockLmsServer::start().await;
+        let leader = "aa:bb:cc:dd:ee:ff";
+        mock.add_player(leader, "Living Room").await;
+
+        let (bus, _rx) = test_bus();
+        let adapter = LmsAdapter::new(bus);
+        adapter
+            .configure(
+                mock.addr().ip().to_string(),
+                Some(mock.addr().port()),
+                None,
+                None,
+            )
+            .await;
+        adapter.start().await.unwrap();
+        mock.clear_commands().await;
+
+        let leader_zone = PrefixedZoneId::lms(leader).to_string();
+        let unknown_zone = PrefixedZoneId::lms("00:00:00:00:00:00").to_string();
+        let result = adapter
+            .set_group_members(&leader_zone, &[unknown_zone], &[])
+            .await;
+        assert!(
+            result.is_err(),
+            "an unknown member must be refused, not synced"
+        );
+        assert!(
+            mock.write_commands(leader).await.is_empty(),
+            "no sync command should reach LMS once validation fails"
+        );
+        assert!(mock.sync_groups().await.is_empty());
+
+        adapter.stop().await;
+        mock.stop().await;
+    }
 }

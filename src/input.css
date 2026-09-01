@@ -184,6 +184,17 @@
     color: var(--text-secondary);
   }
 
+  .badge-success {
+    background: var(--primary-success-color);
+    border: 1px solid var(--secondary-success-color);
+    color: var(--secondary-success-color);
+  }
+
+  .status-panel {
+    background: var(--primary-success-color);
+    border: 1px solid var(--secondary-success-color);
+  }
+
   /* Draggable zone rows (Settings > Zone list).
      Uses project CSS variables rather than Tailwind color utilities: this project defines its
      palette as `--accent-*` / `--surface-*` custom properties, so `bg-accent/10` compiles to
@@ -217,6 +228,28 @@
     accent-color: var(--accent-color);
   }
   .checkbox:focus {
+    outline: 2px solid var(--accent-color);
+    outline-offset: 2px;
+  }
+
+  /* Feature switches are buttons rather than controlled checkbox inputs so
+     their state remains stable across the server-rendered Settings hydrate. */
+  .feature-toggle {
+    @apply inline-flex h-6 w-11 items-center rounded-full p-0.5 transition-colors;
+    background: var(--surface-muted);
+    border: 1px solid var(--border-default);
+  }
+  .feature-toggle[aria-checked="true"] {
+    background: var(--accent-color);
+    border-color: var(--accent-color);
+  }
+  .feature-toggle__knob {
+    @apply block size-5 rounded-full bg-white shadow-sm transition-transform;
+  }
+  .feature-toggle[aria-checked="true"] .feature-toggle__knob {
+    transform: translateX(1.25rem);
+  }
+  .feature-toggle:focus-visible {
     outline: 2px solid var(--accent-color);
     outline-offset: 2px;
   }
@@ -425,6 +458,606 @@
 
   .hqp-saved-path {
     @apply grid grid-cols-[minmax(0,1fr)_2.5rem_minmax(0,1fr)] items-center gap-3;
+  }
+
+  /* ======================================================================
+   * Library page (#550): home page browse/search surface.
+   * ==================================================================== */
+
+  .library-page {
+    @apply pb-28;
+  }
+
+  .library-search-input {
+    @apply mb-4 text-base;
+  }
+
+  .library-source-tabs {
+    @apply flex flex-wrap gap-2 mb-3;
+  }
+
+  .library-tabs {
+    @apply flex flex-wrap gap-1 mb-4 border-b;
+    border-color: var(--border-subtle);
+  }
+
+  .library-tab {
+    @apply px-3 py-2 text-sm font-medium rounded-t-md -mb-px border border-transparent;
+    color: var(--text-secondary);
+  }
+  .library-tab:hover {
+    color: var(--text-primary);
+  }
+  .library-tab--active {
+    color: var(--text-primary);
+    border-color: var(--border-subtle);
+    border-bottom-color: var(--surface-base);
+    background: var(--surface-elevated);
+  }
+
+  .library-breadcrumbs {
+    @apply flex flex-wrap items-center gap-1 mb-4 text-sm;
+    color: var(--text-muted);
+  }
+  .library-breadcrumb-item {
+    @apply rounded px-1 py-0.5;
+    color: var(--text-secondary);
+  }
+  .library-breadcrumb-item:hover {
+    color: var(--text-primary);
+    background: var(--surface-hover);
+  }
+  .library-breadcrumb-item:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: 2px;
+  }
+  .library-breadcrumb-sep {
+    @apply mx-1;
+  }
+
+  .library-content {
+    @apply min-h-[200px];
+  }
+
+  .library-empty,
+  .library-provider-down {
+    @apply flex flex-col items-center gap-3 rounded-xl p-10 text-center;
+    background: var(--surface-elevated);
+    border: 1px dashed var(--border-default);
+  }
+
+  .library-search-heading {
+    @apply text-sm font-semibold mb-2 uppercase tracking-wide;
+    color: var(--text-muted);
+  }
+
+  /* Row list (folders / mixed levels) */
+  .library-list {
+    @apply flex flex-col gap-1;
+  }
+
+  .library-row {
+    @apply flex items-center justify-between gap-3 rounded-lg px-3 py-2.5;
+  }
+  .library-row:hover {
+    background: var(--surface-hover);
+  }
+
+  .library-skeleton-row {
+    @apply h-12 rounded-lg;
+    background: linear-gradient(
+      90deg,
+      var(--surface-elevated) 25%,
+      var(--surface-hover) 37%,
+      var(--surface-elevated) 63%
+    );
+    background-size: 400% 100%;
+    animation: library-skeleton 1.6s ease-in-out infinite;
+  }
+
+  .library-row-actions {
+    @apply flex items-center gap-1 flex-shrink-0;
+  }
+
+  /* Play affordance: always visible at reduced emphasis (the owner could not
+     find the hover-only version, and touch devices have no hover at all);
+     hover/focus brings it to full strength. */
+  .library-play-btn {
+    @apply inline-flex size-9 items-center justify-center rounded-full opacity-45 transition-opacity;
+    color: var(--text-secondary);
+  }
+  @media (hover: none) {
+    .library-play-btn,
+    .library-tile-play {
+      opacity: 1;
+    }
+  }
+  .library-row:hover .library-play-btn,
+  .library-row:focus-within .library-play-btn,
+  .library-tile:hover .library-tile-play,
+  .library-tile:focus-within .library-tile-play {
+    opacity: 1;
+  }
+  .library-play-btn:hover {
+    color: var(--accent-color);
+  }
+  .library-play-btn:focus-visible {
+    opacity: 1;
+    outline: 2px solid var(--accent-color);
+    outline-offset: 2px;
+  }
+
+  .library-chevron-btn {
+    @apply inline-flex size-9 items-center justify-center rounded-full;
+    color: var(--text-muted);
+  }
+  .library-chevron-btn:hover {
+    color: var(--text-primary);
+    background: var(--surface-hover);
+  }
+
+  .library-overflow {
+    @apply relative;
+  }
+  .library-overflow-trigger {
+    @apply inline-flex size-9 items-center justify-center rounded-full;
+    color: var(--text-muted);
+  }
+  .library-overflow-trigger:hover {
+    color: var(--text-primary);
+    background: var(--surface-hover);
+  }
+  .library-overflow-menu {
+    @apply absolute right-0 z-20 mt-1 flex min-w-32 flex-col rounded-md py-1 shadow-lg;
+    background: var(--surface-elevated);
+    border: 1px solid var(--border-default);
+  }
+  .library-overflow-menu button {
+    @apply px-3 py-2 text-left text-sm;
+    color: var(--text-secondary);
+  }
+  .library-overflow-menu button:hover {
+    color: var(--text-primary);
+    background: var(--surface-hover);
+  }
+
+  .library-live-tick {
+    @apply inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-bold tracking-wide;
+    background: var(--primary-error-color);
+    color: var(--secondary-error-color, #fff);
+  }
+
+  /* "Currently playing" equalizer glyph: three bars bouncing at slightly
+     different phases. */
+  .library-eq {
+    @apply inline-flex h-3.5 w-3.5 items-end gap-0.5 flex-shrink-0;
+  }
+  .library-eq span {
+    @apply w-0.5 rounded-sm;
+    background: var(--accent-color);
+    animation: library-eq-pulse 1s ease-in-out infinite;
+  }
+  .library-eq span:nth-child(1) {
+    height: 40%;
+    animation-delay: -0.4s;
+  }
+  .library-eq span:nth-child(2) {
+    height: 100%;
+    animation-delay: -0.2s;
+  }
+  .library-eq span:nth-child(3) {
+    height: 65%;
+    animation-delay: 0s;
+  }
+
+  /* Art-forward grid (album-shaped levels) */
+  .library-grid {
+    @apply grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5;
+  }
+
+  .library-tile {
+    @apply flex flex-col gap-2;
+  }
+
+  .library-tile-art {
+    @apply relative aspect-square w-full cursor-pointer overflow-hidden rounded-lg;
+    background: var(--surface-elevated);
+    border: 1px solid var(--border-default);
+  }
+
+  .library-tile-placeholder {
+    @apply flex h-full w-full items-center justify-center text-3xl;
+    color: var(--text-muted);
+  }
+
+  .library-tile-art-img {
+    @apply h-full w-full object-cover;
+  }
+
+  .library-row-thumb {
+    @apply size-10 shrink-0 rounded object-cover;
+    background: var(--surface-elevated);
+    border: 1px solid var(--border-default);
+  }
+
+  .library-tile-play {
+    @apply absolute bottom-2 right-2 inline-flex size-9 items-center justify-center rounded-full opacity-0 shadow-md transition-opacity;
+    background: var(--accent-color);
+    color: var(--surface-base);
+  }
+
+  .library-tile-chevron {
+    @apply absolute right-2 top-2 inline-flex size-6 items-center justify-center rounded-full;
+    background: color-mix(in srgb, var(--surface-base) 65%, transparent);
+    color: var(--text-primary);
+  }
+
+  .library-eq--tile {
+    @apply absolute left-2 top-2;
+  }
+
+  .library-live-tick--tile {
+    @apply absolute left-2 top-2;
+  }
+
+  .library-tile-meta {
+    @apply min-w-0;
+  }
+
+  /* Staggered reveal on level load. Transform/opacity only, ease-out-quint,
+     ~20ms stagger per row via a CSS custom property the component sets
+     inline (`--library-stagger-index`). */
+  .library-row--reveal,
+  .library-tile--reveal {
+    animation: library-reveal 0.36s cubic-bezier(0.22, 1, 0.36, 1) both;
+    animation-delay: calc(var(--library-stagger-index, 0) * 20ms);
+  }
+
+  /* ======================================================================
+   * Zones strip (#550): persistent bottom play-target bar.
+   * ==================================================================== */
+
+  .zones-strip {
+    @apply fixed inset-x-0 bottom-0 z-30;
+    background: var(--surface-elevated);
+    border-top: 1px solid var(--border-default);
+  }
+
+  /* Wraps below `sm` (#594): the fixed-width control rail leaves almost no
+     room for the art+meta target on a phone, so the target takes its own
+     full row (`basis-full`) and the rail wraps beneath it -- no control
+     ever shrinks below its 44px hit target. Single row returns at `sm`+. */
+  .zones-strip-inner {
+    @apply mx-auto flex max-w-7xl flex-wrap items-center gap-3 px-3 py-2 sm:flex-nowrap sm:px-6 lg:px-8;
+  }
+
+  .zones-strip-target {
+    @apply flex min-w-0 basis-full items-center gap-3 rounded-lg px-3 py-1.5 text-left sm:basis-auto sm:flex-1;
+  }
+  .zones-strip-target:hover {
+    background: var(--surface-hover);
+  }
+  .zones-strip-target:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: 2px;
+  }
+
+  /* #596: the armed header is the picker-row grammar *elevated* -- larger
+     art at every width (48px vs the rows' 32px) with an accent-token ring,
+     so "which zone am I driving" reads instantly without a divergent
+     layout. */
+  .zones-strip-art {
+    @apply size-12 flex-shrink-0 rounded-md object-cover;
+    background: var(--surface-base);
+    box-shadow: 0 0 0 2px var(--accent-color);
+  }
+  /* #594: a themed border so the "no artwork" tile keeps a visible edge on
+     OLED, where `--surface-base` is near-black against an equally dark
+     strip background -- previously the empty tile could read as an
+     unstyled/invisible box rather than a deliberate placeholder. */
+  .zones-strip-art--empty {
+    @apply flex items-center justify-center border text-lg;
+    color: var(--text-muted);
+    border-color: var(--border-subtle);
+  }
+
+  .zones-strip-meta {
+    @apply flex min-w-0 flex-1 flex-col;
+  }
+  /* #596: one name+badge row grammar shared by the armed header and every
+     picker row (art | name+badge+track | rail). The badge truncates along
+     with the name instead of holding its full width, so a long name and a
+     long source label share the squeeze at mid widths rather than the
+     badge crushing the name to a few characters. */
+  .zones-strip-name-row {
+    @apply flex min-w-0 items-center gap-2;
+  }
+  .zones-strip-source-badge {
+    @apply min-w-0 truncate;
+  }
+  /* #596: one zone-name treatment strip-wide -- xs semibold uppercase, in
+     the default text color so the name leads its row ("which room" is the
+     picker's primary question). The armed header's `--armed` modifier
+     swaps in the accent token as its elevation mark. */
+  .zones-strip-zone-name {
+    @apply min-w-0 truncate text-xs font-semibold uppercase tracking-wide;
+  }
+  .zones-strip-zone-name--armed {
+    color: var(--accent-color);
+  }
+  /* #596: one track treatment strip-wide: sm/medium where it is the star
+     (armed header now playing), `--muted` where it supports the zone name
+     (picker rows), `--idle` for the header's empty state. */
+  .zones-strip-track {
+    @apply truncate text-sm font-medium;
+  }
+  .zones-strip-track--idle,
+  .zones-strip-track--muted {
+    color: var(--text-muted);
+    font-weight: 400;
+  }
+  .zones-strip-artist {
+    @apply truncate text-xs;
+    color: var(--text-muted);
+  }
+
+  /* Owner feedback on #585: the collapse/expand chevron read as decoration.
+     Visible-dimmed-always, full-strength on hover/focus (same convention as
+     `.library-play-btn`, not a hover-only affordance), and it rotates with
+     `picker_open` so the open/closed state is legible without relying on
+     `aria-expanded` alone. */
+  .zones-strip-chevron {
+    @apply hidden size-4 flex-shrink-0 opacity-60 transition-all duration-200 sm:block;
+    color: var(--text-muted);
+  }
+  .zones-strip-target:hover .zones-strip-chevron,
+  .zones-strip-target:focus-visible .zones-strip-chevron {
+    opacity: 1;
+  }
+  .zones-strip-chevron--open {
+    transform: rotate(180deg);
+  }
+
+  /* ---- #596: the vertical control rail ------------------------------
+     One right-aligned rail with fixed, token-derived column widths, shared
+     by the armed header and every mini-controller picker row, so
+     play / - / volume value / + sit on the same vertical axes strip-wide
+     regardless of name/track length. Right to left, with --rail-gap
+     between every neighbor:
+
+       header:  [prev][play][next] [volume slot]
+       row:           [play][spacer] [volume slot]
+
+     The spacer stands in for the header's next-track column, so the play
+     buttons share an axis. Below `sm` the rail takes its own full-width
+     line (PR #595's wrap pattern) but stays right-anchored, so the axes
+     hold at every viewport; `flex-wrap` inside the rail is the safety
+     valve for very narrow screens (~<=340px), where the volume slot drops
+     to a second right-anchored line instead of clipping the + button off
+     a fixed-position bar -- axes still hold because every column is
+     anchored to the same right edge. */
+  .zones-strip-rail {
+    --rail-col: 2.75rem;
+    --rail-gap: 0.25rem;
+    --rail-value: 5rem;
+    @apply flex w-full flex-shrink-0 flex-wrap items-center justify-end border-t py-1 sm:ml-auto sm:w-auto sm:flex-nowrap sm:border-t-0 sm:py-0;
+    gap: var(--rail-gap);
+    border-color: var(--border-subtle);
+  }
+  /* Fixed 44px columns: `.btn` alone has no min-width and px-4 padding, so
+     icon buttons would differ in width from the picker's btn-sm ones. A
+     hard --rail-col square keeps every rail column identical while
+     preserving the 44px hit target (`min-h-11` still applies from `.btn`). */
+  .zones-strip-rail .btn {
+    @apply px-0;
+    width: var(--rail-col);
+  }
+  .zones-strip-rail-spacer {
+    @apply flex-shrink-0;
+    width: var(--rail-col);
+  }
+  /* Fixed-width volume slot, derived from the rail tokens: reserved even
+     when a zone reports fixed volume (VolumeControlsCompact renders
+     nothing) so the play column never drifts between rows with and
+     without volume control. The inner component div stretches across it;
+     `justify-between` pins - and + to the slot's edges, which also keeps
+     them on-axis for incremental zones that render no value span. */
+  .zones-strip-volume {
+    @apply flex flex-shrink-0 items-center;
+    width: calc(2 * var(--rail-col) + var(--rail-value) + 2 * var(--rail-gap));
+  }
+  .zones-strip-volume > div {
+    @apply w-full justify-between;
+  }
+  /* <=359px: even the wrapped rail line can't fit transport + volume slot,
+     and letting flex-wrap decide per-rail would wrap the header's rail but
+     not the picker rows' (whose rail is narrower), splitting the shared
+     play axis. Forcing the volume slot onto its own rail line in EVERY
+     rail keeps the wrap deterministic: play/next columns align on line
+     one, - / value / + stay a fixed right-anchored block on line two. */
+  @media (max-width: 359px) {
+    .zones-strip-volume {
+      flex-basis: 100%;
+      justify-content: flex-end;
+    }
+    .zones-strip-volume > div {
+      width: calc(2 * var(--rail-col) + var(--rail-value) + 2 * var(--rail-gap));
+      flex-grow: 0;
+    }
+  }
+  /* #596 (owner: "39 vs 40.0 jiggles"): tabular numerals in a fixed
+     --rail-value box so - / + never shift as digits change. 5rem +
+     nowrap fits the widest real value format_volume produces
+     ("-120.0 dB" device floors included) on a single line. */
+  .zones-strip-volume span {
+    @apply flex-shrink-0 whitespace-nowrap text-center;
+    width: var(--rail-value);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .zones-strip-picker {
+    @apply mx-auto max-w-7xl border-t px-3 py-3 sm:px-6 lg:px-8;
+    border-color: var(--border-subtle);
+  }
+
+  .zones-strip-picker-list {
+    @apply flex flex-col gap-1;
+  }
+
+  /* Owner feedback on #585: rows read as inert text. `.zones-strip-picker-item`
+     is the row's select-target -- same hover/focus/cursor affordance as
+     `.library-row` -- so it visibly reads as clickable, distinct from the
+     `.zones-strip-picker-controls` button group beside it (divider below). */
+  .zones-strip-picker-item {
+    @apply flex min-w-0 basis-full cursor-pointer items-center gap-2 rounded-md px-3 py-2 text-left text-sm transition-colors sm:basis-auto sm:flex-1;
+  }
+  .zones-strip-picker-item:hover {
+    background: var(--surface-hover);
+  }
+  .zones-strip-picker-item:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: -2px;
+  }
+
+  /* #585: a picker row with now-playing state becomes a mini-controller --
+     art, track, playing indicator, play/pause, and volume nudge -- while an
+     idle row (no `RowNowPlaying`) stays the original compact name + badge.
+     #594: on a 375-430px screen the mini-controller's own control rail
+     (play/pause + volume nudges, ~210px) left almost nothing for name/track,
+     the same squeeze the armed header had -- `flex-wrap` here lets the
+     select-target take the full row and the controls wrap to their own line
+     below, same pattern as `.zones-strip-inner`/`.zones-strip-target`.
+     Single row returns at `sm`+. */
+  .zones-strip-picker-row {
+    @apply flex min-w-0 flex-wrap items-center gap-1 sm:flex-nowrap;
+  }
+
+  .zones-strip-picker-art {
+    @apply size-8 flex-shrink-0 rounded object-cover;
+    background: var(--surface-base);
+  }
+  .zones-strip-picker-art--empty {
+    @apply flex items-center justify-center border text-sm;
+    color: var(--text-muted);
+    border-color: var(--border-subtle);
+  }
+
+  .zones-strip-picker-meta {
+    @apply flex min-w-0 flex-1 flex-col gap-0.5;
+  }
+  /* Picker rows reuse `.zones-strip-name-row` / `.zones-strip-zone-name` /
+     `.zones-strip-track` (#596) -- one grammar, no `-picker-` twins. */
+  .zones-strip-picker-np {
+    @apply flex min-w-0 items-center gap-1.5;
+  }
+
+  /* Divider (not a background) keeps the boundary between the row's
+     select-target and its own controls legible without implying the
+     controls are a second clickable "row" (owner feedback on #585).
+     #596: layout and border-color come from the shared `.zones-strip-rail`
+     on the same element; this class only adds the row's `sm`+ left divider
+     (below `sm` the rail's own wrapped top divider takes over -- a lone
+     left border reads as a stray tick on its own line, per #594). Left
+     padding never moves the right-anchored columns. */
+  .zones-strip-picker-controls {
+    @apply sm:border-l sm:pl-2;
+  }
+
+  /* ---- #596: restrained motion ---------------------------------------
+     Arming feedback, transform/opacity only, ease-out, no bounce; disabled
+     under prefers-reduced-motion alongside the other reveal animations at
+     the bottom of this file. Arming is acknowledged where the gesture
+     happens: the pressed row settles (below), and the picker's open/close
+     reveal reuses the library's keyframes. The header itself deliberately
+     does NOT animate -- remounting it per arm change refetches the art and
+     hides the header behind opacity:0 exactly when feedback is wanted, and
+     a mount-only animation would fire only on page load. */
+  .zones-strip-picker {
+    animation: library-reveal 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .zones-strip-picker-item {
+    transition:
+      background-color 0.15s ease-out,
+      transform 0.15s ease-out,
+      opacity 0.15s ease-out;
+  }
+  .zones-strip-picker-item:active {
+    transform: translateY(1px);
+    opacity: 0.85;
+  }
+
+  .zones-strip-transfer {
+    @apply mt-2 flex flex-wrap items-center gap-2 border-t pt-2;
+    border-color: var(--border-subtle);
+  }
+
+  /* #596: sized to the strip it reserves room for -- the wrapped
+     target+rail header measures ~150px below `sm` (~200px under 360px
+     where the volume slot takes its own rail line) vs the single ~76px
+     row at `sm`+. Undersizing this hides the tail of the library list
+     behind the fixed strip. */
+  .library-strip-spacer {
+    @apply h-40 sm:h-24;
+  }
+  @media (max-width: 359px) {
+    .library-strip-spacer {
+      height: 13rem;
+    }
+  }
+}
+
+@keyframes library-skeleton {
+  0% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0 50%;
+  }
+}
+
+@keyframes library-eq-pulse {
+  0%,
+  100% {
+    transform: scaleY(0.4);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+
+@keyframes library-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .library-row--reveal,
+  .library-tile--reveal {
+    animation: none;
+  }
+  .library-skeleton-row {
+    animation: none;
+  }
+  .library-eq span {
+    animation: none;
+  }
+  /* #596: zones strip picker reveal / press-settle motion off with the
+     rest. */
+  .zones-strip-picker {
+    animation: none;
+  }
+  .zones-strip-picker-item {
+    transition: background-color 0.15s ease-out;
+  }
+  .zones-strip-picker-item:active {
+    transform: none;
+    opacity: 1;
   }
 }
 

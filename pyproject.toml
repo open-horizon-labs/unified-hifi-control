@@ -1,0 +1,12 @@
+[tool.pytest.ini_options]
+testpaths = ["custom_components/unified_hifi_control/tests"]
+# The tests import `custom_components.unified_hifi_control.*`; put the repo
+# root on sys.path explicitly so collection works regardless of how pytest
+# derives rootdir (local runs worked by accident of directory layout, CI did not).
+pythonpath = ["."]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+include = ["custom_components/unified_hifi_control/**/*.py"]

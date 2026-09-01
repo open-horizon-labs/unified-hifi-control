@@ -5,14 +5,29 @@ FROM ghcr.io/linuxcontainers/alpine:3.20
 
 WORKDIR /app
 
-# Only need ca-certificates for HTTPS
-RUN apk add --no-cache ca-certificates
+# ca-certificates for HTTPS; openssh-client because the guided Spotify setup
+# opens its HTTPS callback tunnel by running `ssh -R` (see
+# src/api/spotify_tunnel.rs). Without it that flow dies telling a container
+# user to "install the OpenSSH client", which they cannot act on.
+RUN apk add --no-cache ca-certificates openssh-client
 
 # Copy pre-built binary (web assets are embedded)
 COPY dist/unified-hifi-control /app/
+COPY dist/uhc-hiphi-pair /app/
 
 # Make binary executable
-RUN chmod +x /app/unified-hifi-control
+RUN chmod +x /app/unified-hifi-control /app/uhc-hiphi-pair
+
+# Home Assistant custom integration (#613). The add-on image is built FROM
+# this one, and its run.sh copies this directory into Home Assistant's
+# config directory on start. Shipping it here rather than fetching it in the
+# add-on's Dockerfile is what locks the integration to the exact UHC release
+# it was built alongside: same tag, same API contract, no second version to
+# keep in sync. The test suite is stripped because Home Assistant loads this
+# directory as a Python package and the tests are not part of it.
+COPY custom_components/unified_hifi_control /app/custom_components/unified_hifi_control
+RUN rm -rf /app/custom_components/unified_hifi_control/tests \
+    /app/custom_components/unified_hifi_control/requirements_test.txt
 
 # Create data directory for config persistence
 RUN mkdir -p /data

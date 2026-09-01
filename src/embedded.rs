@@ -48,10 +48,52 @@ pub fn has_embedded_assets() -> bool {
     PublicAssets::iter().next().is_some()
 }
 
-/// Get the embedded index.html content.
-/// Returns None if assets weren't embedded.
+/// The fresh dx build output directory next to the running server binary
+/// (`target/dx/<app>/release/web/{server,public}`), when it exists.
+///
+/// #566 postmortem: [`PublicAssets`] is snapshotted when the server crate
+/// *compiles*, but `dx build` writes the current build's hashed
+/// `assets/*.js`/`*.wasm` bundles and `index.html` into `web/public` around /
+/// after that compile — so the embedded snapshot always lags one build
+/// behind. It contains only *previous* builds' clients, and its `index.html`
+/// points at whichever bundle was newest when the compiler ran. Served
+/// as-is, an SSR page could execute a stale client — arbitrarily old,
+/// including pre-#560 clients whose search effect hangs the wasm renderer at
+/// mount — instead of (or in addition to) the client the server was actually
+/// built from. Preferring this on-disk directory whenever it exists makes
+/// the served client the one `dx` just built; the embedded copy stays as the
+/// fallback that keeps true single-binary deployments (no `public/` on disk)
+/// working exactly as before.
+fn disk_public_root() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.join("public");
+    dir.is_dir().then_some(dir)
+}
+
+/// Read `rel` (a `/`-separated path *inside* public/) disk-first, falling
+/// back to the embedded snapshot. `rel` may come from a URL path, so any
+/// segment that could escape the public root rejects the disk read outright
+/// (the embedded lookup was always a pure map lookup and needs no guard).
+fn read_public(rel: &str) -> Option<Vec<u8>> {
+    let path_is_safe = !rel.is_empty()
+        && rel
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains('\\'));
+    if path_is_safe {
+        if let Some(root) = disk_public_root() {
+            if let Ok(bytes) = std::fs::read(root.join(rel)) {
+                return Some(bytes);
+            }
+        }
+    }
+    PublicAssets::get(rel).map(|file| file.data.into_owned())
+}
+
+/// Get the index.html content: the on-disk one next to the binary when
+/// present (always the current build's — see [`disk_public_root`]), else the
+/// embedded snapshot. Returns None only when neither exists.
 pub fn get_index_html() -> Option<String> {
-    PublicAssets::get("index.html").map(|file| String::from_utf8_lossy(&file.data).into_owned())
+    read_public("index.html").map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Axum handler to serve embedded assets at /assets/* paths.
@@ -62,8 +104,8 @@ pub async fn serve_embedded_asset(
     // Files are in assets/ subfolder
     let asset_path = format!("assets/{}", path);
 
-    match PublicAssets::get(&asset_path) {
-        Some(content) => {
+    match read_public(&asset_path) {
+        Some(bytes) => {
             let mime = mime_guess::from_path(&asset_path)
                 .first_or_octet_stream()
                 .to_string();
@@ -73,13 +115,44 @@ pub async fn serve_embedded_asset(
                 .header(header::CONTENT_TYPE, mime)
                 // Immutable cache for hashed assets
                 .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-                .body(Body::from(content.data.into_owned()))
+                .body(Body::from(bytes))
                 .unwrap_or_else(|_| Response::new(Body::empty()))
         }
         None => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("Asset not found"))
             .unwrap_or_else(|_| Response::new(Body::from("Asset not found"))),
+    }
+}
+
+/// Axum handler to serve embedded font files at `/fonts/*` (#560: these
+/// 404'd on the built server -- `public/fonts/` is embedded into
+/// [`PublicAssets`] like every other file under `public/`, but nothing
+/// routed `/fonts/*` requests to it, so the SPA fallback (`serve_index_html`)
+/// answered instead and the browser's woff2 fetch failed).
+pub async fn serve_embedded_font(
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> Response<Body> {
+    let asset_path = format!("fonts/{}", path);
+
+    match read_public(&asset_path) {
+        Some(bytes) => {
+            let mime = mime_guess::from_path(&asset_path)
+                .first_or_octet_stream()
+                .to_string();
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, mime)
+                // Immutable cache: font filenames carry their own content hash upstream.
+                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                .body(Body::from(bytes))
+                .unwrap_or_else(|_| Response::new(Body::empty()))
+        }
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("Font not found"))
+            .unwrap_or_else(|_| Response::new(Body::from("Font not found"))),
     }
 }
 
@@ -103,8 +176,8 @@ pub async fn serve_index_html() -> Response<Body> {
 pub async fn serve_static_file(
     axum::extract::Path(path): axum::extract::Path<String>,
 ) -> Response<Body> {
-    match PublicAssets::get(&path) {
-        Some(content) => {
+    match read_public(&path) {
+        Some(bytes) => {
             let mime = mime_guess::from_path(&path)
                 .first_or_octet_stream()
                 .to_string();
@@ -113,7 +186,7 @@ pub async fn serve_static_file(
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, mime)
                 .header(header::CACHE_CONTROL, "public, max-age=3600")
-                .body(Body::from(content.data.into_owned()))
+                .body(Body::from(bytes))
                 .unwrap_or_else(|_| Response::new(Body::empty()))
         }
         None => Response::builder()
@@ -168,6 +241,26 @@ pub fn extract_bootstrap_snippet() -> Option<String> {
 // =============================================================================
 // This middleware intercepts HTML responses from SSR and injects the WASM
 // bootstrap scripts, enabling the client to hydrate without a public/ directory.
+
+/// Whether the bootstrap snippet must be injected into this HTML response.
+///
+/// Injection exists for one case only: a Dioxus SSR page (it carries the
+/// hydration-data marker) that has **no** WASM loader of its own. A server
+/// built by `dx` renders SSR pages that already carry their own
+/// `<script type="module" ...>` loader for the exact client bundle it was
+/// built with — injecting a second loader on top of that is how #566's
+/// mount hang happened: the snippet comes from the (potentially stale — see
+/// [`disk_public_root`]) `index.html`, so the page ended up executing TWO
+/// different client builds against one DOM, one of which could be old enough
+/// to carry the pre-#560 mount loop. A page that already has any module
+/// script therefore never gets the snippet; the exact-match check stays as a
+/// belt-and-braces guard against double-injection on repeated middleware
+/// passes.
+fn needs_bootstrap(html: &str, bootstrap: &str) -> bool {
+    html.contains("initial_dioxus_hydration_data")
+        && !html.contains("<script type=\"module\"")
+        && !html.contains(bootstrap)
+}
 
 /// Tower layer that injects Dioxus bootstrap scripts into SSR HTML responses.
 #[derive(Clone)]
@@ -242,9 +335,7 @@ where
 
             let mut html = String::from_utf8_lossy(&body_bytes).to_string();
 
-            // Only inject into SSR pages (have hydration data) that don't already have bootstrap
-            // The hydration data marker indicates this is a Dioxus SSR page
-            if html.contains("initial_dioxus_hydration_data") && !html.contains(&bootstrap) {
+            if needs_bootstrap(&html, &bootstrap) {
                 // Inject before </body> if present, otherwise append
                 if let Some(idx) = html.rfind("</body>") {
                     html.insert_str(idx, &format!("\n{}\n", bootstrap));
@@ -275,5 +366,70 @@ mod tests {
     fn test_get_index_html_handles_missing() {
         // This should return None if assets aren't embedded, not panic
         let _index = get_index_html();
+    }
+
+    const BOOTSTRAP: &str =
+        r#"<script type="module" async src="/./assets/unified-hifi-control-dxhOLD.js"></script>"#;
+
+    /// #566 mount-hang regression: an SSR page that already carries its own
+    /// module-script WASM loader (every page rendered by a dx-built server
+    /// does) must NOT get a second loader injected — the snippet comes from
+    /// a potentially stale index.html snapshot, and two different client
+    /// builds hydrating one DOM is exactly how the Library page hung at
+    /// mount (a stale pre-#560 client brought its since-fixed reactive loop
+    /// along with it).
+    #[test]
+    fn ssr_page_with_its_own_module_script_never_gets_a_second_loader() {
+        let html = r#"<body><div id="main"><script>window.initial_dioxus_hydration_data="x";</script></div>
+            <script type="module" async src="/./assets/unified-hifi-control-dxhNEW.js"></script></body>"#;
+        assert!(!needs_bootstrap(html, BOOTSTRAP));
+    }
+
+    /// The one case injection exists for: a Dioxus SSR page with no WASM
+    /// loader at all (a server built by plain `cargo build`, per ADR 002).
+    #[test]
+    fn ssr_page_without_any_loader_gets_the_bootstrap() {
+        let html = r#"<body><script>window.initial_dioxus_hydration_data="x";</script></body>"#;
+        assert!(needs_bootstrap(html, BOOTSTRAP));
+    }
+
+    /// Non-SSR responses (no hydration marker) are never touched.
+    #[test]
+    fn non_ssr_html_is_never_touched() {
+        assert!(!needs_bootstrap("<body>plain page</body>", BOOTSTRAP));
+    }
+
+    /// Idempotence: a page that already contains this exact snippet is not
+    /// injected again.
+    #[test]
+    fn bootstrap_is_not_injected_twice() {
+        let html = format!(
+            r#"<body><script>window.initial_dioxus_hydration_data="x";</script>{BOOTSTRAP}</body>"#
+        );
+        assert!(!needs_bootstrap(&html, BOOTSTRAP));
+    }
+
+    /// `read_public` serves URL-derived paths; anything that could step out
+    /// of public/ must refuse the disk read (the embedded map lookup is
+    /// inherently safe). With no disk root and nothing embedded these all
+    /// come back None either way — the assertion that matters is "no panic,
+    /// no escape", pinned by exercising the guard's rejection branch.
+    #[test]
+    fn read_public_rejects_traversal_shapes() {
+        for rel in [
+            "../Cargo.toml",
+            "assets/../../secret",
+            "assets//x.js",
+            ".",
+            "",
+            "assets\\..\\x",
+        ] {
+            // Must not read anything from outside public/ (and must not panic).
+            let got = read_public(rel);
+            assert!(
+                got.is_none() || PublicAssets::get(rel).is_some(),
+                "traversal-shaped path {rel:?} must never be served from disk"
+            );
+        }
     }
 }

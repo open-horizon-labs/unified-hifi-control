@@ -9027,6 +9027,8 @@ impl HqpAdapter {
                     track_number: (status.track > 0).then_some(status.track),
                     disc_number: None,
                 }),
+                repeat_mode: None,
+                shuffle: None,
             })
         } else {
             None

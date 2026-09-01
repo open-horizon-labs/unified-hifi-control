@@ -14,7 +14,15 @@ use crate::bus::runtime::{
     ProjectionCommit, ProjectionCommitter, ProjectionEntry, ProjectionFreshness, ProjectionKind,
     ProjectionPayload, ProjectionUpdate,
 };
-use crate::bus::{BusEvent, NowPlaying, PrefixedZoneId, SharedBus, Zone};
+use crate::bus::{BusEvent, NowPlaying, PrefixedZoneId, ProviderAccount, SharedBus, Zone};
+use crate::mcp::observation_history::PlaybackObservationHistory;
+
+fn observation_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 /// Whether an HQPlayer snapshot is current or retained across a recoverable outage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +50,9 @@ pub struct HqpSnapshot {
 /// - Provides query interface for API layer
 pub struct ZoneAggregator {
     state: Arc<RwLock<AggregateState>>,
+    provider_accounts: Arc<RwLock<HashMap<String, ProviderAccount>>>,
+    adapter_errors: Arc<RwLock<HashMap<String, String>>>,
+    observed_playback: PlaybackObservationHistory,
     bus: SharedBus,
 }
 
@@ -51,6 +62,7 @@ pub struct ZoneAggregator {
 #[derive(Default)]
 struct AggregateState {
     zones: HashMap<String, Zone>,
+    volume_capabilities: HashMap<String, bool>,
     hqplayer_snapshots: HashMap<String, HqpSnapshot>,
     projection_revision: u64,
     source_cursors: HashMap<String, ProjectionCursor>,
@@ -68,8 +80,32 @@ impl ZoneAggregator {
     pub fn new(bus: SharedBus) -> Self {
         Self {
             state: Arc::new(RwLock::new(AggregateState::default())),
+            provider_accounts: Arc::new(RwLock::new(HashMap::new())),
+            adapter_errors: Arc::new(RwLock::new(HashMap::new())),
+            observed_playback: PlaybackObservationHistory::from_config(),
             bus,
         }
+    }
+
+    pub fn new_with_observation_history(
+        bus: SharedBus,
+        observed_playback: PlaybackObservationHistory,
+    ) -> Self {
+        Self {
+            state: Arc::new(RwLock::new(AggregateState::default())),
+            provider_accounts: Arc::new(RwLock::new(HashMap::new())),
+            adapter_errors: Arc::new(RwLock::new(HashMap::new())),
+            observed_playback,
+            bus,
+        }
+    }
+
+    pub async fn observed_playback_history(
+        &self,
+        zone_id: &str,
+        limit: usize,
+    ) -> Vec<crate::mcp::observation_history::PlaybackObservation> {
+        self.observed_playback.recent(zone_id, limit).await
     }
 
     /// Start the aggregator's event processing loop
@@ -117,11 +153,14 @@ impl ZoneAggregator {
             match event {
                 BusEvent::ZoneDiscovered { zone } => {
                     debug!("Zone discovered: {}", zone.zone_id);
-                    self.state
-                        .write()
-                        .await
-                        .zones
-                        .insert(zone.zone_id.clone(), zone);
+                    self.observed_playback
+                        .record_zone(&zone, observation_now())
+                        .await;
+                    let mut aggregate = self.state.write().await;
+                    aggregate
+                        .volume_capabilities
+                        .insert(zone.zone_id.clone(), zone.volume_control.is_some());
+                    aggregate.zones.insert(zone.zone_id.clone(), zone);
                 }
 
                 BusEvent::ZoneUpdated {
@@ -130,6 +169,9 @@ impl ZoneAggregator {
                     state,
                 } => {
                     debug!("Zone updated: {}", zone_id);
+                    self.observed_playback
+                        .record_state(zone_id.as_str(), state.as_str().into(), observation_now())
+                        .await;
                     if let Some(zone) = self.state.write().await.zones.get_mut(zone_id.as_str()) {
                         zone.zone_name = display_name;
                         zone.state = state.as_str().into();
@@ -138,7 +180,29 @@ impl ZoneAggregator {
 
                 BusEvent::ZoneRemoved { zone_id } => {
                     debug!("Zone removed: {}", zone_id);
-                    self.state.write().await.zones.remove(zone_id.as_str());
+                    self.observed_playback.clear_zone(zone_id.as_str()).await;
+                    let mut aggregate = self.state.write().await;
+                    aggregate.zones.remove(zone_id.as_str());
+                    aggregate.volume_capabilities.remove(zone_id.as_str());
+                }
+
+                BusEvent::ProviderAccountUpdated { provider, account } => {
+                    debug!("Provider account updated: {}", provider);
+                    let mut accounts = self.provider_accounts.write().await;
+                    if let Some(account) = account {
+                        accounts.insert(provider, account);
+                    } else {
+                        accounts.remove(&provider);
+                    }
+                }
+
+                BusEvent::AdapterError { adapter, error } => {
+                    debug!("Adapter error: {}: {}", adapter, error);
+                    self.adapter_errors.write().await.insert(adapter, error);
+                }
+
+                BusEvent::AdapterConnected { adapter, .. } => {
+                    self.adapter_errors.write().await.remove(&adapter);
                 }
 
                 BusEvent::NowPlayingChanged {
@@ -149,43 +213,80 @@ impl ZoneAggregator {
                     image_key,
                 } => {
                     debug!("Now playing changed: {}", zone_id);
-                    if let Some(zone) = self.state.write().await.zones.get_mut(zone_id.as_str()) {
-                        // Preserve fields this compatibility event cannot carry when it describes
-                        // the same track as the canonical snapshot. Reliable projections publish a
-                        // complete Zone first and then emit this event as a post-commit SSE hint;
-                        // treating the hint as a replacement would erase source metadata from the
-                        // authoritative projection. A changed identity deliberately drops metadata
-                        // so details from the previous track cannot leak into the next one.
-                        let same_track = zone.now_playing.as_ref().is_some_and(|np| {
-                            title.as_deref().unwrap_or_default() == np.title
-                                && artist.as_deref().unwrap_or_default() == np.artist
-                                && album.as_deref().unwrap_or_default() == np.album
-                        });
-                        let (seek_position, duration, metadata) = zone
-                            .now_playing
-                            .as_ref()
-                            .map(|np| {
-                                (
-                                    np.seek_position,
-                                    np.duration,
-                                    if same_track {
-                                        np.metadata.clone()
-                                    } else {
-                                        None
-                                    },
-                                )
-                            })
-                            .unwrap_or((None, None, None));
+                    let state = {
+                        let mut aggregate = self.state.write().await;
+                        if let Some(zone) = aggregate.zones.get_mut(zone_id.as_str()) {
+                            // All fields absent is the explicit clear sentinel emitted by
+                            // adapters whose complete snapshot reports no current track. Do
+                            // not turn it into an empty `Some(NowPlaying)`: that would retain a
+                            // phantom track in every API projection until the next song starts.
+                            if title.is_none()
+                                && artist.is_none()
+                                && album.is_none()
+                                && image_key.is_none()
+                            {
+                                zone.now_playing = None;
+                                (zone.state, None)
+                            } else {
+                                // Preserve fields this compatibility event cannot carry when it describes
+                                // the same track as the canonical snapshot. A changed identity drops
+                                // metadata so details from the previous track cannot leak forward.
+                                let same_track = zone.now_playing.as_ref().is_some_and(|np| {
+                                    title.as_deref().unwrap_or_default() == np.title
+                                        && artist.as_deref().unwrap_or_default() == np.artist
+                                        && album.as_deref().unwrap_or_default() == np.album
+                                });
+                                let (seek_position, duration, metadata, repeat_mode, shuffle) =
+                                    zone.now_playing
+                                        .as_ref()
+                                        .map(|np| {
+                                            (
+                                                np.seek_position,
+                                                np.duration,
+                                                same_track.then(|| np.metadata.clone()).flatten(),
+                                                np.repeat_mode,
+                                                np.shuffle,
+                                            )
+                                        })
+                                        .unwrap_or((None, None, None, None, None));
+                                zone.now_playing = Some(NowPlaying {
+                                    title: title.unwrap_or_default(),
+                                    artist: artist.unwrap_or_default(),
+                                    album: album.unwrap_or_default(),
+                                    image_key,
+                                    seek_position,
+                                    duration,
+                                    metadata,
+                                    repeat_mode,
+                                    shuffle,
+                                });
+                                (zone.state, zone.now_playing.clone())
+                            }
+                        } else {
+                            (crate::bus::PlaybackState::Unknown, None)
+                        }
+                    };
+                    self.observed_playback
+                        .record_now_playing(
+                            zone_id.as_str(),
+                            state.0,
+                            state.1.as_ref(),
+                            observation_now(),
+                        )
+                        .await;
+                }
 
-                        zone.now_playing = Some(NowPlaying {
-                            title: title.unwrap_or_default(),
-                            artist: artist.unwrap_or_default(),
-                            album: album.unwrap_or_default(),
-                            image_key,
-                            seek_position,
-                            duration,
-                            metadata,
-                        });
+                BusEvent::PlaybackModesChanged {
+                    zone_id,
+                    repeat_mode,
+                    shuffle,
+                } => {
+                    debug!("Playback modes changed: {}", zone_id);
+                    if let Some(zone) = self.state.write().await.zones.get_mut(zone_id.as_str()) {
+                        if let Some(ref mut now_playing) = zone.now_playing {
+                            now_playing.repeat_mode = repeat_mode;
+                            now_playing.shuffle = shuffle;
+                        }
                     }
                 }
 
@@ -220,6 +321,16 @@ impl ZoneAggregator {
                     }
                 }
 
+                BusEvent::VolumeCapabilityChanged { zone_id, supported } => {
+                    debug!("Volume capability changed: {} = {}", zone_id, supported);
+                    let mut aggregate = self.state.write().await;
+                    if aggregate.zones.contains_key(zone_id.as_str()) {
+                        aggregate
+                            .volume_capabilities
+                            .insert(zone_id.to_string(), supported);
+                    }
+                }
+
                 BusEvent::SeekPositionChanged { zone_id, position } => {
                     debug!("Seek position changed: {} = {}", zone_id, position);
                     if let Some(zone) = self.state.write().await.zones.get_mut(zone_id.as_str()) {
@@ -234,17 +345,26 @@ impl ZoneAggregator {
                     let prefix = format!("{}:", adapter);
 
                     // Remove all zones with this prefix
-                    let mut aggregate = self.state.write().await;
+                    let zone_ids = {
+                        let mut aggregate = self.state.write().await;
+                        let zone_ids: Vec<String> = aggregate
+                            .zones
+                            .keys()
+                            .filter(|k| k.starts_with(&prefix))
+                            .cloned()
+                            .collect();
 
-                    let zone_ids: Vec<String> = aggregate
-                        .zones
-                        .keys()
-                        .filter(|k| k.starts_with(&prefix))
-                        .cloned()
-                        .collect();
+                        for zone_id in &zone_ids {
+                            aggregate.zones.remove(zone_id);
+                            aggregate.volume_capabilities.remove(zone_id);
+                        }
+                        zone_ids
+                    };
 
-                    for zone_id in &zone_ids {
-                        aggregate.zones.remove(zone_id);
+                    if adapter == "applemusic" {
+                        for zone_id in &zone_ids {
+                            self.observed_playback.clear_zone(zone_id).await;
+                        }
                     }
 
                     // Publish flush acknowledgment
@@ -252,6 +372,8 @@ impl ZoneAggregator {
                         adapter: adapter.clone(),
                         zone_ids,
                     });
+                    self.provider_accounts.write().await.remove(&adapter);
+                    self.adapter_errors.write().await.remove(&adapter);
                 }
 
                 BusEvent::ShuttingDown { .. } => {
@@ -291,6 +413,22 @@ impl ZoneAggregator {
         self.state.read().await.zones.get(zone_id).cloned()
     }
 
+    /// Return whether the current device observation says this zone can accept
+    /// volume commands. This is separate from `Zone::volume_control`, whose
+    /// numeric value is absent when a provider reports support but no current
+    /// volume value.
+    pub async fn has_volume_control(&self, zone_id: &str) -> Option<bool> {
+        let aggregate = self.state.read().await;
+        let zone = aggregate.zones.get(zone_id)?;
+        Some(
+            aggregate
+                .volume_capabilities
+                .get(zone_id)
+                .copied()
+                .unwrap_or_else(|| zone.volume_control.is_some()),
+        )
+    }
+
     /// Get now playing for a zone
     pub async fn get_now_playing(&self, zone_id: &str) -> Option<NowPlaying> {
         self.state
@@ -304,6 +442,16 @@ impl ZoneAggregator {
     /// Get zone count
     pub async fn zone_count(&self) -> usize {
         self.state.read().await.zones.len()
+    }
+
+    /// Get the last non-secret account identity reported by a provider.
+    pub async fn get_provider_account(&self, provider: &str) -> Option<ProviderAccount> {
+        self.provider_accounts.read().await.get(provider).cloned()
+    }
+
+    /// Get the last backend error reported by an adapter, if any.
+    pub async fn get_adapter_error(&self, adapter: &str) -> Option<String> {
+        self.adapter_errors.read().await.get(adapter).cloned()
     }
 
     /// Return the aggregator-owned state for one configured HQPlayer instance.
@@ -912,6 +1060,8 @@ mod tests {
             seek_position: Some(12.0),
             duration: Some(120.0),
             metadata: None,
+            repeat_mode: None,
+            shuffle: None,
         });
         zone.volume_control = Some(crate::bus::VolumeControl {
             output_id: Some("hqplayer:main".to_string()),
@@ -1156,5 +1306,61 @@ mod tests {
             .await
             .expect("aggregator exits when the bus is explicitly shut down")
             .expect("aggregator task did not panic");
+    }
+
+    #[tokio::test]
+    async fn playback_mode_event_updates_the_aggregated_now_playing_state() {
+        let bus = crate::bus::create_bus();
+        let aggregator = std::sync::Arc::new(ZoneAggregator::new(bus.clone()));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let running = {
+            let aggregator = aggregator.clone();
+            tokio::spawn(async move { aggregator.run_with_ready(ready_tx).await })
+        };
+        ready_rx.await.expect("aggregator ready");
+
+        let mut zone = projected_zone("musicassistant:kitchen");
+        zone.now_playing = Some(NowPlaying {
+            title: "Kind of Blue".to_string(),
+            artist: "Miles Davis".to_string(),
+            album: "Kind of Blue".to_string(),
+            image_key: None,
+            seek_position: None,
+            duration: None,
+            metadata: None,
+            repeat_mode: Some(crate::bus::RepeatMode::Off),
+            shuffle: Some(false),
+        });
+        bus.publish(BusEvent::ZoneDiscovered { zone });
+        bus.publish(BusEvent::PlaybackModesChanged {
+            zone_id: PrefixedZoneId::musicassistant("kitchen"),
+            repeat_mode: Some(crate::bus::RepeatMode::All),
+            shuffle: Some(true),
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let matches = aggregator
+                    .get_zone("musicassistant:kitchen")
+                    .await
+                    .and_then(|zone| zone.now_playing)
+                    .is_some_and(|track| {
+                        track.repeat_mode == Some(crate::bus::RepeatMode::All)
+                            && track.shuffle == Some(true)
+                    });
+                if matches {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("mode event reaches aggregated state");
+
+        bus.publish(BusEvent::ShuttingDown { reason: None });
+        tokio::time::timeout(Duration::from_secs(1), running)
+            .await
+            .expect("aggregator shutdown")
+            .expect("aggregator task");
     }
 }

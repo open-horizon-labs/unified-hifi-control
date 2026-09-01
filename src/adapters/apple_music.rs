@@ -1,0 +1,864 @@
+//! Native Apple Music adapter boundary.
+//!
+//! Apple Music playback is controlled by a native MusicKit companion.
+//! The companion owns MusicKit authorization and its platform playback
+//! session; this module owns the UHC adapter lifecycle and translates the
+//! companion's state into the shared zone/event model.  The initial platform
+//! target is iPhone `SystemMusicPlayer`; the legacy macOS package remains a
+//! separate, unvalidated execution owner until #486 is proven on hardware.
+//!
+//! The Rust server deliberately does not import MusicKit or automate the
+//! Music.app process.  [`MusicKitCompanion`] is the narrow boundary used by an
+//! in-process macOS companion today and by a paired companion transport later.
+//! See `companion/apple_music/README.md` for the line-oriented wire contract.
+
+use anyhow::{bail, Result};
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
+use tokio::time::interval;
+use tokio_util::sync::CancellationToken;
+
+use crate::adapters::traits::{
+    AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic, LibraryAdapter,
+    LibrarySearchResult,
+};
+use crate::bus::{
+    BusEvent, NowPlaying, PlaybackState, PrefixedZoneId, RepeatMode, VolumeControl, VolumeScale,
+    Zone,
+};
+
+/// UHC adapter prefix for Apple Music zones.
+pub const APPLE_MUSIC_PREFIX: &str = "applemusic";
+
+/// The ApplicationMusicPlayer session used by the native companion.
+pub const APPLICATION_PLAYER_ID: &str = "application";
+
+/// The platform that owns an Apple Music playback session.
+///
+/// This is deliberately not part of [`MusicKitSnapshot`]'s wire shape yet:
+/// adding fields to the paired bridge payload requires the API contract work
+/// tracked by #463.  Keeping the model here lets the adapter and tests make
+/// the ownership distinction without claiming an unvalidated SDK surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompanionPlatform {
+    IPhone,
+    Mac,
+}
+
+/// Identity of the process/device that owns playback for an `applemusic:` zone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionOwner {
+    pub companion_id: String,
+    pub platform: CompanionPlatform,
+}
+
+impl ExecutionOwner {
+    pub fn new(companion_id: impl Into<String>, platform: CompanionPlatform) -> Result<Self> {
+        let companion_id = companion_id.into();
+        if companion_id.is_empty() || companion_id.contains(':') {
+            bail!("Apple Music companion id must be non-empty and may not contain ':'");
+        }
+        Ok(Self {
+            companion_id,
+            platform,
+        })
+    }
+
+    /// The only controllable zone identity owned by this companion.
+    pub fn zone_id(&self) -> PrefixedZoneId {
+        PrefixedZoneId::applemusic(&self.companion_id)
+    }
+}
+
+/// Output route selected by the execution owner.
+///
+/// A route is observation about where audio is expected to emerge; it is not
+/// a UHC zone and therefore cannot receive commands or create a second zone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaybackRoute {
+    Unknown,
+    LocalOutput {
+        display_name: String,
+    },
+    AirPlay {
+        route_id: String,
+        display_name: String,
+    },
+}
+
+impl PlaybackRoute {
+    pub fn is_destination_only(&self) -> bool {
+        matches!(self, Self::AirPlay { .. })
+    }
+}
+
+/// Playback states emitted by the MusicKit companion.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MusicKitPlaybackState {
+    Playing,
+    Paused,
+    Stopped,
+    Interrupted,
+    /// The companion has not obtained a MusicKit playback state yet.
+    Unknown,
+}
+
+impl From<MusicKitPlaybackState> for PlaybackState {
+    fn from(state: MusicKitPlaybackState) -> Self {
+        match state {
+            MusicKitPlaybackState::Playing => Self::Playing,
+            MusicKitPlaybackState::Paused => Self::Paused,
+            MusicKitPlaybackState::Stopped => Self::Stopped,
+            MusicKitPlaybackState::Interrupted => Self::Buffering,
+            MusicKitPlaybackState::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// Track metadata returned by the native MusicKit companion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MusicKitTrack {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    #[serde(default)]
+    pub artwork_url: Option<String>,
+    #[serde(default)]
+    pub position_seconds: Option<f64>,
+    #[serde(default)]
+    pub duration_seconds: Option<f64>,
+}
+
+/// An output discovered by the native companion. Output zones share the
+/// companion's playback owner and are projections of its current output set.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MusicKitOutput {
+    pub output_id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub is_active: bool,
+    #[serde(default)]
+    pub volume: Option<f32>,
+    #[serde(default)]
+    pub is_muted: Option<bool>,
+}
+
+/// Snapshot of the ApplicationMusicPlayer session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MusicKitSnapshot {
+    /// Stable companion-local player identifier. `application` is the
+    /// canonical ID for ApplicationMusicPlayer on macOS.
+    pub player_id: String,
+    pub display_name: String,
+    pub state: MusicKitPlaybackState,
+    #[serde(default)]
+    pub track: Option<MusicKitTrack>,
+    /// Linear volume in the inclusive range 0.0..=1.0, when available.
+    #[serde(default)]
+    pub volume: Option<f32>,
+    #[serde(default)]
+    pub is_muted: bool,
+    /// Current repeat mode when the native player exposes it.
+    #[serde(default)]
+    pub repeat_mode: Option<RepeatMode>,
+    /// Current shuffle state when the native player exposes it.
+    #[serde(default)]
+    pub shuffle: Option<bool>,
+    #[serde(default)]
+    pub outputs: Vec<MusicKitOutput>,
+}
+
+/// Commands understood by the native companion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "command")]
+pub enum MusicKitCommand {
+    Play,
+    Pause,
+    Toggle,
+    Stop,
+    Next,
+    Previous,
+    SetVolume { value: f32 },
+    AdjustVolume { delta: f32 },
+    SetMute { muted: bool },
+    SetRepeat { mode: RepeatMode },
+    SetShuffle { enabled: bool },
+}
+
+/// Request sent over a future in-process/paired companion transport.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum MusicKitRequest {
+    Snapshot,
+    Command { command: MusicKitCommand },
+}
+
+/// Response envelope for the companion transport.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum MusicKitResponse {
+    Snapshot { snapshot: MusicKitSnapshot },
+    Ack,
+    Error { message: String },
+}
+
+/// Narrow Rust/native boundary for MusicKit.
+///
+/// Implementations may call Swift directly in an in-process macOS build or
+/// exchange [`MusicKitRequest`] / [`MusicKitResponse`] over a paired transport.
+/// No provider token crosses this boundary: the companion owns authorization.
+#[async_trait]
+pub trait MusicKitCompanion: Send + Sync {
+    async fn snapshot(&self) -> Result<MusicKitSnapshot>;
+    async fn execute(&self, command: MusicKitCommand) -> Result<()>;
+
+    /// Return every live execution-owner snapshot known to this companion
+    /// transport. Older single-owner companions keep working through the
+    /// default implementation.
+    async fn snapshots(&self) -> Result<Vec<MusicKitSnapshot>> {
+        Ok(vec![self.snapshot().await?])
+    }
+
+    /// Execute against the named player/execution owner. The default keeps
+    /// the historical single-owner behavior; paired transports override it
+    /// to prevent a command crossing companion boundaries.
+    async fn execute_for_player(&self, _player_id: &str, command: MusicKitCommand) -> Result<()> {
+        self.execute(command).await
+    }
+
+    /// Execute an authenticated Apple Music content operation on the native
+    /// companion. The companion owns the MusicKit token; UHC receives only the
+    /// provider-neutral JSON result. Keeping this optional preserves playback
+    /// compatibility with older companions while the content surface rolls
+    /// out in a later companion version.
+    async fn content(
+        &self,
+        _operation: &str,
+        _params: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        bail!("Apple Music content operations are not implemented by this companion")
+    }
+
+    /// Owner-scoped content dispatch. The legacy method remains for catalog
+    /// calls that have no zone context; paired companions override this method
+    /// for playback, queue, library, and mutation operations.
+    async fn content_for_player(
+        &self,
+        _player_id: &str,
+        operation: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.content(operation, params).await
+    }
+}
+
+/// Apple Music adapter backed by a native MusicKit companion.
+#[derive(Clone)]
+pub struct AppleMusicAdapter {
+    companion: Arc<dyn MusicKitCompanion>,
+    poll_interval: Duration,
+    bus: crate::bus::SharedBus,
+    shutdown: Arc<RwLock<CancellationToken>>,
+    running: Arc<AtomicBool>,
+}
+
+impl AppleMusicAdapter {
+    fn owner_display_name(snapshot: &MusicKitSnapshot) -> String {
+        let active_outputs = snapshot
+            .outputs
+            .iter()
+            .filter(|output| output.is_active)
+            .map(|output| output.display_name.as_str())
+            .collect::<Vec<_>>();
+        if active_outputs.is_empty() {
+            snapshot.display_name.clone()
+        } else {
+            format!(
+                "{} — Output: {}",
+                snapshot.display_name,
+                active_outputs.join(" + ")
+            )
+        }
+    }
+
+    fn owner_id_for_zone(zone_id: &str) -> Result<&str> {
+        let player_id = zone_id
+            .strip_prefix("applemusic:")
+            .ok_or_else(|| anyhow::anyhow!("not an Apple Music zone"))?;
+        Ok(player_id.split("~output~").next().unwrap_or(player_id))
+    }
+
+    /// Build an adapter with a companion implementation.
+    pub fn with_companion(
+        bus: crate::bus::SharedBus,
+        companion: Arc<dyn MusicKitCompanion>,
+        poll_interval: Duration,
+    ) -> Self {
+        Self {
+            companion,
+            poll_interval: poll_interval.max(Duration::from_millis(1)),
+            bus,
+            shutdown: Arc::new(RwLock::new(CancellationToken::new())),
+            running: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Convert a companion snapshot into the shared zone representation.
+    pub fn zone_from_snapshot(snapshot: &MusicKitSnapshot) -> Result<Zone> {
+        if snapshot.player_id.is_empty() || snapshot.player_id.contains(':') {
+            bail!("MusicKit companion returned an invalid player id");
+        }
+        if snapshot.display_name.is_empty() {
+            bail!("MusicKit companion returned an empty display name");
+        }
+        if snapshot
+            .volume
+            .is_some_and(|value| !(0.0..=1.0).contains(&value))
+        {
+            bail!("MusicKit companion returned volume outside 0.0..=1.0");
+        }
+
+        let zone_id = PrefixedZoneId::applemusic(&snapshot.player_id).to_string();
+        let now_playing = snapshot.track.as_ref().map(|track| NowPlaying {
+            title: track.title.clone(),
+            artist: track.artist.clone(),
+            album: track.album.clone(),
+            image_key: track.artwork_url.clone(),
+            seek_position: track.position_seconds,
+            duration: track.duration_seconds,
+            metadata: None,
+            repeat_mode: snapshot.repeat_mode,
+            shuffle: snapshot.shuffle,
+        });
+        let volume_control = snapshot.volume.map(|value| VolumeControl {
+            value: value * 100.0,
+            min: 0.0,
+            max: 100.0,
+            step: 1.0,
+            is_muted: snapshot.is_muted,
+            scale: VolumeScale::Percentage,
+            output_id: Some(zone_id.clone()),
+        });
+        let state: PlaybackState = snapshot.state.into();
+
+        Ok(Zone {
+            zone_id,
+            zone_name: Self::owner_display_name(snapshot),
+            state,
+            volume_control,
+            now_playing,
+            source: APPLE_MUSIC_PREFIX.to_string(),
+            is_controllable: true,
+            is_seekable: snapshot
+                .track
+                .as_ref()
+                .and_then(|track| track.duration_seconds)
+                .is_some(),
+            last_updated: now_millis(),
+            is_play_allowed: !matches!(state, PlaybackState::Playing),
+            is_pause_allowed: matches!(state, PlaybackState::Playing),
+            is_next_allowed: true,
+            is_previous_allowed: true,
+        })
+    }
+
+    async fn publish_snapshot(
+        &self,
+        bus: &crate::bus::SharedBus,
+        snapshot: MusicKitSnapshot,
+        discovered: &mut std::collections::HashSet<String>,
+    ) -> Result<Vec<PrefixedZoneId>> {
+        let zone = Self::zone_from_snapshot(&snapshot)?;
+        let zone_id = PrefixedZoneId::applemusic(&snapshot.player_id);
+        let zone_ids = vec![zone_id.clone()];
+
+        if discovered.insert(zone_id.to_string()) {
+            bus.publish(BusEvent::ZoneDiscovered { zone });
+        } else {
+            bus.publish(BusEvent::ZoneUpdated {
+                zone_id: zone_id.clone(),
+                display_name: Self::owner_display_name(&snapshot),
+                state: zone.state.to_string(),
+            });
+            if let Some(track) = snapshot.track.as_ref() {
+                bus.publish(BusEvent::NowPlayingChanged {
+                    zone_id: zone_id.clone(),
+                    title: Some(track.title.clone()),
+                    artist: Some(track.artist.clone()),
+                    album: Some(track.album.clone()),
+                    image_key: track.artwork_url.clone(),
+                });
+                if let Some(position) = track.position_seconds {
+                    bus.publish(BusEvent::SeekPositionChanged {
+                        zone_id: zone_id.clone(),
+                        position: position as i64,
+                    });
+                }
+            } else {
+                // A successful snapshot with no current entry is authoritative: the
+                // companion has observed an idle/empty player, so clear any track
+                // metadata retained by the aggregator rather than leaving the last
+                // song visible indefinitely.
+                bus.publish(BusEvent::NowPlayingChanged {
+                    zone_id: zone_id.clone(),
+                    title: None,
+                    artist: None,
+                    album: None,
+                    image_key: None,
+                });
+            }
+            if let Some(volume) = snapshot.volume {
+                bus.publish(BusEvent::VolumeChanged {
+                    output_id: PrefixedZoneId::applemusic(&snapshot.player_id).to_string(),
+                    value: volume * 100.0,
+                    is_muted: snapshot.is_muted,
+                });
+            }
+        }
+        Ok(zone_ids)
+    }
+
+    fn command_for(command: AdapterCommand) -> Result<MusicKitCommand> {
+        match command {
+            AdapterCommand::Play => Ok(MusicKitCommand::Play),
+            AdapterCommand::Pause => Ok(MusicKitCommand::Pause),
+            AdapterCommand::PlayPause => Ok(MusicKitCommand::Toggle),
+            AdapterCommand::Stop => Ok(MusicKitCommand::Stop),
+            AdapterCommand::Next => Ok(MusicKitCommand::Next),
+            AdapterCommand::Previous => Ok(MusicKitCommand::Previous),
+            AdapterCommand::VolumeAbsolute(value) => {
+                if !(0..=100).contains(&value) {
+                    bail!("Apple Music volume must be between 0 and 100");
+                }
+                Ok(MusicKitCommand::SetVolume {
+                    value: value as f32 / 100.0,
+                })
+            }
+            AdapterCommand::VolumeRelative(value) => {
+                if !(-100..=100).contains(&value) {
+                    bail!("Apple Music relative volume must be between -100 and 100");
+                }
+                Ok(MusicKitCommand::AdjustVolume {
+                    delta: value as f32 / 100.0,
+                })
+            }
+            AdapterCommand::Mute(muted) => Ok(MusicKitCommand::SetMute { muted }),
+            AdapterCommand::SetRepeat(mode) => Ok(MusicKitCommand::SetRepeat { mode }),
+            AdapterCommand::SetShuffle(enabled) => Ok(MusicKitCommand::SetShuffle { enabled }),
+        }
+    }
+
+    async fn start_internal(&self) -> Result<()> {
+        if self.running.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let shutdown = {
+            let mut token = self.shutdown.write().await;
+            *token = CancellationToken::new();
+            token.clone()
+        };
+        let handle =
+            crate::adapters::handle::AdapterHandle::new(self.clone(), self.bus.clone(), shutdown);
+        tokio::spawn(async move {
+            if let Err(error) = handle
+                .run_with_retry(crate::adapters::handle::RetryConfig::default())
+                .await
+            {
+                tracing::warn!("Apple Music adapter stopped: {}", error);
+            }
+        });
+        Ok(())
+    }
+
+    async fn stop_internal(&self) {
+        self.shutdown.read().await.cancel();
+        self.running.store(false, Ordering::SeqCst);
+        self.bus.publish(BusEvent::AdapterStopping {
+            adapter: APPLE_MUSIC_PREFIX.to_string(),
+            reason: Some("requested".to_string()),
+        });
+    }
+}
+
+#[async_trait]
+impl AdapterLogic for AppleMusicAdapter {
+    fn prefix(&self) -> &'static str {
+        APPLE_MUSIC_PREFIX
+    }
+
+    async fn run(&self, ctx: AdapterContext) -> Result<()> {
+        let mut ticker = interval(self.poll_interval);
+        let mut discovered = std::collections::HashMap::<String, String>::new();
+        loop {
+            tokio::select! {
+                _ = ctx.shutdown.cancelled() => return Ok(()),
+                _ = ticker.tick() => {
+                    match self.companion.snapshots().await {
+                        Ok(snapshots) => {
+                            let mut seen = std::collections::HashMap::<String, String>::new();
+                            let mut published = discovered.keys().cloned().collect();
+                            for snapshot in snapshots {
+                                let display_name = snapshot.display_name.clone();
+                                match self.publish_snapshot(&ctx.bus, snapshot, &mut published).await {
+                                    Ok(zone_ids) => {
+                                        for zone_id in zone_ids {
+                                            seen.insert(zone_id.to_string(), display_name.clone());
+                                        }
+                                    }
+                                    Err(error) => tracing::debug!("invalid Apple Music companion snapshot: {error}"),
+                                }
+                            }
+                            for zone_id in discovered.keys().filter(|zone_id| !seen.contains_key(*zone_id)) {
+                                if let Some(zone_id) = PrefixedZoneId::parse(zone_id) {
+                                    ctx.bus.publish(BusEvent::ZoneRemoved { zone_id });
+                                } else {
+                                    tracing::warn!(zone_id, "ignoring malformed Apple Music zone id");
+                                }
+                            }
+                            discovered = seen;
+                        }
+                        Err(error) => {
+                            // A failed refresh is a recoverable liveness
+                            // transition, not proof that the execution owner
+                            // disappeared. Retain the aggregator zone and its
+                            // private history until a later successful poll
+                            // confirms removal or the adapter is stopped.
+                            for (zone_id, display_name) in &discovered {
+                                if let Some(zone_id) = PrefixedZoneId::parse(zone_id) {
+                                    ctx.bus.publish(BusEvent::ZoneUpdated {
+                                        zone_id,
+                                        display_name: display_name.clone(),
+                                        state: "unknown".to_string(),
+                                    });
+                                } else {
+                                    tracing::warn!(zone_id, "ignoring malformed Apple Music zone id");
+                                }
+                            }
+                            let detail = error.to_string().chars().take(256).collect::<String>();
+                            ctx.bus.publish(BusEvent::AdapterError {
+                                adapter: APPLE_MUSIC_PREFIX.to_string(),
+                                error: format!("companion refresh unavailable: {detail}"),
+                            });
+                            tracing::debug!("Apple Music companion unavailable: {error}");
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    async fn handle_command(
+        &self,
+        zone_id: &str,
+        command: AdapterCommand,
+    ) -> Result<AdapterCommandResponse> {
+        if !crate::bus::is_applemusic_zone_id(zone_id) {
+            return Ok(AdapterCommandResponse {
+                success: false,
+                error: Some(format!(
+                    "zone `{zone_id}` is not owned by the applemusic adapter"
+                )),
+            });
+        }
+
+        let player_id = Self::owner_id_for_zone(zone_id)?;
+        if matches!(
+            &command,
+            AdapterCommand::VolumeAbsolute(_)
+                | AdapterCommand::VolumeRelative(_)
+                | AdapterCommand::Mute(_)
+        ) {
+            let has_volume = self
+                .companion
+                .snapshots()
+                .await?
+                .into_iter()
+                .find(|snapshot| snapshot.player_id == player_id)
+                .and_then(|snapshot| snapshot.volume)
+                .is_some();
+            if !has_volume {
+                return Ok(AdapterCommandResponse {
+                    success: false,
+                    error: Some(
+                        "Apple Music volume/mute is unavailable until the companion publishes a validated volume control"
+                            .to_string(),
+                    ),
+                });
+            }
+        }
+
+        let command = Self::command_for(command)?;
+        self.companion
+            .execute_for_player(player_id, command)
+            .await?;
+        Ok(AdapterCommandResponse {
+            success: true,
+            error: None,
+        })
+    }
+}
+
+#[async_trait]
+impl LibraryAdapter for AppleMusicAdapter {
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<LibrarySearchResult>> {
+        let value = self
+            .companion
+            .content(
+                "catalog_search",
+                &serde_json::json!({"query": query, "limit": limit.clamp(1, 50)}),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    async fn search_for_zone(
+        &self,
+        zone_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<LibrarySearchResult>> {
+        self.validate_content_zone(zone_id)?;
+        let value = self
+            .companion
+            .content_for_player(
+                Self::owner_id_for_zone(zone_id)?,
+                "catalog_search",
+                &serde_json::json!({"query": query, "limit": limit.clamp(1, 50), "zone_id": zone_id}),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    async fn play_uri(&self, zone_id: &str, uri: &str) -> Result<String> {
+        self.validate_content_zone(zone_id)?;
+        let value = self
+            .companion
+            .content_for_player(
+                Self::owner_id_for_zone(zone_id)?,
+                "play_uri",
+                &serde_json::json!({"uri": uri, "zone_id": zone_id}),
+            )
+            .await?;
+        content_message(value, "Apple Music item started")
+    }
+
+    async fn queue_uri(&self, zone_id: &str, uri: &str) -> Result<()> {
+        self.validate_content_zone(zone_id)?;
+        self.companion
+            .content_for_player(
+                Self::owner_id_for_zone(zone_id)?,
+                "queue_uri",
+                &serde_json::json!({"uri": uri, "zone_id": zone_id}),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    async fn read_queue(&self, zone_id: &str) -> Result<serde_json::Value> {
+        self.validate_content_zone(zone_id)?;
+        self.companion
+            .content_for_player(
+                Self::owner_id_for_zone(zone_id)?,
+                "queue_read",
+                &serde_json::json!({"zone_id": zone_id}),
+            )
+            .await
+    }
+
+    async fn content(
+        &self,
+        operation: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        validate_content_request(operation, params)?;
+        if let Some(zone_id) = params.get("zone_id").and_then(serde_json::Value::as_str) {
+            self.companion
+                .content_for_player(Self::owner_id_for_zone(zone_id)?, operation, params)
+                .await
+        } else {
+            self.companion.content(operation, params).await
+        }
+    }
+}
+
+impl AppleMusicAdapter {
+    fn validate_content_zone(&self, zone_id: &str) -> Result<()> {
+        if !crate::bus::is_applemusic_zone_id(zone_id) {
+            bail!("zone `{zone_id}` is not owned by the applemusic adapter");
+        }
+        Ok(())
+    }
+}
+
+fn validate_content_request(operation: &str, params: &serde_json::Value) -> Result<()> {
+    // Catalog search is provider-global. Every account, queue, playlist, and
+    // playback operation must name the execution owner so a future multi-
+    // companion bridge cannot silently route content to the wrong player.
+    if matches!(operation, "search" | "catalog_search") {
+        return Ok(());
+    }
+    let zone_id = params
+        .get("zone_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Apple Music content operation requires zone_id"))?;
+    if !crate::bus::is_applemusic_zone_id(zone_id) {
+        bail!("zone `{zone_id}` is not an Apple Music execution-owner zone");
+    }
+    Ok(())
+}
+
+fn content_message(value: serde_json::Value, default: &str) -> Result<String> {
+    match value {
+        serde_json::Value::String(message) => Ok(message),
+        serde_json::Value::Object(map) => Ok(map
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(default)
+            .to_string()),
+        _ => Ok(default.to_string()),
+    }
+}
+
+crate::impl_startable!(AppleMusicAdapter, "applemusic");
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_and_response_are_stable_json() {
+        let request = MusicKitRequest::Command {
+            command: MusicKitCommand::SetVolume { value: 0.5 },
+        };
+        assert_eq!(
+            serde_json::to_string(&request).unwrap_or_default(),
+            r#"{"type":"command","command":{"command":"set_volume","value":0.5}}"#
+        );
+
+        let response = MusicKitResponse::Ack;
+        assert_eq!(
+            serde_json::to_string(&response).unwrap_or_default(),
+            r#"{"type":"ack"}"#
+        );
+    }
+
+    #[test]
+    fn volume_is_rejected_when_companion_reports_an_invalid_range() {
+        let mut snapshot = MusicKitSnapshot {
+            player_id: APPLICATION_PLAYER_ID.to_string(),
+            display_name: "Apple Music".to_string(),
+            state: MusicKitPlaybackState::Paused,
+            track: None,
+            volume: Some(1.5),
+            is_muted: false,
+            repeat_mode: None,
+            shuffle: None,
+            outputs: vec![],
+        };
+        assert!(AppleMusicAdapter::zone_from_snapshot(&snapshot).is_err());
+        snapshot.volume = Some(0.5);
+        assert!(AppleMusicAdapter::zone_from_snapshot(&snapshot).is_ok());
+    }
+
+    #[test]
+    fn player_id_cannot_smuggle_a_second_zone_prefix() {
+        let snapshot = MusicKitSnapshot {
+            player_id: "application:other".to_string(),
+            display_name: "Apple Music".to_string(),
+            state: MusicKitPlaybackState::Paused,
+            track: None,
+            volume: None,
+            is_muted: false,
+            repeat_mode: None,
+            shuffle: None,
+            outputs: vec![],
+        };
+        assert!(AppleMusicAdapter::zone_from_snapshot(&snapshot).is_err());
+    }
+
+    #[test]
+    fn content_operations_require_an_apple_execution_owner() {
+        assert!(validate_content_request("catalog_search", &serde_json::json!({})).is_ok());
+        assert!(validate_content_request("search", &serde_json::json!({})).is_ok());
+        assert!(validate_content_request("playlist_add", &serde_json::json!({})).is_err());
+        assert!(validate_content_request(
+            "playlist_add",
+            &serde_json::json!({"zone_id": "spotify:device"})
+        )
+        .is_err());
+        assert!(validate_content_request(
+            "playlist_add",
+            &serde_json::json!({"zone_id": "applemusic:iphone"})
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn repeat_and_shuffle_commands_use_the_shared_wire_vocabulary() {
+        assert_eq!(
+            serde_json::to_value(MusicKitCommand::SetRepeat {
+                mode: RepeatMode::All
+            })
+            .unwrap(),
+            serde_json::json!({"command": "set_repeat", "mode": "all"})
+        );
+        assert_eq!(
+            serde_json::to_value(MusicKitCommand::SetShuffle { enabled: true }).unwrap(),
+            serde_json::json!({"command": "set_shuffle", "enabled": true})
+        );
+        assert_eq!(
+            AppleMusicAdapter::command_for(AdapterCommand::SetRepeat(RepeatMode::One)).unwrap(),
+            MusicKitCommand::SetRepeat {
+                mode: RepeatMode::One
+            }
+        );
+        assert_eq!(
+            AppleMusicAdapter::command_for(AdapterCommand::SetShuffle(false)).unwrap(),
+            MusicKitCommand::SetShuffle { enabled: false }
+        );
+    }
+
+    #[test]
+    fn snapshot_projects_repeat_and_shuffle_into_now_playing() {
+        let mut snapshot = MusicKitSnapshot {
+            player_id: APPLICATION_PLAYER_ID.to_string(),
+            display_name: "Apple Music".to_string(),
+            state: MusicKitPlaybackState::Paused,
+            track: Some(MusicKitTrack {
+                title: "Song".to_string(),
+                artist: "Artist".to_string(),
+                album: "Album".to_string(),
+                artwork_url: None,
+                position_seconds: None,
+                duration_seconds: None,
+            }),
+            volume: None,
+            is_muted: false,
+            repeat_mode: Some(RepeatMode::One),
+            shuffle: Some(true),
+            outputs: vec![],
+        };
+        let zone = AppleMusicAdapter::zone_from_snapshot(&snapshot).unwrap();
+        let now_playing = zone.now_playing.unwrap();
+        assert_eq!(now_playing.repeat_mode, Some(RepeatMode::One));
+        assert_eq!(now_playing.shuffle, Some(true));
+        snapshot.repeat_mode = None;
+        snapshot.shuffle = None;
+        let zone = AppleMusicAdapter::zone_from_snapshot(&snapshot).unwrap();
+        let now_playing = zone.now_playing.unwrap();
+        assert_eq!(now_playing.repeat_mode, None);
+        assert_eq!(now_playing.shuffle, None);
+    }
+}

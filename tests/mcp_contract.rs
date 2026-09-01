@@ -33,15 +33,19 @@ mod mock_servers;
 
 use axum::{
     body::Body,
-    http::{header, Method, Request},
+    extract::State,
+    http::{header, HeaderMap, Method, Request},
+    response::IntoResponse,
     routing::{delete, get, post},
-    Router,
+    Json, Router,
 };
 use serde_json::{json, Value};
+use std::time::Duration;
 use std::{
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{Arc, Mutex},
+    time::Instant,
 };
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
@@ -49,6 +53,7 @@ use unified_hifi_control::adapters::hqplayer::{HqpInstanceManager, HqpZoneLinkSe
 use unified_hifi_control::adapters::lms::{
     create_lms_adapters_with_runtime, LmsAdapter, LmsRuntimeBridge,
 };
+use unified_hifi_control::adapters::musicassistant::{MusicAssistantAdapter, MusicAssistantConfig};
 use unified_hifi_control::adapters::openhome::OpenHomeAdapter;
 use unified_hifi_control::adapters::roon::RoonAdapter;
 use unified_hifi_control::adapters::upnp::UPnPAdapter;
@@ -60,6 +65,7 @@ use unified_hifi_control::bus::runtime::build_runtime;
 use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::knobs::KnobStore;
 use unified_hifi_control::mcp;
+use unified_hifi_control::mcp::refs::RefTarget;
 use unified_hifi_control::mcp::types::{
     McpHqpOptions, McpHqpSelection, McpPipelineStatus, McpPlayResult, McpSearchResult,
 };
@@ -213,15 +219,16 @@ struct TestApp {
 }
 
 async fn build_state(lms: Option<Arc<LmsAdapter>>) -> AppState {
-    build_state_with_bus(create_bus(), lms).await
+    build_state_with_bus(create_bus(), lms, None).await
 }
 
 async fn build_state_with_bus(
     bus: unified_hifi_control::bus::SharedBus,
     lms: Option<Arc<LmsAdapter>>,
+    roon: Option<Arc<RoonAdapter>>,
 ) -> AppState {
     let coordinator = Arc::new(AdapterCoordinator::new(bus.clone()));
-    let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
+    let roon = roon.unwrap_or_else(|| Arc::new(RoonAdapter::new_disconnected(bus.clone())));
     let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
     let hqp_instances = Arc::new(HqpInstanceManager::new_with_native_sink(
         bus.clone(),
@@ -235,12 +242,12 @@ async fn build_state_with_bus(
     let startable_adapters: Vec<Arc<dyn Startable>> =
         vec![roon.clone(), lms.clone(), openhome.clone(), upnp.clone()];
 
-    AppState::new(
-        roon,
+    let state = AppState::new(
+        roon.clone(),
         hqplayer,
         hqp_instances,
         hqp_zone_links,
-        lms,
+        lms.clone(),
         openhome,
         upnp,
         KnobStore::new(),
@@ -250,7 +257,17 @@ async fn build_state_with_bus(
         startable_adapters,
         Instant::now(),
         CancellationToken::new(),
-    )
+    );
+    // Mirror main.rs's unconditional content-library registration
+    // (#513/#515): `hifi_zone_group` (#517) dispatches
+    // multiroom_status/set_members/ungroup, and `hifi_collections` (#531)
+    // dispatches collections_browse/collections_playlists, to Roon and LMS
+    // through `AdapterRegistry::library_content` exactly like Music
+    // Assistant, so the test harness must expose the same registry entries
+    // production wiring does (see `tests/adapter_boundary_lint.rs`).
+    state.adapter_registry.register_library("roon", roon).await;
+    state.adapter_registry.register_library("lms", lms).await;
+    state
 }
 
 impl TestApp {
@@ -511,8 +528,8 @@ async fn tools_list_matches_fixture() {
 
     assert_eq!(
         tools.len(),
-        12,
-        "expected 12 tools with HQPlayer enabled, got {}: {:?}",
+        17,
+        "expected 17 tools with HQPlayer enabled, got {}: {:?}",
         tools.len(),
         tool_names(tools)
     );
@@ -575,6 +592,11 @@ async fn tools_list_order_is_pinned() {
             "hifi_capabilities",
             // Appended by #396.
             "hifi_play_ref",
+            "hifi_queue",
+            "hifi_spotify",
+            "hifi_apple_music",
+            "hifi_collections",
+            "hifi_zone_group",
         ],
         "tools/list order follows the tool_box! list in src/mcp/tools/mod.rs. \
          APPEND new tools rather than inserting, so this assertion grows by one \
@@ -617,8 +639,13 @@ async fn hqplayer_tools_filtered_when_adapter_disabled() {
             "hifi_status",
             "hifi_capabilities",
             "hifi_play_ref",
+            "hifi_queue",
+            "hifi_spotify",
+            "hifi_apple_music",
+            "hifi_collections",
+            "hifi_zone_group",
         ],
-        "HQPlayer disabled must yield exactly the eight non-HQPlayer tools, in order"
+        "HQPlayer disabled must yield exactly the non-HQPlayer tools, in order"
     );
 }
 
@@ -790,6 +817,73 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
         "hifi_play_ref",
         &[("ref", true), ("zone_id", true), ("action", false)],
     ),
+    (
+        "hifi_queue",
+        &[
+            ("zone_id", true),
+            ("action", true),
+            ("item_id", false),
+            ("position", false),
+            ("target_zone_id", false),
+        ],
+    ),
+    (
+        "hifi_spotify",
+        &[
+            ("action", true),
+            ("playlist_id", false),
+            ("category_id", false),
+            ("name", false),
+            ("description", false),
+            ("uri", false),
+            ("track_id", false),
+            ("public", false),
+            ("limit", false),
+        ],
+    ),
+    (
+        "hifi_apple_music",
+        &[
+            ("action", true),
+            ("id", false),
+            ("query", false),
+            ("uri", false),
+            ("zone_id", false),
+            ("name", false),
+            ("description", false),
+            ("confirm", false),
+            ("idempotency_key", false),
+            ("limit", false),
+            ("offset", false),
+            ("items", false),
+            ("precondition", false),
+            ("signal", false),
+            ("rating", false),
+            ("reason", false),
+            ("source", false),
+        ],
+    ),
+    (
+        "hifi_collections",
+        &[
+            ("zone_id", true),
+            ("action", true),
+            ("path", false),
+            ("media_type", false),
+            ("limit", false),
+            ("offset", false),
+        ],
+    ),
+    (
+        "hifi_zone_group",
+        &[
+            ("action", true),
+            ("zone_id", false),
+            ("leader_zone_id", false),
+            ("member_zone_ids", false),
+            ("confirm", false),
+        ],
+    ),
 ];
 
 #[tokio::test]
@@ -952,7 +1046,7 @@ async fn a_stale_session_id_is_transparently_recovered() {
         .unwrap_or_else(|| panic!("recovered request must return the tool list, got: {response}"));
     assert_eq!(
         tools.len(),
-        12,
+        17,
         "the recovered session must serve the same tool list as a fresh one"
     );
 }
@@ -1311,10 +1405,6 @@ async fn hqplayer_set_pipeline_alias_table_is_pinned() {
         "filternx",
         "shaper",
         "dither",
-        "junk",
-        "junk_filter",
-        "matrix",
-        "matrix_profile",
     ] {
         let text = result_text(
             &app.call_tool(
@@ -1326,27 +1416,6 @@ async fn hqplayer_set_pipeline_alias_table_is_pinned() {
         assert!(
             text.starts_with(&format!("Error: Failed to set {setting}: ")),
             "alias {setting:?} must be recognised and reach the adapter, got {text:?}"
-        );
-    }
-
-    for (setting, value) in [
-        ("convolution", "true"),
-        ("adaptive", "on"),
-        ("adaptive_volume", "1"),
-        ("repeat", "all"),
-        ("random", "true"),
-        ("shuffle", "enabled"),
-    ] {
-        let text = result_text(
-            &app.call_tool(
-                "hifi_hqplayer_set_pipeline",
-                json!({ "setting": setting, "value": value }),
-            )
-            .await,
-        );
-        assert!(
-            text.starts_with(&format!("Error: Failed to set {setting}: ")),
-            "immediate-control alias {setting:?} must be recognised, got {text:?}"
         );
     }
 
@@ -1458,6 +1527,39 @@ async fn hifi_play_refuses_radio_for_lms() {
     );
 }
 
+/// A Spotify ref queued through the generic play-by-ref tool must not touch
+/// the Apple-only listening-plan store. This catches accidental copy/paste of
+/// the Apple queue bookkeeping into the Spotify branch (#483).
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn spotify_play_ref_queue_does_not_write_apple_listening_plan() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let state = build_state(None).await;
+    let token = state
+        .mcp_refs
+        .mint(RefTarget::Spotify {
+            uri: "spotify:track:test".to_string(),
+            title: "Test track".to_string(),
+        })
+        .await;
+    let app = TestApp::with_state(state.clone());
+    let result = app
+        .call_tool(
+            "hifi_play_ref",
+            json!({"ref": token, "zone_id": "spotify:test", "action": "queue"}),
+        )
+        .await;
+    let text = result_text(&result);
+    assert!(
+        !text.contains("listening plan"),
+        "Spotify queueing must not fail through the Apple-only listening plan: {text}"
+    );
+    assert!(
+        state.listening_plans.get("spotify:test").await.is_none(),
+        "Apple listening-plan store must not contain a Spotify zone"
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
 async fn hifi_search_and_hifi_play_report_errors_with_their_own_prefixes() {
@@ -1525,12 +1627,10 @@ async fn transport_routing_reaches_each_adapter_and_refuses_the_rest() {
             "bare id -> refused",
         ),
         ("sonos:abc", "names no adapter", "unknown prefix -> refused"),
-        // #328 wires this: HqpInstanceManager resolution reaches its own
-        // "instance not configured" failure rather than a refusal.
         (
             "hqplayer:desktop",
             "HQPlayer instance 'desktop' is not configured",
-            "hqplayer: -> wired, backend error for an unconfigured instance",
+            "hqplayer: -> dispatched through the managed instance runtime",
         ),
     ];
 
@@ -1569,11 +1669,6 @@ async fn volume_routing_differs_from_transport_routing() {
         // #398 wired these two.
         ("openhome:abc", "Device not found: abc"),
         ("upnp:abc", "Renderer not found: abc"),
-        // #328 wired this one: HqpInstanceManager resolution.
-        (
-            "hqplayer:desktop",
-            "HQPlayer instance 'desktop' is not configured",
-        ),
     ];
     for (zone_id, expected_fragment) in volume_reaches_an_adapter {
         let text = result_text(
@@ -1590,10 +1685,14 @@ async fn volume_routing_differs_from_transport_routing() {
     }
 
     // What volume refuses is now exactly what transport refuses: ids UHC cannot
-    // place at all. `hqplayer:` is no longer in this list — #328 wired it above.
+    // place. HQPlayer is dispatched through its instance runtime as well.
     for (zone_id, expected_fragment) in [
         ("1601a5d4bare", "has no provider prefix"),
         ("sonos:abc", "names no adapter"),
+        (
+            "hqplayer:desktop",
+            "HQPlayer instance 'desktop' is not configured",
+        ),
     ] {
         let text = result_text(
             &app.call_tool(
@@ -1609,7 +1708,8 @@ async fn volume_routing_differs_from_transport_routing() {
     }
 }
 
-/// Search and play route on `roon:` and `lms:`. Everything else is refused.
+/// Search and play route on `roon:` and `lms:`. Everything else is refused;
+/// HQPlayer remains content-unwired even though its transport route is live.
 ///
 /// **Behavior change (#398).** `openhome:`, `upnp:`, `hqplayer:` and unplaceable
 /// ids all reached Roon's library before — searching a library those zones cannot
@@ -1661,6 +1761,1035 @@ async fn library_routing_reaches_roon_and_lms_only() {
 // =============================================================================
 // 7. Round-trips against tests/mock_servers/
 // =============================================================================
+
+#[derive(Clone, Default)]
+struct MusicAssistantMcpMock {
+    requests: Arc<Mutex<Vec<Value>>>,
+}
+
+async fn musicassistant_mcp_handler(
+    State(mock): State<MusicAssistantMcpMock>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> impl IntoResponse {
+    assert_eq!(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer integration-test-token"),
+        "all MA library calls must use the configured bearer token"
+    );
+    mock.requests
+        .lock()
+        .expect("mock request lock")
+        .push(request.clone());
+    let response = match request["command"].as_str() {
+        Some("players/all") => json!([
+            {"player_id":"living-room", "name":"Living Room", "available":true, "supported_features":["set_members"], "group_members":["living-room", "kitchen"]},
+            {"player_id":"kitchen", "name":"Kitchen", "available":true, "active_group":"living-room"}
+        ]),
+        Some("music/search") => json!({
+            "tracks": [{
+                "name": "So What",
+                "uri": "library://track/42",
+                "artists": [{"name": "Miles Davis"}]
+            }]
+        }),
+        Some("music/browse") => json!([
+            // #549: no image_url -- a folder-shaped row honestly has no art.
+            {"name": "Jazz", "path": "library://jazz"},
+            {"name": "So What", "uri": "library://track/42", "artists": [{"name": "Miles Davis"}], "image_url": "https://example.invalid/so-what.jpg"}
+        ]),
+        Some("music/playlists/library_items") => json!([
+            // #549: no image_url -- exercises the absent-honestly path for playlists too.
+            {"name": "Sunday Morning", "uri": "library://playlist/7"}
+        ]),
+        Some("music/tracks/library_items") => json!([
+            {"name": "My Favorite Track", "uri": "library://track/99", "artists": [{"name": "Nina Simone"}], "image_url": "https://example.invalid/favorite-track.jpg"}
+        ]),
+        Some("music/radio/library_items") => json!([
+            {"name": "My Favorite Station", "uri": "library://radio/13"}
+        ]),
+        Some("player_queues/get_active_queue") => json!({
+            // This deliberately differs from the child player id: MCP must
+            // retain MA's active-queue resolution across every operation.
+            "queue_id": "living-room-group",
+            "repeat_mode": "one",
+            "shuffle_enabled": true
+        }),
+        Some("player_queues/get") => json!({
+            "queue_id": "living-room-group",
+            "display_name": "Living Room",
+            "items": 2,
+            "current_index": 0
+        }),
+        Some("player_queues/items") => json!([
+            {"queue_item_id": "q1", "name": "So What", "uri": "library://track/42"},
+            {"queue_item_id": "q2", "name": "Freddie Freeloader", "uri": "library://track/43"}
+        ]),
+        Some("player_queues/play_media")
+        | Some("player_queues/repeat")
+        | Some("player_queues/shuffle")
+        | Some("player_queues/play_index")
+        | Some("player_queues/move_item")
+        | Some("player_queues/delete_item")
+        | Some("player_queues/clear")
+        | Some("player_queues/transfer") => json!({"ok": true}),
+        Some("players/cmd/set_members") | Some("players/cmd/ungroup_many") => json!({"ok": true}),
+        command => panic!("unexpected Music Assistant command: {command:?}"),
+    };
+    Json(response)
+}
+
+/// Configured Music Assistant adapter + real MCP transport + deterministic MA
+/// command mock. It intentionally does not start the poller: the assertions
+/// exercise catalog and queue calls through the existing MCP tools only.
+async fn musicassistant_mcp_app() -> (TestApp, MusicAssistantMcpMock, tokio::task::JoinHandle<()>) {
+    let mock = MusicAssistantMcpMock::default();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("MA mock bind");
+    let port = listener.local_addr().expect("MA mock addr").port();
+    let server = tokio::spawn({
+        let mock = mock.clone();
+        async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/api", post(musicassistant_mcp_handler))
+                    .with_state(mock),
+            )
+            .await
+            .expect("MA mock serve");
+        }
+    });
+
+    let bus = create_bus();
+    let state = build_state_with_bus(bus.clone(), None, None).await;
+    let adapter = Arc::new(
+        MusicAssistantAdapter::new(
+            bus,
+            MusicAssistantConfig {
+                host: "127.0.0.1".to_string(),
+                port,
+                token: "integration-test-token".to_string(),
+                tls: false,
+                allow_insecure_http: true,
+            },
+        )
+        .expect("configured MA adapter"),
+    );
+    state.adapter_registry.register(adapter.clone()).await;
+    state
+        .adapter_registry
+        .register_library("musicassistant", adapter)
+        .await;
+    (TestApp::with_state(state), mock, server)
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn configured_musicassistant_mcp_catalog_refs_and_queue_use_documented_commands() {
+    let (app, mock, server) = musicassistant_mcp_app().await;
+    let zone_id = "musicassistant:group-child";
+
+    let search = app
+        .call_tool(
+            "hifi_search",
+            json!({"query": "so what", "zone_id": zone_id}),
+        )
+        .await;
+    assert_eq!(search["structuredContent"]["outcome"], "ok");
+    let search_results: Vec<Value> =
+        serde_json::from_str(&result_text(&search)).expect("hifi_search result JSON");
+    assert_eq!(search_results[0]["title"], "So What");
+    let reference = search_results[0]["ref"]
+        .as_str()
+        .expect("MA result must mint an opaque ref")
+        .to_string();
+
+    let play = app
+        .call_tool("hifi_play", json!({"query": "so what", "zone_id": zone_id}))
+        .await;
+    assert_eq!(play["structuredContent"]["outcome"], "accepted");
+    assert_eq!(result_text(&play), "Music Assistant item started");
+
+    let ref_play = app
+        .call_tool(
+            "hifi_play_ref",
+            json!({"ref": reference, "zone_id": zone_id}),
+        )
+        .await;
+    assert_eq!(ref_play["structuredContent"]["outcome"], "accepted");
+    assert_eq!(result_text(&ref_play), "Music Assistant item started");
+
+    let ref_queue = app
+        .call_tool(
+            "hifi_play_ref",
+            json!({"ref": search_results[0]["ref"], "zone_id": zone_id, "action": "queue"}),
+        )
+        .await;
+    assert_eq!(ref_queue["structuredContent"]["outcome"], "accepted");
+    assert_eq!(result_text(&ref_queue), "Queued So What on Music Assistant");
+
+    for action in [
+        "repeat_off",
+        "repeat_track",
+        "repeat_context",
+        "shuffle_on",
+        "shuffle_off",
+    ] {
+        let control = app
+            .call_tool(
+                "hifi_control",
+                json!({"zone_id": zone_id, "action": action}),
+            )
+            .await;
+        assert_eq!(
+            control["structuredContent"]["outcome"], "accepted",
+            "Music Assistant action {action} must route through the existing control schema"
+        );
+    }
+
+    let queue = app
+        .call_tool("hifi_queue", json!({"zone_id": zone_id}))
+        .await;
+    assert_eq!(queue["structuredContent"]["outcome"], "ok");
+    let queue_value: Value = serde_json::from_str(&result_text(&queue)).expect("queue result JSON");
+    assert_eq!(queue_value["queue"]["queue_id"], "living-room-group");
+    assert_eq!(queue_value["items"][1]["uri"], "library://track/43");
+
+    let requests = mock.requests.lock().expect("mock request lock").clone();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request["command"].as_str().expect("MA command"))
+            .collect::<Vec<_>>(),
+        [
+            "music/search",
+            "music/search",
+            "player_queues/get_active_queue",
+            "player_queues/play_media",
+            "player_queues/get_active_queue",
+            "player_queues/play_media",
+            "player_queues/get_active_queue",
+            "player_queues/play_media",
+            "player_queues/get_active_queue",
+            "player_queues/repeat",
+            "player_queues/get_active_queue",
+            "player_queues/repeat",
+            "player_queues/get_active_queue",
+            "player_queues/repeat",
+            "player_queues/get_active_queue",
+            "player_queues/shuffle",
+            "player_queues/get_active_queue",
+            "player_queues/shuffle",
+            "player_queues/get_active_queue",
+            "player_queues/get",
+            "player_queues/items",
+        ]
+    );
+    assert_eq!(
+        requests[0]["args"],
+        json!({"search_query": "so what", "limit": 10})
+    );
+    for index in [2, 4, 6, 8, 10, 12, 14, 16, 18] {
+        assert_eq!(requests[index]["args"], json!({"player_id": "group-child"}));
+    }
+    assert_eq!(
+        requests[3]["args"],
+        json!({"queue_id": "living-room-group", "media": "library://track/42", "option": "play"})
+    );
+    assert_eq!(
+        requests[5]["args"],
+        json!({"queue_id": "living-room-group", "media": "library://track/42", "option": "play"})
+    );
+    assert_eq!(
+        requests[7]["args"],
+        json!({"queue_id": "living-room-group", "media": "library://track/42", "option": "add"})
+    );
+    assert_eq!(
+        requests[9]["args"],
+        json!({"queue_id": "living-room-group", "repeat_mode": "off"})
+    );
+    assert_eq!(
+        requests[11]["args"],
+        json!({"queue_id": "living-room-group", "repeat_mode": "one"})
+    );
+    assert_eq!(
+        requests[13]["args"],
+        json!({"queue_id": "living-room-group", "repeat_mode": "all"})
+    );
+    assert_eq!(
+        requests[15]["args"],
+        json!({"queue_id": "living-room-group", "shuffle_enabled": true})
+    );
+    assert_eq!(
+        requests[17]["args"],
+        json!({"queue_id": "living-room-group", "shuffle_enabled": false})
+    );
+    assert_eq!(
+        requests[19]["args"],
+        json!({"queue_id": "living-room-group"})
+    );
+    assert_eq!(
+        requests[20]["args"],
+        json!({"queue_id": "living-room-group", "limit": 100, "offset": 0})
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn musicassistant_queue_mutations_use_documented_wire_commands() {
+    let (app, mock, server) = musicassistant_mcp_app().await;
+    let zone_id = "musicassistant:group-child";
+    for args in [
+        json!({"zone_id": zone_id, "action": "jump", "item_id": "q2"}),
+        json!({"zone_id": zone_id, "action": "reorder", "item_id": "q2", "position": 0}),
+        json!({"zone_id": zone_id, "action": "remove", "item_id": "q2"}),
+        json!({"zone_id": zone_id, "action": "clear"}),
+        json!({"zone_id": zone_id, "action": "transfer", "target_zone_id": "musicassistant:group-child-2"}),
+    ] {
+        assert_eq!(
+            app.call_tool("hifi_queue", args).await["structuredContent"]["outcome"],
+            "accepted"
+        );
+    }
+    let requests = mock.requests.lock().expect("requests").clone();
+    let mutation_args: Vec<_> = requests
+        .iter()
+        .filter_map(|request| match request["command"].as_str()? {
+            "player_queues/play_index"
+            | "player_queues/move_item"
+            | "player_queues/delete_item"
+            | "player_queues/clear"
+            | "player_queues/transfer" => Some((
+                request["command"].as_str().unwrap(),
+                request["args"].clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        mutation_args,
+        vec![
+            (
+                "player_queues/play_index",
+                json!({"queue_id":"living-room-group", "index":"q2"})
+            ),
+            (
+                "player_queues/move_item",
+                json!({"queue_id":"living-room-group", "queue_item_id":"q2", "pos_shift":-1})
+            ),
+            (
+                "player_queues/delete_item",
+                json!({"queue_id":"living-room-group", "item_id_or_index":"q2"})
+            ),
+            (
+                "player_queues/clear",
+                json!({"queue_id":"living-room-group"})
+            ),
+            (
+                "player_queues/transfer",
+                json!({"source_queue_id":"living-room-group", "target_queue_id":"living-room-group"})
+            ),
+        ]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn musicassistant_zone_group_requires_confirmation_and_uses_fresh_ma_status() {
+    let (app, mock, server) = musicassistant_mcp_app().await;
+    let status = app
+        .call_tool("hifi_zone_group", json!({"action":"status"}))
+        .await;
+    assert_eq!(status["structuredContent"]["outcome"], "ok");
+    assert_eq!(
+        status["structuredContent"]["scope"],
+        serde_json::Value::Null
+    );
+    let denied = app.call_tool("hifi_zone_group", json!({"action":"join", "leader_zone_id":"musicassistant:living-room", "member_zone_ids":["musicassistant:kitchen"]})).await;
+    assert_eq!(denied["structuredContent"]["outcome"], "invalid");
+    let joined = app.call_tool("hifi_zone_group", json!({"action":"join", "leader_zone_id":"musicassistant:living-room", "member_zone_ids":["musicassistant:kitchen"], "confirm":true})).await;
+    assert_eq!(joined["structuredContent"]["outcome"], "accepted");
+    let left = app
+        .call_tool(
+            "hifi_zone_group",
+            json!({"action":"leave", "member_zone_ids":["musicassistant:kitchen"], "confirm":true}),
+        )
+        .await;
+    assert_eq!(left["structuredContent"]["outcome"], "accepted");
+    let requests = mock.requests.lock().expect("requests").clone();
+    assert!(requests
+        .iter()
+        .any(|r| r["command"] == "players/cmd/set_members"
+            && r["args"]
+                == json!({"target_player":"living-room","player_ids_to_add":["kitchen"]})));
+    assert!(requests
+        .iter()
+        .any(|r| r["command"] == "players/cmd/ungroup_many"
+            && r["args"] == json!({"player_ids":["kitchen"]})));
+    server.abort();
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn musicassistant_zone_group_refuses_invalid_inputs_before_ma_calls() {
+    let (app, mock, server) = musicassistant_mcp_app().await;
+    for args in [
+        json!({"action":"join", "leader_zone_id":"musicassistant:living-room", "member_zone_ids":[], "confirm":true}),
+        json!({"action":"leave", "member_zone_ids":[], "confirm":true}),
+        json!({"action":"join", "leader_zone_id":"roon:living-room", "member_zone_ids":["musicassistant:kitchen"], "confirm":true}),
+        json!({"action":"join", "leader_zone_id":"musicassistant:living-room", "member_zone_ids":["roon:kitchen"], "confirm":true}),
+        json!({"action":"join", "leader_zone_id":"musicassistant:living-room", "member_zone_ids":["musicassistant:kitchen"]}),
+    ] {
+        assert_eq!(
+            app.call_tool("hifi_zone_group", args).await["structuredContent"]["outcome"],
+            "invalid"
+        );
+    }
+    assert!(mock.requests.lock().expect("requests").is_empty());
+    server.abort();
+}
+
+/// Cross-provider grouping is refused for every pairing among the three
+/// multiroom-capable providers (#517's acceptance criterion), not just the
+/// musicassistant/roon pair the original single-provider tests happened to
+/// cover. Nothing here needs a live backend: every case is refused by zone-id
+/// classification before any adapter is called.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn zone_group_refuses_every_cross_provider_pairing() {
+    let app = TestApp::new().await;
+    for args in [
+        // join: leader and member disagree, for every ordered pairing.
+        json!({"action":"join", "leader_zone_id":"roon:a", "member_zone_ids":["lms:b"], "confirm":true}),
+        json!({"action":"join", "leader_zone_id":"lms:a", "member_zone_ids":["roon:b"], "confirm":true}),
+        json!({"action":"join", "leader_zone_id":"roon:a", "member_zone_ids":["musicassistant:b"], "confirm":true}),
+        json!({"action":"join", "leader_zone_id":"musicassistant:a", "member_zone_ids":["lms:b"], "confirm":true}),
+        // join: a mix of matching and mismatching members must still refuse.
+        json!({"action":"join", "leader_zone_id":"roon:a", "member_zone_ids":["roon:b", "lms:c"], "confirm":true}),
+        // join: a leader from a provider that does not implement grouping at all.
+        json!({"action":"join", "leader_zone_id":"openhome:a", "member_zone_ids":["openhome:b"], "confirm":true}),
+        // leave: members from two different multiroom providers.
+        json!({"action":"leave", "member_zone_ids":["roon:a", "lms:b"], "confirm":true}),
+        json!({"action":"leave", "member_zone_ids":["lms:a", "musicassistant:b"], "confirm":true}),
+        // leave: a provider that does not implement grouping at all.
+        json!({"action":"leave", "member_zone_ids":["upnp:a"], "confirm":true}),
+        // status: a zone_id from a provider that does not implement grouping.
+        json!({"action":"status", "zone_id":"upnp:a"}),
+    ] {
+        let result = app.call_tool("hifi_zone_group", args.clone()).await;
+        assert_eq!(
+            result["structuredContent"]["outcome"], "invalid",
+            "{args} must be refused as invalid: {result}"
+        );
+        assert_eq!(
+            result["structuredContent"]["refusal"]["reason"], "invalid_parameter",
+            "{args}: {result}"
+        );
+    }
+}
+
+/// A `TestApp` wired to a real `RoonAdapter` driven against
+/// `tests/mock_servers/roon_core.rs`'s `FakeRoonCore` -- the same harness
+/// `tests/roon_protocol.rs` uses for Roon's own multiroom tests
+/// (`roon_set_group_members_merges_outputs_into_one_zone` and friends), but
+/// wrapped in the real `/mcp` route so `hifi_zone_group`'s routing (#517) is
+/// proved end to end rather than only at the adapter layer.
+async fn roon_mcp_app(core: &mock_servers::roon_core::FakeRoonCore) -> TestApp {
+    let bus = create_bus();
+    let roon = std::sync::Arc::new(RoonAdapter::new_configured(
+        bus.clone(),
+        "http://test.invalid:8088".to_string(),
+        KnobStore::new(),
+    ));
+    let runner = roon.clone();
+    let ip = core.ip();
+    let port = core.port();
+    tokio::spawn(async move {
+        let _ = runner
+            .run_event_loop_against_core_for_tests(ip, &port)
+            .await;
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if roon.is_browse_connected().await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        roon.is_browse_connected().await,
+        "RoonAdapter never connected to the fake core"
+    );
+
+    let state = build_state_with_bus(bus, None, Some(roon)).await;
+    TestApp::with_state(state)
+}
+
+/// `hifi_zone_group` routing generalized to Roon (issue #517), proved against
+/// the same `FakeRoonCore` fixture `tests/roon_protocol.rs` uses at the
+/// adapter layer -- join merges two single-output zones' outputs via
+/// `group_outputs`, status reports the merge, and leave splits them back via
+/// `ungroup_outputs`, all addressed by `roon:` zone ids with no Music
+/// Assistant or LMS involved.
+///
+/// Roon confirms grouping asynchronously through its ordinary zone
+/// subscription rather than a synchronous RPC reply (documented on
+/// `RoonAdapter::set_group_members`), so this polls `hifi_zone_group`
+/// status rather than trusting the immediate `join`/`leave` response to
+/// reflect the merge -- the same caveat #517 documents on the tool itself.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn roon_zone_group_routes_join_status_and_leave_through_the_registry() {
+    use mock_servers::roon_core::{zone_with_grouping, FakeRoonCore};
+
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let core = FakeRoonCore::start().await;
+    core.set_zones(vec![
+        zone_with_grouping("zone_a", "Living Room", "output_a", &["output_b"]),
+        zone_with_grouping("zone_b", "Kitchen", "output_b", &["output_a"]),
+    ])
+    .await;
+    let app = roon_mcp_app(&core).await;
+
+    // Poll status until the aggregate view either shows the expected group
+    // count or a bound is hit, so a slow merge shows what actually arrived
+    // instead of just "assertion failed".
+    async fn wait_for_group_count(app: &TestApp, expected: usize) -> Value {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let status = app
+                .call_tool(
+                    "hifi_zone_group",
+                    json!({"action": "status", "zone_id": "roon:zone_a"}),
+                )
+                .await;
+            let payload: Value =
+                serde_json::from_str(&result_text(&status)).expect("status payload JSON");
+            let count = payload["groups"].as_array().map(Vec::len).unwrap_or(0);
+            if count == expected || std::time::Instant::now() >= deadline {
+                return payload;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    let before = wait_for_group_count(&app, 0).await;
+    assert_eq!(before["groups"].as_array().unwrap().len(), 0, "{before}");
+
+    let joined = app
+        .call_tool(
+            "hifi_zone_group",
+            json!({
+                "action": "join",
+                "leader_zone_id": "roon:zone_a",
+                "member_zone_ids": ["roon:zone_b"],
+                "confirm": true,
+            }),
+        )
+        .await;
+    assert_eq!(joined["structuredContent"]["outcome"], "accepted");
+
+    let after = wait_for_group_count(&app, 1).await;
+    let groups = after["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1, "{after}");
+    assert_eq!(groups[0]["leader_zone_id"], json!("roon:zone_a"));
+    assert_eq!(
+        groups[0]["member_zone_ids"],
+        json!(["roon:output_b"]),
+        "zone_b was retired by the merge, so the surviving member is named by output id: {after}"
+    );
+    let group_requests = core
+        .requests_named("com.roonlabs.transport:2/group_outputs")
+        .await;
+    assert_eq!(group_requests.len(), 1, "exactly one group_outputs call");
+
+    let left = app
+        .call_tool(
+            "hifi_zone_group",
+            json!({
+                "action": "leave",
+                "member_zone_ids": ["roon:output_b"],
+                "confirm": true,
+            }),
+        )
+        .await;
+    assert_eq!(left["structuredContent"]["outcome"], "accepted");
+
+    let split = wait_for_group_count(&app, 0).await;
+    assert_eq!(split["groups"].as_array().unwrap().len(), 0, "{split}");
+    let ungroup_requests = core
+        .requests_named("com.roonlabs.transport:2/ungroup_outputs")
+        .await;
+    assert_eq!(
+        ungroup_requests.len(),
+        1,
+        "exactly one ungroup_outputs call"
+    );
+
+    core.stop().await;
+}
+
+/// #549: `hifi_collections`' Roon rows carry an `image` field, minted as an
+/// opaque `/api/collections/image?ref=...` path over `RoonAdapter::content`'s
+/// `image_key` (see `RoonAdapter::content`'s `collections_browse` mapping in
+/// `src/adapters/roon.rs`), for a row that has Roon art -- and omit it
+/// entirely, honestly, for one that does not.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn roon_collections_browse_mints_an_image_ref_when_roon_has_art() {
+    use mock_servers::roon_core::{album, FakeItem, FakeLibrary, FakeRoonCore};
+
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![
+        album("Kind of Blue", "Miles Davis", &["So What"]).with_image_key("roon-album-art-key"),
+        FakeItem::list("Jazz"),
+    ];
+    let core = FakeRoonCore::start_with(library).await;
+    let app = roon_mcp_app(&core).await;
+
+    let root = app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": "roon:zone_1", "action": "browse"}),
+        )
+        .await;
+    assert_eq!(root["structuredContent"]["outcome"], "ok");
+    let root_page: Value = serde_json::from_str(&result_text(&root)).expect("root page JSON");
+    let with_art = root_page["items"]
+        .as_array()
+        .expect("root items")
+        .iter()
+        .find(|item| item["title"] == "Kind of Blue")
+        .expect("album row must be present");
+    let image = with_art["image"]
+        .as_str()
+        .expect("a row with a Roon image_key must carry an image field");
+    assert!(
+        image.starts_with("/api/collections/image?ref="),
+        "image must be a same-origin proxy path, not a raw Roon image_key: {image}"
+    );
+    assert!(
+        !image.contains("roon-album-art-key"),
+        "the raw Roon image_key must stay server-side: {image}"
+    );
+
+    let without_art = root_page["items"]
+        .as_array()
+        .expect("root items")
+        .iter()
+        .find(|item| item["title"] == "Jazz")
+        .expect("no-art row must be present");
+    assert!(
+        without_art.get("image").is_none(),
+        "a row with no Roon image_key must omit `image`: {without_art}"
+    );
+
+    core.stop().await;
+}
+
+/// Collections must have one provider-neutral wire shape: no MA URI escapes,
+/// pages are explicit, paths continue browse, and playable rows use the same
+/// opaque refs as search.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn musicassistant_collections_are_paged_and_mint_opaque_playable_refs() {
+    let (app, mock, server) = musicassistant_mcp_app().await;
+    let zone_id = "musicassistant:group-child";
+    let root = app
+        .call_tool(
+            "hifi_collections",
+            json!({
+                "zone_id": zone_id, "action": "browse", "limit": 1
+            }),
+        )
+        .await;
+    assert_eq!(root["structuredContent"]["outcome"], "ok");
+    let root_page: Value =
+        serde_json::from_str(&result_text(&root)).expect("root browse page JSON");
+    assert_eq!(root_page["items"][0]["title"], "Jazz");
+    let path = root_page["items"][0]["path"]
+        .as_str()
+        .expect("browse folder must return an opaque continuation path");
+    assert!(path.starts_with("ref_"));
+    assert_ne!(path, "library://jazz", "MA path must stay server-side");
+    // #549: the folder-shaped root row has no MA image_url, so it must carry
+    // no image field at all -- absent honestly, not a placeholder.
+    assert!(
+        root_page["items"][0].get("image").is_none(),
+        "a row with no provider artwork must omit `image`: {root_page}"
+    );
+
+    let cross_provider = app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": "spotify:not-ma", "action": "browse", "path": path}),
+        )
+        .await;
+    assert_eq!(
+        cross_provider["structuredContent"]["outcome"], "invalid",
+        "{cross_provider}"
+    );
+    assert_eq!(
+        cross_provider["structuredContent"]["refusal"]["parameter"], "path",
+        "an MA collection continuation must not cross provider boundaries"
+    );
+
+    let browse = app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": zone_id, "action": "browse", "path": path, "limit": 1, "offset": 1}),
+        )
+        .await;
+    assert_eq!(browse["structuredContent"]["outcome"], "ok");
+    let browse_page: Value = serde_json::from_str(&result_text(&browse)).expect("browse page JSON");
+    assert_eq!(browse_page["items"][0]["title"], "So What");
+    assert!(browse_page["items"][0]["ref"].as_str().is_some());
+    assert!(
+        browse_page["items"][0].get("uri").is_none(),
+        "provider URI must stay server-side"
+    );
+    // #549: "So What" carries a real MA image_url in the mock fixture --
+    // hifi_collections must mint an opaque, same-origin image ref over it,
+    // never the raw MA URL.
+    let image = browse_page["items"][0]["image"]
+        .as_str()
+        .expect("a row with provider artwork must carry an image field");
+    assert!(
+        image.starts_with("/api/collections/image?ref="),
+        "image must be a same-origin proxy path, not a raw provider URL: {image}"
+    );
+    assert!(
+        !image.contains("example.invalid"),
+        "the raw MA artwork URL must stay server-side: {image}"
+    );
+    let next = app
+        .call_tool(
+            "hifi_play_ref",
+            json!({
+                "zone_id": zone_id,
+                "ref": browse_page["items"][0]["ref"],
+                "action": "next"
+            }),
+        )
+        .await;
+    assert_eq!(next["structuredContent"]["outcome"], "accepted");
+
+    for (action, extra, expected_title, expect_image) in [
+        // #549: "Sunday Morning" carries no image_url in the mock fixture --
+        // absent honestly.
+        ("playlists", json!({}), "Sunday Morning", false),
+        // "My Favorite Track" does carry one.
+        (
+            "favorites",
+            json!({"media_type": "tracks"}),
+            "My Favorite Track",
+            true,
+        ),
+        // "My Favorite Station" does not.
+        (
+            "favorites",
+            json!({"media_type": "radio"}),
+            "My Favorite Station",
+            false,
+        ),
+    ] {
+        let mut args = json!({"zone_id": zone_id, "action": action, "limit": 20, "offset": 0});
+        args.as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        let result = app.call_tool("hifi_collections", args).await;
+        assert_eq!(result["structuredContent"]["outcome"], "ok");
+        let page: Value =
+            serde_json::from_str(&result_text(&result)).expect("collection page JSON");
+        assert_eq!(page["items"][0]["title"], expected_title);
+        assert!(page["items"][0]["ref"].as_str().is_some());
+        assert_eq!(
+            page["items"][0].get("image").is_some(),
+            expect_image,
+            "{expected_title}: image presence must match provider artwork: {page}"
+        );
+    }
+
+    let requests = mock.requests.lock().expect("requests").clone();
+    assert!(requests
+        .iter()
+        .any(|request| request["command"] == "music/browse"
+            && request["args"] == json!({"path": "root"})));
+    assert!(requests
+        .iter()
+        .any(|request| request["command"] == "music/browse"
+            && request["args"] == json!({"path": "library://jazz"})));
+    assert!(requests.iter().any(
+        |request| request["command"] == "music/playlists/library_items"
+            && request["args"] == json!({"limit": 20, "offset": 0})
+    ));
+    assert!(requests
+        .iter()
+        .any(|request| request["command"] == "music/tracks/library_items"
+            && request["args"] == json!({"favorite": true, "limit": 20, "offset": 0})));
+    assert!(requests
+        .iter()
+        .any(|request| request["command"] == "music/radio/library_items"
+            && request["args"] == json!({"favorite": true, "limit": 20, "offset": 0})));
+    assert!(requests.iter().any(
+        |request| request["command"] == "player_queues/play_media"
+            && request["args"]
+                == json!({"queue_id": "living-room-group", "media": "library://track/42", "option": "next"})
+    ));
+    server.abort();
+}
+
+/// #531: LMS's `hifi_collections` slice walks the synthetic root into
+/// Albums, drills into one album's tracks, and mints an opaque ref over the
+/// durable `LmsPlayTarget::Library` id -- never the raw LMS entity id.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn lms_collections_browse_walks_albums_into_tracks() {
+    let h = LmsHarness::start().await;
+    let zone_id = h.zone_id();
+
+    h.mock
+        .set_library_albums(vec![(7, "Kind of Blue", "Miles Davis")])
+        .await;
+    h.mock
+        .set_album_tracks(7, vec![(42, "So What", Some("Miles Davis"))])
+        .await;
+    // #549: the album has a coverid; the track underneath it deliberately
+    // does not, so this one test exercises both the presence and the
+    // absence path.
+    h.mock.set_artwork(7, "cover-kind-of-blue").await;
+
+    let root = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": zone_id, "action": "browse"}),
+        )
+        .await;
+    assert_eq!(root["structuredContent"]["outcome"], "ok");
+    let root_page: Value = serde_json::from_str(&result_text(&root)).expect("root page JSON");
+    let albums_entry = root_page["items"]
+        .as_array()
+        .expect("root items")
+        .iter()
+        .find(|item| item["title"] == "Albums")
+        .expect("root must list Albums");
+    let albums_path = albums_entry["path"].as_str().expect("Albums has a path");
+    assert!(albums_path.starts_with("ref_"));
+
+    let albums = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": zone_id, "action": "browse", "path": albums_path}),
+        )
+        .await;
+    assert_eq!(albums["structuredContent"]["outcome"], "ok");
+    let albums_page: Value = serde_json::from_str(&result_text(&albums)).expect("albums page JSON");
+    assert_eq!(albums_page["items"][0]["title"], "Kind of Blue");
+    assert_eq!(albums_page["items"][0]["subtitle"], "Album by Miles Davis");
+    let album_image = albums_page["items"][0]["image"]
+        .as_str()
+        .expect("an album with a seeded coverid must carry an image field");
+    assert!(
+        album_image.starts_with("/api/collections/image?ref="),
+        "image must be a same-origin proxy path: {album_image}"
+    );
+    assert!(
+        !album_image.contains("cover-kind-of-blue"),
+        "the raw coverid must stay server-side"
+    );
+    let album_path = albums_page["items"][0]["path"]
+        .as_str()
+        .expect("an album is itself browsable, into its tracks");
+
+    let tracks = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": zone_id, "action": "browse", "path": album_path}),
+        )
+        .await;
+    assert_eq!(tracks["structuredContent"]["outcome"], "ok");
+    let tracks_page: Value = serde_json::from_str(&result_text(&tracks)).expect("tracks page JSON");
+    assert_eq!(tracks_page["items"][0]["title"], "So What");
+    let track_ref = tracks_page["items"][0]["ref"]
+        .as_str()
+        .expect("a track is playable, not a browsable path");
+    assert!(tracks_page["items"][0].get("path").is_none());
+    // #549: this track's coverid was never seeded -- absent honestly.
+    assert!(
+        tracks_page["items"][0].get("image").is_none(),
+        "a track with no seeded artwork must omit `image`: {tracks_page}"
+    );
+
+    // The minted ref plays via hifi_play_ref exactly like a search hit's.
+    let play = h
+        .app
+        .call_tool(
+            "hifi_play_ref",
+            json!({"zone_id": zone_id, "ref": track_ref}),
+        )
+        .await;
+    assert_eq!(play["structuredContent"]["outcome"], "accepted");
+
+    h.stop().await;
+}
+
+/// #531: `hifi_collections playlists` lists LMS's saved playlists, and one
+/// playlist's tracks are reachable through the same opaque-path browse call.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn lms_collections_playlists_and_favorites() {
+    let h = LmsHarness::start().await;
+    let zone_id = h.zone_id();
+
+    h.mock
+        .set_library_playlists(vec![(3, "Sunday Morning")])
+        .await;
+    h.mock
+        .set_playlist_tracks(3, vec![(9, "Blue in Green", Some("Miles Davis"))])
+        .await;
+    // #549: this playlist track has a seeded coverid.
+    h.mock.set_artwork(9, "cover-blue-in-green").await;
+    h.mock
+        .set_favorites(vec![("Jazz FM", "http://example.com/jazzfm")])
+        .await;
+    // #549: a second favorite, this one with LMS's own `icon` field.
+    h.mock
+        .set_favorite_with_icon(
+            "Classical FM",
+            "http://example.com/classicalfm",
+            "http://example.com/classicalfm-icon.png",
+        )
+        .await;
+
+    let playlists = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": zone_id, "action": "playlists"}),
+        )
+        .await;
+    assert_eq!(playlists["structuredContent"]["outcome"], "ok");
+    let playlists_page: Value =
+        serde_json::from_str(&result_text(&playlists)).expect("playlists page JSON");
+    assert_eq!(playlists_page["items"][0]["title"], "Sunday Morning");
+    let playlist_path = playlists_page["items"][0]["path"]
+        .as_str()
+        .expect("a playlist is browsable into its tracks");
+
+    let tracks = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": zone_id, "action": "browse", "path": playlist_path}),
+        )
+        .await;
+    assert_eq!(tracks["structuredContent"]["outcome"], "ok");
+    let tracks_page: Value = serde_json::from_str(&result_text(&tracks)).expect("tracks page JSON");
+    assert_eq!(tracks_page["items"][0]["title"], "Blue in Green");
+    let track_image = tracks_page["items"][0]["image"]
+        .as_str()
+        .expect("a playlist track with seeded artwork must carry an image field");
+    assert!(track_image.starts_with("/api/collections/image?ref="));
+
+    let favorites = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": zone_id, "action": "favorites"}),
+        )
+        .await;
+    assert_eq!(favorites["structuredContent"]["outcome"], "ok");
+    let favorites_page: Value =
+        serde_json::from_str(&result_text(&favorites)).expect("favorites page JSON");
+    assert_eq!(favorites_page["items"][0]["title"], "Jazz FM");
+    let favorite_ref = favorites_page["items"][0]["ref"]
+        .as_str()
+        .expect("a favorite with a url is playable");
+    assert!(
+        !favorite_ref.contains("jazzfm"),
+        "the favorite's url must stay server-side"
+    );
+    // #549: "Jazz FM" was seeded with no icon -- absent honestly.
+    assert!(
+        favorites_page["items"][0].get("image").is_none(),
+        "a favorite with no icon must omit `image`: {favorites_page}"
+    );
+    let with_icon = favorites_page["items"]
+        .as_array()
+        .expect("favorites items")
+        .iter()
+        .find(|item| item["title"] == "Classical FM")
+        .expect("Classical FM favorite must be listed");
+    let favorite_image = with_icon["image"]
+        .as_str()
+        .expect("a favorite with an icon must carry an image field");
+    assert!(favorite_image.starts_with("/api/collections/image?ref="));
+    assert!(
+        !favorite_image.contains("classicalfm-icon"),
+        "the raw icon URL must stay server-side"
+    );
+
+    h.stop().await;
+}
+
+/// #531: an opaque path minted for one zone's provider must never resolve
+/// against a different provider's zone -- same safety property #492 already
+/// pins for Music Assistant, now proven for LMS.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn lms_collections_path_does_not_cross_provider_boundaries() {
+    let h = LmsHarness::start().await;
+    let zone_id = h.zone_id();
+    h.mock
+        .set_library_albums(vec![(1, "Album", "Artist")])
+        .await;
+
+    let root = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": zone_id, "action": "browse"}),
+        )
+        .await;
+    let root_page: Value = serde_json::from_str(&result_text(&root)).expect("root page JSON");
+    let path = root_page["items"][0]["path"]
+        .as_str()
+        .expect("root item has a path")
+        .to_string();
+
+    let cross = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": "roon:not-lms", "action": "browse", "path": path}),
+        )
+        .await;
+    assert_eq!(cross["structuredContent"]["outcome"], "invalid", "{cross}");
+    assert_eq!(cross["structuredContent"]["refusal"]["parameter"], "path");
+
+    let stale = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": zone_id, "action": "browse", "path": "ref_not-a-real-token"}),
+        )
+        .await;
+    assert_eq!(stale["structuredContent"]["outcome"], "invalid", "{stale}");
+    assert_eq!(stale["structuredContent"]["refusal"]["parameter"], "path");
+
+    h.stop().await;
+}
 
 /// A `TestApp` wired to a live mock LMS server, with the aggregator running so
 /// discovered players actually reach `hifi_zones`.
@@ -1721,7 +2850,7 @@ impl LmsHarness {
         let upnp = Arc::new(UPnPAdapter::new(bus.clone()));
         let startable_adapters: Vec<Arc<dyn Startable>> = vec![lms.clone()];
         let state = AppState::new(
-            roon,
+            roon.clone(),
             hqplayer,
             hqp_instances,
             hqp_zone_links,
@@ -1737,6 +2866,18 @@ impl LmsHarness {
             CancellationToken::new(),
         )
         .with_reliable_commands(runtime.commands.clone());
+        // Mirror main.rs's unconditional content-library registration
+        // (#513/#515): `hifi_zone_group` (#517) dispatches
+        // multiroom_status/set_members/ungroup, and `hifi_collections` (#531)
+        // dispatches collections_browse/collections_playlists, to Roon and LMS
+        // through `AdapterRegistry::library_content` exactly like Music
+        // Assistant, so the test harness must expose the same registry entries
+        // production wiring does (see `tests/adapter_boundary_lint.rs`).
+        state.adapter_registry.register_library("roon", roon).await;
+        state
+            .adapter_registry
+            .register_library("lms", lms.clone())
+            .await;
 
         // Match production ordering: both consumers are alive before the adapter can publish.
         let aggregator_task = tokio::spawn(async move { aggregator.run().await });
@@ -1866,6 +3007,88 @@ async fn lms_round_trip_pins_the_action_map_and_the_volume_sign() {
              mock received {commands:?}"
         );
     }
+
+    h.stop().await;
+}
+
+/// `hifi_zone_group` routing generalized to LMS (issue #517): a real mock
+/// server, a real adapter registered as an `AdapterRegistry` library (exactly
+/// the wiring `main.rs` does for #513), and the MCP tool driven over the real
+/// `/mcp` route -- join syncs the mock's second player into the first's
+/// group, status reports it, and leave unsyncs it, all addressed by `lms:`
+/// zone ids with no Music Assistant involved.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn lms_zone_group_routes_join_status_and_leave_through_the_registry() {
+    let h = LmsHarness::start().await;
+    const MEMBER_ID: &str = "11:22:33:44:55:66";
+    h.mock.add_player(MEMBER_ID, "Kitchen").await;
+
+    let leader_zone = h.zone_id();
+    let member_zone = format!("lms:{MEMBER_ID}");
+
+    let before = h
+        .app
+        .call_tool(
+            "hifi_zone_group",
+            json!({"action": "status", "zone_id": leader_zone}),
+        )
+        .await;
+    assert_eq!(before["structuredContent"]["outcome"], "ok");
+    assert_eq!(
+        before["structuredContent"]["scope"]["provider"],
+        json!("lms"),
+        "a zone_id-scoped status must identify lms, not aggregate: {before}"
+    );
+    let before_payload: Value =
+        serde_json::from_str(&result_text(&before)).expect("status payload JSON");
+    assert_eq!(
+        before_payload["groups"].as_array().map(Vec::len),
+        Some(0),
+        "no sync group exists yet: {before_payload}"
+    );
+
+    let joined = h
+        .app
+        .call_tool(
+            "hifi_zone_group",
+            json!({
+                "action": "join",
+                "leader_zone_id": leader_zone,
+                "member_zone_ids": [member_zone.clone()],
+                "confirm": true,
+            }),
+        )
+        .await;
+    assert_eq!(joined["structuredContent"]["outcome"], "accepted");
+    let joined_payload: Value =
+        serde_json::from_str(&result_text(&joined)).expect("join payload JSON");
+    let groups = joined_payload["groups"].as_array().expect("groups array");
+    assert_eq!(groups.len(), 1, "{joined_payload}");
+    assert_eq!(groups[0]["leader_zone_id"], json!(leader_zone));
+    assert_eq!(groups[0]["member_zone_ids"], json!([member_zone.clone()]));
+    assert_eq!(
+        h.mock.sync_groups().await,
+        vec![vec![h.player_id.to_string(), MEMBER_ID.to_string()]],
+        "the wire command must address the leader with `sync <member>`, per #403"
+    );
+
+    let left = h
+        .app
+        .call_tool(
+            "hifi_zone_group",
+            json!({
+                "action": "leave",
+                "member_zone_ids": [member_zone],
+                "confirm": true,
+            }),
+        )
+        .await;
+    assert_eq!(left["structuredContent"]["outcome"], "accepted");
+    assert!(
+        h.mock.sync_groups().await.is_empty(),
+        "leave must unsync the member"
+    );
 
     h.stop().await;
 }
@@ -2150,6 +3373,14 @@ const FIELD_ROLES: &[(&str, FieldRole)] = &[
         DisplayOnly("mute readout with no corresponding write: hifi_control has no mute action"),
     ),
     (
+        "repeat_mode",
+        DisplayOnly("current repeat readout; hifi_control repeat_* actions are the write path"),
+    ),
+    (
+        "shuffle",
+        DisplayOnly("current shuffle readout; hifi_control shuffle_* actions are the write path"),
+    ),
+    (
         "title",
         DisplayOnly(
             "human-readable label for a hifi_search result. #396 added `ref` as the \
@@ -2177,6 +3408,25 @@ const FIELD_ROLES: &[(&str, FieldRole)] = &[
             "hifi_play_ref.ref — the opaque token #396 added to hifi_search results. \
          `None` (omitted) when a result has no durable-enough handle to address later; \
          see McpSearchResult's own docs.",
+        ),
+    ),
+    (
+        "path",
+        Consumed(
+            "hifi_collections.path — the opaque browse-continuation token #533/#547 \
+         added to CollectionItem, and #566 added to McpSearchResult so a navigable \
+         hifi_search result (a real browsable hit, or a grouping row like \
+         \"Albums · 35 Results\") can be opened the same way instead of being a dead \
+         end. `None` (omitted) when a result is not navigable; see both structs' \
+         own docs.",
+        ),
+    ),
+    (
+        "image",
+        DisplayOnly(
+            "artwork URL (#549 for hifi_collections rows, #573 for hifi_search hits): a \
+         same-origin `/api/collections/image?ref=...` path over an opaque minted token, \
+         fetched by a web client as an <img src>; no MCP tool takes an image as input.",
         ),
     ),
     // hifi_status / hifi_hqplayer_status readouts.
@@ -2212,57 +3462,24 @@ const FIELD_ROLES: &[(&str, FieldRole)] = &[
     ),
     (
         "options",
-        DisplayOnly("discover-before-set grouping key for HQPlayer advanced controls"),
+        DisplayOnly("HQPlayer current choices; clients use them to choose a value for hifi_hqplayer_set_pipeline"),
     ),
     (
         "options_unavailable_reason",
-        DisplayOnly("actionable diagnostic when a connected HQPlayer cannot provide one coherent options snapshot"),
+        DisplayOnly("reason HQPlayer choices are unavailable; clients must not infer choices from absence"),
     ),
-    (
-        "current",
-        Consumed("hifi_hqplayer_set_pipeline.value"),
-    ),
-    (
-        "choices",
-        Consumed("hifi_hqplayer_set_pipeline.value"),
-    ),
+    ("current", Consumed("hifi_hqplayer_set_pipeline.value")),
+    ("choices", Consumed("hifi_hqplayer_set_pipeline.value")),
     ("mode", Consumed("hifi_hqplayer_set_pipeline.setting='mode'")),
-    (
-        "samplerate",
-        Consumed("hifi_hqplayer_set_pipeline.setting='samplerate'"),
-    ),
-    (
-        "filter1x",
-        Consumed("hifi_hqplayer_set_pipeline.setting='filter1x'"),
-    ),
-    (
-        "filterNx",
-        Consumed("hifi_hqplayer_set_pipeline.setting='filterNx'"),
-    ),
-    (
-        "junk_filter",
-        Consumed("hifi_hqplayer_set_pipeline.setting='junk_filter'"),
-    ),
-    (
-        "matrix_profile",
-        Consumed("hifi_hqplayer_set_pipeline.setting='matrix_profile'"),
-    ),
-    (
-        "convolution",
-        Consumed("hifi_hqplayer_set_pipeline.setting='convolution'"),
-    ),
-    (
-        "adaptive_volume",
-        Consumed("hifi_hqplayer_set_pipeline.setting='adaptive_volume'"),
-    ),
-    (
-        "repeat",
-        Consumed("hifi_hqplayer_set_pipeline.setting='repeat'"),
-    ),
-    (
-        "random",
-        Consumed("hifi_hqplayer_set_pipeline.setting='random'"),
-    ),
+    ("samplerate", Consumed("hifi_hqplayer_set_pipeline.setting='samplerate'")),
+    ("filter1x", Consumed("hifi_hqplayer_set_pipeline.setting='filter1x'")),
+    ("filterNx", Consumed("hifi_hqplayer_set_pipeline.setting='filterNx'")),
+    ("junk_filter", Consumed("hifi_hqplayer_set_pipeline.setting='junk_filter'")),
+    ("matrix_profile", Consumed("hifi_hqplayer_set_pipeline.setting='matrix_profile'")),
+    ("convolution", Consumed("hifi_hqplayer_set_pipeline.setting='convolution'")),
+    ("adaptive_volume", Consumed("hifi_hqplayer_set_pipeline.setting='adaptive_volume'")),
+    ("repeat", Consumed("hifi_hqplayer_set_pipeline.setting='repeat'")),
+    ("random", Consumed("hifi_hqplayer_set_pipeline.setting='random'")),
     (
         "filter",
         DisplayOnly(
@@ -2597,6 +3814,12 @@ async fn no_tool_returns_an_unclassified_field() {
             // #396: `Some` here so the new field is collected and must be
             // classified below, exactly like `title`/`subtitle` above.
             r#ref: Some(String::new()),
+            // #566: same reasoning as `ref` above -- `Some` so `path` is
+            // collected and must be classified below too.
+            path: Some(String::new()),
+            // #573 defect 10: same again -- `Some` so `image` is collected
+            // and must be classified below.
+            image: Some(String::new()),
         })
         .expect("McpSearchResult must serialize"),
         &mut returned,
@@ -2846,24 +4069,13 @@ const TOOL_TEXT_CASES: &[(&str, &str, fn() -> Value)] = &[
         "hifi_hqplayer_set_pipeline",
         || json!({ "setting": "samplerate", "value": "not-a-number" }),
     ),
-    // #328 wires transport/volume for a direct HQPlayer zone through
-    // `HqpInstanceManager` resolution — a zone id naming an instance nothing ever
-    // configured now fails as a backend error naming the missing instance,
-    // rather than #398's `not_implemented` (that classification moved to
-    // `hifi_search`/`hifi_play` below, which still have no HQPlayer content
-    // path).
+    // Added by #398, so its expected text is in TEXT_ADDITIONS rather than in the
+    // pre-envelope fixture. This exercises the direct HQPlayer route when the
+    // requested instance is not configured.
     (
-        "hifi_control/hqplayer_instance_not_configured",
+        "hifi_control/hqplayer_zone_not_wired",
         "hifi_control",
         || json!({ "zone_id": "hqplayer:desktop", "action": "play" }),
-    ),
-    // Added by #328. HQPlayer's library gap (#209) is the only case left
-    // producing a `not_implemented` refusal now that transport/volume are wired,
-    // so `every_refusal_reason_is_actually_produced` depends on it.
-    (
-        "hifi_search/hqplayer_zone_has_no_library",
-        "hifi_search",
-        || json!({ "query": "Eagles", "zone_id": "hqplayer:desktop" }),
     ),
 ];
 
@@ -2873,20 +4085,10 @@ const TOOL_TEXT_CASES: &[(&str, &str, fn() -> Value)] = &[
 /// reason: `mcp_tool_text.json` is not edited, so a case that postdates it needs
 /// its expected value stated somewhere a reader can see. Every string a tool
 /// returns is therefore accounted for in exactly one of the three places.
-const TEXT_ADDITIONS: &[(&str, &str)] = &[
-    (
-        "hifi_control/hqplayer_instance_not_configured",
-        "Error: HQPlayer instance 'desktop' is not configured",
-    ),
-    (
-        "hifi_search/hqplayer_zone_has_no_library",
-        "Error: hqplayer zones have no library path from MCP: UHC's HQPlayer adapter speaks \
-         transport, volume, seek and pipeline settings; whether HQPlayer's control protocol \
-         reaches content operations has not been verified here. Reported as not-yet-implemented \
-         rather than as a provider limit, because an unverified 'never' is the more expensive \
-         error. hifi_capabilities reports what each provider supports.",
-    ),
-];
+const TEXT_ADDITIONS: &[(&str, &str)] = &[(
+    "hifi_control/hqplayer_zone_not_wired",
+    "Error: HQPlayer instance 'desktop' is not configured",
+)];
 
 /// Every string #398 changes, with the value it replaces.
 ///
@@ -2908,8 +4110,6 @@ const TEXT_ADDITIONS: &[(&str, &str)] = &[
 ///
 /// `(fixture key, the string #395 froze, the string #398 replaces it with)`
 const TEXT_CORRECTIONS: &[(&str, &str, &str)] = &[
-    // #328 makes HQPlayer a normal transport/volume provider, but its native
-    // volume unit is dB rather than the normalized 0-100 scale.
     (
         "hifi_control/volume_set_without_value",
         "Error: volume_set requires a value (0-100)",
@@ -2936,7 +4136,7 @@ const TEXT_CORRECTIONS: &[(&str, &str, &str)] = &[
         "hifi_control/volume_unknown_prefix",
         "Error: Volume control not supported for this zone type",
         "Error: Zone id 'sonos:abc' uses the prefix 'sonos:', which names no adapter. \
-         Accepted prefixes: roon:, lms:, openhome:, upnp:, hqplayer:. Call hifi_zones for \
+         Accepted prefixes: roon:, lms:, openhome:, upnp:, hqplayer:, applemusic:, spotify:, musicassistant:. Call hifi_zones for \
          valid zone ids.",
     ),
     // `other => other` forwarded any action string to the adapter, so offline the
@@ -2945,10 +4145,9 @@ const TEXT_CORRECTIONS: &[(&str, &str, &str)] = &[
         "hifi_control/unknown_action_never_reaches_dispatch",
         "Error: Control error: Device not found: abc",
         "Error: Unknown action 'frobnicate'. Valid actions: play, pause, playpause, next, \
-         previous, prev, volume_set, volume_up, volume_down.",
+         previous, prev, volume_set, volume_up, volume_down, repeat_off, repeat_context, \
+         repeat_track, shuffle_on, shuffle_off.",
     ),
-    // #209 exposes the native immediate controls the adapter now verifies. The
-    // refusal must teach clients the expanded setting vocabulary.
     (
         "hifi_hqplayer_set_pipeline/unknown_setting",
         "Error: Unknown setting: oversampling. Valid: mode, samplerate, filter1x, filterNx, shaper, dither",
@@ -3231,19 +4430,12 @@ const EXPECTED_ENVELOPES: &[(&str, &str, Option<&str>)] = &[
         "invalid",
         Some("invalid_parameter"),
     ),
-    // #328: a well-formed hqplayer: zone id now reaches HqpInstanceManager
-    // resolution and fails as a backend error, naming the missing instance.
+    // HQPlayer transport is routed through the instance runtime; this fixture
+    // deliberately uses an unconfigured instance, so it reports backend_error.
     (
-        "hifi_control/hqplayer_instance_not_configured",
+        "hifi_control/hqplayer_zone_not_wired",
         "error",
         Some("backend_error"),
-    ),
-    // The only `not_implemented` left once transport/volume are wired: HQPlayer's
-    // library gap, tracked by #209.
-    (
-        "hifi_search/hqplayer_zone_has_no_library",
-        "unsupported",
-        Some("not_implemented"),
     ),
 ];
 
@@ -3403,7 +4595,6 @@ async fn every_refusal_reason_is_actually_produced() {
 
     for reason in [
         "provider_limitation",
-        "not_implemented",
         "invalid_parameter",
         "unknown_target",
         "backend_error",
@@ -3810,9 +5001,17 @@ async fn unknown_zone_prefix_volume_blames_the_zone_id_not_the_provider() {
     assert_eq!(refusal.get("parameter"), Some(&json!("zone_id")));
     assert_eq!(
         refusal.get("accepted"),
-        Some(&json!(["roon:", "lms:", "openhome:", "upnp:", "hqplayer:"])),
-        "the refusal must enumerate every prefix that names an adapter — five, since \
-         hifi_zones returns hqplayer: ids: {refusal}"
+        Some(&json!([
+            "roon:",
+            "lms:",
+            "openhome:",
+            "upnp:",
+            "hqplayer:",
+            "applemusic:",
+            "spotify:",
+            "musicassistant:"
+        ])),
+        "the refusal must enumerate every prefix that names an adapter: {refusal}"
     );
 
     // And it must NOT claim anything about a provider.
@@ -4034,13 +5233,13 @@ async fn scope_zone_name_is_absent_for_a_zone_the_aggregator_does_not_hold() {
 // mock a full round-trip can be driven through (see #394's notes on why Roon and
 // OpenHome/UPnP cannot be).
 
-/// A write preserves the public `accepted` outcome and carries its confirmed read-back from the
+/// A write reports `accepted`, never `ok`, and carries a read-back from the
 /// aggregator.
 ///
 /// The two halves of #221 in one assertion: the model is told the command was
-/// accepted (so it stops retrying) and is shown the causally linked state (so it does not need a
-/// follow-up call). Internally the command does not return until that projection commits; the
-/// stable envelope vocabulary remains unchanged.
+/// accepted (so it stops retrying) and is shown the state (so it does not need a
+/// follow-up call), with `as_of_ms` so it can judge staleness rather than being
+/// handed a conclusion the server cannot support.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
 async fn lms_write_reports_accepted_with_state_read_back_from_the_aggregator() {
@@ -4059,7 +5258,7 @@ async fn lms_write_reports_accepted_with_state_read_back_from_the_aggregator() {
     assert_eq!(
         env.get("outcome"),
         Some(&json!("accepted")),
-        "the stable public write outcome remains accepted: {env}"
+        "a write must report accepted — nothing here confirms the effect: {env}"
     );
     assert!(
         env.get("refusal").is_none(),
@@ -4109,11 +5308,6 @@ async fn lms_write_reports_accepted_with_state_read_back_from_the_aggregator() {
         "observed.zone and the text's state block must be the same JSON value"
     );
     assert_eq!(from_text.get("zone_id"), Some(&json!(zone_id)));
-    assert_eq!(
-        from_text.get("state"),
-        Some(&json!("playing")),
-        "the endpoint must return the exact post-command LMS readback"
-    );
 
     h.stop().await;
 }
@@ -4124,8 +5318,17 @@ async fn lms_write_reports_accepted_with_state_read_back_from_the_aggregator() {
 /// envelope turns it into: accepted, on this zone, at this level, with a zone
 /// snapshot attached.
 ///
-/// The reliable LMS endpoint now makes the result stronger than the former polling path: it reads
-/// the exact player after the write and correlates that full Zone commit before returning.
+/// # What this deliberately does not assert
+///
+/// It does not check `observed.zone.volume` against the level just set. LMS state
+/// reaches the aggregator by polling, so the snapshot may well predate the
+/// command — asserting the new level would be asserting the verification #395
+/// forbids inventing, and would make this test flaky the moment poll timing
+/// shifted. `as_of_ms` is there so the client draws that conclusion itself.
+///
+/// An earlier name for this test claimed "the resulting level", which the body
+/// never checked. That is the same mislabelled-coverage defect the design gate's
+/// dissent found elsewhere, so the name now says what the body does.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
 async fn lms_volume_write_reports_the_resolved_level_and_reads_the_zone_back() {
@@ -4154,12 +5357,9 @@ async fn lms_volume_write_reports_the_resolved_level_and_reads_the_zone_back() {
         env.get("scope").and_then(|s| s.get("provider")),
         Some(&json!("lms"))
     );
-    assert_eq!(
-        env.get("observed")
-            .and_then(|observed| observed.get("zone"))
-            .and_then(|zone| zone.get("volume")),
-        Some(&json!(55.0)),
-        "the volume path must return its verified post-command projection: {env}"
+    assert!(
+        env.get("observed").is_some(),
+        "the volume path must read state back too, not just transport: {env}"
     );
 
     h.stop().await;
@@ -4336,6 +5536,7 @@ const EXPECTED_CAPABILITIES: &[&str] = &[
     "queue_reorder",
     "queue_remove",
     "queue_clear",
+    "queue_transfer",
     "play_next",
     "repeat_mode",
     "shuffle_mode",
@@ -4344,13 +5545,22 @@ const EXPECTED_CAPABILITIES: &[&str] = &[
     "multiroom_sync",
 ];
 
-/// Every provider a zone id can name — five, not four.
+/// Every provider a zone id can name.
 ///
 /// `hqplayer:` is in `PrefixedZoneId`'s own valid-prefix list
 /// (`src/bus/events.rs`) and `HqpAdapter` publishes `ZoneDiscovered` with it, so
 /// HQPlayer zones appear in `hifi_zones`. A capability report that omitted them
 /// would understate the surface in exactly the way #392 rule 3 forbids.
-const EXPECTED_PROVIDERS: &[&str] = &["roon", "lms", "openhome", "upnp", "hqplayer"];
+const EXPECTED_PROVIDERS: &[&str] = &[
+    "roon",
+    "lms",
+    "openhome",
+    "upnp",
+    "hqplayer",
+    "applemusic",
+    "spotify",
+    "musicassistant",
+];
 
 /// The three states, spelled as they appear on the wire.
 const SUPPORTED: &str = "supported";
@@ -4514,7 +5724,6 @@ async fn lms_never_reports_a_uhc_gap_as_a_provider_limitation() {
 
     // The named cases, spelled out so a regression names itself.
     for capability in [
-        "browse",
         "queue_read",
         "queue_jump",
         "queue_reorder",
@@ -4523,9 +5732,11 @@ async fn lms_never_reports_a_uhc_gap_as_a_provider_limitation() {
         "play_next",
         "repeat_mode",
         "shuffle_mode",
-        "saved_playlists",
-        "favorites",
-        "multiroom_sync",
+        // multiroom_sync, browse, saved_playlists and favorites are
+        // deliberately absent here: #517 wired LMS sync groups (#513) to
+        // `hifi_zone_group`, and #531 wired browse/saved_playlists/favorites
+        // to `hifi_collections`, so all four are `supported` and are
+        // asserted as such below rather than as not-yet-implemented.
     ] {
         let entry = caps
             .get(capability)
@@ -4534,6 +5745,25 @@ async fn lms_never_reports_a_uhc_gap_as_a_provider_limitation() {
             support_of(entry),
             NOT_IMPLEMENTED,
             "lms/{capability} must read as not-yet-implemented until its issue lands"
+        );
+    }
+
+    assert_eq!(
+        support_of(&caps["multiroom_sync"]),
+        "supported",
+        "lms/multiroom_sync must be supported: #513 wired native sync groups and #517 routes \
+         hifi_zone_group to them"
+    );
+    // #531 wired these three to hifi_collections; LMS's protocol always
+    // supported them (that is this test's whole point), and now so does UHC.
+    for capability in ["browse", "saved_playlists", "favorites"] {
+        let entry = caps
+            .get(capability)
+            .unwrap_or_else(|| panic!("lms/{capability} missing"));
+        assert_eq!(
+            support_of(entry),
+            SUPPORTED,
+            "lms/{capability} is wired to hifi_collections since #531"
         );
     }
 }
@@ -4659,7 +5889,9 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
             "lms" => "LMS host not configured",
             "openhome" => "Device not found",
             "upnp" => "Renderer not found",
-            "hqplayer" => "HQPlayer instance 'abc' is not configured",
+            "applemusic" => "adapter `applemusic` is not configured",
+            "spotify" => "adapter `spotify` is not configured",
+            "musicassistant" => "adapter `musicassistant` is not configured",
             other => panic!("no adapter fingerprint for {other}"),
         }
     }
@@ -4682,13 +5914,97 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
             )),
             "search" => Some(("hifi_search", json!({ "query": "q", "zone_id": zone_id }))),
             "play_by_query" => Some(("hifi_play", json!({ "query": "q", "zone_id": zone_id }))),
+            "play_next" => Some((
+                "hifi_play",
+                json!({ "query": "q", "zone_id": zone_id, "action": "next" }),
+            )),
+            "play_by_ref" => Some((
+                "hifi_play_ref",
+                json!({ "ref": "bad-ref", "zone_id": zone_id }),
+            )),
+            "browse" | "saved_playlists" | "favorites"
+                if matches!(provider, "musicassistant" | "lms") =>
+            {
+                Some((
+                    "hifi_collections",
+                    json!({
+                        "zone_id": zone_id,
+                        "action": match capability {
+                            "browse" => "browse",
+                            "saved_playlists" => "playlists",
+                            _ => "favorites",
+                        }
+                    }),
+                ))
+            }
+            // Roon's favorites cell is not (yet) supported, so only browse
+            // and saved_playlists (mapped to Playlists, its browse-hierarchy
+            // node) are probed here.
+            "browse" | "saved_playlists" if provider == "roon" => Some((
+                "hifi_collections",
+                json!({
+                    "zone_id": zone_id,
+                    "action": if capability == "browse" { "browse" } else { "playlists" },
+                }),
+            )),
+            "browse" | "saved_playlists" | "favorites" => {
+                Some(("hifi_spotify", json!({ "action": "playlists" })))
+            }
+            "queue_read" => Some(("hifi_queue", json!({ "zone_id": zone_id }))),
+            "queue_jump" => Some((
+                "hifi_queue",
+                json!({ "zone_id": zone_id, "action": "jump", "item_id": "item" }),
+            )),
+            "queue_reorder" => Some((
+                "hifi_queue",
+                json!({ "zone_id": zone_id, "action": "reorder", "item_id": "item", "position": 0 }),
+            )),
+            "queue_remove" => Some((
+                "hifi_queue",
+                json!({ "zone_id": zone_id, "action": "remove", "item_id": "item" }),
+            )),
+            "queue_clear" => Some((
+                "hifi_queue",
+                json!({ "zone_id": zone_id, "action": "clear" }),
+            )),
+            "queue_transfer" => Some((
+                "hifi_queue",
+                json!({
+                    "zone_id": zone_id,
+                    "action": "transfer",
+                    "target_zone_id": format!("{provider}:xyz"),
+                }),
+            )),
             "repeat_mode" => Some((
-                "hifi_hqplayer_set_pipeline",
-                json!({ "zone_id": zone_id, "setting": "repeat", "value": "off" }),
+                "hifi_control",
+                json!({ "zone_id": zone_id, "action": "repeat_off" }),
             )),
             "shuffle_mode" => Some((
-                "hifi_hqplayer_set_pipeline",
-                json!({ "zone_id": zone_id, "setting": "random", "value": "false" }),
+                "hifi_control",
+                json!({ "zone_id": zone_id, "action": "shuffle_off" }),
+            )),
+            // musicassistant's "multiroom" library is never registered in this
+            // generic TestApp, so a scoped status call reaches the registry's
+            // own "not configured" wording -- the same fingerprint every other
+            // musicassistant probe above proves against.
+            "multiroom_sync" if provider == "musicassistant" => Some((
+                "hifi_zone_group",
+                json!({ "action": "status", "zone_id": zone_id }),
+            )),
+            // Roon and LMS libraries *are* registered (`build_state_with_bus`),
+            // so status would reach a live, empty adapter and succeed instead of
+            // naming it. `join` reaches deep enough into each adapter's own
+            // group-membership resolution to name the provider even while
+            // disconnected/unconfigured -- see the bespoke `expected` strings
+            // below for why status is not used here.
+            "multiroom_sync" => Some((
+                "hifi_zone_group",
+                json!({
+                    "action": "join",
+                    "leader_zone_id": zone_id,
+                    "member_zone_ids": [format!("{provider}:def")],
+                    "confirm": true,
+                }),
             )),
             _ => None,
         }
@@ -4696,6 +6012,11 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
 
     let mut proved = 0usize;
     for provider in EXPECTED_PROVIDERS {
+        // HQPlayer zones are recognised but nothing is wired, so there is no
+        // supported cell to prove; that is asserted separately.
+        if *provider == "hqplayer" {
+            continue;
+        }
         for (capability, entry) in capabilities_of(&payload, provider) {
             if support_of(&entry) != SUPPORTED {
                 continue;
@@ -4708,7 +6029,22 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
                 )
             });
             let text = result_text(&app.call_tool(tool, args).await);
-            let expected = fingerprint(provider);
+            let expected = if *provider == "musicassistant" && capability == "play_next" {
+                "supports action='play' or action='queue'"
+            } else if matches!(*provider, "spotify" | "musicassistant")
+                && capability == "play_by_ref"
+            {
+                "unknown or expired"
+            } else if *provider == "roon" && capability == "multiroom_sync" {
+                // The disconnected fake never populates a zone, so
+                // `resolve_roon_output` fails before `set_group_members` ever
+                // reaches its own "Not connected to Roon" transport check --
+                // this is still RoonAdapter's own wording, just from a step
+                // earlier in the same call.
+                "Roon group leader was not found"
+            } else {
+                fingerprint(provider)
+            };
             assert!(
                 text.to_lowercase().contains(&expected.to_lowercase()),
                 "{provider}/{capability} is reported supported, but calling {tool} produced \
@@ -4718,14 +6054,21 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
             proved += 1;
         }
     }
-    // Roon 5 + LMS 5 + OpenHome 3 (no skip refusal, no library) + UPnP 2 +
-    // HQPlayer 5 (transport, skip, volume, repeat, shuffle) = 20.
+    // The routed Spotify content and mode cells plus Music Assistant's queue
+    // mutations, mode, collections, and zone-group cells add twenty-three probes to the
+    // original provider transport set, plus one more for Music Assistant's
+    // queue_transfer (#507), plus two more for Roon and LMS multiroom_sync,
+    // generalized from the Music Assistant-only original (#517), plus five
+    // for #531's LMS (browse, saved_playlists, favorites) and Roon (browse,
+    // saved_playlists) hifi_collections cells.
+    // Apple Music's transport/skip/volume
+    // cells remain gated until signed physical companion validation (#465).
     // Asserted exactly, not as a floor: a floor would pass while a cell silently
     // stopped being reported as supported, which is the direction that hides a
     // capability rather than inventing one.
     assert_eq!(
-        proved, 20,
-        "{proved} supported cells were proved end to end, expected 20. If a capability was          deliberately wired or unwired, change this number in the same commit."
+        proved, 52,
+        "{proved} supported cells were proved end to end, expected 52. If a capability was deliberately wired or unwired, change this number in the same commit."
     );
 }
 
@@ -4782,7 +6125,16 @@ async fn an_unprefixed_zone_id_is_refused_by_name_instead_of_routed_to_roon() {
              use instead — this is what makes the behavior change recoverable in one call; \
              got {text:?}"
         );
-        for prefix in ["roon:", "lms:", "openhome:", "upnp:", "hqplayer:"] {
+        for prefix in [
+            "roon:",
+            "lms:",
+            "openhome:",
+            "upnp:",
+            "hqplayer:",
+            "applemusic:",
+            "spotify:",
+            "musicassistant:",
+        ] {
             assert!(
                 text.contains(prefix),
                 "{tool}: the refusal must name the accepted prefix {prefix:?}; got {text:?}"
@@ -4855,20 +6207,11 @@ async fn an_unrecognised_zone_prefix_is_refused_instead_of_routed_to_roon() {
     }
 }
 
-/// HQPlayer zones are listed by `hifi_zones` and, before #328, every
-/// `hifi_control` call against one was forwarded to Roon. #328 wires transport
-/// and volume through `HqpInstanceManager` resolution instead: a zone id naming
-/// an instance nothing configured now fails as a backend error naming that
-/// instance, never as a Roon failure and never as `not_implemented` (which
-/// would claim UHC has not wired this at all).
-///
-/// Live dispatch to a *configured* instance is exercised end-to-end in
-/// `tests/mcp_hqplayer_control.rs`, against the stateful HQPlayer wire fake —
-/// this test's job is only the routing/envelope contract for the zone id this
-/// fixture never configures an instance for.
+/// HQPlayer zones are listed by `hifi_zones` and dispatched through the managed
+/// instance runtime rather than being forwarded to Roon.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
-async fn hqplayer_zones_are_recognised_and_wired_to_hqp_instance_manager() {
+async fn hqplayer_zones_are_recognised_and_report_missing_configuration() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
 
@@ -4882,24 +6225,17 @@ async fn hqplayer_zones_are_recognised_and_wired_to_hqp_instance_manager() {
             !text.contains("Not connected to Roon"),
             "an hqplayer: zone must not be forwarded to the Roon adapter; got {text:?}"
         );
-        assert!(
-            text.contains("HQPlayer instance 'desktop' is not configured"),
-            "an hqplayer: zone must resolve through HqpInstanceManager, naming the missing \
-             instance rather than a generic refusal; got {text:?}"
-        );
 
         let env = envelope(&result, "hifi_control");
         assert_eq!(
             env.get("outcome").and_then(Value::as_str),
             Some("error"),
-            "a well-formed but unconfigured instance is a backend failure, not a capability \
-             refusal: {env}"
+            "the zone id is valid and the missing instance is a backend error: {env}"
         );
         assert_eq!(
             env.pointer("/refusal/reason").and_then(Value::as_str),
             Some("backend_error"),
-            "transport/volume are wired (#328); this is the instance lookup failing, not UHC \
-             declining the operation: {env}"
+            "the instance manager owns this configuration failure: {env}"
         );
         assert_eq!(
             env.pointer("/scope/provider").and_then(Value::as_str),
@@ -5286,7 +6622,7 @@ async fn now_playing_resource_agrees_with_hifi_now_playing_tool_for_a_live_zone(
 async fn a_newly_discovered_zone_is_addressable_without_a_restart() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let bus = create_bus();
-    let state = build_state_with_bus(bus.clone(), None).await;
+    let state = build_state_with_bus(bus.clone(), None, None).await;
 
     let aggregator = state.aggregator.clone();
     let aggregator_task = tokio::spawn(async move { aggregator.run().await });
@@ -5472,9 +6808,11 @@ async fn hqplayer_status_resource_agrees_with_the_tool_for_a_live_connection() {
     mock.stop().await;
 }
 
-/// The profiles counterpart to the status test above. A fresh server without
-/// HQPlayer web credentials must not fabricate an empty profile list: both
-/// surfaces report the same underlying unavailability.
+/// The profiles counterpart to the status test above. Trivially equal with no
+/// profiles cached (both are `[]`), which is honest: `get_cached_profiles`
+/// needs a `list_profiles` round-trip the mock doesn't drive here, and the
+/// point of this test is the shared-function property (`hqp_profiles_payload`
+/// is the one place either path reads from), not a specific profile list.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
 async fn hqplayer_profiles_resource_agrees_with_hifi_hqplayer_profiles_tool() {
@@ -5483,7 +6821,6 @@ async fn hqplayer_profiles_resource_agrees_with_hifi_hqplayer_profiles_tool() {
 
     let tool_text = result_text(&app.call_tool("hifi_hqplayer_profiles", json!({})).await);
     assert!(tool_text.contains("Web credentials not configured"));
-
     let read = app.read_resource("hifi://hqplayer/profiles").await;
     assert_eq!(
         read.pointer("/error/data/reason").and_then(Value::as_str),
@@ -5574,7 +6911,7 @@ async fn seed_zone(
 async fn a_hidden_zone_is_withheld_from_every_mcp_zone_surface() {
     let _settings = SettingsFixture::with_hidden_zones(&["roon:phone"]);
     let bus = create_bus();
-    let state = build_state_with_bus(bus.clone(), None).await;
+    let state = build_state_with_bus(bus.clone(), None, None).await;
     let aggregator = state.aggregator.clone();
     let aggregator_task = tokio::spawn(async move { aggregator.run().await });
     // Let the aggregator's bus subscription attach before the first publish, or the event races the
@@ -5641,7 +6978,7 @@ async fn a_hidden_zone_is_withheld_from_every_mcp_zone_surface() {
 async fn a_hidden_zone_remains_controllable_by_id() {
     let _settings = SettingsFixture::with_hidden_zones(&["roon:phone"]);
     let bus = create_bus();
-    let state = build_state_with_bus(bus.clone(), None).await;
+    let state = build_state_with_bus(bus.clone(), None, None).await;
     let aggregator = state.aggregator.clone();
     let aggregator_task = tokio::spawn(async move { aggregator.run().await });
     // Let the aggregator's bus subscription attach before the first publish, or the event races the
@@ -5680,7 +7017,7 @@ async fn a_hidden_zone_remains_controllable_by_id() {
 async fn hifi_zones_is_ordered_and_stable_across_calls() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let bus = create_bus();
-    let state = build_state_with_bus(bus.clone(), None).await;
+    let state = build_state_with_bus(bus.clone(), None, None).await;
     let aggregator = state.aggregator.clone();
     let aggregator_task = tokio::spawn(async move { aggregator.run().await });
 

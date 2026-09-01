@@ -22,6 +22,9 @@ pub struct LayoutProps {
     /// Hide LMS tab in nav
     #[props(default = false)]
     pub hide_lms: bool,
+    /// Hide Spotify tab in nav
+    #[props(default = false)]
+    pub hide_spotify: bool,
     /// Hide Knobs tab in nav
     #[props(default = false)]
     pub hide_knobs: bool,
@@ -70,12 +73,25 @@ pub fn Layout(props: LayoutProps) -> Element {
             sizes: "180x180",
             href: "{*APPLE_TOUCH_ICON_DATA_URL}"
         }
+        // WebMCP bridge (#579): a plain static file (public/webmcp-bridge.js,
+        // served by src/main.rs / src/embedded.rs), deliberately NOT an
+        // `asset!()` -- that would pull it into the wasm bundle. It
+        // feature-detects `document.modelContext` itself and is a no-op on
+        // every browser that doesn't have it yet.
+        // #581: resolved through the runtime base path so the hydrated
+        // client renders the same (possibly ingress-prefixed) src the
+        // server's HTML rewrite emitted. Identity in direct mode.
+        document::Script {
+            src: crate::app::base_path::href("/webmcp-bridge.js"),
+            defer: true
+        }
 
         // Body content
         Nav {
             active: props.nav_active.clone(),
             hide_hqp: props.hide_hqp,
             hide_lms: props.hide_lms,
+            hide_spotify: props.hide_spotify,
             hide_knobs: props.hide_knobs,
         }
         main { class: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-4",

@@ -210,18 +210,27 @@ Home Assistant is not UHC, so this is evidence rather than proof — but it is e
 that #396 should not design on the assumption keys are portable, and enough that
 `/roon/play_item` should be assumed broken until the rig says otherwise.
 
-The default stays `Global` because that is what the adapter's code assumes and these
-tests describe the adapter. **Do not read the default as a claim about Roon.**
-`a_foreign_item_key_is_rejected_when_keys_are_session_scoped` exercises the other
-setting; flip the default once the rig settles it.
+**The rig has now settled it** (issue #593, 2026-08, read-only probe of the
+operator's production Core through UHC's own `/roon/browse`): keys do **not**
+cross sessions, and the observed failure mode is a third one neither citation
+predicted — a foreign key in a fresh session answers *successfully* with the
+root list, no error at all. `ItemKeyScope::PerSessionSilentRootReset` models
+that transcript, and
+`a_foreign_item_key_silently_answers_the_root_when_session_scoping_resets`
+proves the knob fires. The silence is what made #593: `peek_playability`'s
+disposable-session peek judged the root instead of the album and nothing
+errored anywhere.
 
-That last row is the one that matters. `RoonAdapter::play_item` mints a fresh,
-unrelated session key and browses the caller's key inside it, so the repo already
-assumes keys are global. The fake refuses to decide: `ItemKeyScope::Global` is the
-default (matching the repo's assumption) and `ItemKeyScope::PerSession` makes the
-Core reject a foreign key, so a test can pin either answer. #405 must settle it
-against the operator's rig — see
-`a_foreign_item_key_is_rejected_when_keys_are_session_scoped`.
+The default stays `Global` because most existing tests describe the adapter's
+session-internal behavior, where scope never comes into play — but any test
+guarding a code path that browses a held key should set
+`PerSessionSilentRootReset` explicitly, the way #593's collection pins do.
+
+`RoonAdapter::play_item` mints a fresh, unrelated session key and browses the
+caller's key inside it, so it is broken against the observed behavior (it
+would silently land at the root). It has no in-repo callers; see
+`a_foreign_item_key_is_rejected_when_keys_are_session_scoped` for the
+loud-refusal variant a test can still pin.
 
 ### Rejection tests work on both sides of #405, by design
 

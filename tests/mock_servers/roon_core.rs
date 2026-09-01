@@ -248,6 +248,126 @@ pub fn album(title: &str, artist: &str, tracks: &[&str]) -> FakeItem {
         .with_children(children)
 }
 
+/// A playlist whose page puts an immediately-invokable `"Play Playlist"`
+/// action directly alongside its tracks -- the exact shape issue #545's live
+/// repro captured against a real Core (`Available: ["Play Playlist",
+/// "Laundromat (Remastered 2017)", ...]`).
+///
+/// Deliberately different from [`album`]'s shape: an album's first child is
+/// `action_list("Play Album")`, a *wrapper* that itself must be entered to
+/// reach `play_actions()` (double-nested). A playlist's `"Play Playlist"` is
+/// `action` hinted directly -- browsing its own `item_key` invokes it on the
+/// spot (see `handle_browse`'s "Invoking an action does not produce a list"
+/// case below), with no further menu to open. Getting this distinction
+/// wrong is exactly what #545's play-matcher bug was: the adapter treated
+/// every action-hinted row as a submenu wrapper and searched a level too
+/// deep for a literal `"Play Now"`.
+pub fn playlist(title: &str, tracks: &[&str]) -> FakeItem {
+    let mut children = vec![FakeItem::action("Play Playlist")];
+    for track in tracks {
+        children.push(
+            FakeItem::list(track)
+                .with_subtitle(title)
+                .with_children(vec![
+                    FakeItem::action_list("Play Track").with_children(play_actions())
+                ]),
+        );
+    }
+    FakeItem::list(title).with_children(children)
+}
+
+/// An album level shaped like the #573 live crawl captured it: the "Play
+/// Album" verb is an `action_list` wrapper, and -- crucially -- **the track
+/// rows themselves are `action_list` hinted too** (entering a track opens
+/// its Play Now/Queue/Start Radio menu), each carrying an artist subtitle
+/// and artwork. The pre-#573 fixtures modeled tracks as `hint: list`, which
+/// is why #545's "drop every action-hinted row" filter passed every test
+/// while emptying every real album ("`{\"items\":[]}` for a 95-track
+/// playlist").
+pub fn album_live(title: &str, artist: &str, tracks: &[&str]) -> FakeItem {
+    let mut children = vec![FakeItem::action_list("Play Album").with_children(play_actions())];
+    for track in tracks {
+        children.push(
+            FakeItem::action_list(track)
+                .with_subtitle(artist)
+                .with_image_key(&format!("img_{}", track.to_lowercase().replace(' ', "_")))
+                .with_children(play_actions()),
+        );
+    }
+    FakeItem::list(title)
+        .with_subtitle(artist)
+        .with_image_key(&format!("img_{}", title.to_lowercase().replace(' ', "_")))
+        .with_children(children)
+}
+
+/// A playlist level shaped like the #573 live crawl: an immediately-invokable
+/// `"Play Playlist"` action alongside `action_list`-hinted track rows with
+/// artist subtitles (the same live shape #545's repro captured, now with the
+/// track hint modeled correctly -- see [`album_live`]).
+pub fn playlist_live(title: &str, tracks: &[(&str, &str)]) -> FakeItem {
+    let mut children = vec![FakeItem::action("Play Playlist")];
+    for (track, artist) in tracks {
+        children.push(
+            FakeItem::action_list(track)
+                .with_subtitle(artist)
+                .with_children(play_actions()),
+        );
+    }
+    FakeItem::list(title).with_children(children)
+}
+
+/// An artist level shaped exactly as the operator's real Core served one
+/// under Library / Artists (issue #593, recorded 2026-08 via the raw
+/// `/roon/browse` endpoint against the production install):
+///
+/// ```json
+/// {"list":{"title":"/Passenger.","count":3,"level":3,"subtitle":"2 Albums"},
+///  "items":[
+///   {"title":"Play Artist","item_key":"2383:0","hint":"action_list"},
+///   {"title":"Flight of the Crow","subtitle":"Passenger","item_key":"2383:1",
+///    "hint":"list","image_key":"e2ce..."},
+///   {"title":"Runaway","subtitle":"Passenger","item_key":"2383:2",
+///    "hint":"list","image_key":"5b18..."}]}
+/// ```
+///
+/// The artist's own row (one level up, at the Artists list) is `hint: list`
+/// with an "N Albums" subtitle and artwork. The album rows *here* are
+/// `hint: list` too -- they are the rows #593 reported rendering with no
+/// Play -- and each album's own level leads with a "Play Album"
+/// `action_list` wrapper (pass [`album_live`] results in for that shape).
+pub fn artist_live(name: &str, albums: Vec<FakeItem>) -> FakeItem {
+    let mut children = vec![FakeItem::action_list("Play Artist").with_children(play_actions())];
+    let album_count = albums.len();
+    children.extend(albums);
+    FakeItem::list(name)
+        .with_subtitle(&format!(
+            "{album_count} Album{}",
+            if album_count == 1 { "" } else { "s" }
+        ))
+        .with_image_key(&format!("img_{}", name.to_lowercase().replace(' ', "_")))
+        .with_children(children)
+}
+
+/// A live-radio station row, shaped exactly as the operator's real Core
+/// served one under "My Live Radio" (issue #587, recorded 2026-08 via the
+/// raw `/roon/browse` endpoint against the production install):
+///
+/// ```json
+/// {"title":"WOSU-HD2 WOSU Public Media: Classical 101",
+///  "subtitle":"Columbus, Ohio, USA FM 89.7 HD2 English",
+///  "item_key":"1646:0","hint":"action","image_key":"afd6..."}
+/// ```
+///
+/// The load-bearing part is `hint: action` -- browsing a station **plays it
+/// immediately** (no Play Now menu below it), which is why it has no
+/// children here. #587 was exactly this row being mistaken for a play-verb
+/// row and filtered out of `hifi_collections` listings.
+pub fn radio_station(title: &str, subtitle: &str) -> FakeItem {
+    FakeItem::action(title)
+        .with_subtitle(subtitle)
+        .with_image_key(&format!("img_{}", title.to_lowercase().replace(' ', "_")))
+}
+
 /// The fake Core's library: a browse root plus a flat set of searchable items.
 #[derive(Debug, Clone)]
 pub struct FakeLibrary {
@@ -349,14 +469,27 @@ impl FakeLibrary {
 /// That is [`ItemKeyScope::PerSession`] behaviour, and if it is right then
 /// `/roon/play_item` is broken as #405 feared and #396's ref design changes.
 ///
-/// The default here stays `Global` because that is what the adapter's code assumes,
-/// and these tests describe the adapter. **Do not read the default as a claim about
-/// Roon.** `a_foreign_item_key_is_rejected_when_keys_are_session_scoped` exercises
-/// the other setting; flip the default once the operator's rig settles it.
+/// # The operator's rig has now settled it (issue #593, 2026-08)
 ///
-/// Two caveats against over-reading the citations: Home Assistant's integration is
-/// not UHC and may reuse keys differently, and neither source states the *rule* —
-/// only that reuse fails in practice.
+/// Probed read-only against the production Core through UHC's own
+/// `/roon/browse`: keys do **not** cross sessions -- and the failure mode is
+/// neither of the two the citations suggested. A foreign key in a fresh
+/// session answers *successfully* with the root list
+/// ([`ItemKeyScope::PerSessionSilentRootReset`] has the transcript). This is
+/// exactly what broke #593: `peek_playability` peeked in a disposable
+/// session, silently judged the root instead of the album, and no error ever
+/// surfaced.
+///
+/// The default here stays `Global` because most existing tests describe the
+/// adapter's session-internal behavior, where scope never comes into play.
+/// Tests guarding against cross-session assumptions (#593's pins) must set
+/// `set_item_key_scope(PerSessionSilentRootReset)` explicitly -- and any new
+/// adapter code path that browses a key must be exercised under it.
+///
+/// Two caveats against over-reading the third-party citations: Home Assistant's
+/// integration is not UHC and may reuse keys differently, and neither source
+/// states the *rule* — only that reuse fails in practice. The #593 probe
+/// outranks both for the cross-session question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemKeyScope {
     /// Any session may use any key. Matches what this repo assumes today. Default —
@@ -365,6 +498,23 @@ pub enum ItemKeyScope {
     /// A key only resolves in the session that minted it; elsewhere the Core
     /// answers `InvalidItemKey`.
     PerSession,
+    /// A key only resolves in the session that minted it; elsewhere the Core
+    /// answers **successfully with the root list** -- no error at all.
+    ///
+    /// This is the empirical answer to the type-level docs' open question,
+    /// recorded off the operator's production Core (Roon 2.x, 2026-08,
+    /// issue #593's read-only probe through UHC's own `/roon/browse`):
+    /// a key minted in one `multi_session_key`, browsed inside a fresh one,
+    /// returned `action: "list"` with the root ("Explore", `level: 0`) list
+    /// every time -- freshly minted keys included. The same probe showed
+    /// keys of a level still on a session's stack keep resolving *within*
+    /// that session after descending elsewhere (browsing a sibling key
+    /// jumps back to its level). The silence is the dangerous part: #593's
+    /// missing-Play bug was `peek_playability` reading the root's rows as
+    /// the peeked album's and never finding a play verb, with no error
+    /// anywhere -- [`ItemKeyScope::PerSession`]'s loud refusal could not
+    /// have modeled that.
+    PerSessionSilentRootReset,
 }
 
 /// One MOO request as it arrived, for assertions about what the adapter sent.
@@ -533,8 +683,32 @@ struct CoreState {
     rejected_keys: HashSet<String>,
     /// Per-key override of the rejection's message *name*.
     rejection_names: HashMap<String, String>,
+    /// Session keys the Core has forgotten (#616).
+    ///
+    /// A browse session is Core-side state, so it does not outlive the Core's
+    /// view of the extension: reconnecting the extension, restarting the
+    /// Core, or ageing a session out all leave the client holding an
+    /// `(item_key, multi_session_key)` pair that no longer names anything.
+    /// The Core's answer then is `InvalidItemKey` -- the rejection the
+    /// operator reported in #616, naming the very `collections_<nanos>`
+    /// session the key was minted in.
+    ///
+    /// Measured (read-only, against the operator's production Core, Roon 2.x,
+    /// 2026-08): eviction is **not** driven by session count -- 400 further
+    /// sessions minted back-to-back left an untouched earlier key resolving
+    /// normally -- nor by navigating that session elsewhere. So this models
+    /// session loss as the discrete event it is, driven by a test knob,
+    /// rather than inventing a count or timeout rule the Core does not have.
+    ///
+    /// A `pop_all` browse naming a forgotten session revives it at the root,
+    /// as a real Core does for any session key it has not seen before; only
+    /// keys minted before the loss stay rejected.
+    dropped_sessions: HashSet<String>,
     /// One-shot: the next browse, whatever it is, is rejected.
     reject_next_browse: bool,
+    /// One-shot: the next browse carrying `pop_levels` is rejected with
+    /// `InvalidLevels` (see [`FakeRoonCore::reject_next_pop_levels`]).
+    reject_next_pop_levels: bool,
     /// Applied before every response.
     delay: Duration,
     /// Per-item_key delay override, so a test can force responses to arrive out
@@ -562,6 +736,11 @@ struct CoreState {
     core_id: String,
     display_name: String,
     display_version: String,
+    /// The zone subscription's `(req_id, writer)`, captured when
+    /// `subscribe_zones` completes (#509). `group_outputs`/`ungroup_outputs`
+    /// push their effect on this same subscription, mirroring a real Core --
+    /// see the `SubscribeZones` handler for why it must be this req_id.
+    zone_push: Option<(usize, Writer)>,
 }
 
 // =============================================================================
@@ -597,7 +776,9 @@ impl FakeRoonCore {
             item_key_scope: ItemKeyScope::Global,
             rejected_keys: HashSet::new(),
             rejection_names: HashMap::new(),
+            dropped_sessions: HashSet::new(),
             reject_next_browse: false,
+            reject_next_pop_levels: false,
             delay: Duration::ZERO,
             key_delays: HashMap::new(),
             level_delays: HashMap::new(),
@@ -611,6 +792,7 @@ impl FakeRoonCore {
             core_id: format!("fake-core-408-{}", addr.port()),
             display_name: "Fake Roon Core".to_string(),
             display_version: "2.0.408".to_string(),
+            zone_push: None,
         }));
         let root_title = library.root_title.clone();
 
@@ -731,6 +913,62 @@ impl FakeRoonCore {
 
     pub async fn set_item_key_scope(&self, scope: ItemKeyScope) {
         self.state.write().await.item_key_scope = scope;
+    }
+
+    /// Forget every browse session the Core is currently holding (#616).
+    ///
+    /// Models the discrete event behind the operator's report: the extension
+    /// reconnects, or the Core restarts, and every `multi_session_key` a
+    /// client still holds a key for stops naming anything. Afterwards, a
+    /// browse carrying an `item_key` in one of those sessions is answered
+    /// `InvalidItemKey`; a `pop_all` browse revives the session name at the
+    /// root, exactly as a never-before-seen session key would behave.
+    ///
+    /// See [`CoreState::dropped_sessions`] for why this is a knob rather
+    /// than a modelled count or timeout rule.
+    pub async fn drop_all_sessions(&self) {
+        let mut state = self.state.write().await;
+        let keys: Vec<String> = state.sessions.keys().cloned().collect();
+        for key in &keys {
+            state.sessions.remove(key);
+            for servers in state.minted.values_mut() {
+                servers.remove(key);
+            }
+        }
+        state.dropped_sessions.extend(keys);
+    }
+
+    /// One-shot: refuse the next browse that carries `pop_levels` (with
+    /// `InvalidLevels`). Targets the position-restoring pop of a playability
+    /// peek specifically -- `reject_next_browse` cannot, because the peek's
+    /// own descending browse comes first (#593 review follow-up).
+    pub async fn reject_next_pop_levels(&self) {
+        self.state.write().await.reject_next_pop_levels = true;
+    }
+
+    /// Replace the children of the node titled `parent_title`, mid-run.
+    ///
+    /// This is how a test models the library changing under a live Core --
+    /// e.g. the operator adding a radio station in Roon's own app while UHC
+    /// is connected (#587). A real Core serves whatever the level contains
+    /// *at browse time* (this fake likewise snapshots a level's children
+    /// when the level is entered, in `handle_browse`), so the change is
+    /// visible to any browse that happens after the mutation and invisible
+    /// to loads of a level that was entered before it.
+    ///
+    /// Panics when no node carries that title, so a typo fails the test
+    /// loudly instead of mutating nothing.
+    pub async fn set_children_by_title(&self, parent_title: &str, children: Vec<FakeItem>) {
+        let mut state = self.state.write().await;
+        let parent = state
+            .arena
+            .find_by_title(parent_title)
+            .unwrap_or_else(|| panic!("no node titled {parent_title:?} in the fake library"));
+        let indices: Vec<usize> = children
+            .iter()
+            .map(|child| arena_insert(&mut state.arena.nodes, child))
+            .collect();
+        state.arena.nodes[parent].children = indices;
     }
 
     pub async fn set_zones(&self, zones: Vec<Value>) {
@@ -937,6 +1175,48 @@ pub fn default_zone(zone_id: &str, display_name: &str) -> Value {
             "output_id": format!("{zone_id}_output"),
             "zone_id": zone_id,
             "can_group_with_output_ids": [],
+            "display_name": display_name,
+            "source_controls": null,
+            "volume": {
+                "type": "number",
+                "min": 0.0,
+                "max": 100.0,
+                "value": 50.0,
+                "step": 1.0,
+                "is_muted": false
+            }
+        }]
+    })
+}
+
+/// A single-output zone with an explicit output id and grouping
+/// compatibility list (issue #509), for tests that need several distinct
+/// zones whose outputs can (or deliberately cannot) be grouped together.
+/// `default_zone` above always derives `"{zone_id}_output"` and leaves
+/// `can_group_with_output_ids` empty, which cannot express either.
+pub fn zone_with_grouping(
+    zone_id: &str,
+    display_name: &str,
+    output_id: &str,
+    can_group_with_output_ids: &[&str],
+) -> Value {
+    json!({
+        "zone_id": zone_id,
+        "display_name": display_name,
+        "state": "stopped",
+        "is_next_allowed": true,
+        "is_previous_allowed": true,
+        "is_pause_allowed": false,
+        "is_play_allowed": true,
+        "is_seek_allowed": false,
+        "queue_items_remaining": 0,
+        "queue_time_remaining": 0,
+        "now_playing": null,
+        "settings": { "loop": "disabled", "shuffle": false, "auto_radio": false },
+        "outputs": [{
+            "output_id": output_id,
+            "zone_id": zone_id,
+            "can_group_with_output_ids": can_group_with_output_ids,
             "display_name": display_name,
             "source_controls": null,
             "volume": {
@@ -1186,6 +1466,14 @@ async fn handle_request(
         }
         RequestKind::SubscribeZones => {
             let body = json!({ "zones": core.read().await.zones.clone() });
+            // Remember this request id and connection so group_outputs /
+            // ungroup_outputs (#509) can push a later `CONTINUE Changed` on
+            // the same subscription -- exactly how a real Core reports the
+            // effect of grouping, per the fork's own `parse_msg`
+            // (`transport.rs:457-484`): it only recognises `zones_changed` /
+            // `zones_added` / `zones_removed` arriving on the *subscription's*
+            // `req_id`, not a fresh one.
+            core.write().await.zone_push = Some((req_id, writer.clone()));
             // FROM FORK: transport.rs:479 accepts name "Subscribed"; a
             // subscription stays open, hence CONTINUE.
             respond(
@@ -1203,6 +1491,33 @@ async fn handle_request(
         }
         RequestKind::Browse => handle_browse(req_id, &body, &core, &writer, &root_title).await,
         RequestKind::Load => handle_load(req_id, &body, &core, &writer).await,
+        RequestKind::ImageGet => {
+            // A minimal but real 1x1 PNG, framed the way `moo.rs::parse`
+            // reads binary bodies (`Content-Type: image/png` -> the fork's
+            // `ContentType::Png(body)`), so `RoonAdapter::get_image` -- and
+            // through it `/api/collections/image` (#549/#573) -- can be
+            // exercised end to end against this fake.
+            const PNG_1X1: &[u8] = &[
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+                0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9C, 0x63, 0xFC, 0xCF, 0xC0, 0x50, 0x0F, 0x00, 0x04, 0x85, 0x01, 0x80, 0x84, 0xA9,
+                0x8C, 0x21, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+            ];
+            core.write()
+                .await
+                .sent
+                .push((req_id, "Success".to_string()));
+            let mut frame = format!(
+                "MOO/1 COMPLETE Success\nRequest-Id: {req_id}\nContent-Length: {}\nContent-Type: image/png\n\n",
+                PNG_1X1.len()
+            )
+            .into_bytes();
+            frame.extend_from_slice(PNG_1X1);
+            let _ = writer.lock().await.send(Message::Binary(frame)).await;
+        }
+        RequestKind::GroupOutputs => handle_group_outputs(req_id, &body, &core, &writer).await,
+        RequestKind::UngroupOutputs => handle_ungroup_outputs(req_id, &body, &core, &writer).await,
         RequestKind::Unknown => {
             // Mirrors the fork's own reply to an unknown service (lib.rs:588-592).
             // FROM ROONLABS' PUBLISHED API: `InvalidRequest` with an `error` string
@@ -1232,6 +1547,9 @@ enum RequestKind {
     Browse,
     Load,
     Ping,
+    GroupOutputs,
+    UngroupOutputs,
+    ImageGet,
     Unknown,
 }
 
@@ -1245,6 +1563,11 @@ impl RequestKind {
             "com.roonlabs.browse:1/browse" => Self::Browse,
             "com.roonlabs.browse:1/load" => Self::Load,
             "com.roonlabs.ping:1/ping" => Self::Ping,
+            // FROM FORK: transport.rs:334,343 -- both send only `output_ids`.
+            "com.roonlabs.transport:2/group_outputs" => Self::GroupOutputs,
+            "com.roonlabs.transport:2/ungroup_outputs" => Self::UngroupOutputs,
+            // FROM FORK: image.rs SVCNAME + get_image.
+            "com.roonlabs.image:1/get_image" => Self::ImageGet,
             _ => Self::Unknown,
         }
     }
@@ -1303,6 +1626,59 @@ async fn handle_browse(
         drop(state);
         refuse(core, writer, "InvalidItemKey", req_id, &session_key).await;
         return;
+    }
+
+    // --- a session the Core has forgotten (#616) ----------------------------
+    // A `pop_all` request revives the name at the root (a real Core treats an
+    // unknown session key as a new session); anything that leans on state the
+    // lost session held -- an `item_key` minted there, a `pop_levels` step
+    // out of a peek -- is `InvalidItemKey`.
+    if state.dropped_sessions.contains(&session_key) {
+        if pop_all {
+            state.dropped_sessions.remove(&session_key);
+        } else {
+            drop(state);
+            refuse(core, writer, "InvalidItemKey", req_id, &session_key).await;
+            return;
+        }
+    }
+
+    // --- targeted pop_levels rejection (#593 review follow-up) --------------
+    if pop_levels.is_some() && state.reject_next_pop_levels {
+        state.reject_next_pop_levels = false;
+        drop(state);
+        refuse(core, writer, "InvalidLevels", req_id, &session_key).await;
+        return;
+    }
+
+    // --- per-session scoping, silent flavor ---------------------------------
+    // Observed live (issue #593, see `ItemKeyScope::PerSessionSilentRootReset`):
+    // a key this session was never served answers with the ROOT list, exactly
+    // as if the request had been `pop_all` -- successfully, with no error.
+    if state.item_key_scope == ItemKeyScope::PerSessionSilentRootReset {
+        if let Some(key) = item_key {
+            let foreign = !state
+                .minted
+                .get(key)
+                .is_some_and(|sessions| sessions.contains(&session_key));
+            if foreign && !state.reject_next_browse {
+                let root_level = Level {
+                    title: root_title.to_string(),
+                    items: state.arena.root_children.clone(),
+                };
+                let session = state.sessions.entry(session_key.clone()).or_default();
+                session.levels = vec![root_level];
+                // Same epoch semantics as `pop_all`: the reset re-mints the
+                // root level's keys freshly (matching the live probe, where
+                // the reset handed out new `<int>:<int>` keys each time).
+                session.epoch += 1;
+                let list = current_list(&state, &session_key);
+                drop(state);
+                let body = json!({ "action": "list", "list": list });
+                respond(core, writer, "COMPLETE", "Success", req_id, Some(&body)).await;
+                return;
+            }
+        }
     }
 
     // --- error injection ---------------------------------------------------
@@ -1496,6 +1872,263 @@ async fn handle_load(req_id: usize, body: &Value, core: &Arc<RwLock<CoreState>>,
     // FROM FORK: browse.rs:93-98 LoadResult { items, offset, list } — all required.
     let body = json!({ "items": items, "offset": offset, "list": list });
     respond(core, writer, "COMPLETE", "Success", req_id, Some(&body)).await;
+}
+
+// =============================================================================
+// Grouping: group_outputs / ungroup_outputs (issue #509)
+// =============================================================================
+//
+// FROM FORK: `transport.rs:334-350` sends only `{"output_ids": [...]}` and
+// reads no reply body at all -- `Transport::group_outputs`/`ungroup_outputs`
+// return the raw `Option<usize>` request id, not a parsed result. So the
+// client observes the *effect* of grouping only through the zone
+// subscription's `Changed` push, exactly like every other Roon transport
+// write in this fake (`control`, `mute`, `change_volume` get the same
+// body-less `COMPLETE Success`). This fake's own zone-merge/split semantics
+// below are a simplified model, not a documented Core behavior: real Roon's
+// exact index/ordering rules for a merged zone's `outputs` list are
+// unpublished. What is load-bearing is that a merge (a) keeps the leader's
+// zone_id, (b) unions the outputs, and (c) retires any source zone left with
+// none -- which is exactly what issue #509's acceptance criteria describe.
+
+async fn handle_group_outputs(
+    req_id: usize,
+    body: &Value,
+    core: &Arc<RwLock<CoreState>>,
+    writer: &Writer,
+) {
+    let output_ids = string_array(body, "output_ids");
+    respond(core, writer, "COMPLETE", "Success", req_id, None).await;
+
+    let (merge, push) = {
+        let mut state = core.write().await;
+        let merge = merge_zone_outputs(&mut state.zones, &output_ids);
+        (merge, state.zone_push.clone())
+    };
+    let Some((merged_zone, removed_zone_ids)) = merge else {
+        return;
+    };
+    if let Some((sub_req_id, sub_writer)) = push {
+        let mut change = json!({ "zones_changed": [merged_zone] });
+        if !removed_zone_ids.is_empty() {
+            change["zones_removed"] = json!(removed_zone_ids);
+        }
+        send(
+            &sub_writer,
+            "CONTINUE",
+            "Changed",
+            sub_req_id,
+            Some(&change),
+        )
+        .await;
+    }
+}
+
+async fn handle_ungroup_outputs(
+    req_id: usize,
+    body: &Value,
+    core: &Arc<RwLock<CoreState>>,
+    writer: &Writer,
+) {
+    let output_ids = string_array(body, "output_ids");
+    respond(core, writer, "COMPLETE", "Success", req_id, None).await;
+
+    let (changed, added, removed, push) = {
+        let mut state = core.write().await;
+        let (changed, added, removed) = split_zone_outputs(&mut state.zones, &output_ids);
+        (changed, added, removed, state.zone_push.clone())
+    };
+    if changed.is_empty() && added.is_empty() && removed.is_empty() {
+        return;
+    }
+    if let Some((sub_req_id, sub_writer)) = push {
+        let mut zones_changed = changed;
+        zones_changed.extend(added);
+        let mut change = json!({});
+        if !zones_changed.is_empty() {
+            change["zones_changed"] = json!(zones_changed);
+        }
+        if !removed.is_empty() {
+            change["zones_removed"] = json!(removed);
+        }
+        send(
+            &sub_writer,
+            "CONTINUE",
+            "Changed",
+            sub_req_id,
+            Some(&change),
+        )
+        .await;
+    }
+}
+
+fn string_array(body: &Value, field: &str) -> Vec<String> {
+    body.get(field)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `(zone index, output index)` of the zone currently holding `output_id`.
+fn zone_output_index(zones: &[Value], output_id: &str) -> Option<(usize, usize)> {
+    zones.iter().enumerate().find_map(|(zi, zone)| {
+        let outs = zone.get("outputs")?.as_array()?;
+        let oi = outs
+            .iter()
+            .position(|o| o.get("output_id").and_then(Value::as_str) == Some(output_id))?;
+        Some((zi, oi))
+    })
+}
+
+/// Merge every output in `output_ids` into the zone holding the first id.
+/// Returns the merged zone's full JSON and the zone_ids of any source zones
+/// that lost their last output and were retired as a result. `None` when
+/// there was nothing to merge (the leader output was not found, or every
+/// other requested output already belongs to the leader's zone).
+fn merge_zone_outputs(
+    zones: &mut Vec<Value>,
+    output_ids: &[String],
+) -> Option<(Value, Vec<String>)> {
+    let leader_output_id = output_ids.first()?;
+    let (leader_zi, _) = zone_output_index(zones, leader_output_id)?;
+    let leader_zone_id = zones[leader_zi]["zone_id"].as_str()?.to_string();
+
+    let mut moved_from = Vec::new();
+    let mut moved_outputs = Vec::new();
+    for output_id in &output_ids[1..] {
+        let Some((zi, _)) = zone_output_index(zones, output_id) else {
+            continue;
+        };
+        if zi == leader_zi {
+            continue; // already part of the leader's zone
+        }
+        let outs = zones[zi]["outputs"].as_array_mut()?;
+        let Some(pos) = outs
+            .iter()
+            .position(|o| o["output_id"].as_str() == Some(output_id.as_str()))
+        else {
+            continue;
+        };
+        let mut out = outs.remove(pos);
+        out["zone_id"] = json!(leader_zone_id);
+        moved_from.push(zi);
+        moved_outputs.push(out);
+    }
+    if moved_outputs.is_empty() {
+        return None;
+    }
+
+    // Retire any source zone that lost its last output. Removing in
+    // descending index order keeps the remaining indices (including
+    // `leader_zi`, adjusted below) valid.
+    let mut emptied: Vec<usize> = moved_from;
+    emptied.sort_unstable();
+    emptied.dedup();
+    let mut removed_zone_ids = Vec::new();
+    let mut leader_zi = leader_zi;
+    for zi in emptied.into_iter().rev() {
+        if zones[zi]["outputs"]
+            .as_array()
+            .is_some_and(|outs| outs.is_empty())
+        {
+            removed_zone_ids.push(
+                zones[zi]["zone_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            zones.remove(zi);
+            if zi < leader_zi {
+                leader_zi -= 1;
+            }
+        }
+    }
+
+    let leader_outputs = zones[leader_zi]["outputs"].as_array_mut()?;
+    leader_outputs.extend(moved_outputs);
+
+    Some((zones[leader_zi].clone(), removed_zone_ids))
+}
+
+/// Pull every output in `output_ids` out of its current zone into its own
+/// standalone zone. Returns `(zones_changed, zones_added, zones_removed)`:
+/// a source zone that keeps at least one output after losing this one is
+/// `zones_changed`; a source zone left empty is retired into `zones_removed`.
+/// An output already alone in its zone is left untouched (not returned in
+/// any of the three).
+fn split_zone_outputs(
+    zones: &mut Vec<Value>,
+    output_ids: &[String],
+) -> (Vec<Value>, Vec<Value>, Vec<String>) {
+    let mut zones_changed = Vec::new();
+    let mut zones_added = Vec::new();
+    let mut zones_removed = Vec::new();
+
+    for output_id in output_ids {
+        let Some((zi, _)) = zone_output_index(zones, output_id) else {
+            continue;
+        };
+        let output_count = zones[zi]["outputs"].as_array().map_or(0, Vec::len);
+        if output_count <= 1 {
+            continue; // already standalone
+        }
+        let outs = zones[zi]["outputs"].as_array_mut().unwrap();
+        let pos = outs
+            .iter()
+            .position(|o| o["output_id"].as_str() == Some(output_id.as_str()))
+            .unwrap();
+        let mut out = outs.remove(pos);
+
+        let new_zone_id = format!("ungrouped-{output_id}");
+        out["zone_id"] = json!(new_zone_id);
+        let new_zone = standalone_zone_from_output(&new_zone_id, out);
+        zones.push(new_zone.clone());
+        zones_added.push(new_zone);
+
+        if zones[zi]["outputs"].as_array().unwrap().is_empty() {
+            zones_removed.push(
+                zones[zi]["zone_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        } else {
+            zones_changed.push(zones[zi].clone());
+        }
+    }
+    if !zones_removed.is_empty() {
+        zones.retain(|z| {
+            !zones_removed.contains(&z["zone_id"].as_str().unwrap_or_default().to_string())
+        });
+    }
+    (zones_changed, zones_added, zones_removed)
+}
+
+/// Build a minimal, fully-populated standalone zone (every field
+/// `roon_api`'s `transport::Zone` requires, same as [`default_zone`]) around
+/// one output that just left a group.
+fn standalone_zone_from_output(zone_id: &str, output: Value) -> Value {
+    json!({
+        "zone_id": zone_id,
+        "display_name": output["display_name"],
+        "state": "stopped",
+        "is_next_allowed": true,
+        "is_previous_allowed": true,
+        "is_pause_allowed": false,
+        "is_play_allowed": true,
+        "is_seek_allowed": false,
+        "queue_items_remaining": 0,
+        "queue_time_remaining": 0,
+        "now_playing": null,
+        "settings": { "loop": "disabled", "shuffle": false, "auto_radio": false },
+        "outputs": [output],
+    })
 }
 
 fn current_list(state: &CoreState, session_key: &str) -> Value {

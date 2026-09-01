@@ -1,0 +1,10 @@
+# Swift Package Manager build output (swift build / build-app.sh)
+.build/
+.swiftpm/
+
+# Xcode build products (xcodebuild -derivedDataPath, DerivedData/)
+DerivedData/
+xcuserdata/
+
+# build-dmg.sh output
+dist/

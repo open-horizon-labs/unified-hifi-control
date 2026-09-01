@@ -1,0 +1,41 @@
+#include "Version.xcconfig"
+// Watch.xcconfig
+// Build settings for the UHC watchOS controller app (#619).
+//
+// Note this file does NOT #include Shared.xcconfig: that file pins
+// SDKROOT/INFOPLIST_FILE/entitlements for the iOS app, and inheriting them
+// here would try to build the Watch app against the iOS SDK.
+
+PRODUCT_NAME = UHCWatchApp
+PRODUCT_DISPLAY_NAME = UHC
+// Must be the iOS app's identifier plus a suffix for the two to ship as one
+// bundle; the Watch app is embedded in the iOS app's Watch container.
+PRODUCT_BUNDLE_IDENTIFIER = com.openhorizonlabs.uhc.companion.watchkitapp
+DEVELOPMENT_TEAM = B69HKNTV5Q
+
+SDKROOT = watchos
+WATCHOS_DEPLOYMENT_TARGET = 10.0
+TARGETED_DEVICE_FAMILY = 4
+SUPPORTED_PLATFORMS = watchos watchsimulator
+
+GENERATE_INFOPLIST_FILE = NO
+INFOPLIST_FILE = Config/UHCWatchApp-Info.plist
+
+SWIFT_VERSION = 5.0
+CODE_SIGN_STYLE = Automatic
+// No signing identity is configured in CI or on a fresh clone; the simulator
+// build does not need one. Device builds pick up the team above in Xcode.
+CODE_SIGNING_ALLOWED[sdk=watchsimulator*] = NO
+
+SKIP_INSTALL = NO
+ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = NO
+
+// TestFlight/App Store require an app icon on every submitted target.
+ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon
+
+// The Watch app is embedded inside the iOS app, not shipped beside it.
+// Without this it is ALSO copied to the archive root, leaving two .app
+// bundles there; Xcode then cannot identify the primary app, writes no
+// ApplicationProperties, and Organizer offers "Distribute Content"
+// instead of "Distribute App" -- i.e. no TestFlight upload.
+SKIP_INSTALL = YES

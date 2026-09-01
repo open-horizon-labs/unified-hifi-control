@@ -117,6 +117,17 @@ impl ServerHandler for HifiMcpHandler {
                 tools::capabilities::handle_capabilities(state, args).await
             }
             HifiTools::HifiPlayRefTool(args) => tools::library::handle_play_ref(state, args).await,
+            HifiTools::HifiQueueTool(args) => tools::queue::handle_queue(state, args).await,
+            HifiTools::HifiSpotifyTool(args) => tools::spotify::handle_spotify(state, args).await,
+            HifiTools::HifiAppleMusicTool(args) => {
+                tools::apple_music::handle_apple_music(state, args).await
+            }
+            HifiTools::HifiCollectionsTool(args) => {
+                tools::collections::handle_collections(state, args).await
+            }
+            HifiTools::HifiZoneGroupTool(args) => {
+                tools::groups::handle_zone_group(state, args).await
+            }
         }
     }
 

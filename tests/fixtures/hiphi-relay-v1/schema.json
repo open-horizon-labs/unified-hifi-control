@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HiPhi installation relay v1 tagged message",
+  "oneOf": [
+    {"$ref":"#/$defs/hello"}, {"$ref":"#/$defs/heartbeat"},
+    {"$ref":"#/$defs/snapshot"}, {"$ref":"#/$defs/delta"},
+    {"$ref":"#/$defs/command_result"}, {"$ref":"#/$defs/artwork_response"},
+    {"$ref":"#/$defs/challenge"}, {"$ref":"#/$defs/session_established"},
+    {"$ref":"#/$defs/command"}, {"$ref":"#/$defs/artwork_request"},
+    {"$ref":"#/$defs/spotify_callback"},
+    {"$ref":"#/$defs/revoke"}
+  ],
+  "$defs": {
+    "uuid": {"type":"string","format":"uuid"},
+    "opaque": {"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_-]+$"},
+    "message_id": {"type":"string","minLength":1,"maxLength":128},
+    "timestamp": {"type":"integer","minimum":0},
+    "epoch": {"type":"integer","minimum":1},
+    "tagged": {
+      "type":"object","additionalProperties":false,"required":["type","body"],
+      "properties":{"type":{"type":"string"},"body":{"type":"object"}}
+    },
+    "volume": {
+      "type":"object","additionalProperties":false,
+      "required":["value","min","max","step","is_muted"],
+      "properties":{"value":{"type":"number"},"min":{"type":"number"},"max":{"type":"number"},"step":{"type":"number","exclusiveMinimum":0},"is_muted":{"type":"boolean"},"scale":{"type":["string","null"],"maxLength":32}}
+    },
+    "zone": {
+      "type":"object","additionalProperties":false,
+      "required":["zone_handle","zone_name","state"],
+      "properties":{"zone_handle":{"$ref":"#/$defs/opaque"},"zone_name":{"type":"string","maxLength":256},"state":{"type":"string","maxLength":1024},"volume_control":{"oneOf":[{"$ref":"#/$defs/volume"},{"type":"null"}]}}
+    },
+    "now_playing": {
+      "type":"object","additionalProperties":false,
+      "required":["zone_handle","title","artist","image_revision","is_playing","volume"],
+      "properties":{"zone_handle":{"$ref":"#/$defs/opaque"},"title":{"type":"string","maxLength":1024},"artist":{"type":"string","maxLength":1024},"image_revision":{"oneOf":[{"$ref":"#/$defs/opaque"},{"type":"null"}]},"is_playing":{"type":"boolean"},"volume":{"type":["number","null"]}}
+    },
+    "volume_patch": {
+      "oneOf":[
+        {"type":"object","additionalProperties":false,"required":["op","value"],"properties":{"op":{"const":"set"},"value":{"$ref":"#/$defs/volume"}}},
+        {"type":"object","additionalProperties":false,"required":["op"],"properties":{"op":{"const":"clear"}}}
+      ]
+    },
+    "now_playing_patch": {
+      "oneOf":[
+        {"type":"object","additionalProperties":false,"required":["op","value"],"properties":{"op":{"const":"set"},"value":{"$ref":"#/$defs/now_playing"}}},
+        {"type":"object","additionalProperties":false,"required":["op"],"properties":{"op":{"const":"clear"}}}
+      ]
+    },
+    "zone_delta": {
+      "type":"object","additionalProperties":false,"required":["zone_handle"],
+      "properties":{"zone_handle":{"$ref":"#/$defs/opaque"},"zone_name":{"type":"string","maxLength":256},"state":{"type":"string","maxLength":1024},"volume_control":{"$ref":"#/$defs/volume_patch"},"now_playing":{"$ref":"#/$defs/now_playing_patch"}}
+    },
+    "hello": {
+      "allOf":[{"$ref":"#/$defs/tagged"},{"properties":{"type":{"const":"hello"},"body":{"type":"object","additionalProperties":false,"required":["protocol_version","message_id","connector_version","installation_id","epoch","capabilities"],"properties":{"protocol_version":{"const":1},"message_id":{"$ref":"#/$defs/message_id"},"connector_version":{"type":"string","maxLength":128},"installation_id":{"$ref":"#/$defs/uuid"},"epoch":{"$ref":"#/$defs/epoch"},"capabilities":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":128}}}}}}]
+    },
+    "heartbeat": {
+      "allOf":[{"$ref":"#/$defs/tagged"},{"properties":{"type":{"const":"heartbeat"},"body":{"type":"object","additionalProperties":false,"required":["epoch","sent_at"],"properties":{"epoch":{"$ref":"#/$defs/epoch"},"sent_at":{"$ref":"#/$defs/timestamp"}}}}}]
+    },
+    "snapshot": {
+      "allOf":[{"$ref":"#/$defs/tagged"},{"properties":{"type":{"const":"snapshot"},"body":{"type":"object","additionalProperties":false,"required":["protocol_version","message_id","installation_id","epoch","revision","observed_at","expires_at","zones","now_playing"],"properties":{"protocol_version":{"const":1},"message_id":{"$ref":"#/$defs/message_id"},"installation_id":{"$ref":"#/$defs/uuid"},"epoch":{"$ref":"#/$defs/epoch"},"revision":{"type":"integer","minimum":0},"observed_at":{"$ref":"#/$defs/timestamp"},"expires_at":{"$ref":"#/$defs/timestamp"},"zones":{"type":"array","maxItems":128,"items":{"$ref":"#/$defs/zone"}},"now_playing":{"type":"array","maxItems":128,"items":{"$ref":"#/$defs/now_playing"}}}}}}]
+    },
+    "delta": {
+      "allOf":[{"$ref":"#/$defs/tagged"},{"properties":{"type":{"const":"delta"},"body":{"type":"object","additionalProperties":false,"required":["protocol_version","message_id","installation_id","epoch","revision","observed_at","expires_at","zones"],"properties":{"protocol_version":{"const":1},"message_id":{"$ref":"#/$defs/message_id"},"installation_id":{"$ref":"#/$defs/uuid"},"epoch":{"$ref":"#/$defs/epoch"},"revision":{"type":"integer","minimum":0},"observed_at":{"$ref":"#/$defs/timestamp"},"expires_at":{"$ref":"#/$defs/timestamp"},"zones":{"type":"array","maxItems":128,"items":{"$ref":"#/$defs/zone_delta"}}}}}}]
+    },
+    "command_payload": {
+      "oneOf":[
+        {"type":"object","additionalProperties":false,"required":["zone_handle","action"],"properties":{"zone_handle":{"$ref":"#/$defs/opaque"},"action":{"enum":["transport.play_pause","transport.next","transport.previous","volume.up","volume.down"]}}},
+        {"type":"object","additionalProperties":false,"required":["zone_handle","action","value"],"properties":{"zone_handle":{"$ref":"#/$defs/opaque"},"action":{"const":"volume.absolute"},"value":{"type":"number"}}}
+      ]
+    },
+    "command": {
+      "allOf":[{"$ref":"#/$defs/tagged"},{"properties":{"type":{"const":"command"},"body":{"type":"object","additionalProperties":false,"required":["protocol_version","installation_id","control_node_id","epoch","message_id","request_id","idempotency_key","created_at","expires_at","payload","grant"],"properties":{"protocol_version":{"const":1},"installation_id":{"$ref":"#/$defs/uuid"},"control_node_id":{"$ref":"#/$defs/uuid"},"epoch":{"$ref":"#/$defs/epoch"},"message_id":{"$ref":"#/$defs/message_id"},"request_id":{"$ref":"#/$defs/uuid"},"idempotency_key":{"$ref":"#/$defs/uuid"},"created_at":{"$ref":"#/$defs/timestamp"},"expires_at":{"$ref":"#/$defs/timestamp"},"payload":{"$ref":"#/$defs/command_payload"},"grant":{"type":"string","minLength":32,"maxLength":8192}}}}}]
+    },
+    "command_result": {
+      "allOf":[{"$ref":"#/$defs/tagged"},{"properties":{"type":{"const":"command_result"},"body":{"type":"object","additionalProperties":false,"required":["protocol_version","request_id","idempotency_key","status","reason_code","epoch","completed_at"],"properties":{"protocol_version":{"const":1},"request_id":{"$ref":"#/$defs/uuid"},"idempotency_key":{"$ref":"#/$defs/uuid"},"status":{"enum":["executed","rejected","expired","busy","installation_offline","forbidden","unknown_outcome","stale_state"]},"reason_code":{"type":["string","null"],"maxLength":128},"epoch":{"$ref":"#/$defs/epoch"},"completed_at":{"$ref":"#/$defs/timestamp"}}}}}]
+    },
+    "artwork_request": {
+      "allOf":[{"$ref":"#/$defs/tagged"},{"properties":{"type":{"const":"artwork_request"},"body":{"type":"object","additionalProperties":false,"required":["protocol_version","message_id","installation_id","epoch","request_id","zone_handle","artwork_revision","max_source_bytes"],"properties":{"protocol_version":{"const":1},"message_id":{"$ref":"#/$defs/message_id"},"installation_id":{"$ref":"#/$defs/uuid"},"epoch":{"$ref":"#/$defs/epoch"},"request_id":{"$ref":"#/$defs/uuid"},"zone_handle":{"$ref":"#/$defs/opaque"},"artwork_revision":{"$ref":"#/$defs/opaque"},"max_source_bytes":{"type":"integer","minimum":1,"maximum":2097152}}}}}]
+    },
+    "artwork_response": {
+      "allOf":[{"$ref":"#/$defs/tagged"},{"properties":{"type":{"const":"artwork_response"},"body":{"type":"object","additionalProperties":false,"required":["protocol_version","message_id","installation_id","epoch","request_id","artwork_revision","content_type","total_bytes","chunk_count","sha256"],"properties":{"protocol_version":{"const":1},"message_id":{"$ref":"#/$defs/message_id"},"installation_id":{"$ref":"#/$defs/uuid"},"epoch":{"$ref":"#/$defs/epoch"},"request_id":{"$ref":"#/$defs/uuid"},"artwork_revision":{"$ref":"#/$defs/opaque"},"content_type":{"enum":["image/jpeg","image/png","image/webp"]},"total_bytes":{"type":"integer","minimum":1,"maximum":2097152},"chunk_count":{"type":"integer","minimum":1,"maximum":43},"sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"}}}}}]
+    },
+    "challenge": {
+      "allOf":[{"$ref":"#/$defs/tagged"},{"properties":{"type":{"const":"challenge"},"body":{"type":"object","additionalProperties":false,"required":["protocol_version","challenge_id","endpoint","nonce","expires_at"],"properties":{"protocol_version":{"const":1},"challenge_id":{"$ref":"#/$defs/uuid"},"endpoint":{"type":"string","pattern":"^wss://"},"nonce":{"type":"string","minLength":32,"maxLength":256},"expires_at":{"$ref":"#/$defs/timestamp"}}}}}]
+    },
+    "session_established": {
+      "allOf":[{"$ref":"#/$defs/tagged"},{"properties":{"type":{"const":"session_established"},"body":{"type":"object","additionalProperties":false,"required":["epoch"],"properties":{"epoch":{"$ref":"#/$defs/epoch"}}}}}]
+    },
+    "spotify_callback": {
+      "allOf":[{"$ref":"#/$defs/tagged"},{"properties":{"type":{"const":"spotify_callback"},"body":{"oneOf":[
+        {"type":"object","additionalProperties":false,"required":["protocol_version","request_id","client_id","state_digest","redirect_uri","expires_at","code"],"properties":{"protocol_version":{"const":1},"request_id":{"$ref":"#/$defs/uuid"},"client_id":{"type":"string","minLength":16,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"state_digest":{"type":"string","pattern":"^[A-Za-z0-9_-]{43}$"},"redirect_uri":{"const":"https://app.hiphi.audio/api/spotify/callback"},"expires_at":{"$ref":"#/$defs/timestamp"},"code":{"type":"string","minLength":1,"maxLength":4096}}},
+        {"type":"object","additionalProperties":false,"required":["protocol_version","request_id","client_id","state_digest","redirect_uri","expires_at","error"],"properties":{"protocol_version":{"const":1},"request_id":{"$ref":"#/$defs/uuid"},"client_id":{"type":"string","minLength":16,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"state_digest":{"type":"string","pattern":"^[A-Za-z0-9_-]{43}$"},"redirect_uri":{"const":"https://app.hiphi.audio/api/spotify/callback"},"expires_at":{"$ref":"#/$defs/timestamp"},"error":{"type":"string","minLength":1,"maxLength":256}}}
+      ]}}}}]
+    },
+    "revoke": {
+      "allOf":[{"$ref":"#/$defs/tagged"},{"properties":{"type":{"const":"revoke"},"body":{"type":"object","additionalProperties":false,"required":["reason_code"],"properties":{"reason_code":{"type":"string","maxLength":128}}}}}]
+    }
+  },
+  "x-transport-limits": {"max_message_bytes":65536,"max_command_bytes":8192,"max_zones_per_projection":128,"max_pending_commands_per_installation":32,"max_pending_commands_per_zone_lane":8,"max_command_ttl_ms":15000,"max_result_ledger_entries":256,"max_result_ledger_ttl_ms":60000,"max_art_source_bytes":2097152,"max_art_chunk_bytes":49152,"max_art_decoded_width":2048,"max_art_decoded_height":2048,"max_art_output_bytes":524288,"max_art_cache_entries_per_installation":64,"max_art_transforms_per_installation":2,"max_art_capability_ttl_ms":60000},
+  "x-prohibited-fields": ["url","headers","cookies","provider_token","adapter_id","raw_http"]
+}

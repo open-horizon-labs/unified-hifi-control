@@ -6,14 +6,15 @@
 #[cfg(feature = "server")]
 mod server {
     use unified_hifi_control::{
-        adapters, aggregator, api, app, bus, config, coordinator, embedded, firmware, knobs, mcp,
-        mdns,
+        adapters, aggregator, api, app, bus, cloud_connector, config, coordinator, embedded,
+        firmware, knobs, mcp, mdns, mqtt,
     };
 
     // Import load_app_settings for checking adapter enabled state
     use api::load_app_settings;
 
     use anyhow::Result;
+    use axum::middleware::from_fn_with_state;
     use axum::{
         response::{IntoResponse, Redirect},
         routing::{delete, get, post, put},
@@ -25,8 +26,60 @@ mod server {
     use std::time::Instant;
     use tokio::signal;
     use tokio_util::sync::CancellationToken;
-    use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
+    use tower_http::{
+        compression::CompressionLayer,
+        cors::{AllowOrigin, Any, CorsLayer},
+        trace::TraceLayer,
+    };
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    /// Same-origin browser requests do not need CORS. Cross-origin browser
+    /// access is opt-in because this server also exposes playback, OAuth, and
+    /// companion authority endpoints; a global permissive policy would let
+    /// arbitrary sites issue those requests through a tunnel. Operators that
+    /// intentionally host a separate UI must set `UHC_ALLOWED_ORIGINS` to a
+    /// comma-separated list of exact origins.
+    fn configured_cors_layer() -> CorsLayer {
+        let origins =
+            configured_origin_headers(std::env::var("UHC_ALLOWED_ORIGINS").ok().as_deref());
+
+        if origins.is_empty() {
+            tracing::info!("CORS disabled; same-origin access remains available");
+            CorsLayer::new()
+        } else {
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::list(origins))
+                .allow_methods(Any)
+                .allow_headers(Any)
+        }
+    }
+
+    fn configured_origin_headers(raw: Option<&str>) -> Vec<axum::http::HeaderValue> {
+        raw.into_iter()
+            .flat_map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|origin| !origin.is_empty())
+            .filter(|origin| {
+                (origin.starts_with("http://") || origin.starts_with("https://"))
+                    && !origin.chars().any(char::is_whitespace)
+            })
+            .filter_map(|origin| match axum::http::HeaderValue::from_str(&origin) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    tracing::warn!(
+                        origin,
+                        "Ignoring invalid UHC_ALLOWED_ORIGINS entry: {error}"
+                    );
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    }
 
     /// Legacy redirect: /control -> /ui/zones
     async fn control_redirect() -> impl IntoResponse {
@@ -102,6 +155,22 @@ mod server {
             assert!(!is_trusted_lan_ip(&IpAddr::V6(Ipv6Addr::new(
                 0x2001, 0x0db8, 0, 0, 0, 0, 0, 1
             ))));
+        }
+    }
+
+    #[cfg(test)]
+    mod cors_tests {
+        use super::configured_origin_headers;
+
+        #[test]
+        fn cors_is_empty_by_default_and_accepts_only_explicit_origins() {
+            assert!(configured_origin_headers(None).is_empty());
+            let origins = configured_origin_headers(Some(
+                "https://uhc.example.test, https://admin.example.test,not an origin",
+            ));
+            assert_eq!(origins.len(), 2);
+            assert_eq!(origins[0], "https://uhc.example.test");
+            assert_eq!(origins[1], "https://admin.example.test");
         }
     }
 
@@ -267,6 +336,9 @@ mod server {
         ));
         let (lms, lms_cli) =
             adapters::lms::create_lms_adapters_with_runtime(bus.clone(), Some(lms_runtime_bridge));
+        // Both LMS observers publish the same `lms:` projection.  Register the
+        // companion with the coordinator so reconfiguration and shutdown stop
+        // both workers before retiring that shared projection.
         coord.register_companion("lms", lms_cli.clone()).await;
         if let Some(ref lms_config) = config.lms {
             lms.configure(
@@ -300,6 +372,51 @@ mod server {
             Some(upnp_runtime_bridge),
         ));
 
+        // Direct streaming adapters. Credentials are supplied through the
+        // provider OAuth/bridge contract (#463) or environment bootstrap.
+        // Spotify is controller-only: it discovers and controls existing Connect
+        // devices, never acting as a receiver.
+        let spotify = Arc::new(adapters::spotify::SpotifyAdapter::new(bus.clone()));
+        if let Ok(access_token) = std::env::var("SPOTIFY_ACCESS_TOKEN") {
+            if !access_token.trim().is_empty() {
+                spotify
+                    .set_token(adapters::spotify::SpotifyToken {
+                        access_token,
+                        refresh_token: std::env::var("SPOTIFY_REFRESH_TOKEN").ok(),
+                        expires_at: std::env::var("SPOTIFY_TOKEN_EXPIRES_AT")
+                            .ok()
+                            .and_then(|value| value.parse().ok()),
+                    })
+                    .await;
+            }
+        }
+
+        let music_assistant_config = match (
+            std::env::var("MUSIC_ASSISTANT_HOST"),
+            std::env::var("MUSIC_ASSISTANT_TOKEN"),
+        ) {
+            (Ok(host), Ok(token)) if !host.trim().is_empty() && !token.trim().is_empty() => {
+                let port = std::env::var("MUSIC_ASSISTANT_PORT")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(8095);
+                let tls = std::env::var("MUSIC_ASSISTANT_TLS")
+                    .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+                    .unwrap_or(true);
+                let allow_insecure_http = std::env::var("MUSIC_ASSISTANT_INSECURE_HTTP")
+                    .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+                    .unwrap_or(false);
+                Some(adapters::musicassistant::MusicAssistantConfig {
+                    host,
+                    port,
+                    token,
+                    tls,
+                    allow_insecure_http,
+                })
+            }
+            _ => None,
+        };
+
         // =========================================================================
         // Start enabled adapters (single codepath using coordinator)
         // =========================================================================
@@ -321,9 +438,11 @@ mod server {
         tokio::spawn(projection_actor.run());
         tracing::info!("Reliable projection runtime started");
 
-        // Build list of startable adapters
+        // Build the complete lifecycle list. Provider adapters are registered
+        // with the API registry below, but the coordinator owns their start
+        // and stop decisions just like local adapters.
         // Note: lms_cli shares config with lms - both start when LMS is configured
-        let startable_adapters: Vec<Arc<dyn adapters::Startable>> = vec![
+        let legacy_startables: Vec<Arc<dyn adapters::Startable>> = vec![
             roon.clone(),
             hqp_instances.clone(),
             lms.clone(),
@@ -331,6 +450,29 @@ mod server {
             openhome.clone(),
             upnp.clone(),
         ];
+
+        let mut provider_startables: Vec<Arc<dyn adapters::Startable>> = vec![spotify.clone()];
+        let mut startable_adapters = legacy_startables.clone();
+        startable_adapters.extend(provider_startables.iter().cloned());
+
+        // Credential-backed providers historically started whenever their
+        // credentials were present, even before the settings toggle existed.
+        // Keep that compatibility while recording the decision in the same
+        // coordinator registry used by every other adapter.  Dynamic settings
+        // changes can subsequently disable them through the coordinator.
+        coord
+            .set_enabled(
+                "spotify",
+                app_settings.adapters.spotify || spotify.is_configured().await,
+            )
+            .await;
+        let music_assistant_configured = music_assistant_config.is_some();
+        coord
+            .set_enabled(
+                "musicassistant",
+                app_settings.adapters.musicassistant || music_assistant_configured,
+            )
+            .await;
 
         // Fail before starting adapters or the adaptive actor if the public socket cannot be
         // acquired. After this point every fallible server exit goes through explicit teardown.
@@ -344,7 +486,7 @@ mod server {
         coord.start_all_enabled(&startable_adapters).await;
 
         // Build application state (clone Arcs so we can access adapters for shutdown)
-        let state = api::AppState::new(
+        let mut state = api::AppState::new(
             roon,
             hqplayer,
             hqp_instances.clone(),
@@ -361,6 +503,346 @@ mod server {
             shutdown_token.clone(),
         )
         .with_reliable_commands(reliable_commands);
+        // The SSH reverse tunnel receives a separate, loopback-only callback
+        // listener.  It must never forward to this main UHC listener: the
+        // latter intentionally serves many LAN routes that are not safe to
+        // publish merely because Spotify needs one callback (#641).
+        let spotify_callback_port =
+            api::spotify_callback_listener::spawn(state.clone(), shutdown_token.clone()).await?;
+        state
+            .provider_auth
+            .bind_callback_port(spotify_callback_port);
+        if let Some(bootstrap_token) = state.controller_auth.take_bootstrap_secret().await {
+            tracing::info!(
+                "UHC controller bootstrap token (display once; do not put it in a tunnel URL): {}. \
+                 Paste it into the \"Owner setup required\" prompt shown the first time you save \
+                 provider settings (e.g. Spotify) or click Get an HTTPS address in Settings.",
+                bootstrap_token
+            );
+        }
+
+        // #531: registered for `hifi_collections`' content operation only --
+        // `search`/`play_uri` refuse through this trait (see
+        // `LibraryAdapter for LmsAdapter`/`for RoonAdapter`'s docs);
+        // `hifi_search`/`hifi_play` keep calling these adapters directly.
+        state
+            .adapter_registry
+            .register_library("lms", state.lms.clone())
+            .await;
+        state
+            .adapter_registry
+            .register_library("roon", state.roon.clone())
+            .await;
+        state
+            .adapter_registry
+            .register_with_lifecycle(spotify.clone(), spotify.clone())
+            .await;
+        state
+            .adapter_registry
+            .register_library("spotify", spotify.clone())
+            .await;
+        // LMS's transport commands keep going through the dedicated `state.lms`
+        // field/routes; this registration only exposes the provider-neutral
+        // content-library surface (#510's multiroom sync-group operations) via
+        // `AdapterRegistry::library_content("lms", ...)`.
+        state
+            .adapter_registry
+            .register_library("lms", state.lms.clone())
+            .await;
+        // Roon's transport commands keep going through the dedicated
+        // `state.roon` field/routes; this registration only exposes the
+        // provider-neutral content-library surface (#509's multiroom
+        // grouping operations) via `AdapterRegistry::library_content("roon", ...)`.
+        state
+            .adapter_registry
+            .register_library("roon", state.roon.clone())
+            .await;
+        state.provider_auth.attach_spotify(spotify.clone()).await;
+        state
+            .provider_auth
+            .attach_musicassistant(state.musicassistant.clone())
+            .await;
+        let persisted_music_assistant_config = state
+            .provider_auth
+            .musicassistant_bootstrap_config()
+            .unwrap_or_else(|error| {
+                tracing::warn!("Music Assistant encrypted configuration unavailable: {error}");
+                None
+            });
+        if let Some(config) = music_assistant_config.or(persisted_music_assistant_config) {
+            match adapters::musicassistant::MusicAssistantAdapter::new(bus.clone(), config.clone())
+            {
+                Ok(adapter) => {
+                    if let Err(error) = state
+                        .musicassistant
+                        .install(Arc::new(adapter), config)
+                        .await
+                    {
+                        tracing::warn!("Music Assistant adapter disabled: {error}");
+                    }
+                }
+                Err(error) => tracing::warn!("Music Assistant adapter disabled: {error}"),
+            }
+        }
+        // An encrypted credential-only restart discovers its usable client
+        // here, after the initial settings registry was constructed. Preserve
+        // the established credential-backed provider behavior: a configured
+        // MA peer starts even when its optional feature switch was previously
+        // false, while later settings writes remain authoritative.
+        coord
+            .set_enabled(
+                "musicassistant",
+                app_settings.adapters.musicassistant || state.musicassistant.is_configured().await,
+            )
+            .await;
+        state
+            .adapter_registry
+            .register_with_lifecycle(state.musicassistant.clone(), state.musicassistant.clone())
+            .await;
+        state
+            .adapter_registry
+            .register_library("musicassistant", state.musicassistant.clone())
+            .await;
+
+        // HiPhi Cloud is strictly opt-in.  The connector opens an outbound
+        // authenticated WSS socket only when the complete installation and
+        // pinned issuer configuration is present; it requests a fresh,
+        // installation-signed short-lived session grant for every reconnect and
+        // never adds a LAN route or proxies this server's HTTP API.
+        match state
+            .hiphi_connector
+            .start_from_runtime(state.clone(), config::get_config_dir())
+            .await
+        {
+            Ok(cloud_connector::runtime::ConnectorStart::Started) => {
+                tracing::info!("HiPhi Cloud connector started (outbound WSS)");
+            }
+            Ok(cloud_connector::runtime::ConnectorStart::AlreadyRunning) => {}
+            Ok(cloud_connector::runtime::ConnectorStart::NotConfigured) => {}
+            Err(error) => tracing::warn!("HiPhi Cloud connector disabled: {error}"),
+        }
+        provider_startables.push(state.musicassistant.clone());
+        let mut startable_adapters = (*state.startable_adapters).clone();
+        startable_adapters.push(state.musicassistant.clone());
+        state.startable_adapters = Arc::new(startable_adapters);
+
+        // Apple Music playback is owned by a native MusicKit companion. The
+        // paired bridge implementation shares the registry with the HTTP
+        // pairing endpoints and starts on the first successful claim.
+        let apple_music = Arc::new(adapters::apple_music::AppleMusicAdapter::with_companion(
+            bus.clone(),
+            Arc::new(api::apple_bridge::PairedMusicKitCompanion::new(
+                state.apple_bridges.clone(),
+            )),
+            std::time::Duration::from_secs(5),
+        ));
+        state
+            .adapter_registry
+            .register_with_lifecycle(apple_music.clone(), apple_music.clone())
+            .await;
+        state
+            .adapter_registry
+            .register_library("applemusic", apple_music.clone())
+            .await;
+
+        // Provider adapters participate in the same feature-toggle lifecycle as
+        // local adapters. Their zones still arrive through the bus and the
+        // aggregator; the registry only dispatches commands and controls their
+        // lifecycle after the coordinator has approved them.
+        provider_startables.push(apple_music.clone());
+        let mut startable_adapters = (*state.startable_adapters).clone();
+        startable_adapters.push(apple_music.clone());
+        state.startable_adapters = Arc::new(startable_adapters);
+        coord.start_all_enabled(&provider_startables).await;
+
+        // Optional MQTT/Home Assistant discovery publisher (#508). A pure
+        // bus consumer with no zones of its own, so it does not join
+        // `startable_adapters`/the coordinator - just a background task
+        // this settings toggle and encrypted broker record turn on or off.
+        //
+        // Broker settings come from one of two places (#605): the user's own
+        // encrypted record, or `UHC_MQTT_*` handed over by the Home Assistant
+        // add-on, which reads them from the Supervisor. `mqtt_bootstrap::plan`
+        // owns the precedence between them; the log line below always names
+        // the winner, so an install with no entities can be diagnosed from
+        // the add-on log alone.
+        state.mqtt.set_base_url(base_url.clone());
+        // Whether the add-on's run.sh started us (#613). It decides one thing
+        // here: a broker handed over by the Supervisor is adopted either way,
+        // but only a standalone install has MQTT switched on for it, because
+        // only there is MQTT the route into Home Assistant.
+        let running_as_addon = api::ha_integration::running_as_addon();
+        // Mirror the persisted provenance of the MQTT toggle so
+        // `GET /api/mqtt/status` can answer "did a person choose this?"
+        // without reading app-settings.json on every poll.
+        state
+            .mqtt
+            .set_enable_source(app_settings.mqtt_enabled_by)
+            .await;
+        let environment_mqtt = match api::mqtt_bootstrap::from_env() {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(
+                    "Ignoring MQTT environment configuration: {error}. \
+                     Configure the broker in Settings instead."
+                );
+                None
+            }
+        };
+        match api::credentials::MqttCredentialStore::from_env() {
+            Ok(store) => match store.load() {
+                Ok(stored) => {
+                    use api::mqtt_bootstrap::MqttBootstrap;
+                    match api::mqtt_bootstrap::plan(stored, environment_mqtt, running_as_addon) {
+                        MqttBootstrap::ApplyEnvironment { record, enable } => {
+                            let host = record.host.clone();
+                            let port = record.port;
+                            // Save before enabling: a publisher running off a
+                            // record that never reached disk would come back
+                            // unconfigured on the next boot.
+                            match store.save(&record) {
+                                Ok(()) => {
+                                    state.mqtt.configure(record).await;
+                                    if !enable {
+                                        // Add-on install (#613): the broker is
+                                        // now filled in, and that is all. The
+                                        // integration this add-on installs is
+                                        // what puts zones into Home Assistant,
+                                        // so switching MQTT on as well would
+                                        // publish to a broker nobody asked to
+                                        // publish to.
+                                        //
+                                        // "Do not turn it on" is not "turn it
+                                        // off". Someone already publishing
+                                        // whose Supervisor rotated the broker
+                                        // password arrives here with a changed
+                                        // record and `mqtt: true` on disk;
+                                        // dropping them to silent would be
+                                        // this change breaking the very setup
+                                        // it promises not to touch.
+                                        let already_on = app_settings.adapters.mqtt;
+                                        if already_on {
+                                            state.mqtt.set_enabled(true).await;
+                                        }
+                                        tracing::info!(
+                                            broker = %format!("{host}:{port}"),
+                                            enabled = already_on,
+                                            "MQTT broker details from the Home Assistant add-on saved; \
+                                             publishing is left exactly as it was"
+                                        );
+                                    } else if api::enable_mqtt_in_settings(
+                                        api::credentials::MqttEnableSource::User,
+                                    ) {
+                                        state.mqtt.set_enabled(true).await;
+                                        // Standalone: whoever set UHC_MQTT_*
+                                        // chose this, so the #610 warning
+                                        // about Home Assistant not consuming
+                                        // it still belongs to them (#613).
+                                        state
+                                            .mqtt
+                                            .set_enable_source(
+                                                api::credentials::MqttEnableSource::User,
+                                            )
+                                            .await;
+                                        tracing::info!(
+                                            broker = %format!("{host}:{port}"),
+                                            "MQTT configured from environment; publisher enabled"
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            "MQTT configured from environment \
+                                             but the setting could not be saved; enable it in Settings"
+                                        );
+                                    }
+                                }
+                                Err(error) => tracing::warn!(
+                                    "MQTT environment configuration could not be saved: {error}"
+                                ),
+                            }
+                        }
+                        MqttBootstrap::EnvironmentUnchanged(record) => {
+                            let host = record.host.clone();
+                            let port = record.port;
+                            state.mqtt.configure(record).await;
+                            // Deliberately no re-enable: the toggle was
+                            // persisted when this config was first applied, so
+                            // `app_settings` now carries the user's answer.
+                            if app_settings.adapters.mqtt {
+                                state.mqtt.set_enabled(true).await;
+                            }
+                            tracing::info!(
+                                broker = %format!("{host}:{port}"),
+                                enabled = app_settings.adapters.mqtt,
+                                "MQTT configured from environment (Home Assistant add-on); unchanged since last start"
+                            );
+                        }
+                        MqttBootstrap::UseStored(record) => {
+                            let host = record.host.clone();
+                            let port = record.port;
+                            let source = record.source;
+                            state.mqtt.configure(record).await;
+                            if app_settings.adapters.mqtt {
+                                state.mqtt.set_enabled(true).await;
+                            }
+                            match source {
+                                api::credentials::MqttConfigSource::User => tracing::info!(
+                                    broker = %format!("{host}:{port}"),
+                                    enabled = app_settings.adapters.mqtt,
+                                    "MQTT configured from your saved settings (these win over the environment)"
+                                ),
+                                api::credentials::MqttConfigSource::Environment => tracing::info!(
+                                    broker = %format!("{host}:{port}"),
+                                    enabled = app_settings.adapters.mqtt,
+                                    "MQTT using the broker a previous environment bootstrap saved; \
+                                     the environment no longer supplies one"
+                                ),
+                            }
+                        }
+                        MqttBootstrap::Unconfigured => {
+                            if app_settings.adapters.mqtt {
+                                tracing::info!(
+                                    "MQTT publisher enabled in settings but no broker is configured yet"
+                                );
+                            } else {
+                                tracing::info!(
+                                    "MQTT publisher not configured; no Home Assistant entities will be published"
+                                );
+                            }
+                        }
+                    }
+                }
+                // An unreadable record is never overwritten: the environment
+                // bootstrap would otherwise destroy a user's broker settings
+                // over a transient decryption failure.
+                Err(error) => tracing::warn!("MQTT credential record unavailable: {error}"),
+            },
+            Err(error) => tracing::warn!("MQTT credential store unavailable: {error}"),
+        }
+
+        // Whether anyone is actually *reading* what the publisher publishes
+        // (#610). Everything above only establishes UHC's own half: a broker
+        // it reaches, discovery messages it sends. Home Assistant will not
+        // show a single entity unless its own MQTT integration has been added
+        // by hand, and that is invisible from the broker side - which is how
+        // an install with a flawless MQTT status block produced no entities
+        // at all.
+        //
+        // Started unconditionally, not just when the publisher is on: the
+        // question is about Home Assistant, and having the answer ready is
+        // what lets Settings say something useful the moment publishing is
+        // switched on. Outside the add-on this returns immediately without
+        // spawning anything.
+        mqtt::consumer::spawn_core_poll(state.mqtt.consumer_monitor(), shutdown_token.clone());
+
+        // Whether Home Assistant has actually loaded the integration the
+        // add-on installed (#613). Same core API, different question: the
+        // files being on disk is not the same as core having them, and the
+        // gap between the two is one Home Assistant restart that nothing
+        // else would tell the user about.
+        api::ha_integration::spawn_load_poll(
+            api::ha_integration::load_monitor(),
+            shutdown_token.clone(),
+        );
 
         // Clone state for shutdown diagnostics
         let state_for_shutdown = state.clone();
@@ -369,9 +851,69 @@ mod server {
         let mcp_extension = mcp::create_mcp_extension(state.clone());
 
         // Build API routes
+        let api_oauth_start = api::provider_auth::oauth_start;
+        let api_oauth_callback = api::provider_auth::oauth_callback;
+        let api_oauth_revoke = api::provider_auth::oauth_revoke;
+        let api_provider_configure = api::provider_auth::configure_provider;
+        let api_spotify_account = api::spotify_account_handler;
+        let api_spotify_tunnel_start = api::provider_auth::spotify_tunnel_start;
+        let api_spotify_tunnel_status = api::provider_auth::spotify_tunnel_status;
+        let api_spotify_tunnel_stop = api::provider_auth::spotify_tunnel_stop;
+        let api_musicassistant_status = api::provider_auth::musicassistant_status;
+        let api_bridge_pair = api::apple_bridge::pair;
+        let api_bridge_discover_pairing = api::apple_bridge::discover_pairing;
+        let api_bridge_claim = api::apple_bridge::claim;
+        let api_bridge_revoke = api::apple_bridge::revoke;
+        let api_bridge_rename = api::apple_bridge::rename;
+        let api_bridge_revoke_by_bridge_id = api::apple_bridge::revoke_by_bridge_id;
+        let api_bridge_status = api::apple_bridge::status;
+        let api_bridge_state = api::apple_bridge::state;
+        let api_bridge_commands = api::apple_bridge::commands;
+        let api_bridge_ack = api::apple_bridge::acknowledge;
+        let api_bridge_content = api::apple_bridge::content;
+        let api_bridge_content_ack = api::apple_bridge::acknowledge_content;
+        let controller_bootstrap = api::controller_auth::bootstrap;
+        let controller_status = api::controller_auth::status;
+        let api_mqtt_status = api::mqtt_settings::status;
+        let api_ha_integration_status = api::ha_integration::status;
+        let api_mqtt_configure = api::mqtt_settings::configure;
+        #[rustfmt::skip]
         let router = Router::new()
             // Health check
             .route("/status", get(api::status_handler))
+            // Installation-bound controller bootstrap/session boundary
+            .route("/api/controller/bootstrap", post(controller_bootstrap))
+            .route("/api/controller/status", get(controller_status))
+            .route("/api/hiphi/pairing/status", get(api::hiphi_pairing::status))
+            .route("/api/hiphi/pairing/prepare", post(api::hiphi_pairing::prepare))
+            .route("/api/hiphi/pairing/initiate", post(api::hiphi_pairing::initiate))
+            .route("/api/hiphi/pairing/complete", post(api::hiphi_pairing::complete))
+            // Provider authorization and native companion pairing
+            .route("/api/providers/{provider}/oauth/start", get(api_oauth_start))
+            .route("/api/providers/{provider}/oauth/callback", get(api_oauth_callback))
+            .route("/api/providers/{provider}/oauth/revoke", post(api_oauth_revoke))
+            .route("/api/providers/{provider}/configure", post(api_provider_configure))
+            .route("/api/providers/spotify/account", get(api_spotify_account))
+            .route("/api/providers/spotify/tunnel/start", post(api_spotify_tunnel_start))
+            .route("/api/providers/spotify/tunnel/status", get(api_spotify_tunnel_status))
+            .route("/api/providers/spotify/tunnel/stop", post(api_spotify_tunnel_stop))
+            .route("/api/providers/musicassistant/status", get(api_musicassistant_status))
+            // MQTT/Home Assistant discovery publisher settings (#508)
+            .route("/api/mqtt/status", get(api_mqtt_status))
+            .route("/api/mqtt/configure", post(api_mqtt_configure))
+            .route("/api/home-assistant/integration", get(api_ha_integration_status))
+            .route("/api/bridges/applemusic/pair", post(api_bridge_pair))
+            .route("/api/bridges/applemusic/discover", post(api_bridge_discover_pairing))
+            .route("/api/bridges/applemusic/claim", post(api_bridge_claim))
+            .route("/api/bridges/applemusic/revoke", post(api_bridge_revoke))
+            .route("/api/bridges/applemusic/rename", post(api_bridge_rename))
+            .route("/api/bridges/applemusic/remove", post(api_bridge_revoke_by_bridge_id))
+            .route("/api/bridges/applemusic/status", get(api_bridge_status))
+            .route("/api/bridges/applemusic/state", post(api_bridge_state))
+            .route("/api/bridges/applemusic/commands", get(api_bridge_commands))
+            .route("/api/bridges/applemusic/commands/{command_id}", post(api_bridge_ack))
+            .route("/api/bridges/applemusic/content", get(api_bridge_content))
+            .route("/api/bridges/applemusic/content/{request_id}", post(api_bridge_content_ack))
             // Roon routes
             .route("/roon/status", get(api::roon_status_handler))
             .route("/roon/zones", get(api::roon_zones_handler))
@@ -477,6 +1019,17 @@ mod server {
             // App settings API
             .route("/api/settings", get(api::api_settings_get_handler))
             .route("/api/settings", post(api::api_settings_post_handler))
+            // Library browse, queue and play-ref for the web UI (#507). Same
+            // verb vocabulary as the hifi_collections/hifi_queue/hifi_play_ref
+            // MCP tools -- see src/api/browse.rs.
+            .route("/api/collections", post(api::browse::collections_handler))
+            // Per-item artwork for hifi_collections rows (#549); mirrors
+            // /roon/image and /now_playing/image but resolves an opaque ref
+            // minted by hifi_collections instead of a live zone's own state.
+            .route("/api/collections/image", get(api::collections_image_handler))
+            .route("/api/queue", post(api::browse::queue_handler))
+            .route("/api/play_ref", post(api::browse::play_ref_handler))
+            .route("/api/search", post(api::browse::search_handler))
             // Kept on one line each: the API-contract extractor (tests/api_contract.rs) only sees
             // single-line `.route(...)` calls, so a multi-line form would slip past the guard.
             .route("/api/zones/visibility", get(api::zone_visibility_get))
@@ -493,6 +1046,7 @@ mod server {
             .route("/knob/config", get(knobs::knob_config_handler))
             .route("/knob/config", post(knobs::knob_config_update_handler))
             .route("/knob/devices", get(knobs::knob_devices_handler))
+            .route("/knob/devices/{knob_id}", delete(knobs::routes::knob_remove_handler))
             // Knob protocol routes (firmware uses these paths directly)
             .route("/now_playing", get(knobs::knob_now_playing_handler))
             .route("/now_playing/image", get(knobs::knob_image_handler))
@@ -518,41 +1072,87 @@ mod server {
             .route("/control", get(control_redirect))
             .route("/admin", get(settings_redirect))
             // Embedded WASM/JS assets (ADR 002: serve from memory, no disk extraction)
-            .route("/assets/{*path}", get(embedded::serve_embedded_asset))
-            // Embedded static files (favicon, CSS, images)
-            .route(
-                "/favicon.ico",
-                get(|| embedded::serve_static_file(axum::extract::Path("favicon.ico".to_string()))),
-            )
-            .route(
-                "/apple-touch-icon.png",
-                get(|| {
-                    embedded::serve_static_file(axum::extract::Path(
-                        "apple-touch-icon.png".to_string(),
-                    ))
-                }),
-            )
-            .route(
-                "/tailwind.css",
-                get(|| {
-                    embedded::serve_static_file(axum::extract::Path("tailwind.css".to_string()))
-                }),
-            )
-            .route(
-                "/dx-components-theme.css",
-                get(|| {
-                    embedded::serve_static_file(axum::extract::Path(
-                        "dx-components-theme.css".to_string(),
-                    ))
-                }),
-            )
+            .route("/assets/{*path}", get(embedded::serve_embedded_asset));
+
+        // #560: fonts 404'd on the built server -- public/fonts/ is
+        // embedded like every other public/ file, but (unlike /assets/*)
+        // nothing routed requests there, so the SPA fallback answered
+        // instead. Gated at runtime rather than on `feature = "web"`
+        // because it serves embedded PublicAssets data regardless of that
+        // feature -- but only when embedded assets exist: without them,
+        // serve_dioxus_application() below serves exe-adjacent public/
+        // itself, and a second /fonts route would make axum panic.
+        let router = if embedded::has_embedded_assets() {
+            router.route("/fonts/{*path}", get(embedded::serve_embedded_font))
+        } else {
+            router
+        };
+
+        // Static file routes (favicon, touch icon, stylesheets). Gated at
+        // runtime on the same condition that picks the serve branch below:
+        // with embedded assets we use serve_api_application(), which serves
+        // NO static files — without these routes the app head's stylesheet
+        // links 404 on every page load of the dx-built fullstack server.
+        // Without embedded assets, serve_dioxus_application() nest_services
+        // every file in exe-adjacent public/ itself, and registering these
+        // same paths there makes axum panic at startup on overlapping routes.
+        let router = if embedded::has_embedded_assets() {
+            router
+                .route(
+                    "/favicon.ico",
+                    get(|| {
+                        embedded::serve_static_file(axum::extract::Path("favicon.ico".to_string()))
+                    }),
+                )
+                .route(
+                    "/apple-touch-icon.png",
+                    get(|| {
+                        embedded::serve_static_file(axum::extract::Path(
+                            "apple-touch-icon.png".to_string(),
+                        ))
+                    }),
+                )
+                .route(
+                    "/tailwind.css",
+                    get(|| {
+                        embedded::serve_static_file(axum::extract::Path("tailwind.css".to_string()))
+                    }),
+                )
+                // WebMCP bridge (#579): plain static JS, not part of the
+                // wasm bundle. Loaded on every page by `document::Script` in
+                // src/app/components/layout.rs.
+                .route(
+                    "/webmcp-bridge.js",
+                    get(|| {
+                        embedded::serve_static_file(axum::extract::Path(
+                            "webmcp-bridge.js".to_string(),
+                        ))
+                    }),
+                )
+                .route(
+                    "/dx-components-theme.css",
+                    get(|| {
+                        embedded::serve_static_file(axum::extract::Path(
+                            "dx-components-theme.css".to_string(),
+                        ))
+                    }),
+                )
+        } else {
+            router
+        };
+
+        let router = router
             // MCP routes (same port as main app)
             .route("/mcp", get(mcp::handle_mcp_get))
             .route("/mcp", post(mcp::handle_mcp_post))
             .route("/mcp", delete(mcp::handle_mcp_delete))
             // Middleware
             .layer(mcp_extension)
-            .layer(CorsLayer::permissive())
+            .layer(from_fn_with_state(
+                state.controller_auth.clone(),
+                api::controller_auth::middleware,
+            ))
+            .layer(configured_cors_layer())
             .layer(CompressionLayer::new())
             .layer(TraceLayer::new_for_http())
             .with_state(state);
@@ -582,6 +1182,16 @@ mod server {
             // Standard SSR mode for development
             router.serve_dioxus_application(serve_config(), app::App)
         };
+
+        // HA Ingress (#581): outermost layer so it sees the final HTML
+        // (including the injected bootstrap snippet above). A pure
+        // passthrough unless UHC_INGRESS=1 AND the request came from the
+        // Supervisor's proxy with a valid X-Ingress-Path -- direct mode
+        // never observes it. See src/api/ingress.rs.
+        let router = router.layer(api::ingress::IngressRewriteLayer);
+        if api::ingress::ingress_enabled() {
+            tracing::info!("HA Ingress mode enabled (UHC_INGRESS=1)");
+        }
 
         // Start server with graceful shutdown
         tracing::info!("Listening on http://{}", addr);
@@ -667,6 +1277,10 @@ mod server {
         coord
             .stop_all(state_for_shutdown.startable_adapters.as_ref())
             .await;
+        // MQTT is not in that list (see its wiring above) - stop it
+        // explicitly so it publishes "offline" rather than relying solely
+        // on the broker noticing a dropped TCP connection via the LWT.
+        state_for_shutdown.mqtt.shutdown().await;
         if let Some(ref fw) = firmware_service {
             fw.stop();
         }

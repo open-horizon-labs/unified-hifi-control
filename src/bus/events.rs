@@ -52,11 +52,39 @@ impl PrefixedZoneId {
         Self(format!("hqplayer:{}", raw_id.as_ref()))
     }
 
+    /// Create an Apple Music zone ID.
+    ///
+    /// The raw ID is owned by the native MusicKit companion.  The first
+    /// macOS companion uses `application` for its ApplicationMusicPlayer session;
+    /// paired companions may provide a stable installation identifier.
+    pub fn applemusic(raw_id: impl AsRef<str>) -> Self {
+        Self(format!("applemusic:{}", raw_id.as_ref()))
+    }
+
+    /// Create a Spotify Connect device zone ID.
+    pub fn spotify(raw_id: impl AsRef<str>) -> Self {
+        Self(format!("spotify:{}", raw_id.as_ref()))
+    }
+
+    /// Create a Music Assistant player zone ID.
+    pub fn musicassistant(raw_id: impl AsRef<str>) -> Self {
+        Self(format!("musicassistant:{}", raw_id.as_ref()))
+    }
+
     /// Parse a prefixed zone ID from a string.
     /// Returns None if the string doesn't contain a valid prefix.
     pub fn parse(s: impl AsRef<str>) -> Option<Self> {
         let s = s.as_ref();
-        let valid_prefixes = ["roon:", "lms:", "openhome:", "upnp:", "hqplayer:"];
+        let valid_prefixes = [
+            "roon:",
+            "lms:",
+            "openhome:",
+            "upnp:",
+            "hqplayer:",
+            "applemusic:",
+            "spotify:",
+            "musicassistant:",
+        ];
         if valid_prefixes.iter().any(|p| s.starts_with(p)) {
             Some(Self(s.to_string()))
         } else {
@@ -78,6 +106,18 @@ impl PrefixedZoneId {
     pub fn raw_id(&self) -> &str {
         self.0.split(':').nth(1).unwrap_or(&self.0)
     }
+}
+
+/// Whether a string names exactly one Apple Music execution owner.
+///
+/// Apple companion state is owner-scoped. A bare prefix or a nested prefix
+/// would allow unrelated sessions to share private context, so every layer
+/// uses this same predicate rather than a loose `starts_with` check.
+pub fn is_applemusic_zone_id(value: &str) -> bool {
+    let Some(owner) = value.strip_prefix("applemusic:") else {
+        return false;
+    };
+    !owner.is_empty() && !owner.contains(':')
 }
 
 impl fmt::Display for PrefixedZoneId {
@@ -252,6 +292,14 @@ pub struct NowPlaying {
 
     /// Additional metadata (format, bitrate, etc.)
     pub metadata: Option<TrackMetadata>,
+
+    /// Current repeat mode, when the provider reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_mode: Option<RepeatMode>,
+
+    /// Current shuffle state, when the provider reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shuffle: Option<bool>,
 }
 
 /// Additional track metadata
@@ -435,6 +483,14 @@ pub struct CommandResponse {
 /// - Adapter lifecycle: Adapter start/stop, cleanup
 /// - System: Shutdown, health checks
 /// - Legacy: Backward-compatible events for existing integrations
+///   Non-secret account identity returned by a provider adapter.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderAccount {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub email: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 #[allow(clippy::large_enum_variant)] // Zone is intentionally large for full state
@@ -464,6 +520,15 @@ pub enum BusEvent {
         zone_id: PrefixedZoneId,
     },
 
+    /// Provider account identity discovered by an adapter.
+    ProviderAccountUpdated {
+        provider: String,
+        account: Option<ProviderAccount>,
+    },
+
+    /// A provider adapter could not refresh its backend state.
+    AdapterError { adapter: String, error: String },
+
     // =========================================================================
     // Now Playing Events
     // =========================================================================
@@ -481,6 +546,13 @@ pub enum BusEvent {
         image_key: Option<String>,
     },
 
+    /// Repeat/shuffle state changed for a zone.
+    PlaybackModesChanged {
+        zone_id: PrefixedZoneId,
+        repeat_mode: Option<RepeatMode>,
+        shuffle: Option<bool>,
+    },
+
     /// Seek position changed (for progress updates)
     SeekPositionChanged {
         /// Zone identifier (must be prefixed, e.g., "roon:xxx")
@@ -493,6 +565,13 @@ pub enum BusEvent {
         output_id: String,
         value: f32,
         is_muted: bool,
+    },
+
+    /// Whether a zone can accept volume commands independently of whether a
+    /// current numeric volume was available in the latest observation.
+    VolumeCapabilityChanged {
+        zone_id: PrefixedZoneId,
+        supported: bool,
     },
 
     // =========================================================================
@@ -622,9 +701,13 @@ impl BusEvent {
             Self::ZoneDiscovered { .. } => "zone_discovered",
             Self::ZoneUpdated { .. } => "zone_updated",
             Self::ZoneRemoved { .. } => "zone_removed",
+            Self::ProviderAccountUpdated { .. } => "provider_account_updated",
+            Self::AdapterError { .. } => "adapter_error",
             Self::NowPlayingChanged { .. } => "now_playing_changed",
+            Self::PlaybackModesChanged { .. } => "playback_modes_changed",
             Self::SeekPositionChanged { .. } => "seek_position_changed",
             Self::VolumeChanged { .. } => "volume_changed",
+            Self::VolumeCapabilityChanged { .. } => "volume_capability_changed",
             Self::CommandReceived { .. } => "command_received",
             Self::CommandResult { .. } => "command_result",
             Self::AdapterStopping { .. } => "adapter_stopping",
@@ -655,6 +738,7 @@ impl BusEvent {
                 | Self::ZoneUpdated { .. }
                 | Self::ZoneRemoved { .. }
                 | Self::ZonesFlushed { .. }
+                | Self::VolumeCapabilityChanged { .. }
         )
     }
 
@@ -663,6 +747,7 @@ impl BusEvent {
         matches!(
             self,
             Self::NowPlayingChanged { .. }
+                | Self::PlaybackModesChanged { .. }
                 | Self::SeekPositionChanged { .. }
                 | Self::VolumeChanged { .. }
         )
@@ -684,6 +769,7 @@ impl BusEvent {
                 | Self::AdapterStopped { .. }
                 | Self::AdapterConnected { .. }
                 | Self::AdapterDisconnected { .. }
+                | Self::AdapterError { .. }
         )
     }
 
@@ -788,6 +874,9 @@ mod tests {
 
         let hqp = PrefixedZoneId::hqplayer("instance");
         assert_eq!(hqp.as_str(), "hqplayer:instance");
+
+        let applemusic = PrefixedZoneId::applemusic("application");
+        assert_eq!(applemusic.as_str(), "applemusic:application");
     }
 
     #[test]
@@ -798,9 +887,18 @@ mod tests {
         assert!(PrefixedZoneId::parse("openhome:abc").is_some());
         assert!(PrefixedZoneId::parse("upnp:abc").is_some());
         assert!(PrefixedZoneId::parse("hqplayer:abc").is_some());
+        assert!(PrefixedZoneId::parse("applemusic:application").is_some());
 
         // Invalid - no prefix
         assert!(PrefixedZoneId::parse("abc123").is_none());
         assert!(PrefixedZoneId::parse("unknown:abc").is_none());
+    }
+
+    #[test]
+    fn apple_music_execution_owner_ids_are_exactly_scoped() {
+        assert!(is_applemusic_zone_id("applemusic:iphone"));
+        assert!(!is_applemusic_zone_id("applemusic:"));
+        assert!(!is_applemusic_zone_id("applemusic:owner:child"));
+        assert!(!is_applemusic_zone_id("spotify:device"));
     }
 }
