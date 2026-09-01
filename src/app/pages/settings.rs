@@ -2307,6 +2307,25 @@ pub fn Settings() -> Element {
                                         "Why HiPhi Cloud?"
                                     }
                                 }
+                                div { class: "mt-4 rounded-md border border-default bg-elevated p-4 text-sm",
+                                    p { class: "font-medium text-primary", "Before you start" }
+                                    p { class: "mt-1 text-secondary",
+                                        "Spotify requires the owner of a Development Mode app to have an active Spotify Premium subscription. Each Spotify account using playback control also needs Premium. If the owner's Premium lapses, the app stops working until the owner resubscribes."
+                                    }
+                                    p { class: "mt-2 text-secondary",
+                                        "A Development Mode app supports up to five authenticated Spotify users. Add any account other than the app owner under Users Management in the Spotify dashboard."
+                                    }
+                                    p { class: "mt-2 text-secondary",
+                                        "HiPhi Cloud routes a one-use authorization response to this paired installation. It does not retain the authorization code. It never receives your Client Secret, PKCE verifier, or Spotify access and refresh tokens. UHC exchanges the code directly with Spotify and keeps the access and refresh tokens encrypted on this UHC server."
+                                    }
+                                    a {
+                                        class: "link mt-2 inline-block",
+                                        href: "https://developer.spotify.com/documentation/web-api/concepts/quota-modes",
+                                        target: "_blank",
+                                        rel: "noopener noreferrer",
+                                        "Spotify Premium and Development Mode requirements"
+                                    }
+                                }
                                 div {
                                     class: "mt-2",
                                     hidden: spotify_account.is_none(),
@@ -2405,8 +2424,8 @@ pub fn Settings() -> Element {
                                             "ⓘ"
                                         }
                                         div { id: "spotify-step-1-info", class: spotify_info_panel_class(1), role: "note",
-                                            p { "Spotify only lets an app you own control your players, so you create a free one to act as your personal key. In the dashboard, choose \"Create app\", give it any name, and accept Spotify's terms. Nothing gets published anywhere." }
-                                            p { class: "mt-2", "New apps run in development mode: the Spotify accounts allowed to sign in must be listed on the app's User Management page." }
+                                            p { "Create a personal Development Mode app in Spotify's dashboard. Give it any name, select Web API, and accept Spotify's terms. The app is not published." }
+                                            p { class: "mt-2", "The app owner needs active Spotify Premium. Add any other Spotify account that will authorize UHC under Users Management." }
                                         }
                                     }
                                 }
@@ -2414,7 +2433,7 @@ pub fn Settings() -> Element {
                                     id: "spotify-step-1-body",
                                     hidden: !spotify_step1_open,
                                     aria_hidden: !spotify_step1_open,
-                                    p { class: "mt-2 text-sm text-secondary", "Create a free app in Spotify's developer dashboard -- it takes about a minute." }
+                                    p { class: "mt-2 text-sm text-secondary", "Create an app in Spotify's developer dashboard. Select Web API when Spotify asks which API you plan to use." }
                                     div { class: "mt-3 flex flex-wrap gap-2",
                                         a {
                                             class: "btn btn-primary min-h-11 inline-flex items-center",
@@ -2475,7 +2494,8 @@ pub fn Settings() -> Element {
                                             "ⓘ"
                                         }
                                         div { id: "spotify-step-2-info", class: spotify_info_panel_class(2), role: "note",
-                                            p { "Spotify sends your browser to HiPhi's fixed secure callback. HiPhi passes the one-use response to this paired UHC installation; Spotify tokens remain encrypted here." }
+                                            p { "Spotify sends your browser to HiPhi's fixed secure callback. HiPhi routes the one-use response to this paired UHC installation and does not retain the authorization code." }
+                                            p { class: "mt-2", "UHC keeps the PKCE verifier local, exchanges the code directly with Spotify, and stores the access and refresh tokens encrypted on this UHC server." }
                                             p { class: "mt-2", "The address never changes, so you register it once and never run a tunnel or expose this server." }
                                         }
                                     }
@@ -2501,7 +2521,7 @@ pub fn Settings() -> Element {
                                                     span { aria_live: "polite", "{spotify_callback_copy_state().label(\"Copy URL\")}" }
                                                 }
                                             }
-                                            p { class: "mt-2 text-xs text-muted", "HiPhi Cloud handles only the callback handoff. Your Spotify sign-in and playback stay on this UHC installation." }
+                                            p { class: "mt-2 text-xs text-muted", "HiPhi Cloud routes the callback response but does not retain the authorization code. Spotify tokens and playback authority stay on this UHC installation." }
                                         }
                                     } else if spotify_remote_origin() {
                                         // Remote/LAN origin -- the common case (a NAS or any
@@ -2695,7 +2715,7 @@ pub fn Settings() -> Element {
                                         }
                                         div { id: "spotify-step-3-info", class: spotify_info_panel_class(3), role: "note",
                                             p { "The Client ID is the long code on your app's page in the Spotify dashboard. It identifies your app; it is not a password, and it is stored on this UHC server -- never in the browser." }
-                                            p { class: "mt-2", "HiPhi never needs your Client Secret. UHC uses PKCE and keeps the verifier and Spotify tokens local." }
+                                            p { class: "mt-2", "HiPhi never receives your Client Secret or PKCE verifier. UHC stores the Spotify access and refresh tokens encrypted on this server." }
                                         }
                                     }
                                 }

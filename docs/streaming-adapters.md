@@ -92,6 +92,13 @@ Spotify uses an authorization-code flow with PKCE and a fixed HiPhi callback:
 
 ### Spotify's 2026 Development Mode boundary
 
+The owner of a Development Mode app must have an active Spotify Premium
+subscription. If that subscription lapses, the app stops working until the
+owner resubscribes. Each account using Spotify playback control also needs
+Premium. A Development Mode app supports up to five authenticated Spotify
+users; add accounts other than the owner under **Users Management** in the
+Spotify Developer Dashboard before they authorize UHC.
+
 UHC controls existing Spotify Connect devices; it is not a Connect receiver
 and receives no audio. For applications created under Spotify's current
 Development Mode rules, UHC uses `/me/playlists`, parses a playlist's `items`
@@ -146,10 +153,13 @@ For a local or QNAP install, open Settings in the browser you will use for
 authorization. The Spotify card's "Client settings" pane now walks through the
 whole flow as numbered steps: create/open an app in the Spotify Developer
 Dashboard, copy the fixed HiPhi callback shown there (with a one-click copy
-button) into the app's Redirect URIs, paste the Client ID, save, then Connect.
+button) into the app's Redirect URIs, select **Web API**, paste the Client ID,
+save, then Connect.
 The installation must first be paired with HiPhi Cloud. HiPhi is used only for
-the owner-approved callback handoff; normal playback requests and token refresh
-remain between UHC and Spotify.
+the owner-approved callback handoff. It routes the one-use response to the
+paired installation and does not retain the authorization code. The PKCE
+verifier and encrypted Spotify access and refresh tokens stay on UHC; normal
+playback requests and token refresh remain between UHC and Spotify.
 
 ### First save on a NAS: the owner bootstrap prompt (#570)
 
