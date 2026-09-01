@@ -7,7 +7,6 @@ use strict;
 use warnings;
 
 use File::Spec::Functions qw(catfile catdir);
-use File::Basename qw(dirname);
 use File::Path qw(make_path);
 use JSON::XS;
 use Proc::Background;
@@ -41,13 +40,10 @@ sub init {
         make_path($configDir) or $log->error("Failed to create data directory $configDir: $!");
     }
 
-    # On macOS, clear quarantine from both bundled executables. Settings invokes
-    # uhc-hiphi-pair beside the server, so clearing only the server leaves the
-    # enrollment ceremony broken even though normal playback works.
+    # On macOS, clear quarantine flag to prevent Gatekeeper blocking unsigned binary
     if (main::ISMAC && (my $binary = $class->bin())) {
-        my $binaryDir = dirname($binary);
-        system('xattr', '-cr', $binaryDir);
-        $? && $log->error("Failed to clear quarantine attributes in $binaryDir: $!");
+        system('xattr', '-cr', $binary);
+        $? && $log->error("Failed to clear quarantine attribute on $binary: $!");
     }
 }
 
@@ -100,7 +96,6 @@ sub start {
     # Using local ensures they're restored after Proc::Background->new() returns
     local $ENV{PORT} = $port;
     local $ENV{CONFIG_DIR} = $configDir;
-    local $ENV{UHC_CONFIG_DIR} = $configDir;
     local $ENV{LMS_HOST} = '127.0.0.1';
     local $ENV{LMS_PORT} = $lmsPort;
     local $ENV{LMS_UNIFIEDHIFI_STARTED} = 'true';

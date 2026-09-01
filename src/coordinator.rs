@@ -20,16 +20,7 @@ use std::sync::Arc;
 /// All available adapters in the system.
 /// This is the single source of truth for what adapters exist.
 /// Note: "lms-cli" is a companion to "lms" and shares its enabled state.
-pub const AVAILABLE_ADAPTERS: &[&str] = &[
-    "roon",
-    "lms",
-    "lms-cli",
-    "openhome",
-    "upnp",
-    "spotify",
-    "applemusic",
-    "musicassistant",
-];
+pub const AVAILABLE_ADAPTERS: &[&str] = &["roon", "lms", "lms-cli", "openhome", "upnp", "hqplayer"];
 
 /// Registered adapter with its spawn function
 struct RegisteredAdapter {
@@ -40,8 +31,7 @@ struct RegisteredAdapter {
     enabled: bool,
     /// Running task handle (if started)
     handle: Option<JoinHandle<()>>,
-    /// Startable adapters own their child tasks internally rather than exposing
-    /// a JoinHandle through the coordinator.
+    /// Startable adapters own their child tasks internally rather than exposing a JoinHandle here.
     direct_running: bool,
     /// Cancellation token for this adapter
     cancel: CancellationToken,
@@ -54,8 +44,8 @@ struct RegisteredAdapter {
 pub struct AdapterCoordinator {
     adapters: RwLock<HashMap<String, RegisteredAdapter>>,
     /// Companion workers grouped under their provider's one client-visible
-    /// projection.  Lifecycle operations cancel the whole group before the
-    /// shared projection is retired.
+    /// projection. The coordinator owns this topology so every lifecycle path
+    /// applies the same cancellation fence.
     companions: RwLock<HashMap<String, Vec<Arc<dyn Startable>>>>,
     bus: SharedBus,
     /// Global shutdown token (parent of all adapter tokens)
@@ -97,9 +87,7 @@ impl AdapterCoordinator {
                 "lms-cli" => settings.lms,
                 "openhome" => settings.openhome,
                 "upnp" => settings.upnp,
-                "spotify" => settings.spotify,
-                "applemusic" => settings.applemusic,
-                "musicassistant" => settings.musicassistant,
+                "hqplayer" => settings.hqplayer,
                 _ => false,
             };
             self.register(name, enabled).await;
@@ -130,71 +118,21 @@ impl AdapterCoordinator {
             }
             match self.start_adapter_and_companions(adapter.as_ref()).await {
                 Ok(()) => info!("Started adapter: {}", name),
-                Err(error) => warn!("Failed to start adapter {}: {}", name, error),
+                Err(e) => warn!("Failed to start adapter {}: {}", name, e),
             }
         }
     }
 
-    /// Start one adapter under the coordinator's feature-toggle decision.
-    ///
-    /// Dynamic settings changes and provider re-authorization use this same
-    /// path as process startup.  Keeping the decision here prevents a
-    /// credentialed provider from quietly growing a second lifecycle policy
-    /// that bypasses the coordinator.
-    pub async fn start_enabled(&self, adapter: &Arc<dyn Startable>) -> anyhow::Result<bool> {
-        let name = adapter.name();
-        if !self.is_enabled(name).await {
-            debug!("Adapter {} is disabled, skipping", name);
-            return Ok(false);
-        }
+    /// Start one direct [`Startable`] and update the coordinator's lifecycle
+    /// record.  HTTP configuration paths use this rather than owning a shadow
+    /// "running" state beside the coordinator.
+    pub async fn start_adapter_and_track(&self, adapter: &dyn Startable) -> Result<()> {
         if !adapter.can_start().await {
-            debug!("Adapter {} cannot start (not configured?), skipping", name);
-            return Ok(false);
+            return Err(anyhow::anyhow!("adapter cannot start"));
         }
-        self.start_adapter_and_companions(adapter.as_ref()).await?;
-        Ok(true)
-    }
-
-    /// Reconcile lifecycle state with the last persisted settings after a
-    /// failed settings transaction. Rollback is best-effort: the initiating
-    /// error remains the useful response while any rollback failure is logged.
-    pub async fn rollback_adapter_transitions(
-        &self,
-        adapters: &[Arc<dyn Startable>],
-        previous: &AdapterSettings,
-        transitions: &[&str],
-    ) {
-        for name in transitions.iter().rev().copied() {
-            let Some(was_enabled) = adapter_enabled(previous, name) else {
-                continue;
-            };
-            self.set_enabled(name, was_enabled).await;
-            let Some(adapter) = adapters.iter().find(|adapter| adapter.name() == name) else {
-                continue;
-            };
-            if was_enabled {
-                if let Err(error) = self.start_adapter_and_companions(adapter.as_ref()).await {
-                    tracing::error!("Failed to roll back adapter {}: {}", name, error);
-                }
-            } else {
-                self.stop_adapter_and_companions_then_flush(
-                    adapter.as_ref(),
-                    name,
-                    "settings transaction rollback",
-                )
-                .await;
-            }
-        }
-    }
-
-    /// Stop one adapter through the coordinator-owned lifecycle path.
-    pub async fn stop_one(&self, adapter: &Arc<dyn Startable>) {
-        self.stop_adapter_and_companions_then_flush(
-            adapter.as_ref(),
-            adapter.name(),
-            "settings disable",
-        )
-        .await;
+        adapter.start().await?;
+        self.set_running(adapter.name(), true).await;
+        Ok(())
     }
 
     /// Stop all adapters from the provided list.
@@ -216,17 +154,12 @@ impl AdapterCoordinator {
         }
     }
 
-    /// Start one direct adapter and record its lifecycle state.
-    pub async fn start_adapter_and_track(&self, adapter: &dyn Startable) -> Result<()> {
-        if !adapter.can_start().await {
-            return Err(anyhow::anyhow!("adapter cannot start"));
-        }
-        adapter.start().await?;
-        self.set_running(adapter.name(), true).await;
-        Ok(())
-    }
-
-    /// Retire one adapter projection before stopping its worker.
+    /// Retire an adapter's client-visible projection before stopping its worker.
+    ///
+    /// `ZoneAggregator` owns zones, so this is the one lifecycle operation for
+    /// every stop path: publish `AdapterStopping`, stop the adapter, then update
+    /// the coordinator's running state. The caller supplies a precise reason so
+    /// observability distinguishes shutdown, reconfiguration, and settings disable.
     pub async fn stop_adapter_and_flush(&self, adapter: &dyn Startable, reason: &str) {
         self.bus.publish(BusEvent::AdapterStopping {
             adapter: adapter.name().to_string(),
@@ -237,7 +170,16 @@ impl AdapterCoordinator {
         debug!("Stopped adapter: {}", adapter.name());
     }
 
-    /// Stop all observers sharing one provider projection before retiring it.
+    /// Cancel a group of workers which jointly observe one provider, then retire that
+    /// provider's projection exactly once.
+    ///
+    /// LMS is the current user: its HTTP poller and CLI subscription share an
+    /// `lms:` projection.  Retiring the projection after only one observer has
+    /// stopped lets the other observer re-publish a fact from the old server.
+    /// Cancellation is therefore issued to *every* observer before the
+    /// aggregator is told the provider has stopped.  The explicit projection
+    /// owner is separate from worker names because companion workers need not
+    /// have their own zone-ID prefix.
     pub async fn stop_adapters_then_flush(
         &self,
         adapters: &[&dyn Startable],
@@ -257,6 +199,9 @@ impl AdapterCoordinator {
         }
     }
 
+    /// Register a worker that observes the same provider projection as
+    /// `provider`. Composition does this once; handlers never need to know a
+    /// provider's internal worker topology.
     pub async fn register_companion(&self, provider: &str, companion: Arc<dyn Startable>) {
         self.companions
             .write()
@@ -266,6 +211,8 @@ impl AdapterCoordinator {
             .push(companion);
     }
 
+    /// Start a provider's primary adapter and every registered companion,
+    /// tracking their lifecycle centrally.
     pub async fn start_adapter_and_companions(&self, adapter: &dyn Startable) -> Result<()> {
         self.start_adapter_and_track(adapter).await?;
         let companions = self
@@ -289,6 +236,8 @@ impl AdapterCoordinator {
         Ok(())
     }
 
+    /// Cancel a provider's primary worker and its registered companions, then
+    /// retire their shared projection once.
     pub async fn stop_adapter_and_companions_then_flush(
         &self,
         adapter: &dyn Startable,
@@ -380,6 +329,13 @@ impl AdapterCoordinator {
         }
     }
 
+    /// Record lifecycle state for Startable adapters that own their worker tasks internally.
+    pub async fn set_running(&self, prefix: &str, running: bool) {
+        if let Some(adapter) = self.adapters.write().await.get_mut(prefix) {
+            adapter.direct_running = running;
+        }
+    }
+
     /// Check if an adapter is enabled
     pub async fn is_enabled(&self, prefix: &str) -> bool {
         let adapters = self.adapters.read().await;
@@ -393,16 +349,6 @@ impl AdapterCoordinator {
             .get(prefix)
             .map(|a| a.handle.is_some() || a.direct_running)
             .unwrap_or(false)
-    }
-
-    /// Record direct-managed running state for an adapter whose lifecycle is not owned by
-    /// `start_adapter`/`stop_adapter` (for example HQPlayer/LMS instances started inline by an API
-    /// handler). Visible to the rest of the crate so those handlers can keep coordinator bookkeeping
-    /// in sync.
-    pub(crate) async fn set_running(&self, prefix: &str, running: bool) {
-        if let Some(adapter) = self.adapters.write().await.get_mut(prefix) {
-            adapter.direct_running = running;
-        }
     }
 
     /// Stop a single adapter
@@ -568,25 +514,11 @@ impl AdapterCoordinator {
                     AdapterStatus {
                         prefix: prefix.clone(),
                         enabled: adapter.enabled,
-                        running: adapter.handle.is_some(),
+                        running: adapter.handle.is_some() || adapter.direct_running,
                     },
                 )
             })
             .collect()
-    }
-}
-
-fn adapter_enabled(settings: &AdapterSettings, name: &str) -> Option<bool> {
-    match name {
-        "roon" => Some(settings.roon),
-        "lms" => Some(settings.lms),
-        "openhome" => Some(settings.openhome),
-        "upnp" => Some(settings.upnp),
-        "hqplayer" => Some(settings.hqplayer),
-        "spotify" => Some(settings.spotify),
-        "applemusic" => Some(settings.applemusic),
-        "musicassistant" => Some(settings.musicassistant),
-        _ => None,
     }
 }
 
@@ -605,6 +537,46 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
+    struct DirectStartable {
+        started: AtomicBool,
+    }
+
+    struct RecordingStartable {
+        name: &'static str,
+        stopped: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Startable for RecordingStartable {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn start(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&self) {
+            self.stopped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Startable for DirectStartable {
+        fn name(&self) -> &'static str {
+            "direct"
+        }
+
+        async fn start(&self) -> Result<()> {
+            self.started.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn stop(&self) {
+            self.started.store(false, Ordering::SeqCst);
+        }
+    }
+
     #[tokio::test]
     async fn test_register_and_check_enabled() {
         let bus = create_bus();
@@ -617,22 +589,93 @@ mod tests {
         assert!(!coord.is_enabled("disabled").await);
     }
 
+    /// Issue #162: the public settings model has carried an `hqplayer` enable switch while the
+    /// lifecycle registry silently omitted it. A configured producer therefore could not enter the
+    /// coordinator-owned start/stop path at all.
+    ///
+    /// **Label: client-red.** The settings surface already promises this toggle controls the adapter.
     #[tokio::test]
-    async fn provider_adapters_follow_feature_settings() {
+    async fn hqplayer_setting_registers_the_managed_adapter() {
         let bus = create_bus();
         let coord = AdapterCoordinator::new(bus);
         let settings = AdapterSettings {
-            spotify: true,
-            applemusic: true,
-            musicassistant: true,
+            hqplayer: true,
             ..Default::default()
         };
 
         coord.register_from_settings(&settings).await;
 
-        assert!(coord.is_enabled("spotify").await);
-        assert!(coord.is_enabled("applemusic").await);
-        assert!(coord.is_enabled("musicassistant").await);
+        assert!(
+            coord
+                .registered_adapters()
+                .await
+                .iter()
+                .any(|a| a == "hqplayer"),
+            "HQPlayer must be a coordinator-owned lifecycle, not an opportunistic page read"
+        );
+        assert!(coord.is_enabled("hqplayer").await);
+    }
+
+    #[tokio::test]
+    async fn direct_startable_lifecycle_is_reported_as_running() {
+        let bus = create_bus();
+        let coord = AdapterCoordinator::new(bus);
+        coord.register("direct", true).await;
+
+        let adapter = Arc::new(DirectStartable {
+            started: AtomicBool::new(false),
+        });
+        let adapters: Vec<Arc<dyn Startable>> = vec![adapter.clone()];
+
+        coord.start_all_enabled(&adapters).await;
+        assert!(adapter.started.load(Ordering::SeqCst));
+        assert!(coord.is_running("direct").await);
+        assert!(coord.adapter_status().await["direct"].running);
+
+        coord.stop_all(&adapters).await;
+        assert!(!adapter.started.load(Ordering::SeqCst));
+        assert!(!coord.is_running("direct").await);
+        assert!(!coord.adapter_status().await["direct"].running);
+    }
+
+    #[tokio::test]
+    async fn grouped_lifecycle_cancels_every_lms_observer_and_retires_one_projection() {
+        let bus = create_bus();
+        let mut events = bus.subscribe();
+        let coord = AdapterCoordinator::new(bus);
+        coord.register("lms", true).await;
+        coord.register("lms-cli", true).await;
+        coord.set_running("lms", true).await;
+        coord.set_running("lms-cli", true).await;
+
+        let polling_stopped = Arc::new(AtomicBool::new(false));
+        let cli_stopped = Arc::new(AtomicBool::new(false));
+        let polling = Arc::new(RecordingStartable {
+            name: "lms",
+            stopped: polling_stopped.clone(),
+        });
+        let cli = Arc::new(RecordingStartable {
+            name: "lms-cli",
+            stopped: cli_stopped.clone(),
+        });
+        coord.register_companion("lms", cli.clone()).await;
+
+        coord
+            .stop_adapter_and_companions_then_flush(
+                polling.as_ref(),
+                "lms",
+                "test LMS reconfiguration",
+            )
+            .await;
+
+        assert!(polling_stopped.load(Ordering::SeqCst));
+        assert!(cli_stopped.load(Ordering::SeqCst));
+        assert!(!coord.is_running("lms").await);
+        assert!(!coord.is_running("lms-cli").await);
+        assert!(matches!(
+            events.recv().await,
+            Ok(BusEvent::AdapterStopping { adapter, .. }) if adapter == "lms"
+        ));
     }
 
     #[tokio::test]
@@ -687,52 +730,6 @@ mod tests {
 
         assert!(!started.load(Ordering::SeqCst));
         assert!(!coord.is_running("disabled").await);
-    }
-
-    struct LifecycleProbe {
-        started: Arc<AtomicBool>,
-        stopped: Arc<AtomicBool>,
-    }
-
-    #[async_trait::async_trait]
-    impl Startable for LifecycleProbe {
-        fn name(&self) -> &'static str {
-            "probe"
-        }
-
-        async fn start(&self) -> anyhow::Result<()> {
-            self.started.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-
-        async fn stop(&self) {
-            self.stopped.store(true, Ordering::SeqCst);
-        }
-    }
-
-    #[tokio::test]
-    async fn dynamic_provider_lifecycle_uses_coordinator_decision() {
-        let coord = AdapterCoordinator::new(create_bus());
-        coord.register("probe", true).await;
-        let started = Arc::new(AtomicBool::new(false));
-        let stopped = Arc::new(AtomicBool::new(false));
-        let adapter: Arc<dyn Startable> = Arc::new(LifecycleProbe {
-            started: started.clone(),
-            stopped: stopped.clone(),
-        });
-
-        coord.start_enabled(&adapter).await.expect("start succeeds");
-        assert!(started.load(Ordering::SeqCst));
-        coord.stop_one(&adapter).await;
-        assert!(stopped.load(Ordering::SeqCst));
-
-        coord.set_enabled("probe", false).await;
-        started.store(false, Ordering::SeqCst);
-        coord
-            .start_enabled(&adapter)
-            .await
-            .expect("disabled is no-op");
-        assert!(!started.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

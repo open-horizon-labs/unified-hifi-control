@@ -5,9 +5,9 @@ use dioxus::prelude::*;
 /// A dismissable error alert that displays an error message with a close button.
 #[component]
 pub fn ErrorAlert(
-    // The error message to display
+    /// The error message to display
     message: String,
-    // Called when the dismiss button is clicked
+    /// Called when the dismiss button is clicked
     on_dismiss: EventHandler<()>,
 ) -> Element {
     rsx! {

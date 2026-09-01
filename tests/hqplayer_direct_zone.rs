@@ -21,7 +21,6 @@
 mod mock_servers;
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
@@ -30,7 +29,6 @@ use axum::http::{Request, StatusCode};
 use axum::response::Redirect;
 use axum::routing::{get, post};
 use axum::Router;
-use image::ImageEncoder;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
@@ -53,7 +51,6 @@ use unified_hifi_control::api::{self, AppState};
 use unified_hifi_control::bus::runtime::build_runtime;
 use unified_hifi_control::bus::{create_bus, BusEvent, PlaybackState, SharedBus, Zone};
 use unified_hifi_control::coordinator::AdapterCoordinator;
-use unified_hifi_control::knobs::image::Rgb565ResizePolicy;
 use unified_hifi_control::knobs::{self, KnobStore};
 
 // =============================================================================
@@ -106,16 +103,15 @@ fn fast_recovery() -> HqpRecoveryConfig {
 
 /// The two client-facing routes under test, wired exactly as `main.rs` wires them.
 ///
-/// `/control`, `/knob/now_playing`, and `/now_playing/image` are the knob's media surface;
-/// `/zones` is what both clients read to populate their picker. Nothing else is mounted, so a test
-/// cannot accidentally pass through a route the client does not use.
+/// `/control` and `/knob/now_playing` are the knob's whole world; `/zones` is what both clients read
+/// to populate their picker. Nothing else is mounted, so a test cannot accidentally pass through a
+/// route the client does not use.
 fn client_router(state: AppState) -> Router {
     Router::new()
         .route("/hqplayer/configure", post(api::hqp_configure_handler))
         .route("/control", post(knobs::knob_control_handler))
         .route("/knob/control", post(knobs::knob_control_handler))
         .route("/knob/now_playing", get(knobs::knob_now_playing_handler))
-        .route("/now_playing/image", get(knobs::knob_image_handler))
         .route("/zones", get(knobs::knob_zones_handler))
         .with_state(state)
 }
@@ -501,7 +497,7 @@ async fn an_unknown_prefix_is_refused_but_a_legacy_unprefixed_id_still_means_roo
     let rig = Rig::new().await;
 
     let (status, body) = rig
-        .post_control(json!({"zone_id":"unknown:abc","action":"play"}))
+        .post_control(json!({"zone_id":"spotify:abc","action":"play"}))
         .await;
     assert_eq!(
         status,
@@ -649,14 +645,7 @@ async fn hqplayer_current_cover_reaches_the_unified_image_interface() {
 
     let image = rig
         .state
-        .get_image(
-            "hqplayer:cover",
-            "hqplayer:test-track",
-            None,
-            None,
-            None,
-            None,
-        )
+        .get_image("hqplayer:cover", "hqplayer:test-track", None, None, None)
         .await
         .expect("fetch the current HQPlayer cover through the unified image interface");
     assert_eq!(image.content_type, "image/jpeg");
@@ -664,113 +653,6 @@ async fn hqplayer_current_cover_reaches_the_unified_image_interface() {
 
     rig.shutdown().await;
     cover_server.abort();
-}
-
-/// Frame requests for the same artwork identity must not refetch or redither
-/// the provider image. A dimension or composition change remains a cache miss.
-#[tokio::test]
-async fn packed_frame_cover_is_cached_by_artwork_identity_and_policy() {
-    let image = image::RgbaImage::from_pixel(20, 20, image::Rgba([255, 0, 0, 255]));
-    let mut png = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut png)
-        .write_image(&image, 20, 20, image::ExtendedColorType::Rgba8)
-        .expect("encode cover PNG");
-    let requests = Arc::new(AtomicUsize::new(0));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind cover server");
-    let web_port = listener.local_addr().expect("cover address").port();
-    let cover_server = {
-        let requests = Arc::clone(&requests);
-        tokio::spawn(async move {
-            let app = Router::new().route(
-                "/cover/current",
-                get(move || {
-                    let png = png.clone();
-                    let requests = Arc::clone(&requests);
-                    async move {
-                        requests.fetch_add(1, Ordering::SeqCst);
-                        ([("content-type", "image/png")], png)
-                    }
-                }),
-            );
-            axum::serve(listener, app).await.expect("serve cover");
-        })
-    };
-
-    let rig = Rig::new().await;
-    rig.manager
-        .add_instance(
-            "packed".to_string(),
-            "127.0.0.1".to_string(),
-            Some(9),
-            Some(web_port),
-            None,
-            None,
-        )
-        .await;
-    let policy = Some(Rgb565ResizePolicy::SmartCover {
-        max_crop_percent: 10,
-    });
-
-    for _ in 0..2 {
-        let packed = rig
-            .state
-            .get_image(
-                "hqplayer:packed",
-                "same-track-art",
-                Some(800),
-                Some(450),
-                Some("eink_acep6"),
-                policy,
-            )
-            .await
-            .expect("packed cover");
-        assert_eq!(packed.content_type, "application/octet-stream");
-        assert_eq!(packed.data.len(), 180_000);
-    }
-    assert_eq!(
-        requests.load(Ordering::SeqCst),
-        1,
-        "second request is cached"
-    );
-
-    let resized = rig
-        .state
-        .get_image(
-            "hqplayer:packed",
-            "same-track-art",
-            Some(798),
-            Some(450),
-            Some("eink_acep6"),
-            policy,
-        )
-        .await
-        .expect("different geometry");
-    assert_eq!(resized.data.len(), 798 * 450 / 2);
-    assert_eq!(requests.load(Ordering::SeqCst), 2, "geometry is isolated");
-
-    rig.shutdown().await;
-    cover_server.abort();
-}
-
-#[tokio::test]
-async fn packed_frame_cover_rejects_unbounded_allocations_before_provider_lookup() {
-    let rig = Rig::new().await;
-    let request = Request::builder()
-        .uri(
-            "/now_playing/image?zone_id=hqplayer:none&format=eink_acep6&width=100000&height=100000",
-        )
-        .body(Body::empty())
-        .expect("build oversized image request");
-    let response = rig
-        .app
-        .clone()
-        .oneshot(request)
-        .await
-        .expect("oversized image response");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    rig.shutdown().await;
 }
 
 /// **Client expectation.** A seek on a zone the server told the client was not seekable is refused

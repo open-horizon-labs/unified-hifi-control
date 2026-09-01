@@ -50,12 +50,13 @@
 //!
 //! **Capability is per provider, not per device.** A fixed-volume Roon output —
 //! an endpoint feeding an analogue preamp — has no volume control, and this module
-//! reports `volume: supported` for it. The wire payload therefore carries
-//! `has_volume_control` beside the provider capability. It uses an explicit
-//! per-device capability when a provider supplies one (Spotify's
-//! `supports_volume`), even when the current value is null; otherwise it falls
-//! back to whether the aggregator has observed a numeric volume control. Clients
-//! can combine that device observation with the provider-level capability.
+//! reports `volume: supported` for it. UHC cannot currently do better: the
+//! aggregator's `volume_control: None` conflates "this output has no volume
+//! control" with "no volume has been read yet", so deriving from it would mislabel
+//! every freshly discovered zone. The wire payload carries the aggregator's
+//! `has_volume_control` observation beside the capability so a client can combine
+//! the two itself; the ambiguity is documented on that field rather than resolved
+//! by guessing.
 //!
 //! **Capability is per operation family, not per action.** `transport` covers
 //! play/pause and `transport_skip` covers next/previous, because UPnP refuses the
@@ -115,8 +116,6 @@ pub enum Capability {
     QueueRemove,
     /// Empty the queue.
     QueueClear,
-    /// Move an active queue from one zone to another (#507).
-    QueueTransfer,
     /// Insert immediately after the current item.
     PlayNext,
     /// Read and set repeat mode.
@@ -149,7 +148,6 @@ impl Capability {
         Self::QueueReorder,
         Self::QueueRemove,
         Self::QueueClear,
-        Self::QueueTransfer,
         Self::PlayNext,
         Self::RepeatMode,
         Self::ShuffleMode,
@@ -174,7 +172,6 @@ impl Capability {
             Self::QueueReorder => "queue_reorder",
             Self::QueueRemove => "queue_remove",
             Self::QueueClear => "queue_clear",
-            Self::QueueTransfer => "queue_transfer",
             Self::PlayNext => "play_next",
             Self::RepeatMode => "repeat_mode",
             Self::ShuffleMode => "shuffle_mode",
@@ -305,8 +302,6 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
                 | (ZoneTarget::OpenHome, TransportRoute::OpenHome)
                 | (ZoneTarget::Upnp, TransportRoute::Upnp)
                 | (ZoneTarget::HqPlayer, TransportRoute::HqPlayer)
-                | (ZoneTarget::Spotify, TransportRoute::Spotify)
-                | (ZoneTarget::MusicAssistant, TransportRoute::MusicAssistant)
         ),
         // Same route as Transport, minus the adapters that refuse the two skip
         // actions. Read from the adapter's own const so the claim cannot drift
@@ -319,8 +314,6 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
                     | (ZoneTarget::OpenHome, TransportRoute::OpenHome)
                     | (ZoneTarget::Upnp, TransportRoute::Upnp)
                     | (ZoneTarget::HqPlayer, TransportRoute::HqPlayer)
-                    | (ZoneTarget::Spotify, TransportRoute::Spotify)
-                    | (ZoneTarget::MusicAssistant, TransportRoute::MusicAssistant)
             );
             let adapter_refuses = target == ZoneTarget::Upnp
                 && crate::adapters::upnp::REFUSED_TRANSPORT_ACTIONS.contains(&"next");
@@ -333,65 +326,14 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
                 | (ZoneTarget::OpenHome, VolumeRoute::OpenHome)
                 | (ZoneTarget::Upnp, VolumeRoute::Upnp)
                 | (ZoneTarget::HqPlayer, VolumeRoute::HqPlayer)
-                | (ZoneTarget::Spotify, VolumeRoute::Spotify)
-                | (ZoneTarget::MusicAssistant, VolumeRoute::MusicAssistant)
         ),
         Capability::Search | Capability::PlayByQuery => matches!(
             (target, target.for_library()),
-            (ZoneTarget::Roon, LibraryRoute::Roon)
-                | (ZoneTarget::Lms, LibraryRoute::Lms)
-                | (ZoneTarget::Spotify, LibraryRoute::Spotify)
-                | (ZoneTarget::MusicAssistant, LibraryRoute::MusicAssistant)
+            (ZoneTarget::Roon, LibraryRoute::Roon) | (ZoneTarget::Lms, LibraryRoute::Lms)
         ),
-        Capability::PlayByRef => {
-            matches!(
-                (target, target.for_library()),
-                (ZoneTarget::Spotify, LibraryRoute::Spotify)
-                    | (ZoneTarget::MusicAssistant, LibraryRoute::MusicAssistant)
-            )
-        }
-        Capability::RepeatMode | Capability::ShuffleMode => {
-            (target == ZoneTarget::Spotify
-                && matches!(target.for_transport(), TransportRoute::Spotify))
-                || target == ZoneTarget::HqPlayer
-                || (target == ZoneTarget::MusicAssistant
-                    && matches!(target.for_transport(), TransportRoute::MusicAssistant))
-        }
-        Capability::QueueRead => matches!(target, ZoneTarget::Spotify | ZoneTarget::MusicAssistant),
-        Capability::QueueJump
-        | Capability::QueueReorder
-        | Capability::QueueRemove
-        | Capability::QueueClear
-        | Capability::QueueTransfer => target == ZoneTarget::MusicAssistant,
-        Capability::PlayNext => target == ZoneTarget::MusicAssistant,
-        // #517: LMS (#513) and Roon (#515) both implement the
-        // multiroom_status/multiroom_set_members/multiroom_ungroup contract at
-        // the adapter layer, exactly like Music Assistant. `hifi_zone_group`
-        // routes join/leave/status to whichever of the three owns the zone
-        // prefix (`src/mcp/tools/groups.rs`), so all three are routed here.
-        Capability::MultiroomSync => matches!(
-            target,
-            ZoneTarget::MusicAssistant | ZoneTarget::Roon | ZoneTarget::Lms
-        ),
-        // #531: LMS implements all three (albums/artists/playlists/favorites
-        // queries over the CLI/jsonrpc). Roon implements browse and playlists
-        // (the same browse/load session `hifi_search` already drives);
-        // favorites remains a gap -- see `GAPS` below -- because Roon exposes
-        // it as a browse hierarchy this slice does not yet walk into.
-        Capability::Browse => matches!(
-            target,
-            ZoneTarget::MusicAssistant | ZoneTarget::Lms | ZoneTarget::Roon
-        ),
-        Capability::SavedPlaylists => matches!(
-            target,
-            ZoneTarget::Spotify | ZoneTarget::MusicAssistant | ZoneTarget::Lms | ZoneTarget::Roon
-        ),
-        Capability::Favorites => {
-            matches!(
-                target,
-                ZoneTarget::Spotify | ZoneTarget::MusicAssistant | ZoneTarget::Lms
-            )
-        }
+        Capability::RepeatMode | Capability::ShuffleMode => target == ZoneTarget::HqPlayer,
+        // Nothing else has an MCP call path at all yet.
+        _ => false,
     };
     supported.then_some(Support::Supported)
 }
@@ -440,14 +382,6 @@ const ROON_QUEUE_IS_READ_PLUS_JUMP: &str = "The Roon API's transport service exp
     pinned roon-api fork (ohc/main) exposes subscribe_queue and play_from_here and nothing \
     further.";
 
-/// OpenHome's per-room `Playlist:1` has no cross-room action, and Songcast
-/// relays audio rather than queue state.
-const OPENHOME_HAS_NO_QUEUE_TRANSFER: &str = "OpenHome's Playlist:1 (Read/Insert/DeleteId/\
-    DeleteAll) is scoped to one room's renderer; the service set defines no action that moves \
-    one room's playlist into another's. Songcast (Sender:1/Receiver:1) relays audio to a group, \
-    it does not merge queue state. Verified from the OpenHome service definitions, not from a \
-    device.";
-
 /// Playing a *named* item is a different question from *finding* one, and the ship
 /// gate's dissent caught this module conflating them.
 ///
@@ -470,10 +404,6 @@ const PLAY_A_NAMED_URI_EXISTS: &str =
     reference minted against a media server would work. Verified from the UPnP AV and OpenHome \
     service definitions, not from a device.";
 
-const APPLE_TRANSPORT_NOT_VALIDATED: &str = "the native iPhone companion path is implemented, \
-    but SystemMusicPlayer transport and volume behavior remains pending signed physical-device \
-    validation (#465).";
-
 /// HQPlayer content operations: UHC's XML control protocol coverage does not
 /// include them and the protocol's own reach has not been verified here. Reported
 /// as a gap rather than a limit, per this module's bias rule.
@@ -491,12 +421,14 @@ const HQPLAYER_CONTENT_UNVERIFIED: &str = "UHC's HQPlayer adapter speaks transpo
 #[rustfmt::skip]
 const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     // -------------------------------------------------------------------------
-    // Roon. Transport, volume, search, play-by-query and (since #517)
-    // multiroom_sync are routed.
+    // Roon. Transport, volume, search and play-by-query are routed.
     // -------------------------------------------------------------------------
     (ZoneTarget::Roon, Capability::PlayByRef, Gap::NotWired("#396",
         "RoonAdapter::browse/load/play_item exist and are exposed over HTTP; MCP mints no \
          reference for a search hit to act on.")),
+    (ZoneTarget::Roon, Capability::Browse, Gap::NotWired("#399",
+        "RoonAdapter::browse() and load() exist and POST /roon/browse exposes them; only the \
+         MCP projection is missing.")),
     (ZoneTarget::Roon, Capability::QueueRead, Gap::NotWired("#400",
         "the pinned roon-api fork exposes subscribe_queue(zone, max_items), which nothing in \
          UHC calls.")),
@@ -506,7 +438,6 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     (ZoneTarget::Roon, Capability::QueueReorder, Gap::ProviderCannot(ROON_QUEUE_IS_READ_PLUS_JUMP)),
     (ZoneTarget::Roon, Capability::QueueRemove, Gap::ProviderCannot(ROON_QUEUE_IS_READ_PLUS_JUMP)),
     (ZoneTarget::Roon, Capability::QueueClear, Gap::ProviderCannot(ROON_QUEUE_IS_READ_PLUS_JUMP)),
-    (ZoneTarget::Roon, Capability::QueueTransfer, Gap::ProviderCannot(ROON_QUEUE_IS_READ_PLUS_JUMP)),
     (ZoneTarget::Roon, Capability::PlayNext, Gap::NotWired("#399",
         "Roon's browse item actions include Play Next alongside Play Now and Queue; UHC's \
          PlayAction models only Play, Queue and Radio, so this arrives with browse rather \
@@ -517,9 +448,15 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     (ZoneTarget::Roon, Capability::ShuffleMode, Gap::NotWired("#360",
         "the Roon API's transport service takes a shuffle setting; UHC drives it from no \
          surface.")),
-    (ZoneTarget::Roon, Capability::Favorites, Gap::NotWired("#531",
+    (ZoneTarget::Roon, Capability::SavedPlaylists, Gap::NotWired("#399",
+        "Roon exposes Playlists as a browse hierarchy, so this arrives with browse rather \
+         than as its own protocol feature.")),
+    (ZoneTarget::Roon, Capability::Favorites, Gap::NotWired("#399",
         "Roon exposes My Favorites and tags as browse hierarchies, so this arrives with \
          browse.")),
+    (ZoneTarget::Roon, Capability::MultiroomSync, Gap::NotWired("#360",
+        "the Roon API's transport service groups and ungroups outputs; UHC exposes no \
+         grouping on any surface.")),
 
     // -------------------------------------------------------------------------
     // LMS. **Not one ProviderCannot** -- every gap here is UHC's, verified live
@@ -531,6 +468,10 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
          that playlistcontrol accepts, verified live; MCP discards them and hands back a title. \
          Note the XMLBrowser paths (globalsearch, favorites) return positional breadcrumbs \
          instead, which is #396's safety problem, not a capability gap.")),
+    (ZoneTarget::Lms, Capability::Browse, Gap::NotWired("#402",
+        "browselibrary items and the native albums/artists/genres/years/playlists/mediafolder \
+         queries walk the whole hierarchy with native <start> <n> paging -- all \
+         verified live on Lyrion 9.1.2. The adapter never calls any of them.")),
     (ZoneTarget::Lms, Capability::QueueRead, Gap::NotWired("#400",
         "status <player> <start> <n> returns the whole current playlist with playlist_cur_index; \
          verified live.")),
@@ -543,13 +484,6 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
         "playlist delete <index> removes one queued item; verified live.")),
     (ZoneTarget::Lms, Capability::QueueClear, Gap::NotWired("#400",
         "playlist clear empties the queue; verified live.")),
-    (ZoneTarget::Lms, Capability::QueueTransfer, Gap::NotWired("#400",
-        "sync <playerid> was verified live (#403) to merge a player into another's sync group by \
-         adopting the leader's queue, which destroys the source's queue rather than transferring \
-         it; the CLI reference names no dedicated queue-to-queue transfer command. A composite \
-         emulation -- read the source's playlist, replay it against the target with \
-         playlistcontrol, then playlist clear the source -- is buildable from primitives #400 \
-         already verified live, but is not wired.")),
     (ZoneTarget::Lms, Capability::PlayNext, Gap::NotWired("#403",
         "playlistcontrol cmd:insert places an item immediately after the current one, verified \
          live -- and LmsPlayAction::Insert is already modelled in the adapter and simply \
@@ -560,6 +494,19 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     (ZoneTarget::Lms, Capability::ShuffleMode, Gap::NotWired("#403",
         "playlist shuffle <0|1|2> and playlist shuffle ? read and write it; verified live. \
          Setting it reshuffles the queue, so it is also a queue mutation.")),
+    (ZoneTarget::Lms, Capability::SavedPlaylists, Gap::NotWired("#403",
+        "playlists / playlists tracks / playlistcontrol cmd:load playlist_id / playlists new / \
+         rename / delete all exist and were verified live. playlist save additionally needs a \
+         configured playlistdir, which is unset on a stock install -- so its own answer is \
+         three-state at the server level, which is why #403 probes pref playlistdir ?.")),
+    (ZoneTarget::Lms, Capability::Favorites, Gap::NotWired("#403",
+        "favorites items / favorites playlist play / add / delete / exists all work; verified \
+         live. Note LMS favorites have no durable id -- only a url -- so a ref must be minted \
+         over the url.")),
+    (ZoneTarget::Lms, Capability::MultiroomSync, Gap::NotWired("#403",
+        "sync <playerid>, sync -, sync ? and the server-scoped syncgroups ? all work; verified \
+         live. Joining is destructive to the target zone's queue, which is why #403 gates it \
+         behind confirmation.")),
 
     // -------------------------------------------------------------------------
     // OpenHome. Transport, skip and (since #398) volume are routed.
@@ -576,7 +523,6 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
          OpenHome service definitions, not from a device.")),
     (ZoneTarget::OpenHome, Capability::QueueRemove, Gap::NotWired("#392", OPENHOME_PLAYLIST_SERVICE_UNUSED)),
     (ZoneTarget::OpenHome, Capability::QueueClear, Gap::NotWired("#392", OPENHOME_PLAYLIST_SERVICE_UNUSED)),
-    (ZoneTarget::OpenHome, Capability::QueueTransfer, Gap::ProviderCannot(OPENHOME_HAS_NO_QUEUE_TRANSFER)),
     (ZoneTarget::OpenHome, Capability::PlayNext, Gap::NotWired("#392", OPENHOME_PLAYLIST_SERVICE_UNUSED)),
     (ZoneTarget::OpenHome, Capability::RepeatMode, Gap::NotWired("#392", OPENHOME_PLAYLIST_SERVICE_UNUSED)),
     (ZoneTarget::OpenHome, Capability::ShuffleMode, Gap::NotWired("#392", OPENHOME_PLAYLIST_SERVICE_UNUSED)),
@@ -612,7 +558,6 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     (ZoneTarget::Upnp, Capability::QueueReorder, Gap::ProviderCannot(UPNP_HAS_NO_QUEUE)),
     (ZoneTarget::Upnp, Capability::QueueRemove, Gap::ProviderCannot(UPNP_HAS_NO_QUEUE)),
     (ZoneTarget::Upnp, Capability::QueueClear, Gap::ProviderCannot(UPNP_HAS_NO_QUEUE)),
-    (ZoneTarget::Upnp, Capability::QueueTransfer, Gap::ProviderCannot(UPNP_HAS_NO_QUEUE)),
     (ZoneTarget::Upnp, Capability::PlayNext, Gap::NotWired("#396", PLAY_A_NAMED_URI_EXISTS)),
     (ZoneTarget::Upnp, Capability::RepeatMode, Gap::NotWired("#392",
         "AVTransport:1's SetPlayMode takes REPEAT_ONE and REPEAT_ALL, so repeat is a protocol \
@@ -634,16 +579,11 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
          service definitions, not from a device.")),
 
     // -------------------------------------------------------------------------
-    // Apple Music. The native companion path exists, but transport acceptance
-    // remains deliberately gated until a signed iPhone run proves it.
-    // -------------------------------------------------------------------------
-    (ZoneTarget::AppleMusic, Capability::Transport, Gap::NotWired("#465", APPLE_TRANSPORT_NOT_VALIDATED)),
-    (ZoneTarget::AppleMusic, Capability::TransportSkip, Gap::NotWired("#465", APPLE_TRANSPORT_NOT_VALIDATED)),
-    (ZoneTarget::AppleMusic, Capability::Volume, Gap::NotWired("#465", APPLE_TRANSPORT_NOT_VALIDATED)),
-
-    // -------------------------------------------------------------------------
-    // HQPlayer content remains unverified; transport, volume, and pipeline mode
-    // control are routed through HqpInstanceManager.
+    // HQPlayer. #398 found the largest gap here (nothing routed at all); #328
+    // closed transport and volume, both now routed through `HqpInstanceManager`
+    // resolution (`ZoneTarget::HqPlayer` -> `TransportRoute`/`VolumeRoute::HqPlayer`).
+    // Content operations remain a UHC gap tracked by #209: the protocol's own
+    // reach past transport/volume/seek/pipeline settings is unverified.
     // -------------------------------------------------------------------------
     (ZoneTarget::HqPlayer, Capability::Search, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::PlayByQuery, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
@@ -654,7 +594,6 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     (ZoneTarget::HqPlayer, Capability::QueueReorder, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::QueueRemove, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::QueueClear, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
-    (ZoneTarget::HqPlayer, Capability::QueueTransfer, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::PlayNext, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::SavedPlaylists, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::Favorites, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
@@ -671,64 +610,6 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
 pub fn support(target: ZoneTarget, capability: Capability) -> Support {
     if let Some(supported) = routed(target, capability) {
         return supported;
-    }
-    if target == ZoneTarget::AppleMusic {
-        if matches!(
-            capability,
-            Capability::Transport | Capability::TransportSkip | Capability::Volume
-        ) {
-            return Support::NotImplemented {
-                tracked_by: "#465",
-                evidence: APPLE_TRANSPORT_NOT_VALIDATED,
-            };
-        }
-        let tracked_by = match capability {
-            Capability::Search | Capability::PlayByQuery | Capability::PlayByRef => "#481",
-            Capability::Browse | Capability::SavedPlaylists | Capability::Favorites => "#482",
-            Capability::QueueRead
-            | Capability::QueueJump
-            | Capability::QueueReorder
-            | Capability::QueueRemove
-            | Capability::QueueClear
-            | Capability::PlayNext => "#483",
-            _ => "#462",
-        };
-        return Support::NotImplemented {
-            tracked_by,
-            evidence: "the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.",
-        };
-    }
-    if target == ZoneTarget::Spotify {
-        return match capability {
-            Capability::Browse => Support::NotImplemented {
-                tracked_by: "#473",
-                evidence: "Spotify removed categories, category playlists, featured playlists, and new releases from the Web API surface available to new Development Mode applications in February 2026. A future browse implementation must use a currently available, quota-aware surface rather than call those retired endpoints.",
-            },
-            Capability::QueueJump
-            | Capability::QueueReorder
-            | Capability::QueueRemove
-            | Capability::QueueClear
-            | Capability::QueueTransfer => Support::Unsupported {
-                evidence: "Spotify's Web API exposes Get the User's Queue and Add Item to Playback Queue, but no endpoint to jump, reorder, remove, clear, or transfer active queue contents. Verified from the Spotify Web API Player reference, not inferred from a device.",
-            },
-            Capability::PlayNext => Support::NotImplemented {
-                tracked_by: "#474",
-                evidence: "Spotify exposes Add Item to Playback Queue and UHC routes it through hifi_play action=queue, but UHC does not expose a distinct play-next operation for Spotify.",
-            },
-            Capability::MultiroomSync => Support::Unsupported {
-                evidence: "Spotify's Transfer Playback endpoint accepts a single target device and does not synchronize multiple Connect devices; transfer is device selection, not multiroom grouping. Verified from the Spotify Web API Transfer Playback reference, not inferred from a device.",
-            },
-            _ => Support::NotImplemented {
-                tracked_by: "#462",
-                evidence: "the Spotify adapter has no routed implementation for this capability; the provider-neutral streaming follow-up tracks it.",
-            },
-        };
-    }
-    if matches!(target, ZoneTarget::AppleMusic | ZoneTarget::MusicAssistant) {
-        return Support::NotImplemented {
-            tracked_by: "#462",
-            evidence: "the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.",
-        };
     }
     match GAPS
         .iter()
@@ -795,13 +676,13 @@ pub struct McpCapabilityZone {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zone_name: Option<String>,
     pub provider: Provider,
-    /// Whether the latest device observation says this zone accepts volume.
+    /// Whether the aggregator currently holds a volume control for this zone.
     ///
-    /// **An observation, not a provider capability.** When the provider exposes
-    /// an explicit per-device flag (currently Spotify), that flag is authoritative
-    /// even if the numeric value is absent. Other providers fall back to whether
-    /// a numeric control has been observed, so `false` can still mean "not yet
-    /// observed" there. Absent when the aggregator holds no such zone.
+    /// **An observation, not a capability.** `false` means either "this output
+    /// has no volume control" or "no volume has been read yet", and UHC cannot
+    /// tell those apart — which is exactly why `volume`'s capability state is
+    /// per provider and this is reported separately for the client to weigh.
+    /// Absent when the aggregator holds no such zone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub has_volume_control: Option<bool>,
 }
@@ -852,36 +733,8 @@ mod tests {
         let mut stale = Vec::new();
         for target in ZoneTarget::PROVIDERS {
             for capability in Capability::ALL {
+                let listed = GAPS.iter().any(|(t, c, _)| t == target && c == capability);
                 let routed = routed(*target, *capability).is_some();
-                let listed = !routed
-                    && (GAPS.iter().any(|(t, c, _)| t == target && c == capability)
-                        || (matches!(
-                            target,
-                            &ZoneTarget::AppleMusic
-                                | &ZoneTarget::Spotify
-                                | &ZoneTarget::MusicAssistant
-                        ) && matches!(
-                            capability,
-                            Capability::Browse
-                                | Capability::QueueJump
-                                | Capability::QueueReorder
-                                | Capability::QueueRemove
-                                | Capability::QueueClear
-                                | Capability::QueueTransfer
-                                | Capability::PlayNext
-                                | Capability::SavedPlaylists
-                                | Capability::Favorites
-                                | Capability::MultiroomSync
-                        ) || (matches!(target, &ZoneTarget::AppleMusic)
-                            && matches!(
-                                capability,
-                                Capability::Search
-                                    | Capability::PlayByQuery
-                                    | Capability::PlayByRef
-                                    | Capability::QueueRead
-                                    | Capability::RepeatMode
-                                    | Capability::ShuffleMode
-                            ))));
                 if !routed && !listed {
                     missing.push((target.label(), capability.name()));
                 }
@@ -1012,7 +865,10 @@ mod tests {
         }
     }
 
-    /// HQPlayer transport and volume are routed through its instance manager.
+    /// HQPlayer zones appear in `hifi_zones`, and #328 wired transport and volume
+    /// through `HqpInstanceManager` resolution. `routed()` is the only source of
+    /// `Supported`, so this also proves `for_transport`/`for_volume` actually
+    /// route `ZoneTarget::HqPlayer` rather than leaving it in the gap table.
     #[test]
     fn hqplayer_transport_and_volume_are_supported_since_328() {
         for capability in [
@@ -1022,8 +878,44 @@ mod tests {
         ] {
             assert_eq!(
                 support(ZoneTarget::HqPlayer, capability),
-                Support::Supported
+                Support::Supported,
+                "hqplayer/{}: #328 wired this through HqpInstanceManager resolution",
+                capability.name()
             );
+        }
+    }
+
+    #[test]
+    fn hqplayer_repeat_and_shuffle_are_supported_by_the_pipeline_tool() {
+        for capability in [Capability::RepeatMode, Capability::ShuffleMode] {
+            assert_eq!(
+                support(ZoneTarget::HqPlayer, capability),
+                Support::Supported,
+                "hqplayer/{}: hifi_hqplayer_set_pipeline has a live-verified route",
+                capability.name()
+            );
+        }
+    }
+
+    /// Content operations are the gap #328 left. HQPlayer's XML control protocol
+    /// speaks transport, volume, seek and pipeline settings; whether it reaches
+    /// content is unverified, so this stays a UHC gap tracked by #209 rather than
+    /// a provider limit.
+    #[test]
+    fn hqplayer_content_operations_are_still_gaps_tracked_by_209() {
+        for capability in [
+            Capability::Search,
+            Capability::PlayByQuery,
+            Capability::PlayByRef,
+            Capability::Browse,
+        ] {
+            match support(ZoneTarget::HqPlayer, capability) {
+                Support::NotImplemented { tracked_by, .. } => assert_eq!(tracked_by, "#209"),
+                other => panic!(
+                    "hqplayer/{}: expected a gap tracked by #209, got {other:?}",
+                    capability.name()
+                ),
+            }
         }
     }
 
@@ -1073,7 +965,7 @@ mod tests {
                 capability.name()
             );
         }
-        assert_eq!(seen.len(), 19, "the vocabulary changed size: {seen:?}");
+        assert_eq!(seen.len(), 18, "the vocabulary changed size: {seen:?}");
     }
 
     /// A refusal built from a capability state must carry the same
@@ -1096,61 +988,5 @@ mod tests {
         assert!(Support::Supported
             .refusal(Capability::Transport, vec![])
             .is_none());
-    }
-
-    #[test]
-    fn spotify_repeat_and_shuffle_are_supported() {
-        assert_eq!(
-            support(ZoneTarget::Spotify, Capability::RepeatMode),
-            Support::Supported
-        );
-        assert_eq!(
-            support(ZoneTarget::Spotify, Capability::ShuffleMode),
-            Support::Supported
-        );
-        assert!(matches!(
-            support(ZoneTarget::AppleMusic, Capability::RepeatMode),
-            Support::NotImplemented { .. }
-        ));
-    }
-
-    #[test]
-    fn spotify_library_capabilities_follow_library_routing() {
-        assert_eq!(
-            support(ZoneTarget::Spotify, Capability::Search),
-            Support::Supported
-        );
-        assert_eq!(
-            support(ZoneTarget::Spotify, Capability::PlayByQuery),
-            Support::Supported
-        );
-        assert_eq!(
-            support(ZoneTarget::Spotify, Capability::PlayByRef),
-            Support::Supported
-        );
-        assert!(matches!(
-            support(ZoneTarget::Spotify, Capability::Browse),
-            Support::NotImplemented {
-                tracked_by: "#473",
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn apple_transport_capabilities_wait_for_physical_validation() {
-        for capability in [
-            Capability::Transport,
-            Capability::TransportSkip,
-            Capability::Volume,
-        ] {
-            assert!(matches!(
-                support(ZoneTarget::AppleMusic, capability),
-                Support::NotImplemented {
-                    tracked_by: "#465",
-                    ..
-                }
-            ));
-        }
     }
 }

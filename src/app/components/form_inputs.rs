@@ -7,13 +7,13 @@ use crate::app::api::PowerModeConfig;
 /// A labeled power mode timeout input with description.
 #[component]
 pub fn PowerModeInput(
-    // Input label
+    /// Input label
     label: &'static str,
-    // Description text shown below label
+    /// Description text shown below label
     description: &'static str,
-    // Current configuration
+    /// Current configuration
     config: PowerModeConfig,
-    // Called when the value changes
+    /// Called when the value changes
     on_change: EventHandler<PowerModeConfig>,
 ) -> Element {
     let timeout_sec = config.timeout_sec;
@@ -46,13 +46,13 @@ pub fn PowerModeInput(
 /// A labeled toggle switch with description.
 #[component]
 pub fn ToggleInput(
-    // Input label
+    /// Input label
     label: &'static str,
-    // Description text shown below label
+    /// Description text shown below label
     description: &'static str,
-    // Current checked state
+    /// Current checked state
     checked: bool,
-    // Called when the toggle changes
+    /// Called when the toggle changes
     on_change: EventHandler<bool>,
 ) -> Element {
     rsx! {

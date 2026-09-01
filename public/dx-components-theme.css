@@ -1,60 +1,17 @@
 /* This file contains the global styles for the styled dioxus components. You only
  * need to import this file once in your project root.
- *
- * Fonts are self-hosted (see /fonts) — this is a LAN appliance with no
- * guaranteed CDN access, so no @import of a remote font stylesheet here.
- * HiPhi brand faces: Atkinson Hyperlegible Next (body/UI) and Familjen
- * Grotesk (display/headings). Both are SIL Open Font License, sampled from
- * https://hiphi.audio/ (styles.css) and downloaded from Google Fonts'
- * static CDN (fonts.gstatic.com) at build/dev time — the served app itself
- * makes no further requests to it.
  */
-@font-face {
-  font-family: "Atkinson Hyperlegible Next";
-  font-style: normal;
-  font-weight: 400 700;
-  font-display: swap;
-  src: url("/fonts/atkinson-hyperlegible-next-latin.woff2") format("woff2");
-}
-
-@font-face {
-  font-family: "Familjen Grotesk";
-  font-style: normal;
-  font-weight: 500 700;
-  font-display: swap;
-  src: url("/fonts/familjen-grotesk-latin.woff2") format("woff2");
-}
+@import url("https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&display=swap");
 
 body {
   padding: 0;
   margin: 0;
   background-color: var(--primary-color);
   color: var(--secondary-color-4);
-  font-family:
-    "Atkinson Hyperlegible Next",
-    system-ui,
-    -apple-system,
-    "Segoe UI",
-    Roboto,
-    sans-serif;
+  font-family: Inter, sans-serif;
   font-optical-sizing: auto;
   font-style: normal;
   font-weight: 400;
-}
-
-/* Display type treatment for page titles/headlines, echoing hiphi.audio's
- * editorial headline weight. Body text stays on the highly-legible face. */
-h1,
-h2,
-h3 {
-  font-family:
-    "Familjen Grotesk",
-    system-ui,
-    -apple-system,
-    "Segoe UI",
-    Roboto,
-    sans-serif;
-  letter-spacing: -0.02em;
 }
 
 /* Default: follow system preference */
@@ -83,52 +40,41 @@ h3 {
   --light: ;
 }
 
-/* OLED black: true-black ground AND near-black neutral elevations.
-   Elevation is conveyed by faint neutral steps + existing borders, not navy
-   tint — on an OLED panel the page should read as black, full stop. */
+/* OLED black: pure black surfaces for AMOLED screens */
 :root.theme-oled {
   --dark: initial;
   --light: ;
-  --primary-color: #000000;
-  --primary-color-1: #000000;
-  --primary-color-2: #000000;
-  --primary-color-3: #060606;
+  --primary-color-1: #000;
+  --primary-color-2: #000;
+  --primary-color-3: #000;
   --primary-color-4: #0a0a0a;
-  --primary-color-5: #101010;
-  --primary-color-6: #181a1c;
-  --primary-color-7: #222528;
+  --primary-color-5: #0a0a0a;
+  --primary-color-6: #1a1a1a;
+  --primary-color-7: #2a2a2a;
 }
 
 :root {
-  /*
-   * HiPhi brand palette — sampled directly from https://hiphi.audio/styles.css
-   * (:root custom properties --midnight/--midnight-2/--navy-soft/--cyan/etc).
-   * Dark = the HiPhi surface (navy ground, cyan accent), Light = the site's
-   * companion light palette (off-white ground, cyan-dark accent for AA).
-   * Verified against WCAG 2.1 contrast (see PR body for the ratio table).
-   */
+  /* Primary colors */
+  --primary-color: var(--dark, #000) var(--light, #fff);
+  --primary-color-1: var(--dark, #0e0e0e) var(--light, #fbfbfb);
+  --primary-color-2: var(--dark, #0a0a0a) var(--light, #fff);
+  --primary-color-3: var(--dark, #141313) var(--light, #f8f8f8);
+  --primary-color-4: var(--dark, #1a1a1a) var(--light, #f8f8f8);
+  --primary-color-5: var(--dark, #262626) var(--light, #f5f5f5);
+  --primary-color-6: var(--dark, #232323) var(--light, #e5e5e5);
+  --primary-color-7: var(--dark, #3e3e3e) var(--light, #b0b0b0);
 
-  /* Primary colors (surfaces, darkest -> lightest elevation) */
-  --primary-color: var(--dark, #071a2e) var(--light, #f8fafb);
-  --primary-color-1: var(--dark, #04111f) var(--light, #ffffff);
-  --primary-color-2: var(--dark, #071a2e) var(--light, #ffffff);
-  --primary-color-3: var(--dark, #0a2136) var(--light, #f3f7f9);
-  --primary-color-4: var(--dark, #0d2943) var(--light, #edf3f6);
-  --primary-color-5: var(--dark, #123a58) var(--light, #e3ebf0);
-  --primary-color-6: var(--dark, #1c4363) var(--light, #d5e1e8);
-  --primary-color-7: var(--dark, #2c5a80) var(--light, #b9c9d4);
-
-  /* Secondary colors (text, darkest -> lightest emphasis) */
-  --secondary-color: var(--dark, #f8fafb) var(--light, #172536);
-  --secondary-color-1: var(--dark, #f8fafb) var(--light, #172536);
-  --secondary-color-2: var(--dark, #e3edf3) var(--light, #253b4f);
-  --secondary-color-3: var(--dark, #cddce6) var(--light, #2c4459);
-  --secondary-color-4: var(--dark, #b9c9d4) var(--light, #344b5f);
-  --secondary-color-5: var(--dark, #90a8ba) var(--light, #5c7488);
-  --secondary-color-6: var(--dark, #62798c) var(--light, #b9c9d4);
+  /* Secondary colors */
+  --secondary-color: var(--dark, #fff) var(--light, #000);
+  --secondary-color-1: var(--dark, #fafafa) var(--light, #000);
+  --secondary-color-2: var(--dark, #e6e6e6) var(--light, #0d0d0d);
+  --secondary-color-3: var(--dark, #dcdcdc) var(--light, #2b2b2b);
+  --secondary-color-4: var(--dark, #d4d4d4) var(--light, #111);
+  --secondary-color-5: var(--dark, #a1a1a1) var(--light, #848484);
+  --secondary-color-6: var(--dark, #5d5d5d) var(--light, #d0d0d0);
 
   /* Highlight colors */
-  --focused-border-color: var(--dark, #00c8f0) var(--light, #00677d);
+  --focused-border-color: var(--dark, #2b7fff) var(--light, #2b7fff);
   --primary-success-color: var(--dark, #02271c) var(--light, #ecfdf5);
   --secondary-success-color: var(--dark, #b6fae3) var(--light, #10b981);
   --primary-warning-color: var(--dark, #342203) var(--light, #fffbeb);
@@ -157,9 +103,9 @@ h3 {
   --border-default: var(--primary-color-6);
   --border-subtle: var(--primary-color-7);
 
-  /* Accent color (links, primary buttons) — HiPhi cyan */
+  /* Accent color (links, primary buttons) */
   --accent-color: var(--focused-border-color);
-  --accent-hover: var(--dark, #4dd8f7) var(--light, #00566a);
+  --accent-hover: var(--dark, #3d8fff) var(--light, #1a6fef);
 }
 
 /* Modern browsers with `scrollbar-*` support */

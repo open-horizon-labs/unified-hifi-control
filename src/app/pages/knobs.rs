@@ -307,10 +307,10 @@ pub fn Knobs() -> Element {
 
     rsx! {
         Layout {
-            title: "Controllers".to_string(),
+            title: "Knobs".to_string(),
             nav_active: "knobs".to_string(),
 
-            h1 { class: "text-2xl font-bold mb-6", "Controllers" }
+            h1 { class: "text-2xl font-bold mb-6", "Knob Devices" }
 
             p { class: "mb-6 text-muted",
                 a {
@@ -650,7 +650,7 @@ fn StateCascadePreview(
     let final_is_power_off = states.last().map(|(_, _, _, off)| *off).unwrap_or(false);
 
     rsx! {
-        div { class: "mt-4 p-3 bg-elevated rounded-lg",
+        div { class: "mt-4 p-3 bg-black/10 dark:bg-black/20 rounded-lg",
             // State flow diagram - more prominent
             div { class: "flex items-center gap-1.5 flex-wrap justify-center",
                 for (i, (name, timeout, icon, is_off)) in states.iter().enumerate() {
@@ -666,9 +666,9 @@ fn StateCascadePreview(
                         class: format!(
                             "flex flex-col items-center px-3 py-1.5 rounded text-xs leading-tight {}",
                             if i == states.len() - 1 {
-                                if *is_off { "bg-hover status-err font-medium" } else { "bg-hover status-ok font-medium" }
+                                if *is_off { "bg-red-500/20 text-red-700 dark:text-red-200 font-medium" } else { "bg-green-500/20 text-green-700 dark:text-green-200 font-medium" }
                             } else {
-                                "bg-hover text-secondary"
+                                "bg-black/5 dark:bg-white/10 text-gray-700 dark:text-gray-200"
                             }
                         ),
                         span { class: "text-base", "{icon}" }
@@ -746,7 +746,7 @@ fn ConfigModal(
 
                 // Header
                 div { class: "flex items-center justify-between mb-6",
-                    h2 { class: "text-xl font-semibold", "Controller Configuration" }
+                    h2 { class: "text-xl font-semibold", "Knob Configuration" }
                     button {
                         class: "text-muted hover:text-white text-xl",
                         aria_label: "Close",

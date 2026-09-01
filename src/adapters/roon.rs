@@ -6,8 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use roon_api::{
     browse::{
-        Action as BrowseAction, Browse, BrowseOpts, BrowseResult, Item as BrowseItem, ItemHint,
-        LoadOpts, LoadResult,
+        Browse, BrowseOpts, BrowseResult, Item as BrowseItem, ItemHint, LoadOpts, LoadResult,
     },
     image::{Args as ImageArgs, Format as ImageFormat, Image, Scale, Scaling},
     status::{self, Status},
@@ -15,7 +14,6 @@ use roon_api::{
     CoreEvent, Info, Parsed, RoonApi, RoonApiError, Services, Svc,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -27,8 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::adapters::handle::{AdapterHandle, RetryConfig};
 use crate::adapters::traits::{
-    AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic, LibraryAdapter,
-    LibrarySearchResult,
+    AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
 };
 use crate::bus::{
     runtime::{
@@ -49,17 +46,6 @@ const BROWSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default search result limit
 const DEFAULT_SEARCH_LIMIT: usize = 50;
-
-/// Page size used when re-walking a browse trail (#616). Larger than a UI
-/// page because nothing is rendered from it -- it is scanned for one title.
-const TRAIL_PAGE_SIZE: usize = 100;
-
-/// How deep into a single level a trail re-walk will scan before giving up.
-/// Roon offers no "find the row named X" verb, so a level is paged through;
-/// this bounds that against a level with hundreds of thousands of rows. A
-/// container that lives past this cap fails recovery and the caller reports
-/// the Core's original rejection.
-const TRAIL_SCAN_LIMIT: usize = 5_000;
 
 /// Category names returned by Roon search - these are containers, not playable items
 const CATEGORY_NAMES: &[&str] = &[
@@ -100,80 +86,14 @@ impl PlayAction {
         }
     }
 
-    /// Whether an action row's title (from a Roon `hint: action`/`action_list`
-    /// item) expresses this intent.
-    ///
-    /// #545: a real Core does not always offer the generic three-item menu
-    /// `tests/mock_servers/roon_core.rs::play_actions()` models ("Play Now",
-    /// "Queue", "Start Radio") -- browsing a playlist or album entry can put
-    /// a context verb ("Play Playlist", "Play Album", "Shuffle") directly
-    /// alongside real content one level up from that menu. The live repro
-    /// that drove this fix hit exactly that: the adapter searched for the
-    /// literal string "Play Now" among `["Play Playlist", <track titles>]`
-    /// and never found it, even though "Play Playlist" was right there and
-    /// the Core had already acted on it (see `resolve_item_key`'s docs for
-    /// why the play still succeeded despite the error). Matching by prefix/
-    /// substring instead of an exact literal is what makes this find the
-    /// right row regardless of which noun Roon puts after the verb.
-    fn matches_title(self, title: &str) -> bool {
-        let lower = title.to_lowercase();
-        match self {
-            // "Play Now", "Play Album", "Play Playlist", "Play Artist",
-            // "Play Track", "Play Radio Station", ... -- every context verb
-            // observed or documented for immediate playback starts with
-            // "play".
-            Self::Play => lower.starts_with("play"),
-            Self::Queue => lower.contains("queue"),
-            Self::Radio => lower.contains("radio"),
-        }
-    }
-
-    /// The canonical verb text `tests/mock_servers/roon_core.rs::play_actions()`
-    /// models this intent with, for error messages only (not for matching --
-    /// see [`Self::matches_title`], which a real Core's context verbs may
-    /// not equal literally).
-    fn canonical_verb(self) -> &'static str {
+    /// Get the Roon action title
+    fn action_title(&self) -> &'static str {
         match self {
             Self::Play => "Play Now",
             Self::Queue => "Queue",
             Self::Radio => "Start Radio",
         }
     }
-}
-
-/// Pick the action row (from a level's `hint: action`/`action_list` items)
-/// that best matches the requested [`PlayAction`].
-///
-/// Only [`PlayAction::Play`] falls back to the first action-hinted row when
-/// none matches by name, per #545's acceptance criteria ("intent mapping or
-/// first play-action") -- Roon's vocabulary for "play this" is genuinely
-/// varied ("Play Now", "Play Album", "Play Playlist", ...) so a Play request
-/// should still succeed against an unrecognised verb. Queue and Radio stay
-/// strict: asking to queue or start radio when the Core only offers a Play
-/// verb is a real "not available" case, not something to silently downgrade
-/// to Play -- see `an_action_the_core_does_not_offer_is_reported_with_what_
-/// is_available` (`tests/roon_protocol.rs`), which predates #545 and still
-/// expects that refusal.
-fn find_action_item(items: &[BrowseItem], action: PlayAction) -> Option<&BrowseItem> {
-    let candidates: Vec<&BrowseItem> = items
-        .iter()
-        .filter(|item| {
-            matches!(
-                item.hint,
-                Some(ItemHint::Action) | Some(ItemHint::ActionList)
-            )
-        })
-        .collect();
-    if let Some(found) = candidates
-        .iter()
-        .find(|item| action.matches_title(&item.title))
-    {
-        return Some(found);
-    }
-    if matches!(action, PlayAction::Play) {
-        return candidates.first().copied();
-    }
-    None
 }
 
 /// Find the first playable item in a list (hint is Action or ActionList)
@@ -248,201 +168,10 @@ pub(crate) fn is_ungrounded_grouping(item: &BrowseItem) -> bool {
     is_category(item) || looks_like_a_result_count_grouping(item)
 }
 
-/// Whether an action-hinted browse row is a *verb* ("Play Playlist",
-/// "Shuffle", ...) rather than playable leaf content (a track).
-///
-/// #573 defect 1: #545 dropped every `hint: action`/`action_list` row from
-/// `hifi_collections browse` listings -- but a live Core marks a playlist's
-/// and an album's **track rows** `action_list` too (entering a track opens
-/// its Play Now/Queue/Start Radio menu), so every album and playlist level
-/// came back `items: []`. The two kinds must be told apart:
-///
-/// - `hint: action` rows fire immediately when browsed (the #545 live repro's
-///   "Play Playlist").
-/// - `hint: action_list` rows open a menu when browsed.
-///
-/// #587: *neither* hint alone decides. #578's lineage treated every
-/// `hint: action` row as a verb, but a live Core marks **radio station rows**
-/// under My Live Radio `hint: action` too -- browsing a station plays it
-/// immediately, so the hint is honest, yet the row is addressable content.
-/// Captured off the operator's Core (Roon 2.x, 2026-08, issue #587):
-///
-/// ```json
-/// {"title":"WOSU-HD2 WOSU Public Media: Classical 101",
-///  "subtitle":"Columbus, Ohio, USA FM 89.7 HD2 English",
-///  "item_key":"1646:0","hint":"action","image_key":"afd6..."}
-/// ```
-///
-/// Dropping every `action` row emptied My Live Radio exactly the way #545's
-/// "drop every action-hinted row" emptied albums. So both action-ish hints
-/// now share the same belt-and-braces test: a row is a *verb* only when it
-/// reads as one of Roon's play verbs *and* carries none of the content
-/// signals every live content row carried (a subtitle, artwork). A track
-/// named "Play That Funky Music" and a station named "WOSU-HD2" both keep
-/// their subtitle/artwork (and neither title is a verb) and stay content; a
-/// bare "Play Album"/"Play Playlist"/"Shuffle" wrapper row has neither.
-pub(crate) fn is_immediate_action_row(item: &BrowseItem) -> bool {
-    match item.hint {
-        Some(ItemHint::Action) | Some(ItemHint::ActionList) => {
-            item.subtitle.as_deref().is_none_or(str::is_empty)
-                && item.image_key.is_none()
-                && is_play_verb_title(&item.title)
-        }
-        _ => false,
-    }
-}
-
-/// Whether a row title reads as one of Roon's play verbs.
-///
-/// The vocabulary is every context verb observed live (#545's repro and the
-/// #573 crawl) plus the canonical three-item menu -- deliberately a closed
-/// list, not a "starts with play" prefix match, so a track that merely starts
-/// with the word "play" cannot be mistaken for a verb (see
-/// [`is_immediate_action_row`]'s second signal for the belt-and-braces
-/// subtitle/artwork requirement on top of this).
-fn is_play_verb_title(title: &str) -> bool {
-    let lower = title.trim().to_lowercase();
-    matches!(
-        lower.as_str(),
-        "play now" | "shuffle" | "queue" | "add next" | "add to queue" | "start radio"
-    ) || lower.strip_prefix("play ").is_some_and(|noun| {
-        matches!(
-            noun,
-            "now"
-                | "album"
-                | "playlist"
-                | "playlists"
-                | "artist"
-                | "track"
-                | "tracks"
-                | "all"
-                | "genre"
-                | "composer"
-                | "work"
-                | "station"
-                | "radio station"
-        )
-    })
-}
-
-/// Error marker: a playability peek descended into an item but the
-/// `pop_levels: 1` browse restoring the caller's position failed, so the
-/// session now sits at an unknown level (#593 review follow-up).
-///
-/// This is categorically different from an ordinary peek failure: a refused
-/// peek leaves the caller's position intact and classification can degrade
-/// gracefully, but after a failed restoration every further `load` in that
-/// session would silently map the wrong list (an album's tracks as its
-/// parent's rows). Carried in an [`anyhow::Error`]'s context chain; callers
-/// test for it with `error.is::<BrowsePositionLost>()` and stop paging.
-#[derive(Debug)]
-pub(crate) struct BrowsePositionLost;
-
-impl std::fmt::Display for BrowsePositionLost {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "browse position lost: could not step back out of a playability \
-             peek; abandoning this listing rather than paging an unknown level"
-        )
-    }
-}
-
-/// Whether a row is Roon's "No Results" placeholder rather than content.
-///
-/// #573 defect 7: an empty node (the live crawl's "My Live Radio") comes back
-/// as a single row titled "No Results" that still carries an `item_key`, so
-/// `classify_navigability`'s "non-list row with a key is playable" rule
-/// minted a play ref for it and the UI offered Play on a non-item. Matched by
-/// title plus the absence of every content signal (subtitle, artwork), same
-/// belt-and-braces shape as [`is_immediate_action_row`], so a real track that
-/// happens to be titled "No Results" keeps its subtitle/art and stays.
-pub(crate) fn is_no_results_placeholder(item: &BrowseItem) -> bool {
-    item.title.eq_ignore_ascii_case("no results")
-        && item.subtitle.as_deref().is_none_or(str::is_empty)
-        && item.image_key.is_none()
-        && !matches!(item.hint, Some(ItemHint::List))
-}
-
-/// Strip Roon's `[[id|Name]]` link markup down to `Name`, leaving all other
-/// text untouched.
-///
-/// #573 defect 5: browse `subtitle` fields embed Roon's internal link markup
-/// verbatim -- `[[55418|Michael Jackson]]`, including compound credits like
-/// `[[8827258|Willie Colón]] & [[1981050|Rubén Blades]]`. Clients (the web
-/// UI, `hifi_collections`, `hifi_search`) have no use for the ids, so the
-/// adapter mapping strips them to plain names in one place. Malformed markup
-/// (an unterminated `[[`, no `|`) is passed through literally rather than
-/// guessed at.
-pub(crate) fn strip_roon_link_markup(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("[[") {
-        let (before, after_open) = rest.split_at(start);
-        out.push_str(before);
-        let body = &after_open[2..];
-        match body.find("]]") {
-            Some(end) => {
-                let inner = &body[..end];
-                match inner.split_once('|') {
-                    // `[[id|Name]]` -> `Name`
-                    Some((_, name)) => out.push_str(name),
-                    // `[[something]]` without a `|`: not Roon's link shape;
-                    // keep it verbatim.
-                    None => {
-                        out.push_str("[[");
-                        out.push_str(inner);
-                        out.push_str("]]");
-                    }
-                }
-                rest = &body[end + 2..];
-            }
-            None => {
-                // Unterminated `[[`: keep the rest verbatim.
-                out.push_str(after_open);
-                return out;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
 /// Strip "roon:" prefix from zone/output IDs.
 /// MCP and aggregator use prefixed IDs (e.g., "roon:zone_123"), but Roon API expects bare IDs.
 fn strip_roon_prefix(id: &str) -> &str {
     id.strip_prefix("roon:").unwrap_or(id)
-}
-
-/// Require a properly-prefixed Roon zone id and return its bare id.
-///
-/// Unlike [`strip_roon_prefix`] (used by the pre-existing transport paths,
-/// which tolerate a bare id for backward compatibility), the multiroom
-/// grouping surface (#509) is new and follows the stricter validation the
-/// Music Assistant and LMS adapters already apply to their own multiroom
-/// parameters (`musicassistant_player_id`, `lms_player_id`).
-fn roon_zone_id(zone_id: &str, parameter: &str) -> Result<String> {
-    zone_id
-        .strip_prefix("roon:")
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("{parameter} must be a Roon zone id"))
-}
-
-/// [`roon_zone_id`] over a list, rejecting duplicates the same way the
-/// Music Assistant and LMS multiroom contracts do.
-fn roon_zone_ids(zone_ids: &[String], parameter: &str) -> Result<Vec<String>> {
-    let mut ids = Vec::with_capacity(zone_ids.len());
-    for zone_id in zone_ids {
-        let id = roon_zone_id(zone_id, parameter)?;
-        if ids.contains(&id) {
-            return Err(anyhow::anyhow!(
-                "{parameter} must not contain duplicate zones"
-            ));
-        }
-        ids.push(id);
-    }
-    Ok(ids)
 }
 
 /// Pending image request - stores the oneshot sender to deliver the result
@@ -901,14 +630,6 @@ pub struct Output {
     pub output_id: String,
     pub display_name: String,
     pub volume: Option<VolumeInfo>,
-    /// Output ids this output can be grouped with, straight from the Core
-    /// (`transport::Output::can_group_with_output_ids`). Roon only groups
-    /// outputs that share a streaming protocol (RAAT with RAAT, AirPlay with
-    /// AirPlay, etc); this is the Core's own compatibility list, so grouping
-    /// (#509) refuses upfront against it instead of guessing at protocol
-    /// names the wire format never exposes.
-    #[serde(default)]
-    pub can_group_with_output_ids: Vec<String>,
 }
 
 /// Volume information
@@ -1342,13 +1063,6 @@ pub struct RoonAdapter {
     /// Present only in the composed server.  It routes complete Core callbacks into the
     /// aggregator-owned projection and owns command/callback correlation.
     runtime_bridge: Option<Arc<RoonRuntimeBridge>>,
-    /// Where pairing state (`roon_state.json`) is loaded from and saved to.
-    ///
-    /// Defaults to `get_roon_state_path()`, i.e. the production config directory
-    /// (honouring `UHC_CONFIG_DIR`). Overridable via [`Self::with_state_path_for_tests`]
-    /// so each test instance gets its own file instead of racing every other
-    /// `RoonAdapter` in the test binary over one shared path (issue #554).
-    state_path: PathBuf,
 }
 
 impl RoonAdapter {
@@ -1362,7 +1076,6 @@ impl RoonAdapter {
             started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             knob_store: None,
             runtime_bridge: None,
-            state_path: get_roon_state_path(),
         }
     }
 
@@ -1390,23 +1103,7 @@ impl RoonAdapter {
             started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             knob_store: Some(knob_store),
             runtime_bridge,
-            state_path: get_roon_state_path(),
         }
-    }
-
-    /// Test seam (issue #554): point this adapter's pairing-state persistence at a
-    /// caller-owned path instead of the shared production config directory.
-    ///
-    /// `tests/roon_protocol.rs` spawns many `RoonAdapter`s in one test binary; every
-    /// one of them registers against its own fake Core and read-modify-writes
-    /// `roon_state.json` on pairing. Sharing one file (even a tempdir one) meant two
-    /// adapters could interleave load->save and permanently drop each other's token.
-    /// Each test now gets its own file via this seam, so production behaviour
-    /// (`get_roon_state_path()`, honouring `UHC_CONFIG_DIR`) is unchanged.
-    #[doc(hidden)]
-    pub fn with_state_path_for_tests(mut self, path: PathBuf) -> Self {
-        self.state_path = path;
-        self
     }
 
     /// Create and immediately start Roon adapter (legacy API for compatibility)
@@ -1495,7 +1192,6 @@ impl RoonAdapter {
                 ip,
                 port: port.to_string(),
             },
-            self.state_path.clone(),
         )
         .await
     }
@@ -1676,213 +1372,6 @@ impl RoonAdapter {
         };
         transport.mute(&output_id, &how).await;
         Ok(())
-    }
-
-    // -------------------------------------------------------------------------
-    // Multiroom grouping (#509): `Transport::group_outputs` / `ungroup_outputs`
-    // wired to the `multiroom_status` / `multiroom_set_members` /
-    // `multiroom_ungroup` contract the Music Assistant adapter already
-    // implements (`src/adapters/musicassistant.rs`).
-    //
-    // Roon groups *outputs*, not zones. Grouping merges every named zone's
-    // outputs into a single zone; the Core keeps the leader's zone_id and
-    // retires the other zones (their outputs move under the leader's
-    // zone_id in the next zone update). This adapter resolves each zone
-    // argument to one representative output -- the same first-output
-    // resolution `change_volume` (above) already uses for multi-output
-    // zones -- and lets the ordinary zone-event pipeline in `run()`
-    // (`Parsed::Zones` / `Parsed::ZonesRemoved`, already unconditional for
-    // every zone change) publish the resulting `ZoneUpdated` /
-    // `ZoneRemoved` bus events. No special-case bus code is needed for
-    // grouping: from the bus's perspective a merge is just an ordinary zone
-    // update plus zone removal.
-    //
-    // Because member zone ids do not survive a merge, this adapter reports
-    // (and accepts back) *outputs* as members once a group exists: for a
-    // zone with more than one output, `multiroom_status` treats the first
-    // output as the "leader" and the rest as members, addressed as
-    // `roon:<output_id>` rather than a zone id. That is a stable-but-
-    // arbitrary UHC display convention (mirroring the same call LMS's
-    // adapter documents for its own leaderless sync groups), not a Roon
-    // fact: `resolve_roon_output` accepts either a live zone id or a bare
-    // output id, so a caller can always name a group member whether or not
-    // it currently has its own zone.
-
-    /// Resolve `id` (bare, no "roon:" prefix) to one Roon output: either the
-    /// first output of a zone with this id, or -- for a member of an
-    /// existing group, whose original zone id was retired by the merge --
-    /// the output with this id directly.
-    async fn resolve_roon_output(&self, id: &str) -> Result<Output> {
-        let state = self.state.read().await;
-        if let Some(zone) = state.zones.get(id) {
-            return zone
-                .outputs
-                .first()
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Zone has no outputs: {id}"));
-        }
-        state
-            .zones
-            .values()
-            .find_map(|zone| zone.outputs.iter().find(|o| o.output_id == id).cloned())
-            .ok_or_else(|| anyhow::anyhow!("Roon zone or output was not found: {id}"))
-    }
-
-    /// Report every Roon zone with more than one output as a group.
-    ///
-    /// `can_set_members` is always `true`: every Roon output accepts
-    /// `group_outputs`/`ungroup_outputs` unconditionally, so there is no
-    /// per-group capability to check (unlike Music Assistant's per-leader
-    /// `SET_MEMBERS` feature flag).
-    pub async fn multiroom_status(&self) -> Result<Value> {
-        let state = self.state.read().await;
-        let groups: Vec<Value> = state
-            .zones
-            .values()
-            .filter(|zone| zone.outputs.len() > 1)
-            .filter_map(|zone| {
-                let (_leader_output, member_outputs) = zone.outputs.split_first()?;
-                Some(json!({
-                    "leader_zone_id": PrefixedZoneId::roon(&zone.zone_id).to_string(),
-                    "member_zone_ids": member_outputs
-                        .iter()
-                        .map(|o| PrefixedZoneId::roon(&o.output_id).to_string())
-                        .collect::<Vec<_>>(),
-                    "can_set_members": true,
-                }))
-            })
-            .collect();
-        Ok(json!({ "groups": groups }))
-    }
-
-    /// Group `add_zone_ids` (and any current members of `leader_zone_id`'s
-    /// group) together via `group_outputs`, and ungroup `remove_zone_ids` via
-    /// `ungroup_outputs`, then return the current `multiroom_status`.
-    ///
-    /// Roon confirms grouping asynchronously through the ordinary zone
-    /// subscription rather than a synchronous RPC reply (the same is true of
-    /// `change_volume`/`mute`/`control` above), so -- unlike the Music
-    /// Assistant and LMS adapters, whose underlying protocols are
-    /// request/response -- the status returned here is a snapshot of
-    /// current knowledge, not a guaranteed post-condition. Callers that need
-    /// the authoritative outcome should watch the zone bus, exactly as they
-    /// already must for every other Roon transport command.
-    pub async fn set_group_members(
-        &self,
-        leader_zone_id: &str,
-        add_zone_ids: &[String],
-        remove_zone_ids: &[String],
-    ) -> Result<Value> {
-        if add_zone_ids.is_empty() && remove_zone_ids.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Roon group membership needs at least one member"
-            ));
-        }
-        let leader_id = roon_zone_id(leader_zone_id, "leader_zone_id")?;
-        let add_ids = roon_zone_ids(add_zone_ids, "member_zone_ids_to_add")?;
-        let remove_ids = roon_zone_ids(remove_zone_ids, "member_zone_ids_to_remove")?;
-        for id in add_ids.iter().chain(remove_ids.iter()) {
-            if id == &leader_id {
-                return Err(anyhow::anyhow!(
-                    "Roon group leader cannot be its own member input"
-                ));
-            }
-        }
-
-        let leader_output = self
-            .resolve_roon_output(&leader_id)
-            .await
-            .map_err(|_| anyhow::anyhow!("Roon group leader was not found"))?;
-        let mut add_outputs = Vec::with_capacity(add_ids.len());
-        for id in &add_ids {
-            add_outputs.push(
-                self.resolve_roon_output(id)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Roon group member was not found"))?,
-            );
-        }
-        let mut remove_outputs = Vec::with_capacity(remove_ids.len());
-        for id in &remove_ids {
-            remove_outputs.push(
-                self.resolve_roon_output(id)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Roon group member was not found"))?,
-            );
-        }
-
-        // Roon only groups outputs that share a streaming protocol. The Core
-        // does not expose a queryable protocol name, but `can_group_with_output_ids`
-        // *is* the Core's own compatibility list for the leader's output, so a
-        // mismatch here is refused cleanly instead of being sent to the Core
-        // to fail (or be silently ignored) in some undocumented way.
-        for output in &add_outputs {
-            if !leader_output
-                .can_group_with_output_ids
-                .iter()
-                .any(|id| id == &output.output_id)
-            {
-                return Err(anyhow::anyhow!(
-                    "Cannot group '{}' with '{}': they do not share a compatible streaming protocol",
-                    output.display_name,
-                    leader_output.display_name
-                ));
-            }
-        }
-
-        let transport = {
-            let state = self.state.read().await;
-            state
-                .transport
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("Not connected to Roon"))?
-        };
-
-        if !add_outputs.is_empty() {
-            let mut output_ids: Vec<&str> = vec![leader_output.output_id.as_str()];
-            output_ids.extend(add_outputs.iter().map(|o| o.output_id.as_str()));
-            transport.group_outputs(output_ids).await;
-        }
-        for output in &remove_outputs {
-            transport
-                .ungroup_outputs(vec![output.output_id.as_str()])
-                .await;
-        }
-
-        self.multiroom_status().await
-    }
-
-    /// Ungroup each of `member_zone_ids` via `ungroup_outputs`, then return
-    /// the current `multiroom_status`. See [`Self::set_group_members`] for
-    /// why the returned status is a snapshot rather than a guaranteed
-    /// post-condition.
-    pub async fn ungroup_members(&self, member_zone_ids: &[String]) -> Result<Value> {
-        let member_ids = roon_zone_ids(member_zone_ids, "member_zone_ids")?;
-        if member_ids.is_empty() {
-            return Err(anyhow::anyhow!("Roon ungroup needs at least one member"));
-        }
-        let mut outputs = Vec::with_capacity(member_ids.len());
-        for id in &member_ids {
-            outputs.push(
-                self.resolve_roon_output(id)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Roon group member was not found"))?,
-            );
-        }
-
-        let transport = {
-            let state = self.state.read().await;
-            state
-                .transport
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("Not connected to Roon"))?
-        };
-        for output in &outputs {
-            transport
-                .ungroup_outputs(vec![output.output_id.as_str()])
-                .await;
-        }
-
-        self.multiroom_status().await
     }
 
     /// Get album art image
@@ -2183,466 +1672,6 @@ impl RoonAdapter {
         }
 
         Ok((session_key, vec![]))
-    }
-
-    // =========================================================================
-    // hifi_collections (#531): the same browse/load machinery `hifi_search`
-    // already drives, exposed as hierarchy walking rather than a query.
-    // =========================================================================
-
-    /// One `hifi_collections browse` step: enter `item_key` within
-    /// `session_key` (a fresh session and the collection root when both are
-    /// `None`), then load one page. Returns the (possibly newly minted)
-    /// session key, the page's items, and the level's total count for
-    /// `next_offset`.
-    ///
-    /// Deliberately never combines `pop_all` with `item_key` in the same
-    /// request, and never sends `pop_all` when resuming an existing
-    /// session -- see [`Self::play_ref`]'s doc comment for the live evidence
-    /// that combination hangs a real Core.
-    pub async fn browse_collection(
-        &self,
-        zone_id: &str,
-        item_key: Option<&str>,
-        session_key: Option<&str>,
-        offset: usize,
-        limit: usize,
-    ) -> Result<(String, Vec<BrowseItem>, usize)> {
-        let bare_zone_id = strip_roon_prefix(zone_id);
-        let session_key = session_key.map(ToOwned::to_owned).unwrap_or_else(|| {
-            format!(
-                "collections_{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            )
-        });
-
-        let mut opts = BrowseOpts {
-            multi_session_key: Some(session_key.clone()),
-            zone_or_output_id: Some(bare_zone_id.to_string()),
-            ..Default::default()
-        };
-        match item_key {
-            Some(key) => opts.item_key = Some(key.to_string()),
-            // Only reset the browse stack when there is nowhere to navigate
-            // from -- i.e. a brand new session at the collection root.
-            None => opts.pop_all = true,
-        }
-        self.browse(opts).await?;
-
-        let mut load = self
-            .load(LoadOpts {
-                multi_session_key: Some(session_key.clone()),
-                offset,
-                count: Some(limit),
-                ..Default::default()
-            })
-            .await?;
-
-        // #573 defect 11: entering an album from a search hit lands on an
-        // intermediate level whose sole row is the album itself again (same
-        // title as the level, `hint: list`), forcing a second click that adds
-        // nothing. When a non-root level's entire content is that one
-        // self-referential list row, descend through it so the caller gets
-        // the real level (the tracks) in one step. The title-equality guard
-        // keeps a legitimate single-child folder (an artist with one album)
-        // untouched. One descent only -- Roon does not nest this shape.
-        if item_key.is_some() && load.list.count == 1 {
-            let only_row = match load.items.first() {
-                Some(row) => Some(row.clone()),
-                // A paged request (offset past the single row) still needs
-                // the row to decide; fetch it without disturbing `offset`.
-                None => self
-                    .load(LoadOpts {
-                        multi_session_key: Some(session_key.clone()),
-                        offset: 0,
-                        count: Some(1),
-                        ..Default::default()
-                    })
-                    .await?
-                    .items
-                    .into_iter()
-                    .next(),
-            };
-            if let Some(row) = only_row {
-                if matches!(row.hint, Some(ItemHint::List)) && row.title == load.list.title {
-                    if let Some(self_key) = row.item_key.as_deref() {
-                        self.browse(BrowseOpts {
-                            multi_session_key: Some(session_key.clone()),
-                            item_key: Some(self_key.to_string()),
-                            zone_or_output_id: Some(bare_zone_id.to_string()),
-                            ..Default::default()
-                        })
-                        .await?;
-                        load = self
-                            .load(LoadOpts {
-                                multi_session_key: Some(session_key.clone()),
-                                offset,
-                                count: Some(limit),
-                                ..Default::default()
-                            })
-                            .await?;
-                    }
-                }
-            }
-        }
-
-        // #545: a level must never hand back the very item it was just
-        // entered through as one of its own children -- browsing that child
-        // would just re-enter the same node, which is how "browse a
-        // playlist, see the playlist again as a child of itself" nesting
-        // was reported. Whatever upstream Roon behavior produces this
-        // (a self-referential header row, a session bug) is not something
-        // this adapter can distinguish from here, but the guard is correct
-        // either way: nothing can legitimately contain itself.
-        let items = match item_key {
-            Some(parent_key) => load
-                .items
-                .into_iter()
-                .filter(|item| item.item_key.as_deref() != Some(parent_key))
-                .collect(),
-            None => load.items,
-        };
-
-        Ok((session_key, items, load.list.count))
-    }
-
-    /// Peek one level into a navigable (`hint: list`) item to learn whether
-    /// Roon also exposes it as directly playable, and whether that peek
-    /// finds any real content besides the play action(s) themselves.
-    ///
-    /// Returns `(playable, has_other_content)`.
-    ///
-    /// #545: Roon puts play actions one level *below* the browsable item
-    /// itself (see `resolve_item_key`'s docs on `enter_item`) -- there is no
-    /// hint on the item's own row that says "you can also play this without
-    /// navigating in". The only way to know is to look: browse `item_key`,
-    /// check the first few rows of what comes back, and step back out.
-    ///
-    /// # The peek MUST happen inside the caller's own session (#593)
-    ///
-    /// This method's first version peeked in a disposable `peek_<nanos>`
-    /// session instead, assuming `item_key`s resolve across sessions. A real
-    /// Core scopes them per session, and its failure mode is *silent*:
-    /// browsing a foreign key inside a fresh session answers `action: list`
-    /// with the **root** ("Explore", level 0) list -- no error at all.
-    /// Probed read-only against the operator's production Core (Roon 2.x,
-    /// 2026-08, issue #593): a key minted in one `/roon/browse` session,
-    /// browsed inside a fresh one, returned the root every time. So every
-    /// peek judged the root's rows (never a play verb among them), no
-    /// list-hinted container ever classified as playable, and albums under
-    /// Artists rendered with no Play at all -- while the whole suite stayed
-    /// green, because `FakeRoonCore`'s default `ItemKeyScope::Global` modeled
-    /// exactly the assumption that was wrong (`PerSessionSilentRootReset` now
-    /// models the observed behavior).
-    ///
-    /// Peeking in the caller's session pushes the peeked level onto that
-    /// session's stack, so this browses `pop_levels: 1` afterwards to
-    /// restore the caller's position -- `content()`'s fetch-ahead loop pages
-    /// the *current* level by bare `load`s and would otherwise page the
-    /// peeked child instead (same probe: keys of a level still on the stack
-    /// stay valid after descending elsewhere and popping back).
-    ///
-    /// Bounded to a small peek (`PEEK_COUNT`) rather than the whole level:
-    /// every fixture and the live #545 repro both put the action row(s)
-    /// first, so a short prefix answers both questions at a fraction of the
-    /// cost of loading the full page, and `list.count` (not the prefix
-    /// length) is what `has_other_content` is actually judged against.
-    ///
-    /// # Errors
-    ///
-    /// An ordinary failure (the peek's own browse or load refused) is safe
-    /// to degrade from -- the caller's position is intact. A failure of the
-    /// restoring `pop_levels` browse is not: the error then carries
-    /// [`BrowsePositionLost`] in its chain, and the caller must stop paging
-    /// this session (see [`Self::classify_navigability`]).
-    async fn peek_playability(
-        &self,
-        zone_id: &str,
-        session_key: &str,
-        item_key: &str,
-    ) -> Result<(bool, bool)> {
-        const PEEK_COUNT: usize = 5;
-        let browse_result = self
-            .browse(BrowseOpts {
-                multi_session_key: Some(session_key.to_string()),
-                item_key: Some(item_key.to_string()),
-                zone_or_output_id: Some(zone_id.to_string()),
-                ..Default::default()
-            })
-            .await?;
-        if !matches!(browse_result.action, BrowseAction::List) {
-            // Not expected for a `hint: list` item -- nothing was pushed
-            // onto the session's stack (an invoked action produces no list),
-            // so there is nothing to pop either.
-            return Ok((false, false));
-        }
-        let loaded = self
-            .load(LoadOpts {
-                multi_session_key: Some(session_key.to_string()),
-                count: Some(PEEK_COUNT),
-                ..Default::default()
-            })
-            .await;
-        // The browse above pushed the peeked level -- restore the caller's
-        // position before propagating any load failure, or the session would
-        // be left one level deep and every subsequent `load` of the caller's
-        // page would silently read the wrong level.
-        let popped = self
-            .browse(BrowseOpts {
-                multi_session_key: Some(session_key.to_string()),
-                pop_levels: Some(1),
-                zone_or_output_id: Some(zone_id.to_string()),
-                ..Default::default()
-            })
-            .await;
-        // A failed restoration outranks a failed load: the session now sits
-        // at an unknown level, and any further `load` against it (the
-        // fetch-ahead loop, the caller's next page) would silently map the
-        // wrong list -- an album's tracks as the parent's rows. Surface it
-        // as the typed [`BrowsePositionLost`] so classification stops the
-        // page instead of degrading to "not playable" the way an ordinary
-        // peek failure does.
-        if let Err(error) = popped {
-            return Err(error.context(BrowsePositionLost));
-        }
-        let loaded = loaded?;
-        // #573 defect 1: `action_list`-hinted track rows are content, not
-        // action rows (see `is_immediate_action_row`) -- only the verb rows
-        // that get filtered out of listings count against "other content"
-        // here, or an album whose whole peek window is [Play Album,
-        // track, track, ...] would read as a pure action leaf and lose its
-        // navigability.
-        //
-        // #587: `playable` is judged on the same verb-row count, no longer on
-        // "any action-ish hint one level down". A live Core marks radio
-        // station rows `hint: action` (see `is_immediate_action_row`'s
-        // captured shape), so the broad count read a folder of stations
-        // (My Live Radio) as directly playable -- but invoking it has no
-        // verb row to walk, so the minted Play ref could only ever error
-        // ("Action 'Play Now' not available"). Every genuinely playable
-        // container observed live leads with a verb row ("Play Album",
-        // "Play Playlist", ...), which is exactly what this counts.
-        let immediate_action_rows = loaded
-            .items
-            .iter()
-            .filter(|item| is_immediate_action_row(item))
-            .count();
-        let playable = immediate_action_rows > 0;
-        let has_other_content = loaded.list.count > immediate_action_rows;
-        Ok((playable, has_other_content))
-    }
-
-    /// Classify one browse-session row's navigable/playable status.
-    ///
-    /// `hint: list` rows are peeked one level (via [`Self::peek_playability`])
-    /// to learn whether Roon also exposes a direct play action there;
-    /// everything else is judged by `item_key` presence alone. This is the
-    /// exact per-item logic `content()`'s `collections_browse`/
-    /// `collections_playlists` mapping used inline before #566 factored it
-    /// out here so `hifi_search` (#566) could apply the identical dual
-    /// navigable+playable treatment PR #547 established for
-    /// `hifi_collections`, rather than maintaining a second copy that could
-    /// silently drift from this one.
-    ///
-    /// `session_key` must be the session `item` was listed in: a real Core
-    /// scopes `item_key`s per session, and peeking anywhere else silently
-    /// judges the wrong level (#593 -- see [`Self::peek_playability`]).
-    ///
-    /// # Errors
-    ///
-    /// `Err` only when the peek lost the session's browse position
-    /// ([`BrowsePositionLost`]): the caller must stop paging this session,
-    /// because every further `load` against it would map an unknown level's
-    /// rows. Any *other* peek failure leaves the position intact and
-    /// degrades gracefully to "navigable, not playable", exactly as before.
-    pub(crate) async fn classify_navigability(
-        &self,
-        zone_id: &str,
-        session_key: &str,
-        item: &BrowseItem,
-    ) -> Result<(bool, bool)> {
-        let list_hinted = matches!(item.hint, Some(ItemHint::List));
-        let (playable, has_other_content) = if list_hinted {
-            match item.item_key.as_deref() {
-                Some(key) => match self.peek_playability(zone_id, session_key, key).await {
-                    Ok(peeked) => peeked,
-                    Err(error) if error.is::<BrowsePositionLost>() => return Err(error),
-                    Err(_) => (false, true),
-                },
-                None => (false, true),
-            }
-        } else {
-            (item.item_key.is_some(), true)
-        };
-        // A pure leaf whose only content one level down is an action list (a
-        // track: "Play Track" and nothing else) has nothing left to navigate
-        // into once that action row is filtered out -- classify it as
-        // playable only, not also navigable, so "Open" doesn't land on an
-        // empty level. A container that offers both real content *and* a
-        // play action (an album, a playlist) stays navigable too.
-        let navigable = list_hinted && (!playable || has_other_content);
-        Ok((navigable, playable))
-    }
-
-    /// Filter and map one raw browse page into `hifi_collections`' item
-    /// shape, appending to `mapped`. Shared by `content()`'s first-page
-    /// mapping and its #573 fetch-ahead loop so the two can never disagree
-    /// about what a listing row is.
-    /// `Err` only on [`BrowsePositionLost`] (see
-    /// [`Self::classify_navigability`]) -- the page must not be served, and
-    /// the caller must not keep loading this session.
-    async fn map_collection_page(
-        &self,
-        zone_id: &str,
-        session_key: &str,
-        items: Vec<BrowseItem>,
-        at_collection_root: bool,
-        mapped: &mut Vec<Value>,
-    ) -> Result<()> {
-        for item in items {
-            // #573 defect 3: the exact-title category filter
-            // (`is_category`) was verified for *search result* levels only,
-            // but the Library node's real children are titled exactly
-            // "Artists"/"Albums"/"Tracks"/... too -- so it swallowed the
-            // whole Library level down to "Search". Browse levels rely on
-            // the source-independent `"<N> Results"` subtitle signal alone;
-            // search paths (`hifi_search`) keep the stricter dual check.
-            if looks_like_a_result_count_grouping(&item) {
-                continue;
-            }
-            if at_collection_root {
-                // #566 (live install): Roon's browse root also carries its
-                // own "Settings" node -- extension configuration inside
-                // Roon's hierarchy, not music content. It has no `item_key`
-                // (nothing to browse into or play) and was leaking through
-                // as a permanently inert row. Matched by title, documented
-                // as such, and scoped to the true root only, so a
-                // differently-purposed "Settings" row nested deeper in the
-                // hierarchy (if one ever exists) is untouched.
-                if item.title == "Settings" {
-                    continue;
-                }
-                // #573 defect 4: the root's "Playlists" node duplicates the
-                // dedicated Playlists tab (`collections_playlists` enters
-                // the same node by name), so the Browse tab hides it rather
-                // than offering the same list twice.
-                if item.title == "Playlists" {
-                    continue;
-                }
-            }
-            // #545 / #573 defect 1: verb rows ("Play Playlist", "Play
-            // Album", "Shuffle", ...) are the implementation detail
-            // `resolve_item_key` walks to invoke a play action, not
-            // addressable content. But a live Core also marks playlist and
-            // album *track rows* `action_list` -- dropping every
-            // action-hinted row (as #545 first did) emptied every album and
-            // playlist level. `is_immediate_action_row` keeps the verb rows
-            // out while the action_list-hinted playable leaf rows stay.
-            if matches!(item.hint, Some(ItemHint::Header)) || is_immediate_action_row(&item) {
-                continue;
-            }
-            // #573 defect 7: Roon renders an empty node as a "No Results"
-            // placeholder row that still carries an `item_key`; minting a
-            // play ref for it offers Play on a non-item.
-            if is_no_results_placeholder(&item) {
-                continue;
-            }
-            let (navigable, playable) = self
-                .classify_navigability(zone_id, session_key, &item)
-                .await?;
-            // #573 defect 4: at the collection root, "Library" repeats the
-            // page's own name (the UI breadcrumb read "Library / Library").
-            // "Local Library" names the same node distinguishably.
-            let title = if at_collection_root && item.title == "Library" {
-                "Local Library".to_string()
-            } else {
-                // #573 defect 5: strip `[[id|Name]]` link markup.
-                strip_roon_link_markup(&item.title)
-            };
-            mapped.push(serde_json::json!({
-                "title": title,
-                "subtitle": item.subtitle.as_deref().map(strip_roon_link_markup),
-                "item_key": item.item_key,
-                "navigable": navigable,
-                "playable": playable,
-                // #549: Roon's own image_key, resolved through the same
-                // `RoonAdapter::get_image` now-playing art already uses --
-                // `hifi_collections` mints an opaque ref over this rather
-                // than handing it to a client directly.
-                "image_key": item.image_key,
-            }));
-        }
-        Ok(())
-    }
-
-    /// Enter a named top-level browse node (`"Playlists"`, ...) in a fresh
-    /// session and load one page of its contents in a single call --
-    /// `hifi_collections playlists`'s whole job, since Roon exposes playlists
-    /// as a browse hierarchy rather than its own protocol feature (see the
-    /// capability table's note on this).
-    pub async fn browse_named_root_node(
-        &self,
-        zone_id: &str,
-        node_title: &str,
-        offset: usize,
-        limit: usize,
-    ) -> Result<(String, Vec<BrowseItem>, usize)> {
-        let bare_zone_id = strip_roon_prefix(zone_id);
-        let session_key = format!(
-            "collections_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-
-        self.browse(BrowseOpts {
-            multi_session_key: Some(session_key.clone()),
-            zone_or_output_id: Some(bare_zone_id.to_string()),
-            pop_all: true,
-            ..Default::default()
-        })
-        .await?;
-
-        let root_items = self
-            .load(LoadOpts {
-                multi_session_key: Some(session_key.clone()),
-                count: Some(50),
-                ..Default::default()
-            })
-            .await?;
-
-        let node = root_items
-            .items
-            .iter()
-            .find(|item| item.title.eq_ignore_ascii_case(node_title))
-            .ok_or_else(|| anyhow::anyhow!("{node_title} not found in Roon browse root"))?;
-        let node_key = node
-            .item_key
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("{node_title} has no item_key"))?;
-
-        self.browse(BrowseOpts {
-            multi_session_key: Some(session_key.clone()),
-            item_key: Some(node_key),
-            zone_or_output_id: Some(bare_zone_id.to_string()),
-            ..Default::default()
-        })
-        .await?;
-
-        let items = self
-            .load(LoadOpts {
-                multi_session_key: Some(session_key.clone()),
-                offset,
-                count: Some(limit),
-                ..Default::default()
-            })
-            .await?;
-
-        Ok((session_key, items.items, items.list.count))
     }
 
     /// Search and play the first matching result
@@ -2992,7 +2021,7 @@ impl RoonAdapter {
         );
 
         let bare_zone_id = strip_roon_prefix(zone_id);
-        self.resolve_item_key(&session_key, item_key, bare_zone_id, action, None)
+        self.resolve_item_key(&session_key, item_key, bare_zone_id, action)
             .await
     }
 
@@ -3029,36 +2058,12 @@ impl RoonAdapter {
     /// So this is now `play_item`'s exact resolution logic, unchanged, with
     /// only `multi_session_key` swapped for the caller-supplied minting
     /// session instead of a fresh one.
-    ///
-    /// `fallback_title` is the ref's own title (`hifi_play_ref`'s `title`
-    /// field, e.g. a playlist or album name) -- seeded into the result
-    /// message before browsing finds anything more specific, so a caller
-    /// that plays a top-level item whose own action fires immediately (see
-    /// [`Self::resolve_item_key`]'s docs) still gets a human-readable
-    /// message instead of the raw `item_key`.
-    /// # Recovering a key the Core no longer honours (#616)
-    ///
-    /// Re-entering the minting session is right whenever that session still
-    /// exists. When it does not, the Core answers `InvalidItemKey` and the
-    /// old behaviour was to hand the human that rejection verbatim --
-    /// "search or browse again to get a fresh key" -- which asks them to
-    /// perform, by hand, a walk this adapter can perform itself.
-    ///
-    /// So a rejection is now a retry, not a verdict: given `trail` (the
-    /// titles from the browse root down to this item, carried on the ref
-    /// since #616), [`Self::resolve_trail`] re-walks it in a fresh session,
-    /// mints an equivalent key, and the play is attempted once more. The
-    /// caller only sees an error when recovery itself fails -- and then it
-    /// is the *original* rejection that surfaces, because that is the one
-    /// that describes what actually went wrong.
     pub async fn play_ref(
         &self,
         item_key: &str,
         multi_session_key: &str,
         zone_id: &str,
         action: PlayAction,
-        fallback_title: &str,
-        trail: &[String],
     ) -> Result<String> {
         if item_key.is_empty() {
             return Err(anyhow::anyhow!("item_key cannot be empty"));
@@ -3068,227 +2073,8 @@ impl RoonAdapter {
         }
 
         let bare_zone_id = strip_roon_prefix(zone_id);
-        let first = self
-            .resolve_item_key(
-                multi_session_key,
-                item_key,
-                bare_zone_id,
-                action,
-                Some(fallback_title),
-            )
-            .await;
-
-        let Err(error) = first else {
-            return first;
-        };
-
-        // Only a key the Core actively rejected is worth re-walking. A
-        // timeout, a lost Core, or a zone that does not exist are not fixed
-        // by minting a fresh key, and retrying them would double the wait.
-        if !matches!(
-            RoonBrowseError::from_error(&error).map(|rejection| rejection.kind),
-            Some(RoonBrowseErrorKind::InvalidItemKey)
-        ) {
-            return Err(error);
-        }
-        if trail.is_empty() {
-            return Err(error);
-        }
-
-        tracing::info!(
-            session_key = %multi_session_key,
-            trail = ?trail,
-            "roon: item key rejected; re-walking its trail in a fresh session"
-        );
-
-        let (recovered_session, recovered_key) = match self.resolve_trail(zone_id, trail).await {
-            Ok(pair) => pair,
-            Err(recovery_error) => {
-                tracing::info!(
-                    error = %recovery_error,
-                    "roon: could not re-walk the trail; reporting the Core's original rejection"
-                );
-                return Err(error);
-            }
-        };
-        self.resolve_item_key(
-            &recovered_session,
-            &recovered_key,
-            bare_zone_id,
-            action,
-            Some(fallback_title),
-        )
-        .await
-        .map_err(|_| error)
-    }
-
-    /// Re-walk `trail` -- titles from the browse root down to and including
-    /// the wanted item -- in a session minted for this walk, and report
-    /// `(session_key, item_key)` for the item it lands on.
-    ///
-    /// This is the recovery half of #616. It deliberately starts from the
-    /// root with `pop_all` in a *fresh* session rather than reusing the
-    /// caller's: the caller's session is, by the time this runs, the one the
-    /// Core just rejected a key from.
-    ///
-    /// Titles are matched exactly. Roon has no "find the row named X" browse
-    /// verb, so each level is paged through until the title turns up or the
-    /// level is exhausted; [`TRAIL_SCAN_LIMIT`] caps that so a walk down a
-    /// hundred-thousand-track list cannot run away. A title that has since
-    /// been renamed, or moved past the cap, simply fails the walk -- the
-    /// caller then reports the original rejection, which is the honest
-    /// answer.
-    pub(crate) async fn resolve_trail(
-        &self,
-        zone_id: &str,
-        trail: &[String],
-    ) -> Result<(String, String)> {
-        if trail.is_empty() {
-            return Err(anyhow::anyhow!("cannot re-walk an empty trail"));
-        }
-        let bare_zone_id = strip_roon_prefix(zone_id);
-        let session_key = format!(
-            "recover_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-
-        // Land on the browse root. Safe to `pop_all` here precisely because
-        // the session is new: no key anyone holds was minted in it.
-        self.browse(BrowseOpts {
-            multi_session_key: Some(session_key.clone()),
-            zone_or_output_id: Some(bare_zone_id.to_string()),
-            pop_all: true,
-            ..Default::default()
-        })
-        .await?;
-
-        let mut found_key: Option<String> = None;
-        for (depth, title) in trail.iter().enumerate() {
-            // Descend into the previous match before looking for this one.
-            if let Some(parent_key) = found_key.take() {
-                self.browse(BrowseOpts {
-                    multi_session_key: Some(session_key.clone()),
-                    item_key: Some(parent_key),
-                    zone_or_output_id: Some(bare_zone_id.to_string()),
-                    ..Default::default()
-                })
-                .await?;
-            }
-            let matched = self
-                .find_titled_row(&session_key, title, depth == 0)
-                .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "re-walking the browse trail lost the row {title:?} at depth {depth}"
-                    )
-                })?;
-            found_key = Some(matched);
-        }
-
-        let item_key = found_key
-            .ok_or_else(|| anyhow::anyhow!("re-walking the browse trail found no item key"))?;
-        Ok((session_key, item_key))
-    }
-
-    /// Page through the level `session_key` is currently on, looking for a
-    /// row whose title matches `title`. `Ok(None)` means the level was read
-    /// to its end (or to [`TRAIL_SCAN_LIMIT`]) without a match.
-    ///
-    /// Trails are recorded from what the *client* was shown, and
-    /// `map_collection_page` does not show rows verbatim: it renames the
-    /// root's "Library" row to "Local Library" (#573 defect 4) and strips
-    /// `[[id|Name]]` link markup from every other title (#573 defect 5). So
-    /// matching has to compare against the same rendering, or a trail can
-    /// never find the row it names -- which is how the first cut of this
-    /// walk failed at depth 0. `at_root` selects the rename, exactly as the
-    /// mapping's own `at_collection_root` does.
-    async fn find_titled_row(
-        &self,
-        session_key: &str,
-        title: &str,
-        at_root: bool,
-    ) -> Result<Option<String>> {
-        let mut offset = 0usize;
-        loop {
-            let page = self
-                .load(LoadOpts {
-                    multi_session_key: Some(session_key.to_string()),
-                    offset,
-                    count: Some(TRAIL_PAGE_SIZE),
-                    ..Default::default()
-                })
-                .await?;
-            let fetched = page.items.len();
-            for item in page.items {
-                let shown = if at_root && item.title == "Library" {
-                    "Local Library".to_string()
-                } else {
-                    strip_roon_link_markup(&item.title)
-                };
-                if shown == title {
-                    if let Some(key) = item.item_key {
-                        return Ok(Some(key));
-                    }
-                }
-            }
-            offset += fetched;
-            if fetched == 0 || offset >= page.list.count.min(TRAIL_SCAN_LIMIT) {
-                return Ok(None);
-            }
-        }
-    }
-
-    /// Browse `item_key` within `session_key` and report what came back:
-    /// either the Core already invoked it (see below), or a new list to
-    /// search/descend.
-    ///
-    /// # Browsing an `Action` item invokes it -- it does not open a menu
-    ///
-    /// Confirmed by `tests/mock_servers/roon_core.rs::handle_browse`'s own
-    /// "Invoking an action does not produce a list" case (its comment there
-    /// records that nothing in this repo read `BrowseResult::action` before
-    /// #545, so this was never caught): a `hint: action` item's browse
-    /// response carries `action: none`/`message`, not `action: list`, and
-    /// the load-bearing fact is which *response* came back, not the item's
-    /// own `hint` -- a `hint: action_list` item behaves the same way once
-    /// its own children resolve to a single directly-invokable action.
-    /// Checking `browse_result.action` here, instead of unconditionally
-    /// calling `load()` afterward the way this method's predecessor did, is
-    /// what fixes #545's play-matcher bug: the old code always reloaded and
-    /// searched the *current* list for a literal `"Play Now"` -- which,
-    /// after an `Action` item's browse, is still whatever list was active
-    /// beforehand (the Core pushed nothing new), one level too deep, mixed
-    /// with unrelated titles (track names). The play had already happened;
-    /// only the bookkeeping afterward was wrong, which is why it "worked"
-    /// while also reporting an error.
-    async fn enter_item(
-        &self,
-        session_key: &str,
-        zone_id: &str,
-        item_key: &str,
-    ) -> Result<Option<Vec<BrowseItem>>> {
-        let browse_result = self
-            .browse(BrowseOpts {
-                multi_session_key: Some(session_key.to_string()),
-                item_key: Some(item_key.to_string()),
-                zone_or_output_id: Some(zone_id.to_string()),
-                ..Default::default()
-            })
-            .await?;
-        if !matches!(browse_result.action, BrowseAction::List) {
-            return Ok(None);
-        }
-        let items = self
-            .load(LoadOpts {
-                multi_session_key: Some(session_key.to_string()),
-                count: Some(20),
-                ..Default::default()
-            })
-            .await?;
-        Ok(Some(items.items))
+        self.resolve_item_key(multi_session_key, item_key, bare_zone_id, action)
+            .await
     }
 
     /// Shared body of [`Self::play_item`] and [`Self::play_ref`]: browse into
@@ -3304,142 +2090,93 @@ impl RoonAdapter {
         item_key: &str,
         bare_zone_id: &str,
         action: PlayAction,
-        fallback_title: Option<&str>,
     ) -> Result<String> {
-        let mut container_title = fallback_title.unwrap_or(item_key).to_string();
-        let mut next_key = item_key.to_string();
+        let session_key = session_key.to_string();
+        let bare_zone_id = bare_zone_id.to_string();
 
-        // Bounded "no action row here -- descend into the first item and try
-        // again" loop, for a plain container that needs one more hop before
-        // reaching real content (mirrors `try_navigate_to_playable`'s same
-        // one-hop assumption for search). #545's live repro needed zero hops
-        // (the playlist's own item_key already led to a mixed action+track
-        // level); this stays bounded rather than unbounded purely as a
-        // safety margin against an unexpected Core shape looping forever.
-        for _ in 0..4 {
-            let Some(items) = self
-                .enter_item(session_key, bare_zone_id, &next_key)
-                .await?
-            else {
-                // `next_key` itself was directly invokable -- see
-                // `enter_item`'s docs. Nothing else to do.
-                return Ok(container_title);
-            };
+        self.browse(BrowseOpts {
+            multi_session_key: Some(session_key.clone()),
+            item_key: Some(item_key.to_string()),
+            zone_or_output_id: Some(bare_zone_id.clone()),
+            ..Default::default()
+        })
+        .await?;
 
-            if let Some(matched) = find_action_item(&items, action) {
-                let verb = matched.title.clone();
-                let key = matched
-                    .item_key
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("Action has no item_key"))?;
+        let items = self
+            .load(LoadOpts {
+                multi_session_key: Some(session_key.clone()),
+                count: Some(20),
+                ..Default::default()
+            })
+            .await?;
 
-                match self.enter_item(session_key, bare_zone_id, &key).await? {
-                    // `matched` was itself directly invokable (the common
-                    // case: a `hint: action` row like "Play Playlist", or a
-                    // `hint: action_list` row whose own browse turns out to
-                    // invoke rather than list -- Roon does not promise which,
-                    // so this is decided by the response either way).
-                    None => return Ok(format!("{verb}: {container_title}")),
-                    // `matched` was an `action_list` wrapper needing one more
-                    // descent (the "double-nested action_list" case: e.g.
-                    // "Play Album" opens a menu of "Play Now"/"Queue"/"Start
-                    // Radio"). Search that menu for the same intent and
-                    // invoke it; do not check its own response further --
-                    // this is as deep as any known Roon shape nests.
-                    Some(inner_items) => {
-                        let Some(inner_matched) = find_action_item(&inner_items, action) else {
-                            let available: Vec<_> = inner_items.iter().map(|i| &i.title).collect();
-                            return Err(anyhow::anyhow!(
-                                "Action '{}' not available. Available: {:?}",
-                                action.canonical_verb(),
-                                available
-                            ));
-                        };
-                        let inner_verb = inner_matched.title.clone();
-                        let inner_key = inner_matched
-                            .item_key
-                            .clone()
-                            .ok_or_else(|| anyhow::anyhow!("Action has no item_key"))?;
-                        self.browse(BrowseOpts {
-                            multi_session_key: Some(session_key.to_string()),
-                            item_key: Some(inner_key),
-                            zone_or_output_id: Some(bare_zone_id.to_string()),
-                            ..Default::default()
-                        })
-                        .await?;
-                        return Ok(format!("{inner_verb}: {verb}"));
-                    }
-                }
-            }
+        if let Some(playable) = find_playable_item(&items.items) {
+            let title = playable.title.clone();
+            let key = playable
+                .item_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
+            return self
+                .execute_play_action(&session_key, &bare_zone_id, &title, &key, action)
+                .await;
+        }
 
-            // No row at this level directly names the requested intent --
-            // before giving up, peek inside any `action_list` wrapper here
-            // (e.g. "Play Album" wrapping "Play Now"/"Queue"/"Start Radio",
-            // #545's own `album()` fixture shape). Peeking is safe: browsing
-            // a `hint: action_list` item never invokes anything by itself
-            // (only `hint: action` does -- see `enter_item`'s docs), it just
-            // opens the menu, so trying each wrapper in turn has no
-            // side effect beyond the one that actually matches.
-            for wrapper in items
-                .iter()
-                .filter(|item| matches!(item.hint, Some(ItemHint::ActionList)))
-            {
-                let Some(wrapper_key) = wrapper.item_key.clone() else {
-                    continue;
-                };
-                let Some(inner_items) = self
-                    .enter_item(session_key, bare_zone_id, &wrapper_key)
-                    .await?
-                else {
-                    continue;
-                };
-                if let Some(inner_matched) = find_action_item(&inner_items, action) {
-                    let inner_verb = inner_matched.title.clone();
-                    let inner_key = inner_matched
-                        .item_key
-                        .clone()
-                        .ok_or_else(|| anyhow::anyhow!("Action has no item_key"))?;
-                    self.browse(BrowseOpts {
-                        multi_session_key: Some(session_key.to_string()),
-                        item_key: Some(inner_key),
-                        zone_or_output_id: Some(bare_zone_id.to_string()),
+        // Try "Play Album" action
+        if let Some(play_album) = items.items.iter().find(|i| i.title == "Play Album") {
+            let key = play_album
+                .item_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Play Album has no key"))?;
+            return self
+                .execute_play_action(&session_key, &bare_zone_id, "Album", &key, action)
+                .await;
+        }
+
+        // Try navigating into first item
+        if let Some(first) = items.items.first() {
+            if let Some(key) = &first.item_key {
+                self.browse(BrowseOpts {
+                    multi_session_key: Some(session_key.clone()),
+                    item_key: Some(key.clone()),
+                    zone_or_output_id: Some(bare_zone_id.clone()),
+                    ..Default::default()
+                })
+                .await?;
+
+                let deeper = self
+                    .load(LoadOpts {
+                        multi_session_key: Some(session_key.clone()),
+                        count: Some(20),
                         ..Default::default()
                     })
                     .await?;
-                    return Ok(format!("{inner_verb}: {}", wrapper.title));
-                }
-            }
 
-            // This level *does* offer at least one action (directly, or
-            // inside a wrapper this just peeked and found no match in),
-            // just not one matching the requested intent (e.g. Queue/Radio
-            // requested against a level that only offers "Play Playlist")
-            // -- that is a real "not available" refusal, not an invitation
-            // to descend into a bare `action` row and invoke the wrong
-            // thing. See `roon_play_ref_does_not_silently_substitute_
-            // queue_for_an_unavailable_action` (`tests/roon_protocol.rs`).
-            if items.iter().any(|item| {
-                matches!(
-                    item.hint,
-                    Some(ItemHint::Action) | Some(ItemHint::ActionList)
-                )
-            }) {
-                let available: Vec<_> = items.iter().map(|i| &i.title).collect();
-                return Err(anyhow::anyhow!(
-                    "Action '{}' not available. Available: {:?}",
-                    action.canonical_verb(),
-                    available
-                ));
-            }
-
-            // No action row at this level at all -- a plain container.
-            // Descend into the first item and look again.
-            match items.first().and_then(|item| item.item_key.clone()) {
-                Some(key) => {
-                    container_title = items[0].title.clone();
-                    next_key = key;
+                if let Some(playable) = find_playable_item(&deeper.items) {
+                    let title = playable.title.clone();
+                    let item_key = playable
+                        .item_key
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
+                    return self
+                        .execute_play_action(&session_key, &bare_zone_id, &title, &item_key, action)
+                        .await;
                 }
-                None => break,
+
+                if let Some(play_album) = deeper.items.iter().find(|i| i.title == "Play Album") {
+                    let key = play_album
+                        .item_key
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("Play Album has no key"))?;
+                    return self
+                        .execute_play_action(
+                            &session_key,
+                            &bare_zone_id,
+                            &first.title,
+                            &key,
+                            action,
+                        )
+                        .await;
+                }
             }
         }
 
@@ -3449,13 +2186,7 @@ impl RoonAdapter {
         ))
     }
 
-    /// Invoke the action row at `item_key` (`item_title` is that row's own
-    /// title, e.g. "Play Album"), matching `action`'s intent rather than an
-    /// exact literal. Shared by `search_and_play`'s fallbacks below --
-    /// `resolve_item_key` above inlines the same `enter_item`+
-    /// [`find_action_item`] steps itself, since it also needs to thread a
-    /// human-readable container title through that this method's older,
-    /// narrower call sites never had.
+    /// Execute a play action on a specific item
     async fn execute_play_action(
         &self,
         session_key: &str,
@@ -3464,229 +2195,76 @@ impl RoonAdapter {
         item_key: &str,
         action: PlayAction,
     ) -> Result<String> {
-        let Some(items) = self.enter_item(session_key, zone_id, item_key).await? else {
-            // #545: `item_key` itself was directly invokable -- see
-            // `enter_item`'s docs. None of this method's pre-#545 call sites
-            // could hit this (they only ever passed an `action_list` item's
-            // key, which always produced a menu) but a future caller might.
-            return Ok(item_title.to_string());
-        };
+        self.browse(BrowseOpts {
+            multi_session_key: Some(session_key.to_string()),
+            item_key: Some(item_key.to_string()),
+            zone_or_output_id: Some(zone_id.to_string()),
+            ..Default::default()
+        })
+        .await?;
 
-        let Some(matched) = find_action_item(&items, action) else {
-            let available: Vec<_> = items.iter().map(|i| &i.title).collect();
-            return Err(anyhow::anyhow!(
-                "Action '{}' not available. Available: {:?}",
-                action.canonical_verb(),
-                available
-            ));
-        };
-        let verb = matched.title.clone();
-        let key = matched
+        let mut actions = self
+            .load(LoadOpts {
+                multi_session_key: Some(session_key.to_string()),
+                count: Some(10),
+                ..Default::default()
+            })
+            .await?;
+
+        // Handle double-nested action_list
+        if actions.items.len() == 1 {
+            if let Some(item) = actions.items.first() {
+                if matches!(item.hint, Some(ItemHint::ActionList)) {
+                    if let Some(key) = &item.item_key {
+                        self.browse(BrowseOpts {
+                            multi_session_key: Some(session_key.to_string()),
+                            item_key: Some(key.clone()),
+                            zone_or_output_id: Some(zone_id.to_string()),
+                            ..Default::default()
+                        })
+                        .await?;
+
+                        actions = self
+                            .load(LoadOpts {
+                                multi_session_key: Some(session_key.to_string()),
+                                count: Some(10),
+                                ..Default::default()
+                            })
+                            .await?;
+                    }
+                }
+            }
+        }
+
+        let action_title = action.action_title();
+
+        let action_item = actions
+            .items
+            .iter()
+            .find(|item| item.title == action_title)
+            .ok_or_else(|| {
+                let available: Vec<_> = actions.items.iter().map(|i| &i.title).collect();
+                anyhow::anyhow!(
+                    "Action '{}' not available. Available: {:?}",
+                    action_title,
+                    available
+                )
+            })?;
+
+        let action_key = action_item
             .item_key
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Action has no item_key"))?;
 
-        match self.enter_item(session_key, zone_id, &key).await? {
-            None => Ok(format!("{verb}: {item_title}")),
-            // Double-nested action_list: `matched` was itself a wrapper
-            // (e.g. an inner "Play Album" opening "Play Now"/"Queue"/"Start
-            // Radio") -- search that menu for the same intent.
-            Some(inner_items) => {
-                let Some(inner_matched) = find_action_item(&inner_items, action) else {
-                    let available: Vec<_> = inner_items.iter().map(|i| &i.title).collect();
-                    return Err(anyhow::anyhow!(
-                        "Action '{}' not available. Available: {:?}",
-                        action.canonical_verb(),
-                        available
-                    ));
-                };
-                let inner_verb = inner_matched.title.clone();
-                let inner_key = inner_matched
-                    .item_key
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("Action has no item_key"))?;
-                self.browse(BrowseOpts {
-                    multi_session_key: Some(session_key.to_string()),
-                    item_key: Some(inner_key),
-                    zone_or_output_id: Some(zone_id.to_string()),
-                    ..Default::default()
-                })
-                .await?;
-                Ok(format!("{inner_verb}: {verb}"))
-            }
-        }
-    }
-}
+        self.browse(BrowseOpts {
+            multi_session_key: Some(session_key.to_string()),
+            item_key: Some(action_key),
+            zone_or_output_id: Some(zone_id.to_string()),
+            ..Default::default()
+        })
+        .await?;
 
-/// Content-library surface: the multiroom grouping operations (#509) and
-/// the `hifi_collections` browse operations (#531) are both implemented
-/// here. Roon's own search/play surfaces are reached through their
-/// dedicated paths (`RoonAdapter::search`, `RoonAdapter::play_item`, ...)
-/// rather than through this trait's `search`/`play_uri` -- a Roon playable
-/// target is an `(item_key, multi_session_key)` pair, not a portable URI
-/// (see `RoonRefTarget`'s docs) -- which is exactly why `hifi_search`/
-/// `hifi_play`/`hifi_play_ref` already call `RoonAdapter` directly
-/// (pre-existing debt, unaffected by this registration). `content` is what
-/// lets the provider-neutral MCP registry (`AdapterRegistry::library_content`)
-/// dispatch `multiroom_status`, `multiroom_set_members`,
-/// `multiroom_ungroup`, `collections_browse` and `collections_playlists` to
-/// Roon the same way it already dispatches the multiroom operations to
-/// Music Assistant (`src/adapters/musicassistant.rs`).
-#[async_trait]
-impl LibraryAdapter for RoonAdapter {
-    async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<LibrarySearchResult>> {
-        Err(anyhow::anyhow!(
-            "Roon search is not reachable through the generic library registry; hifi_search \
-             calls RoonAdapter directly because a Roon item_key is scoped to the \
-             multi_session_key that minted it, not a flat URI"
-        ))
-    }
-
-    async fn play_uri(&self, _zone_id: &str, _uri: &str) -> Result<String> {
-        Err(anyhow::anyhow!(
-            "Roon playback is not reachable through the generic library registry; \
-             hifi_play/hifi_play_ref call RoonAdapter directly for the same reason as search"
-        ))
-    }
-
-    /// `operation` is one of `multiroom_status`, `multiroom_set_members`,
-    /// `multiroom_ungroup`, `collections_browse` or `collections_playlists`
-    /// (never `collections_favorites` -- Roon's favorites capability is not
-    /// wired, see `crate::mcp::capabilities`). The collections response is
-    /// this adapter's own shape, not `hifi_collections`' wire shape:
-    /// `{session_key, items: [{title, subtitle, item_key, navigable}],
-    /// next_offset}`. `crate::mcp::tools::collections::handle_roon` mints
-    /// the opaque ref (a path for `navigable`, a playable ref otherwise)
-    /// pairing `item_key` with `session_key` -- this method's job ends at
-    /// handing back an already session-scoped, already grouping-filtered
-    /// page, not at deciding what a client may address.
-    async fn content(&self, operation: &str, params: &Value) -> Result<Value> {
-        match operation {
-            "multiroom_status" => self.multiroom_status().await,
-            "multiroom_set_members" => {
-                let leader = params
-                    .get("leader_zone_id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Roon group operation requires leader_zone_id")
-                    })?;
-                let add = params
-                    .get("member_zone_ids_to_add")
-                    .or_else(|| params.get("member_zone_ids"))
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Roon group operation requires member_zone_ids")
-                    })?
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .collect::<Vec<_>>();
-                let remove = params
-                    .get("member_zone_ids_to_remove")
-                    .and_then(Value::as_array)
-                    .map(|members| {
-                        members
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(ToOwned::to_owned)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                self.set_group_members(leader, &add, &remove).await
-            }
-            "multiroom_ungroup" => {
-                let members = params
-                    .get("member_zone_ids")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| anyhow::anyhow!("Roon ungroup requires member_zone_ids"))?
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .collect::<Vec<_>>();
-                self.ungroup_members(&members).await
-            }
-            "collections_browse" | "collections_playlists" => {
-                let zone_id = params
-                    .get("zone_id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("zone_id is required"))?;
-                let limit = params
-                    .get("limit")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(20)
-                    .clamp(1, 50) as usize;
-                let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
-                let request_item_key = params.get("item_key").and_then(Value::as_str);
-                // Browsing the true collection root -- `collections_browse`
-                // with no `item_key` to resume into (see
-                // `browse_collection`'s `None => pop_all` branch).
-                // `collections_playlists` always enters the named
-                // "Playlists" node instead, so it is never at this root.
-                let at_collection_root =
-                    operation == "collections_browse" && request_item_key.is_none();
-                let (session_key, items, total) = if operation == "collections_browse" {
-                    let session_key = params.get("session_key").and_then(Value::as_str);
-                    self.browse_collection(zone_id, request_item_key, session_key, offset, limit)
-                        .await?
-                } else {
-                    self.browse_named_root_node(zone_id, "Playlists", offset, limit)
-                        .await?
-                };
-                let mut mapped: Vec<Value> = Vec::new();
-                self.map_collection_page(
-                    zone_id,
-                    &session_key,
-                    items,
-                    at_collection_root,
-                    &mut mapped,
-                )
-                .await?;
-                // #573 defect 8: `next_offset` used to be computed against
-                // Roon's raw `list.count`, *before* the grouping/action-row
-                // filters above dropped items -- so a fully-filtered page
-                // advertised "Load more" over nothing, potentially forever.
-                // Fetch ahead instead: while the filtered page is still
-                // short and raw rows remain, load and filter further chunks
-                // (bounded), and advertise a next page only when raw rows
-                // genuinely remain past what was consumed.
-                let mut consumed = (offset + limit).min(total);
-                const FETCH_AHEAD_ROUNDS: usize = 4;
-                let mut rounds = 0;
-                while mapped.len() < limit && consumed < total && rounds < FETCH_AHEAD_ROUNDS {
-                    let chunk = self
-                        .load(LoadOpts {
-                            multi_session_key: Some(session_key.clone()),
-                            offset: consumed,
-                            count: Some(limit),
-                            ..Default::default()
-                        })
-                        .await?;
-                    if chunk.items.is_empty() {
-                        consumed = total;
-                        break;
-                    }
-                    consumed = (consumed + chunk.items.len()).min(total);
-                    self.map_collection_page(
-                        zone_id,
-                        &session_key,
-                        chunk.items,
-                        at_collection_root,
-                        &mut mapped,
-                    )
-                    .await?;
-                    rounds += 1;
-                }
-                let next_offset = (consumed < total).then_some(consumed as u64);
-                Ok(serde_json::json!({
-                    "session_key": session_key,
-                    "items": mapped,
-                    "next_offset": next_offset,
-                }))
-            }
-            _ => Err(anyhow::anyhow!(
-                "Roon content operation `{operation}` is not supported"
-            )),
-        }
+        Ok(format!("{}: {}", action_title, item_title))
     }
 }
 
@@ -3732,7 +2310,6 @@ impl AdapterLogic for RoonAdapter {
             self.knob_store.clone(),
             self.runtime_bridge.clone(),
             CoreConnect::Discovery,
-            self.state_path.clone(),
         )
         .await;
         command_shutdown.cancel();
@@ -3766,14 +2343,6 @@ impl AdapterLogic for RoonAdapter {
                 self.change_volume(zone_id, delta as f32, true).await
             }
             AdapterCommand::Mute(mute) => self.mute(zone_id, mute).await,
-            AdapterCommand::SetRepeat(_) | AdapterCommand::SetShuffle(_) => {
-                return Ok(AdapterCommandResponse {
-                    success: false,
-                    error: Some(
-                        "Repeat and shuffle are not implemented by the Roon adapter".to_string(),
-                    ),
-                });
-            }
         };
 
         match result {
@@ -4027,7 +2596,6 @@ fn convert_zone(roon_zone: &RoonZone) -> Zone {
                 is_muted: v.is_muted,
                 step: v.step,
             }),
-            can_group_with_output_ids: o.can_group_with_output_ids.clone(),
         })
         .collect();
 
@@ -4089,8 +2657,6 @@ fn roon_zone_to_bus_zone(zone: &Zone) -> BusZone {
         seek_position: np.seek_position.map(|p| p as f64),
         duration: np.length.map(|l| l as f64),
         metadata: None,
-        repeat_mode: None,
-        shuffle: None,
     });
 
     BusZone {
@@ -4125,7 +2691,6 @@ enum CoreConnect {
 }
 
 /// Main Roon event loop
-#[allow(clippy::too_many_arguments)]
 async fn run_roon_loop(
     state: Arc<RwLock<RoonState>>,
     bus: SharedBus,
@@ -4134,7 +2699,6 @@ async fn run_roon_loop(
     knob_store: Option<KnobStore>,
     runtime_bridge: Option<Arc<RoonRuntimeBridge>>,
     connect: CoreConnect,
-    state_path: PathBuf,
 ) -> Result<()> {
     tracing::info!("Starting Roon discovery...");
 
@@ -4143,8 +2707,7 @@ async fn run_roon_loop(
 
     // Ensure config subdirectory exists for state persistence
     // Issue #76: State files now go into unified-hifi/ subdirectory
-    // Issue #554: path is caller-supplied (production default: get_roon_state_path()),
-    // so concurrent tests can each own a private file instead of racing over one.
+    let state_path = get_roon_state_path();
     if let Some(parent) = state_path.parent() {
         if !parent.exists() {
             std::fs::create_dir_all(parent)?;
@@ -4781,138 +3344,6 @@ async fn run_roon_loop(
 crate::impl_startable!(RoonAdapter, "roon", is_configured);
 
 #[cfg(test)]
-mod defect_573_row_classification {
-    use super::*;
-
-    fn item(title: &str, hint: Option<ItemHint>) -> BrowseItem {
-        BrowseItem {
-            title: title.to_string(),
-            subtitle: None,
-            image_key: None,
-            item_key: Some("k".to_string()),
-            hint,
-            input_prompt: None,
-        }
-    }
-
-    /// Every play-verb shape observed live is an action row.
-    #[test]
-    fn verb_rows_are_immediate_action_rows() {
-        for title in [
-            "Play Now",
-            "Play Album",
-            "Play Playlist",
-            "Play Artist",
-            "Shuffle",
-            "Queue",
-            "Start Radio",
-        ] {
-            for hint in [ItemHint::ActionList, ItemHint::Action] {
-                assert!(
-                    is_immediate_action_row(&item(title, Some(hint.clone()))),
-                    "{title} ({hint:?}) must classify as an action row"
-                );
-            }
-        }
-    }
-
-    /// #587: a live Core marks radio station rows under My Live Radio
-    /// `hint: action` (browsing one plays it immediately) -- they are
-    /// content, not verb rows. Shape captured off the operator's Core; see
-    /// `is_immediate_action_row`'s docs.
-    #[test]
-    fn action_hinted_radio_station_rows_are_content() {
-        let mut station = item(
-            "WOSU-HD2 WOSU Public Media: Classical 101",
-            Some(ItemHint::Action),
-        );
-        station.subtitle = Some("Columbus, Ohio, USA FM 89.7 HD2 English".to_string());
-        station.image_key = Some("afd611dd".to_string());
-        assert!(
-            !is_immediate_action_row(&station),
-            "a station row with subtitle and artwork is content"
-        );
-
-        // Even a bare station (no subtitle, no artwork) survives: its title
-        // is not one of Roon's play verbs.
-        assert!(!is_immediate_action_row(&item(
-            "WOSU-HD2",
-            Some(ItemHint::Action)
-        )));
-    }
-
-    /// #573 defect 1: an `action_list` track row (artist subtitle, artwork)
-    /// is content, never an action row -- including tracks whose titles
-    /// start with "Play".
-    #[test]
-    fn action_list_track_rows_are_content() {
-        let mut track = item("So What", Some(ItemHint::ActionList));
-        track.subtitle = Some("Miles Davis".to_string());
-        assert!(!is_immediate_action_row(&track));
-
-        let mut tricky = item("Play That Funky Music", Some(ItemHint::ActionList));
-        tricky.subtitle = Some("Wild Cherry".to_string());
-        assert!(
-            !is_immediate_action_row(&tricky),
-            "a track titled with the word Play keeps its subtitle and stays content"
-        );
-
-        // Even a bare action_list row is content unless its title reads as
-        // a known verb.
-        assert!(!is_immediate_action_row(&item(
-            "Blue in Green",
-            Some(ItemHint::ActionList)
-        )));
-
-        // List rows are never action rows.
-        assert!(!is_immediate_action_row(&item(
-            "Play Album",
-            Some(ItemHint::List)
-        )));
-    }
-
-    /// #573 defect 7: the placeholder is matched by title plus the absence
-    /// of every content signal.
-    #[test]
-    fn no_results_placeholder_is_detected() {
-        assert!(is_no_results_placeholder(&item("No Results", None)));
-        assert!(is_no_results_placeholder(&item("no results", None)));
-
-        let mut real_track = item("No Results", None);
-        real_track.subtitle = Some("Some Band".to_string());
-        assert!(
-            !is_no_results_placeholder(&real_track),
-            "a real track titled No Results keeps its subtitle and stays"
-        );
-        assert!(!is_no_results_placeholder(&item(
-            "No Results",
-            Some(ItemHint::List)
-        )));
-    }
-
-    /// #573 defect 5: markup stripping, including the compound live shapes.
-    #[test]
-    fn link_markup_is_stripped_to_plain_names() {
-        assert_eq!(
-            strip_roon_link_markup("[[55418|Michael Jackson]]"),
-            "Michael Jackson"
-        );
-        assert_eq!(
-            strip_roon_link_markup("[[8827258|Willie Colón]] & [[1981050|Rubén Blades]]"),
-            "Willie Colón & Rubén Blades"
-        );
-        assert_eq!(strip_roon_link_markup("plain text"), "plain text");
-        // Malformed shapes pass through verbatim rather than being guessed at.
-        assert_eq!(strip_roon_link_markup("[[no pipe]]"), "[[no pipe]]");
-        assert_eq!(strip_roon_link_markup("[[unterminated"), "[[unterminated");
-        assert_eq!(
-            strip_roon_link_markup("prefix [[1|Name]] suffix"),
-            "prefix Name suffix"
-        );
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -4942,7 +3373,6 @@ mod tests {
                     is_muted: None,
                     step: None,
                 }),
-                can_group_with_output_ids: Vec::new(),
             }],
         }
     }
@@ -5008,7 +3438,6 @@ mod tests {
                 output_id: "output-no-vol".to_string(),
                 display_name: "No Volume Output".to_string(),
                 volume: None,
-                can_group_with_output_ids: Vec::new(),
             }],
         };
         let bus_zone = roon_zone_to_bus_zone(&zone);
@@ -5030,8 +3459,6 @@ mod tests {
             seek_position: Some(seek_position),
             duration: Some(645.0),
             metadata: None,
-            repeat_mode: None,
-            shuffle: None,
         });
         zone
     }

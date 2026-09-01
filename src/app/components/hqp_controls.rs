@@ -7,14 +7,16 @@ use crate::app::api::{HqpMatrixProfile, HqpProfile};
 /// HQPlayer profile selector dropdown.
 #[component]
 pub fn HqpProfileSelect(
-    // Available profiles to choose from
+    /// Available profiles to choose from
     profiles: Vec<HqpProfile>,
-    // Called when a profile is selected
+    /// Called when a profile is selected
     on_select: EventHandler<String>,
-    // Optional CSS class for the select element
-    #[props(default = "input".to_string())] class: String,
-    // Disable the select element
-    #[props(default = false)] disabled: bool,
+    /// Optional CSS class for the select element
+    #[props(default = "input".to_string())]
+    class: String,
+    /// Disable the select element
+    #[props(default = false)]
+    disabled: bool,
 ) -> Element {
     rsx! {
         select {
@@ -56,16 +58,18 @@ pub fn HqpProfileSelect(
 /// HQPlayer matrix profile selector dropdown.
 #[component]
 pub fn HqpMatrixSelect(
-    // Available matrix profiles to choose from
+    /// Available matrix profiles to choose from
     profiles: Vec<HqpMatrixProfile>,
-    // Currently active profile name. `None` is the unnamed `[Default]` matrix.
+    /// Currently active profile name. `None` is the unnamed `[Default]` matrix.
     active: Option<String>,
-    // Called with the native profile name; empty selects `[Default]`.
+    /// Called with the native profile name; empty selects `[Default]`.
     on_select: EventHandler<String>,
-    // Optional CSS class for the select element
-    #[props(default = "input".to_string())] class: String,
-    // Disable the select element
-    #[props(default = false)] disabled: bool,
+    /// Optional CSS class for the select element
+    #[props(default = "input".to_string())]
+    class: String,
+    /// Disable the select element
+    #[props(default = false)]
+    disabled: bool,
 ) -> Element {
     rsx! {
         select {
@@ -90,18 +94,18 @@ pub fn HqpMatrixSelect(
 /// Compact HQP controls for use in cards (profile + matrix in a row).
 #[component]
 pub fn HqpControlsCompact(
-    // Available profiles
+    /// Available profiles
     profiles: Vec<HqpProfile>,
-    // Available matrix profiles
+    /// Available matrix profiles
     matrix_profiles: Vec<HqpMatrixProfile>,
-    // Whether the matrix inventory was read successfully. The unnamed `[Default]` exists even
-    // when there are no saved named profiles.
+    /// Whether the matrix inventory was read successfully. The unnamed `[Default]` exists even
+    /// when there are no saved named profiles.
     matrix_available: bool,
-    // Currently active matrix profile name; `None` is the unnamed `[Default]` matrix.
+    /// Currently active matrix profile name; `None` is the unnamed `[Default]` matrix.
     active_matrix: Option<String>,
-    // Called when a profile is selected
+    /// Called when a profile is selected
     on_profile_select: EventHandler<String>,
-    // Called when a matrix profile is selected
+    /// Called when a matrix profile is selected
     on_matrix_select: EventHandler<String>,
 ) -> Element {
     rsx! {

@@ -18,7 +18,6 @@ server = [
     "dep:tower-http",
     "dep:roon-api",
     "dep:reqwest",
-    "dep:tokio-tungstenite",
     "dep:tracing-subscriber",
     "dep:config",
     "dep:image",
@@ -33,9 +32,6 @@ server = [
     "dep:mime_guess",
     "dep:http-body-util",
     "dep:rust-mcp-sdk",
-    "dep:rumqttc",
-    "dep:ed25519-dalek",
-    "dep:uuid",
 ]
 web = ["dioxus/web"]
 
@@ -53,7 +49,6 @@ md5 = "0.8"
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.8"
-uuid = { version = "1", features = ["serde", "v4"], optional = true }
 
 # Regex (shared)
 regex = "1"
@@ -82,9 +77,6 @@ async-trait = "0.1"
 # Base64 (shared)
 base64 = "0.22.1"
 
-# Authenticated encryption for provider credentials at rest
-chacha20poly1305 = "0.10"
-
 # Dioxus UI primitives (shared - needed for SSR and client hydration)
 dioxus-primitives = { git = "https://github.com/DioxusLabs/components", version = "0.0.1", default-features = false, features = ["router"] }
 
@@ -103,11 +95,6 @@ roon-api = { git = "https://github.com/open-horizon-labs/rust-roon-api.git", bra
 
 # HTTP client (server only)
 reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "rustls-tls"], optional = true }
-
-# WebSocket client (server only) - Music Assistant event subscription (#506).
-# rustls to match reqwest's TLS backend rather than pulling in a second (native-tls)
-# implementation.
-tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"], optional = true }
 
 # Logging subscriber (server only - needs tokio)
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
@@ -139,19 +126,12 @@ resvg = { version = "0.47.0", features = ["default"], optional = true }
 # MCP server (server only)
 rust-mcp-sdk = { version = "0.8", default-features = false, features = ["server", "macros", "hyper-server", "sse"], optional = true }
 
-# MQTT publisher for Home Assistant discovery (server only, issue #508)
-rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"], optional = true }
-
-# Public-key-only verification and locally held installation identity for the
-# optional outbound HiPhi Cloud connector. The cloud signing key never enters UHC.
-ed25519-dalek = { version = "2.2", features = ["rand_core"], optional = true }
-
 # ============ WEB-ONLY DEPENDENCIES ============
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["Window", "Location", "Navigator", "Clipboard", "Document", "HtmlDocument", "HtmlElement", "HtmlTextAreaElement", "CssStyleDeclaration", "Node", "Element", "DomTokenList", "Storage", "Request", "RequestInit", "Response", "Headers", "EventSource", "MessageEvent", "Performance", "PerformanceEntry"] }
+web-sys = { version = "0.3", features = ["Window", "Navigator", "Clipboard", "Document", "HtmlDocument", "HtmlElement", "HtmlTextAreaElement", "CssStyleDeclaration", "Node", "Element", "DomTokenList", "Storage", "Request", "RequestInit", "Response", "Headers", "EventSource", "MessageEvent"] }
 serde-wasm-bindgen = "0.6"
 # getrandom needs js feature for WASM (used by rand)
 getrandom = { version = "0.2", features = ["js"] }
@@ -163,11 +143,6 @@ path = "src/main.rs"
 [[bin]]
 name = "protocol-checker"
 path = "src/bin/protocol_checker.rs"
-required-features = ["server"]
-
-[[bin]]
-name = "uhc-hiphi-pair"
-path = "src/bin/uhc_hiphi_pair.rs"
 required-features = ["server"]
 
 [dev-dependencies]
@@ -184,13 +159,10 @@ syn = { version = "2", features = ["full", "parsing", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 walkdir = "2"
 tempfile = "3"
-# tokio-tungstenite moved to [dependencies] (#506): the Music Assistant adapter now
-# needs a WebSocket *client* in production, and tests/mock_servers/roon_core.rs's
-# WebSocket *server* fake shares that same declaration.
-# In-process MQTT broker for tests/mqtt_integration.rs (issue #508). Pure-Rust,
-# embeddable, and wire-compatible with the `rumqttc` client used by the publisher -
-# this is the "mock/in-process broker" the issue's acceptance criteria calls for.
-rumqttd = { version = "0.19", default-features = false }
+# WebSocket *server* for tests/mock_servers/roon_core.rs (the Roon Core protocol fake).
+# Pinned to the same version roon-api uses as its client, so the fake and the real
+# client library share one framing implementation and no new crate is compiled.
+tokio-tungstenite = "0.21"
 
 [profile.release]
 lto = true

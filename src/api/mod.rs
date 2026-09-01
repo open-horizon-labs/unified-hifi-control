@@ -4,20 +4,16 @@ use crate::adapters::hqplayer::{
     HqpAdapter, HqpAdvancedOptionsSnapshot, HqpInstanceManager, HqpProfile, HqpZoneLinkService,
 };
 use crate::adapters::lms::LmsAdapter;
-use crate::adapters::musicassistant::ReconfigurableMusicAssistant;
 use crate::adapters::openhome::OpenHomeAdapter;
 use crate::adapters::roon::RoonAdapter;
 use crate::adapters::upnp::UPnPAdapter;
-use crate::adapters::{
-    AdapterCommand, AdapterCommandResponse, AdapterLogic, LibraryAdapter, LibrarySearchResult,
-    Startable,
-};
+use crate::adapters::Startable;
 use crate::aggregator::{HqpSnapshotPresence, ZoneAggregator};
 use crate::bus::runtime::{
     CommandDeadlines, CommandGateway, CommandLane, CommandRequest, CommandStatus,
     HqpRuntimeCommand, RuntimeCommand,
 };
-use crate::bus::{Command, HqpImageSource, PrefixedZoneId, ProviderAccount, SharedBus};
+use crate::bus::{Command, HqpImageSource, PrefixedZoneId, SharedBus};
 use crate::coordinator::AdapterCoordinator;
 use crate::knobs::KnobStore;
 use axum::{
@@ -39,233 +35,6 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-pub mod apple_bridge;
-pub mod browse;
-pub mod controller_auth;
-pub mod credentials;
-pub mod ha_integration;
-pub mod hiphi_pairing;
-pub mod ingress;
-pub mod mqtt_bootstrap;
-pub mod mqtt_settings;
-pub mod provider_auth;
-pub mod spotify_callback_listener;
-pub mod spotify_tunnel;
-
-const MAX_REMOTE_ARTWORK_BYTES: usize = 10 * 1024 * 1024;
-
-/// Registry for provider adapters whose transport is not represented by a
-/// dedicated field on `AppState` (for example cloud and bridge-backed sources).
-/// The aggregator remains the read-side source of truth; this registry only
-/// dispatches commands to the owning adapter.
-#[derive(Default)]
-pub struct AdapterRegistry {
-    adapters: tokio::sync::RwLock<std::collections::HashMap<String, Arc<dyn AdapterLogic>>>,
-    libraries: tokio::sync::RwLock<std::collections::HashMap<String, Arc<dyn LibraryAdapter>>>,
-    startables: tokio::sync::RwLock<std::collections::HashMap<String, Arc<dyn Startable>>>,
-}
-
-impl AdapterRegistry {
-    pub async fn register(&self, adapter: Arc<dyn AdapterLogic>) {
-        self.adapters
-            .write()
-            .await
-            .insert(adapter.prefix().to_string(), adapter);
-    }
-
-    pub async fn register_with_lifecycle(
-        &self,
-        adapter: Arc<dyn AdapterLogic>,
-        startable: Arc<dyn Startable>,
-    ) {
-        self.register(adapter).await;
-        self.startables
-            .write()
-            .await
-            .insert(startable.name().to_string(), startable);
-    }
-
-    /// Start a registered lifecycle owner through the coordinator without
-    /// exposing its concrete adapter type to an API handler.
-    pub async fn start_registered_if_enabled(
-        &self,
-        coordinator: &AdapterCoordinator,
-        name: &str,
-    ) -> anyhow::Result<bool> {
-        let startable = self
-            .startables
-            .read()
-            .await
-            .get(name)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("adapter `{name}` is not registered"))?;
-        coordinator.start_enabled(&startable).await
-    }
-
-    /// Register the optional content-library surface for a provider. Keeping
-    /// this separate from transport registration prevents a provider that can
-    /// control a zone from being advertised as searchable by accident.
-    pub async fn register_library(&self, prefix: &str, adapter: Arc<dyn LibraryAdapter>) {
-        self.libraries
-            .write()
-            .await
-            .insert(prefix.to_string(), adapter);
-    }
-
-    pub async fn start(&self, prefix: &str) -> anyhow::Result<()> {
-        let adapter = self
-            .startables
-            .read()
-            .await
-            .get(prefix)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("adapter `{prefix}` is not registered"))?;
-        adapter.start().await
-    }
-
-    pub async fn stop(&self, prefix: &str) {
-        if let Some(adapter) = self.startables.read().await.get(prefix).cloned() {
-            adapter.stop().await;
-        }
-    }
-
-    pub async fn command(
-        &self,
-        prefix: &str,
-        zone_id: &str,
-        command: AdapterCommand,
-    ) -> anyhow::Result<AdapterCommandResponse> {
-        let adapter = self
-            .adapters
-            .read()
-            .await
-            .get(prefix)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("adapter `{prefix}` is not configured"))?;
-        adapter.handle_command(zone_id, command).await
-    }
-
-    /// Whether a provider owns transport commands through this registry.
-    /// Legacy adapters have dedicated fields and routes, so the shared knob
-    /// route uses this to distinguish registry-backed providers from unknown
-    /// zone prefixes without maintaining another hard-coded list.
-    pub async fn has_adapter(&self, prefix: &str) -> bool {
-        self.adapters.read().await.contains_key(prefix)
-    }
-
-    pub async fn search_library(
-        &self,
-        prefix: &str,
-        query: &str,
-        limit: usize,
-    ) -> anyhow::Result<Vec<LibrarySearchResult>> {
-        let adapter = self
-            .libraries
-            .read()
-            .await
-            .get(prefix)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("adapter `{prefix}` is not configured"))?;
-        adapter.search(query, limit).await
-    }
-
-    pub async fn search_library_for_zone(
-        &self,
-        prefix: &str,
-        zone_id: &str,
-        query: &str,
-        limit: usize,
-    ) -> anyhow::Result<Vec<LibrarySearchResult>> {
-        let adapter = self
-            .libraries
-            .read()
-            .await
-            .get(prefix)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("adapter `{prefix}` is not configured"))?;
-        adapter.search_for_zone(zone_id, query, limit).await
-    }
-
-    pub async fn play_library_uri(
-        &self,
-        prefix: &str,
-        zone_id: &str,
-        uri: &str,
-    ) -> anyhow::Result<String> {
-        let adapter = self
-            .libraries
-            .read()
-            .await
-            .get(prefix)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("adapter `{prefix}` is not configured"))?;
-        adapter.play_uri(zone_id, uri).await
-    }
-
-    pub async fn queue_library_uri(
-        &self,
-        prefix: &str,
-        zone_id: &str,
-        uri: &str,
-    ) -> anyhow::Result<()> {
-        let adapter = self
-            .libraries
-            .read()
-            .await
-            .get(prefix)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("adapter `{prefix}` is not configured"))?;
-        adapter.queue_uri(zone_id, uri).await
-    }
-
-    pub async fn play_next_library_uri(
-        &self,
-        prefix: &str,
-        zone_id: &str,
-        uri: &str,
-    ) -> anyhow::Result<()> {
-        let adapter = self
-            .libraries
-            .read()
-            .await
-            .get(prefix)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("adapter `{prefix}` is not configured"))?;
-        adapter.play_next_uri(zone_id, uri).await
-    }
-
-    pub async fn read_library_queue(
-        &self,
-        prefix: &str,
-        zone_id: &str,
-    ) -> anyhow::Result<serde_json::Value> {
-        let adapter = self
-            .libraries
-            .read()
-            .await
-            .get(prefix)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("adapter `{prefix}` is not configured"))?;
-        adapter.read_queue(zone_id).await
-    }
-
-    pub async fn library_content(
-        &self,
-        prefix: &str,
-        operation: &str,
-        params: &serde_json::Value,
-    ) -> anyhow::Result<serde_json::Value> {
-        let adapter = self
-            .libraries
-            .read()
-            .await
-            .get(prefix)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("adapter `{prefix}` is not configured"))?;
-        adapter.content(operation, params).await
-    }
-}
-
 /// Shared application state
 #[derive(Clone)]
 pub struct AppState {
@@ -277,12 +46,6 @@ pub struct AppState {
     pub lms: Arc<LmsAdapter>,
     pub openhome: Arc<OpenHomeAdapter>,
     pub upnp: Arc<UPnPAdapter>,
-    /// Stable owner for the reconfigurable outbound Music Assistant client.
-    pub musicassistant: Arc<ReconfigurableMusicAssistant>,
-    pub adapter_registry: Arc<AdapterRegistry>,
-    pub provider_auth: Arc<provider_auth::ProviderAuthState>,
-    pub controller_auth: controller_auth::ControllerAuthState,
-    pub apple_bridges: apple_bridge::AppleBridgeRegistry,
     pub knobs: KnobStore,
     pub bus: SharedBus,
     pub aggregator: Arc<ZoneAggregator>,
@@ -298,29 +61,9 @@ pub struct AppState {
     /// constructor parameter -- like `sse_connections` above -- so every
     /// existing `AppState::new` call site is untouched by this addition.
     pub mcp_refs: crate::mcp::refs::RefTable,
-    /// Opaque image refs (#549): what a `hifi_collections`/`/api/collections`
-    /// item's `image` field resolves through, so a collection browse row can
-    /// carry a per-item artwork reference without ever handing a client the
-    /// provider-native image handle behind it. Deliberately a separate table
-    /// from `mcp_refs` -- see `crate::mcp::refs::ImageRef`'s docs for why.
-    pub image_refs: crate::mcp::refs::ImageRefTable,
-    /// Bounded cache of fully composed, dithered, and packed Frame artwork.
-    pub eink_artwork_cache: crate::knobs::image::EinkArtworkCache,
-    /// UHC-owned requested listening sequences, separate from provider queue
-    /// observations (#483).
-    pub listening_plans: crate::mcp::listening_plan::ListeningPlanStore,
-    /// Explicit Apple Music feedback and bounded adaptation context (#485).
-    pub apple_feedback: crate::mcp::feedback::FeedbackStore,
     /// Private reliable command ingress.  Surfaces retain their existing request/response shapes
     /// and use this only for provider paths that have migrated to a correlated readback.
     pub reliable_commands: Option<CommandGateway>,
-    /// Optional MQTT publisher exposing every zone to Home Assistant (#508).
-    /// Fully inert until both configured and enabled; see
-    /// `crate::mqtt::MqttPublisher`.
-    pub mqtt: Arc<crate::mqtt::MqttPublisher>,
-    /// Process-owned HiPhi connector lifecycle. It is package-agnostic and
-    /// survives Settings reloads by reconstructing from owner-only config.
-    pub hiphi_connector: crate::cloud_connector::runtime::ConnectorSupervisor,
 }
 
 impl AppState {
@@ -342,19 +85,6 @@ impl AppState {
         shutdown: CancellationToken,
     ) -> Self {
         let hqp_images: Arc<dyn HqpImageSource> = hqp_instances.clone();
-        let adapter_registry = Arc::new(AdapterRegistry::default());
-        let mqtt = Arc::new(crate::mqtt::MqttPublisher::new(
-            bus.clone(),
-            aggregator.clone(),
-            adapter_registry.clone(),
-            knobs.clone(),
-        ));
-        let provider_auth = Arc::new(provider_auth::ProviderAuthState::default());
-        // The Spotify tunnel (#538) spawns an `ssh` child process; wire the
-        // server's own shutdown token in so a graceful shutdown kills it
-        // too, instead of relying solely on the manual stop / OAuth
-        // completion / lifetime-cap paths.
-        provider_auth.bind_shutdown(shutdown.clone());
         Self {
             roon,
             hqplayer,
@@ -364,14 +94,6 @@ impl AppState {
             lms,
             openhome,
             upnp,
-            musicassistant: Arc::new(ReconfigurableMusicAssistant::new(bus.clone())),
-            adapter_registry,
-            provider_auth,
-            controller_auth: controller_auth::ControllerAuthState::new(),
-            apple_bridges: apple_bridge::AppleBridgeRegistry::from_env().unwrap_or_else(|error| {
-                tracing::error!("Apple Music companion credential store is unavailable: {error}");
-                apple_bridge::AppleBridgeRegistry::default()
-            }),
             knobs,
             bus,
             aggregator,
@@ -381,21 +103,11 @@ impl AppState {
             shutdown,
             sse_connections: Arc::new(AtomicUsize::new(0)),
             mcp_refs: crate::mcp::refs::RefTable::new(),
-            image_refs: crate::mcp::refs::ImageRefTable::new(),
-            eink_artwork_cache: crate::knobs::image::EinkArtworkCache::default(),
-            listening_plans: crate::mcp::listening_plan::ListeningPlanStore::from_config(),
-            apple_feedback: crate::mcp::feedback::FeedbackStore::from_config(),
             reliable_commands: None,
-            mqtt,
-            hiphi_connector: crate::cloud_connector::runtime::ConnectorSupervisor::default(),
         }
     }
 
     pub fn with_reliable_commands(mut self, commands: CommandGateway) -> Self {
-        // The MQTT publisher (#508) resolves inbound HA commands for legacy zones through this
-        // same gateway (#529); it cannot receive one in its own constructor because `Arc<AppState>`
-        // itself is not assembled yet at that point (see `MqttPublisher::set_reliable_commands`).
-        self.mqtt.set_reliable_commands(commands.clone());
         self.reliable_commands = Some(commands);
         self
     }
@@ -421,122 +133,16 @@ impl AppState {
         width: Option<u32>,
         height: Option<u32>,
         format: Option<&str>,
-        resize_policy: Option<crate::knobs::image::Rgb565ResizePolicy>,
-    ) -> anyhow::Result<crate::bus::ImageData> {
-        self.get_image_with_source_limit(
-            zone_id,
-            image_key,
-            width,
-            height,
-            format,
-            resize_policy,
-            None,
-        )
-        .await
-    }
-
-    /// Connector-only artwork fetch with a hard streaming source ceiling.
-    /// Existing LAN image behavior keeps its provider-native limits; the
-    /// hosted artwork lane must stop reading before its signed request bound
-    /// can be exceeded in memory.
-    pub async fn get_image_bounded(
-        &self,
-        zone_id: &str,
-        image_key: &str,
-        max_source_bytes: usize,
-    ) -> anyhow::Result<crate::bus::ImageData> {
-        anyhow::ensure!(
-            max_source_bytes > 0,
-            "artwork source limit must be positive"
-        );
-        self.get_image_with_source_limit(
-            zone_id,
-            image_key,
-            None,
-            None,
-            None,
-            None,
-            Some(max_source_bytes),
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn get_image_with_source_limit(
-        &self,
-        zone_id: &str,
-        image_key: &str,
-        width: Option<u32>,
-        height: Option<u32>,
-        format: Option<&str>,
-        resize_policy: Option<crate::knobs::image::Rgb565ResizePolicy>,
-        source_limit: Option<usize>,
     ) -> anyhow::Result<crate::bus::ImageData> {
         use crate::bus::ImageData;
-        use crate::knobs::image::{
-            image_to_eink_acep6_with_policy, jpeg_to_rgb565_with_policy, EinkCacheKey,
-            Rgb565ResizePolicy,
-        };
-
-        let dimensions = match (width, height) {
-            (Some(w), Some(h)) => (w, h),
-            (Some(w), None) => (w, w),
-            (None, Some(h)) => (h, h),
-            (None, None) if format == Some("eink_acep6") => (800, 450),
-            (None, None) => (240, 240),
-        };
-        let resize_policy = resize_policy.unwrap_or(Rgb565ResizePolicy::Exact);
-        let eink_cache_key = (format == Some("eink_acep6")).then(|| EinkCacheKey {
-            zone_id: zone_id.to_string(),
-            image_key: image_key.to_string(),
-            width: dimensions.0,
-            height: dimensions.1,
-            resize_policy,
-            converter_version: 1,
-        });
-        if let Some(key) = eink_cache_key.as_ref() {
-            if let Some(data) = self.eink_artwork_cache.get(key) {
-                return Ok(ImageData {
-                    content_type: "application/octet-stream".to_string(),
-                    data: data.as_ref().clone(),
-                });
-            }
-        }
-
-        // Smart composition needs the source aspect ratio. Asking a provider
-        // for the final rectangle first can irreversibly stretch or crop it
-        // before UHC gets a chance to apply the crop budget/gallery mat.
-        let provider_dimensions = if resize_policy == Rgb565ResizePolicy::Exact {
-            (width, height)
-        } else {
-            (None, None)
-        };
+        use crate::knobs::image::jpeg_to_rgb565;
 
         // Fetch raw image from appropriate adapter
         let raw_image = if zone_id.starts_with("lms:") {
-            let (content_type, data) = match source_limit {
-                Some(limit) => {
-                    self.lms
-                        .get_artwork_bounded(
-                            image_key,
-                            provider_dimensions.0,
-                            provider_dimensions.1,
-                            limit,
-                        )
-                        .await?
-                }
-                None => {
-                    self.lms
-                        .get_artwork(image_key, provider_dimensions.0, provider_dimensions.1)
-                        .await?
-                }
-            };
+            let (content_type, data) = self.lms.get_artwork(image_key, width, height).await?;
             ImageData { content_type, data }
         } else if zone_id.starts_with("openhome:") {
-            let img = match source_limit {
-                Some(limit) => self.openhome.get_image_bounded(image_key, limit).await?,
-                None => self.openhome.get_image(image_key).await?,
-            };
+            let img = self.openhome.get_image(image_key).await?;
             ImageData {
                 content_type: img.content_type,
                 data: img.data,
@@ -545,32 +151,10 @@ impl AppState {
             anyhow::bail!(
                 "UPnP zones don't support image retrieval - the protocol doesn't expose album art URLs"
             )
-        } else if zone_id.starts_with("spotify:") {
-            fetch_remote_artwork_url_bounded(
-                reqwest::Url::parse(image_key)?,
-                source_limit.unwrap_or(MAX_REMOTE_ARTWORK_BYTES),
-            )
-            .await?
-        } else if zone_id.starts_with("applemusic:") {
-            fetch_apple_music_artwork(image_key, source_limit.unwrap_or(MAX_REMOTE_ARTWORK_BYTES))
-                .await?
-        } else if zone_id.starts_with("musicassistant:") {
-            fetch_musicassistant_artwork(
-                image_key,
-                source_limit.unwrap_or(MAX_REMOTE_ARTWORK_BYTES),
-            )
-            .await?
         } else if let Some(instance) = zone_id.strip_prefix("hqplayer:") {
-            let image = self.hqp_images.get_current_cover(instance).await?;
-            if source_limit.is_some_and(|limit| image.data.len() > limit) {
-                anyhow::bail!("remote artwork is too large");
-            }
-            image
+            self.hqp_images.get_current_cover(instance).await?
         } else if zone_id.starts_with("roon:") || !zone_id.contains(':') {
-            let img = self
-                .roon
-                .get_image(image_key, provider_dimensions.0, provider_dimensions.1)
-                .await?;
+            let img = self.roon.get_image(image_key, width, height).await?;
             ImageData {
                 content_type: img.content_type,
                 data: img.data,
@@ -578,18 +162,18 @@ impl AppState {
         } else {
             anyhow::bail!("Unknown zone type for image: {}", zone_id)
         };
-        if source_limit.is_some_and(|limit| raw_image.data.len() > limit) {
-            anyhow::bail!("remote artwork is too large");
-        }
 
-        // Convert to RGB565 if requested (for ESP32 LCD/e-ink displays).
-        // The smart variant is a capability handshake: older servers return
-        // the source image, allowing firmware to detect and use its fallback.
-        if matches!(format, Some("rgb565" | "rgb565-smart")) {
+        // Convert to RGB565 if requested (for ESP32 LCD displays)
+        if format == Some("rgb565") {
             // Use square dimensions when only one side specified (matches adapter behavior)
-            let (target_w, target_h) = dimensions;
+            let (target_w, target_h) = match (width, height) {
+                (Some(w), Some(h)) => (w, h),
+                (Some(w), None) => (w, w),
+                (None, Some(h)) => (h, h),
+                (None, None) => (240, 240),
+            };
 
-            match jpeg_to_rgb565_with_policy(&raw_image.data, target_w, target_h, resize_policy) {
+            match jpeg_to_rgb565(&raw_image.data, target_w, target_h) {
                 Ok(rgb565) => Ok(ImageData {
                     content_type: "application/octet-stream".to_string(),
                     data: rgb565.data,
@@ -599,124 +183,10 @@ impl AppState {
                     Ok(raw_image)
                 }
             }
-        } else if format == Some("eink_acep6") {
-            let (target_w, target_h) = dimensions;
-            match image_to_eink_acep6_with_policy(
-                &raw_image.data,
-                target_w,
-                target_h,
-                resize_policy,
-            ) {
-                Ok(eink) => {
-                    let Some(cache_key) = eink_cache_key else {
-                        return Ok(raw_image);
-                    };
-                    let data = self.eink_artwork_cache.insert(cache_key, eink.data);
-                    Ok(ImageData {
-                        content_type: "application/octet-stream".to_string(),
-                        data: data.as_ref().clone(),
-                    })
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "Frame artwork conversion failed for {zone_id} at {target_w}x{target_h}: {error}"
-                    );
-                    Ok(raw_image)
-                }
-            }
         } else {
             Ok(raw_image)
         }
     }
-}
-
-async fn fetch_apple_music_artwork(
-    image_key: &str,
-    max_bytes: usize,
-) -> anyhow::Result<crate::bus::ImageData> {
-    let url = validate_apple_music_artwork_url(image_key)?;
-    fetch_remote_artwork_url_bounded(url, max_bytes).await
-}
-
-/// Music Assistant's `image_url` (#549) is already an absolute URL the MA
-/// server hands out for both now-playing and library items -- there is no
-/// separate provider-side id/proxy to resolve the way Roon's `image_key` or
-/// LMS's coverid are. Unlike Apple Music's CDN allowlist (MA art can come
-/// from any of MA's own providers, not one known host), the only guard
-/// worth enforcing here is "this is actually an http(s) URL", so a
-/// malformed or unexpected scheme fails closed rather than being handed to
-/// `reqwest` uninspected.
-async fn fetch_musicassistant_artwork(
-    image_key: &str,
-    max_bytes: usize,
-) -> anyhow::Result<crate::bus::ImageData> {
-    let url = validate_musicassistant_artwork_url(image_key)?;
-    fetch_remote_artwork_url_bounded(url, max_bytes).await
-}
-
-fn validate_musicassistant_artwork_url(image_key: &str) -> anyhow::Result<reqwest::Url> {
-    let url = reqwest::Url::parse(image_key)
-        .map_err(|_| anyhow::anyhow!("Music Assistant artwork URL is invalid"))?;
-    if url.scheme() != "http" && url.scheme() != "https" {
-        anyhow::bail!("Music Assistant artwork URL must be http or https");
-    }
-    Ok(url)
-}
-
-fn validate_apple_music_artwork_url(image_key: &str) -> anyhow::Result<reqwest::Url> {
-    let url = reqwest::Url::parse(image_key)
-        .map_err(|_| anyhow::anyhow!("Apple Music artwork URL is invalid"))?;
-    let url = if url.scheme().eq_ignore_ascii_case("musickit") {
-        let fat = url
-            .query_pairs()
-            .find(|(key, _)| key == "fat")
-            .map(|(_, value)| value.into_owned())
-            .ok_or_else(|| anyhow::anyhow!("MusicKit artwork URL has no CDN URL"))?;
-        reqwest::Url::parse(&fat)
-            .map_err(|_| anyhow::anyhow!("MusicKit artwork CDN URL is invalid"))?
-    } else {
-        url
-    };
-    let host = url.host_str().unwrap_or_default();
-    if url.scheme() != "https" || !(host == "mzstatic.com" || host.ends_with(".mzstatic.com")) {
-        anyhow::bail!("Apple Music artwork URL is not an allowed Apple CDN URL");
-    }
-
-    Ok(url)
-}
-
-async fn fetch_remote_artwork_url_bounded(
-    url: reqwest::Url,
-    max_bytes: usize,
-) -> anyhow::Result<crate::bus::ImageData> {
-    let response = reqwest::get(url).await?.error_for_status()?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > max_bytes as u64)
-    {
-        anyhow::bail!("remote artwork is too large");
-    }
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| value.starts_with("image/"))
-        .ok_or_else(|| anyhow::anyhow!("remote artwork is not an image"))?
-        .to_string();
-    let mut response = response;
-    let mut data = Vec::with_capacity(
-        response
-            .content_length()
-            .unwrap_or_default()
-            .min(max_bytes as u64) as usize,
-    );
-    while let Some(chunk) = response.chunk().await? {
-        if data.len().saturating_add(chunk.len()) > max_bytes {
-            anyhow::bail!("remote artwork is too large");
-        }
-        data.extend_from_slice(&chunk);
-    }
-    Ok(crate::bus::ImageData { content_type, data })
 }
 
 /// Send legacy/bookmarked flash-page requests straight to the secure Web Serial origin.
@@ -732,19 +202,8 @@ pub(crate) async fn dispatch_lms_runtime_command(
     zone_id: &str,
     command: Command,
 ) -> anyhow::Result<()> {
-    dispatch_lms_runtime_command_via(state.reliable_commands.as_ref(), zone_id, command).await
-}
-
-/// Same routing and readback wait as [`dispatch_lms_runtime_command`], parameterized directly over
-/// the reliable command gateway so callers without a full `AppState` - MQTT's inbound command
-/// router (#529) - reuse the identical dispatch path HTTP/knob/MCP use.
-pub(crate) async fn dispatch_lms_runtime_command_via(
-    gateway: Option<&CommandGateway>,
-    zone_id: &str,
-    command: Command,
-) -> anyhow::Result<()> {
     let target = PrefixedZoneId::lms(zone_id.strip_prefix("lms:").unwrap_or(zone_id));
-    let Some(gateway) = gateway else {
+    let Some(gateway) = state.reliable_commands.as_ref() else {
         // Compatibility-only construction used by older embedders and contract fixtures. There is
         // no direct adapter fallback: preserve the established actionable error while refusing
         // native I/O outside the reliable runtime.
@@ -791,23 +250,12 @@ pub(crate) async fn dispatch_openhome_runtime_command(
     zone_id: &str,
     command: Command,
 ) -> anyhow::Result<()> {
-    dispatch_openhome_runtime_command_via(state.reliable_commands.as_ref(), zone_id, command).await
-}
-
-/// Same routing as [`dispatch_openhome_runtime_command`], parameterized directly over the reliable
-/// command gateway so callers without a full `AppState` - MQTT's inbound command router (#529) -
-/// reuse the identical dispatch path HTTP/knob/MCP use.
-pub(crate) async fn dispatch_openhome_runtime_command_via(
-    gateway: Option<&CommandGateway>,
-    zone_id: &str,
-    command: Command,
-) -> anyhow::Result<()> {
-    if gateway.is_none() {
+    if state.reliable_commands.is_none() {
         let raw_id = zone_id.strip_prefix("openhome:").unwrap_or(zone_id);
         return Err(anyhow::anyhow!("Device not found: {raw_id}"));
     }
     dispatch_provider_runtime_command(
-        gateway,
+        state,
         PrefixedZoneId::openhome(zone_id.strip_prefix("openhome:").unwrap_or(zone_id)),
         command,
         "OpenHome",
@@ -823,26 +271,15 @@ pub(crate) async fn dispatch_upnp_runtime_command(
     zone_id: &str,
     command: Command,
 ) -> anyhow::Result<()> {
-    dispatch_upnp_runtime_command_via(state.reliable_commands.as_ref(), zone_id, command).await
-}
-
-/// Same routing as [`dispatch_upnp_runtime_command`], parameterized directly over the reliable
-/// command gateway so callers without a full `AppState` - MQTT's inbound command router (#529) -
-/// reuse the identical dispatch path HTTP/knob/MCP use.
-pub(crate) async fn dispatch_upnp_runtime_command_via(
-    gateway: Option<&CommandGateway>,
-    zone_id: &str,
-    command: Command,
-) -> anyhow::Result<()> {
     // Standalone API/MCP fixtures intentionally compose no runtime. Preserve
     // the frozen adapter-shaped refusal without doing native I/O outside the
     // composed server's reliable endpoint.
-    if gateway.is_none() {
+    if state.reliable_commands.is_none() {
         let raw_id = zone_id.strip_prefix("upnp:").unwrap_or(zone_id);
         return Err(anyhow::anyhow!("Renderer not found: {raw_id}"));
     }
     dispatch_provider_runtime_command(
-        gateway,
+        state,
         PrefixedZoneId::upnp(zone_id.strip_prefix("upnp:").unwrap_or(zone_id)),
         command,
         "UPnP",
@@ -857,22 +294,11 @@ pub(crate) async fn dispatch_roon_runtime_command(
     zone_id: &str,
     command: Command,
 ) -> anyhow::Result<()> {
-    dispatch_roon_runtime_command_via(state.reliable_commands.as_ref(), zone_id, command).await
-}
-
-/// Same routing as [`dispatch_roon_runtime_command`], parameterized directly over the reliable
-/// command gateway so callers without a full `AppState` - MQTT's inbound command router (#529) -
-/// reuse the identical dispatch path HTTP/knob/MCP use.
-pub(crate) async fn dispatch_roon_runtime_command_via(
-    gateway: Option<&CommandGateway>,
-    zone_id: &str,
-    command: Command,
-) -> anyhow::Result<()> {
-    if gateway.is_none() {
+    if state.reliable_commands.is_none() {
         return Err(anyhow::anyhow!("Not connected to Roon"));
     }
     dispatch_provider_runtime_command(
-        gateway,
+        state,
         PrefixedZoneId::roon(zone_id.strip_prefix("roon:").unwrap_or(zone_id)),
         command,
         "Roon",
@@ -881,12 +307,12 @@ pub(crate) async fn dispatch_roon_runtime_command_via(
 }
 
 async fn dispatch_provider_runtime_command(
-    gateway: Option<&CommandGateway>,
+    state: &AppState,
     target: PrefixedZoneId,
     command: Command,
     provider: &str,
 ) -> anyhow::Result<()> {
-    let Some(gateway) = gateway else {
+    let Some(gateway) = state.reliable_commands.as_ref() else {
         return Err(anyhow::anyhow!(
             "{provider} reliable command runtime is unavailable"
         ));
@@ -1174,78 +600,6 @@ pub async fn roon_image_handler(
         }
         Err(e) => {
             tracing::warn!("Image fetch failed: {}", e);
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-                .into_response()
-        }
-    }
-}
-
-/// Query params for the collections image proxy (#549).
-#[derive(Deserialize)]
-pub struct CollectionImageQuery {
-    /// Opaque token minted by `hifi_collections`/`/api/collections` on a
-    /// browse row's `image` field. Never a provider-native image key.
-    pub r#ref: String,
-    #[serde(default)]
-    pub width: Option<u32>,
-    #[serde(default)]
-    pub height: Option<u32>,
-    #[serde(default)]
-    pub format: Option<String>,
-}
-
-/// GET /api/collections/image -- fetch a `hifi_collections` item's artwork.
-///
-/// Resolves the opaque `ref` through `state.image_refs` to a
-/// `(zone_id, image_key)` pair and re-enters `AppState::get_image`'s
-/// existing per-provider dispatch, exactly like `/now_playing/image` and
-/// `/roon/image` already do for now-playing art -- the only difference is
-/// the image handle came from a browse row's ref, not the zone's live state.
-/// An unknown, expired, or evicted ref reads as a plain 404, the same shape
-/// as any other image fetch failure; nothing about a stale-vs-invalid ref is
-/// distinguishable from here, deliberately (see `crate::mcp::refs`' module
-/// docs on why that collapse is the point).
-pub async fn collections_image_handler(
-    State(state): State<AppState>,
-    axum::extract::Query(params): axum::extract::Query<CollectionImageQuery>,
-) -> impl IntoResponse {
-    let Some(target) = state.image_refs.resolve(&params.r#ref).await else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: "image ref is unknown or expired".to_string(),
-            }),
-        )
-            .into_response();
-    };
-    match state
-        .get_image(
-            &target.zone_id,
-            &target.image_key,
-            params.width,
-            params.height,
-            params.format.as_deref(),
-            None,
-        )
-        .await
-    {
-        Ok(image_data) => {
-            let headers = [(
-                axum::http::header::CONTENT_TYPE,
-                image_data
-                    .content_type
-                    .parse()
-                    .unwrap_or(axum::http::HeaderValue::from_static("image/jpeg")),
-            )];
-            (StatusCode::OK, headers, image_data.data).into_response()
-        }
-        Err(e) => {
-            tracing::warn!("Collection image fetch failed: {}", e);
             (
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
@@ -1672,6 +1026,48 @@ pub async fn roon_browse_status_handler(State(state): State<AppState>) -> impl I
 // HQPlayer handlers
 // =============================================================================
 
+/// GET /hqplayer/status - HQPlayer connection status
+pub async fn hqp_status_handler(
+    State(state): State<AppState>,
+) -> Json<crate::adapters::hqplayer::HqpConnectionStatus> {
+    if let Some(snapshot) = state.aggregator.get_hqplayer_snapshot("default").await {
+        let mut connection = snapshot.observation.connection;
+        connection.connected = snapshot.presence == HqpSnapshotPresence::Live;
+        Json(connection)
+    } else {
+        // Configuration exists before the first native observation and remains useful while the
+        // endpoint is unavailable; this fallback contains configuration, not playback state.
+        Json(state.hqplayer.get_status().await)
+    }
+}
+
+/// GET /hqplayer/pipeline - HQPlayer pipeline status
+pub async fn hqp_pipeline_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match state.aggregator.get_hqplayer_snapshot("default").await {
+        Some(snapshot) if snapshot.presence == HqpSnapshotPresence::Live => {
+            (StatusCode::OK, Json(snapshot.observation.pipeline)).into_response()
+        }
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "HQPlayer not connected".to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn hqp_default_pipeline_from_aggregator(
+    state: &AppState,
+) -> Option<crate::adapters::hqplayer::PipelineStatus> {
+    state
+        .aggregator
+        .get_hqplayer_snapshot("default")
+        .await
+        .filter(|snapshot| snapshot.presence == HqpSnapshotPresence::Live)
+        .map(|snapshot| snapshot.observation.pipeline)
+}
+
 pub(crate) async fn refresh_hqp_advanced_aggregate(
     state: &AppState,
     instance_name: &str,
@@ -1711,49 +1107,6 @@ pub(crate) async fn refresh_hqp_profiles_aggregate(
         .and_then(|snapshot| snapshot.profiles)
         .ok_or_else(|| anyhow::anyhow!("HQPlayer profiles were not retained by the aggregator"))
 }
-
-async fn hqp_default_pipeline_from_aggregator(
-    state: &AppState,
-) -> Option<crate::adapters::hqplayer::PipelineStatus> {
-    state
-        .aggregator
-        .get_hqplayer_snapshot("default")
-        .await
-        .filter(|snapshot| snapshot.presence == HqpSnapshotPresence::Live)
-        .map(|snapshot| snapshot.observation.pipeline)
-}
-
-/// GET /hqplayer/status - HQPlayer connection status
-pub async fn hqp_status_handler(
-    State(state): State<AppState>,
-) -> Json<crate::adapters::hqplayer::HqpConnectionStatus> {
-    if let Some(snapshot) = state.aggregator.get_hqplayer_snapshot("default").await {
-        let mut connection = snapshot.observation.connection;
-        connection.connected = snapshot.presence == HqpSnapshotPresence::Live;
-        Json(connection)
-    } else {
-        // Configuration exists before the first native observation and remains useful while the
-        // endpoint is unavailable; this fallback contains configuration, not playback state.
-        Json(state.hqplayer.get_status().await)
-    }
-}
-
-/// GET /hqplayer/pipeline - HQPlayer pipeline status
-pub async fn hqp_pipeline_handler(State(state): State<AppState>) -> impl IntoResponse {
-    match state.aggregator.get_hqplayer_snapshot("default").await {
-        Some(snapshot) if snapshot.presence == HqpSnapshotPresence::Live => {
-            (StatusCode::OK, Json(snapshot.observation.pipeline)).into_response()
-        }
-        _ => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "HQPlayer not connected".to_string(),
-            }),
-        )
-            .into_response(),
-    }
-}
-
 /// HQPlayer control request
 #[derive(Deserialize)]
 pub struct HqpControlRequest {
@@ -1852,8 +1205,9 @@ async fn hqp_apply_named_setting(
     value: &str,
 ) -> anyhow::Result<()> {
     let normalized = match setting {
-        "mode" | "filter" | "filter1x" | "filterNx" | "filternx" | "shaper" | "dither"
-        | "junk_filter" => value.to_string(),
+        "mode" | "filter1x" | "filterNx" | "filternx" | "shaper" | "dither" | "junk_filter" => {
+            value.to_string()
+        }
         "matrix_profile" if value.eq_ignore_ascii_case("[default]") => String::new(),
         "matrix_profile" => value.to_string(),
         "convolution" | "adaptive_volume" | "random" => parse_hqp_bool(value)?.to_string(),
@@ -2318,43 +1672,6 @@ impl Drop for SseConnectionGuard {
     }
 }
 
-/// Patches a serialized `BusEvent`'s embedded zone with the live
-/// `browse_supported` derivation (#557).
-///
-/// `bus::events::Zone` -- the wire type embedded in `ZoneDiscovered` and
-/// broadcast to every SSE subscriber -- predates #531's per-provider
-/// `browse_supported` flag and has no field for it, unlike the REST
-/// `/zones` and `/knob/zones` projections (`knobs::routes::ZoneInfo`),
-/// which compute it correctly via
-/// [`crate::mcp::tools::collections::zone_supports_hifi_collections`].
-/// Every adapter's zone-discovery path would need a matching edit to add
-/// a field that doesn't exist yet, so instead this patches the
-/// already-serialized JSON at the one point a `ZoneDiscovered` event
-/// leaves the process. The frontend's `crate::app::api::Zone` treats a
-/// missing `browse_supported` as `false` (`#[serde(default)]`), so an
-/// unpatched payload silently told every client -- Roon zones included --
-/// that no zone could browse. A no-op for every other event: none of them
-/// carry a `/payload/zone` pointer.
-fn patch_zone_discovered_browse_supported(value: &mut serde_json::Value) {
-    let Some(zone_id) = value
-        .pointer("/payload/zone/zone_id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-    else {
-        return;
-    };
-    let supported = crate::mcp::tools::collections::zone_supports_hifi_collections(&zone_id);
-    if let Some(zone) = value
-        .pointer_mut("/payload/zone")
-        .and_then(|v| v.as_object_mut())
-    {
-        zone.insert(
-            "browse_supported".to_string(),
-            serde_json::Value::Bool(supported),
-        );
-    }
-}
-
 pub async fn events_handler(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -2377,17 +1694,9 @@ pub async fn events_handler(
     let stream = with_shutdown
         .filter_map(|result| match result {
             Ok(event) => {
-                // Serialize event to a Value first so ZoneDiscovered's embedded
-                // zone can be patched with the live browse_supported derivation
-                // (#557) before going out as JSON.
-                match serde_json::to_value(&event) {
-                    Ok(mut value) => {
-                        patch_zone_discovered_browse_supported(&mut value);
-                        match serde_json::to_string(&value) {
-                            Ok(json) => Some(Ok(Event::default().data(json))),
-                            Err(_) => None,
-                        }
-                    }
+                // Serialize event to JSON
+                match serde_json::to_string(&event) {
+                    Ok(json) => Some(Ok(Event::default().data(json))),
                     Err(_) => None,
                 }
             }
@@ -3230,18 +2539,6 @@ pub struct AppSettings {
     pub hide_lms_page: bool,
     #[serde(default)]
     pub adapters: AdapterSettings,
-    /// Who turned `adapters.mqtt` on (#613).
-    ///
-    /// Not part of `AdapterSettings` because it is not an adapter toggle: it
-    /// is provenance for one, and the only thing that reads it is the
-    /// decision about whether to warn that Home Assistant is not consuming
-    /// what UHC publishes. Under the add-on, publishing that nobody asked
-    /// for must not produce a warning about nobody receiving it.
-    ///
-    /// `POST /api/settings` sets this itself rather than trusting the body,
-    /// so the client never has to know the field exists.
-    #[serde(default)]
-    pub mqtt_enabled_by: crate::api::credentials::MqttEnableSource,
     /// Zone IDs the user has hidden from every zone list.
     ///
     /// `Option` rather than `Vec` because this type is both the stored shape *and* the request body
@@ -3308,19 +2605,6 @@ pub struct AdapterSettings {
     pub lms: bool,
     #[serde(default)]
     pub hqplayer: bool,
-    /// Spotify is an opt-in controller for existing Connect devices.
-    #[serde(default)]
-    pub spotify: bool,
-    /// Apple Music is an opt-in bridge-backed playback adapter.
-    #[serde(default)]
-    pub applemusic: bool,
-    /// Music Assistant is an opt-in remote playback adapter.
-    #[serde(default)]
-    pub musicassistant: bool,
-    /// The MQTT/Home Assistant discovery publisher (#508) is opt-in and off
-    /// by default: it needs a broker configured before it can do anything.
-    #[serde(default)]
-    pub mqtt: bool,
 }
 
 fn default_true() -> bool {
@@ -3347,12 +2631,7 @@ impl Default for AppSettings {
                 openhome: false,
                 lms: false,
                 hqplayer: false,
-                spotify: false,
-                applemusic: false,
-                musicassistant: false,
-                mqtt: false,
             },
-            mqtt_enabled_by: crate::api::credentials::MqttEnableSource::Automatic,
         }
     }
 }
@@ -3409,27 +2688,6 @@ fn mutate_app_settings(mutate: impl FnOnce(&mut AppSettings)) -> bool {
     let mut settings = load_app_settings();
     mutate(&mut settings);
     save_app_settings_locked(&settings)
-}
-
-/// Turn the MQTT publisher on in persisted settings during the startup
-/// environment bootstrap (#605).
-///
-/// Persisting matters as much as enabling does. Enabling only in memory would
-/// leave `app-settings.json` saying `mqtt: false`, so the *next* boot could
-/// not tell "the add-on switched this on for you" from "you switched it off",
-/// and the user's later decision to turn it off would not survive a restart.
-pub fn enable_mqtt_in_settings(source: credentials::MqttEnableSource) -> bool {
-    mutate_app_settings(|settings| {
-        settings.adapters.mqtt = true;
-        // Who gets the blame, and therefore the warning (#613). Outside the
-        // add-on, `UHC_MQTT_*` is the operator's own docker-compose or
-        // systemd unit - a deliberate choice, so
-        // [`credentials::MqttEnableSource::User`]. Under the add-on nothing
-        // reaches here at all any more; the only records left carrying
-        // `Automatic` are the ones an older add-on wrote before this
-        // distinction existed, which is exactly whose warning must stay off.
-        settings.mqtt_enabled_by = source;
-    })
 }
 
 /// Overwrite the settings wholesale. Test-only on purpose.
@@ -3506,29 +2764,6 @@ pub async fn api_settings_get_handler() -> impl IntoResponse {
     Json(load_app_settings())
 }
 
-#[derive(Debug, Serialize)]
-pub struct SpotifyAccountResponse {
-    pub account: Option<ProviderAccount>,
-    /// Whether UHC has a persisted Spotify client configuration. This is
-    /// deliberately non-secret and lets the UI distinguish configured from
-    /// unconfigured even when Spotify profile lookup is unavailable.
-    #[serde(default)]
-    pub configured: bool,
-    pub error: Option<String>,
-}
-
-/// GET /api/providers/spotify/account - Last account identity reported by the
-/// Spotify adapter. Tokens and client credentials never leave the server.
-pub async fn spotify_account_handler(
-    State(state): State<AppState>,
-) -> Json<SpotifyAccountResponse> {
-    Json(SpotifyAccountResponse {
-        account: state.aggregator.get_provider_account("spotify").await,
-        configured: state.provider_auth.spotify_configured().await,
-        error: state.aggregator.get_adapter_error("spotify").await,
-    })
-}
-
 /// POST /api/settings - Update app settings with dynamic adapter enable/disable
 pub async fn api_settings_post_handler(
     State(state): State<AppState>,
@@ -3556,21 +2791,6 @@ pub async fn api_settings_post_handler(
         if new_settings.zone_names.is_none() {
             new_settings.zone_names = current.zone_names.clone();
         }
-        // Provenance for the MQTT toggle (#613), decided here rather than
-        // taken from the body: a request that flips `mqtt` from off to on is
-        // a person clicking a switch, which is exactly what makes the
-        // "Home Assistant isn't receiving this" warning fair to show. Turning
-        // it off clears the flag, so a later automatic enable does not
-        // inherit a choice made about a different broker.
-        new_settings.mqtt_enabled_by = if new_settings.adapters.mqtt {
-            if current.adapters.mqtt {
-                current.mqtt_enabled_by
-            } else {
-                credentials::MqttEnableSource::User
-            }
-        } else {
-            credentials::MqttEnableSource::Automatic
-        };
         *current = new_settings.clone();
     });
 
@@ -3594,122 +2814,58 @@ pub async fn api_settings_post_handler(
         ("openhome", old_adapters.openhome != new_adapters.openhome),
         ("upnp", old_adapters.upnp != new_adapters.upnp),
         ("hqplayer", old_adapters.hqplayer != new_adapters.hqplayer),
-        ("spotify", old_adapters.spotify != new_adapters.spotify),
-        (
-            "applemusic",
-            old_adapters.applemusic != new_adapters.applemusic,
-        ),
-        (
-            "musicassistant",
-            old_adapters.musicassistant != new_adapters.musicassistant,
-        ),
-        ("mqtt", old_adapters.mqtt != new_adapters.mqtt),
     ];
 
-    let mut applied_transitions = Vec::new();
-    for (name, changed) in &adapter_changes {
+    for (name, changed) in adapter_changes {
         if !changed {
             continue;
         }
 
         // Get the new enabled state
-        let now_enabled = match *name {
+        let now_enabled = match name {
             "roon" => new_adapters.roon,
             "lms" => new_adapters.lms,
             "openhome" => new_adapters.openhome,
             "upnp" => new_adapters.upnp,
             "hqplayer" => new_adapters.hqplayer,
-            "spotify" => new_adapters.spotify,
-            "applemusic" => new_adapters.applemusic,
-            "musicassistant" => new_adapters.musicassistant,
-            // MQTT is a bus consumer, not a `Startable` in `adapters_list` -
-            // handled separately below via `state.mqtt` (the sanctioned
-            // surface `tests/adapter_boundary_lint.rs` allows this module
-            // to reach; it is not part of the legacy coordinator registry).
-            "mqtt" => continue,
             _ => continue,
         };
 
         // Update coordinator state
         coord.set_enabled(name, now_enabled).await;
-        applied_transitions.push(*name);
 
         // Find the adapter and start/stop it
-        if let Some(adapter) = adapters_list.iter().find(|a| a.name() == *name) {
+        if let Some(adapter) = adapters_list.iter().find(|a| a.name() == name) {
             if now_enabled {
-                // An adapter that is not yet configured (no host, no
-                // credentials, ...) is not a startup failure -- it is the
-                // ordinary state of "enabled, waiting to be configured".
-                // `start_all_enabled`/`start_enabled` already treat
-                // `can_start() == false` as a skip rather than an error; this
-                // toggle path used to reach `start_adapter_and_companions`
-                // unconditionally, which raised "adapter cannot start" and
-                // rolled the whole settings write back (see issue #544).
-                // Mirror the skip here so enabling an unconfigured adapter
-                // succeeds and leaves it idle, matching v3's behavior, and
-                // only a genuine start failure of a *configured* adapter
-                // triggers rollback.
-                if !adapter.can_start().await {
-                    tracing::info!(
-                        "Adapter {} enabled but not yet configured; leaving idle until configured",
-                        name
-                    );
-                } else {
-                    tracing::info!("Dynamically enabling adapter: {}", name);
-                    if let Err(error) = coord.start_adapter_and_companions(adapter.as_ref()).await {
-                        tracing::warn!("Failed to start adapter {}: {}", name, error);
-                        // Do not persist a feature as enabled when its runtime
-                        // could not be started. The Settings client will restore
-                        // its last confirmed switch position from this response.
-                        coord
-                            .rollback_adapter_transitions(
-                                adapters_list.as_ref(),
-                                old_adapters,
-                                &applied_transitions,
-                            )
-                            .await;
-                        // The new settings were already persisted (inside the write
-                        // lock, for the hidden-zones carry-forward); put the old
-                        // ones back so disk matches the rolled-back runtime.
-                        let _ = mutate_app_settings(|current| *current = old_settings.clone());
-                        return Json(serde_json::json!({
-                            "ok": false,
-                            "error": format!("Could not enable {name}: {error}"),
-                        }));
+                tracing::info!("Dynamically enabling adapter: {}", name);
+                if name == "lms" {
+                    if let Err(e) = coord.start_adapter_and_companions(adapter.as_ref()).await {
+                        tracing::warn!("Failed to start LMS observers: {}", e);
+                    }
+                } else if adapter.can_start().await {
+                    if let Err(e) = coord.start_adapter_and_track(adapter.as_ref()).await {
+                        tracing::warn!("Failed to start adapter {}: {}", name, e);
                     }
                 }
             } else {
                 tracing::info!("Dynamically disabling adapter: {}", name);
-                coord
-                    .stop_adapter_and_companions_then_flush(
-                        adapter.as_ref(),
-                        name,
-                        "settings disable",
-                    )
-                    .await;
+                if name == "lms" {
+                    coord
+                        .stop_adapter_and_companions_then_flush(
+                            adapter.as_ref(),
+                            "lms",
+                            "disabled via settings",
+                        )
+                        .await;
+                } else {
+                    coord
+                        .stop_adapter_and_flush(adapter.as_ref(), "disabled via settings")
+                        .await;
+                }
             }
         }
     }
 
-    // MQTT is a bus consumer with no zones/companions to flush, so it does
-    // not go through the coordinator's start/stop-and-flush lifecycle - it
-    // simply turns its background publisher task on or off.
-    if old_adapters.mqtt != new_adapters.mqtt {
-        state.mqtt.set_enabled(new_adapters.mqtt).await;
-        // Keep the live publisher's copy of the provenance in step with the
-        // one just persisted (#613), so the status endpoint stops or starts
-        // qualifying for the "Home Assistant isn't receiving this" warning
-        // in the same request that flipped the toggle.
-        state
-            .mqtt
-            .set_enable_source(new_settings.mqtt_enabled_by)
-            .await;
-        applied_transitions.push("mqtt");
-    }
-
-    // Settings were persisted up front (inside the write lock, so the
-    // hidden-zones carry-forward is race-free); every requested runtime
-    // transition succeeded, so disk and runtime now agree.
     Json(serde_json::json!({"ok": true}))
 }
 
@@ -3949,106 +3105,12 @@ pub async fn zone_visibility_post(Json(req): Json<ZoneVisibilityRequest>) -> imp
 }
 
 #[cfg(test)]
-fn adapter_enabled(settings: &AdapterSettings, name: &str) -> Option<bool> {
-    match name {
-        "roon" => Some(settings.roon),
-        "lms" => Some(settings.lms),
-        "openhome" => Some(settings.openhome),
-        "upnp" => Some(settings.upnp),
-        "hqplayer" => Some(settings.hqplayer),
-        "spotify" => Some(settings.spotify),
-        "applemusic" => Some(settings.applemusic),
-        "musicassistant" => Some(settings.musicassistant),
-        "mqtt" => Some(settings.mqtt),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::bus::{create_bus, BusEvent, PlaybackState, Zone};
-    use axum::response::IntoResponse;
-    use http_body_util::BodyExt;
     use serial_test::serial;
     use std::env;
     use std::time::Duration;
-
-    /// Pulls the JSON body out of a handler's `impl IntoResponse`, for tests
-    /// that need to assert on `{"ok": ..., "error": ...}` rather than only
-    /// on the settings file the handler wrote.
-    async fn response_json(response: impl IntoResponse) -> serde_json::Value {
-        let body = response.into_response().into_body();
-        let bytes = body
-            .collect()
-            .await
-            .expect("response body must be readable")
-            .to_bytes();
-        serde_json::from_slice(&bytes).expect("response body must be valid JSON")
-    }
-
-    /// Builds a minimal `bus::events::Zone` for a given zone id, for tests
-    /// that only care about the id -> `browse_supported` derivation.
-    fn test_zone(zone_id: &str) -> Zone {
-        Zone {
-            zone_id: zone_id.to_string(),
-            zone_name: "Test Zone".to_string(),
-            state: PlaybackState::Stopped,
-            volume_control: None,
-            now_playing: None,
-            source: "test".to_string(),
-            is_controllable: true,
-            is_seekable: false,
-            last_updated: 0,
-            is_play_allowed: true,
-            is_pause_allowed: true,
-            is_next_allowed: true,
-            is_previous_allowed: true,
-        }
-    }
-
-    /// #557: a `ZoneDiscovered` event's embedded zone predates #531's
-    /// `browse_supported` flag on the wire, so it must be patched into the
-    /// serialized JSON rather than read off the struct (which has no such
-    /// field). Every provider #531 wired -- Roon included -- must come out
-    /// `true`; a provider it did not wire must come out `false`.
-    #[test]
-    fn zone_discovered_sse_payload_reports_browse_supported() {
-        for (zone_id, expected) in [
-            ("roon:zone-1", true),
-            ("lms:zone-1", true),
-            ("musicassistant:zone-1", true),
-            ("openhome:zone-1", false),
-            ("upnp:zone-1", false),
-            ("hqplayer:zone-1", false),
-        ] {
-            let event = BusEvent::ZoneDiscovered {
-                zone: test_zone(zone_id),
-            };
-            let mut value = serde_json::to_value(&event).expect("event serializes");
-            patch_zone_discovered_browse_supported(&mut value);
-            assert_eq!(
-                value.pointer("/payload/zone/browse_supported"),
-                Some(&serde_json::Value::Bool(expected)),
-                "zone_id={zone_id}"
-            );
-        }
-    }
-
-    /// Non-`ZoneDiscovered` events have no `/payload/zone` pointer, so the
-    /// patch must be a no-op rather than panicking or inserting a stray
-    /// field.
-    #[test]
-    fn patch_is_noop_for_events_without_a_zone() {
-        let event = BusEvent::RoonConnected {
-            core_name: "Test Core".to_string(),
-            version: "1.0".to_string(),
-        };
-        let mut value = serde_json::to_value(&event).expect("event serializes");
-        let before = value.clone();
-        patch_zone_discovered_browse_supported(&mut value);
-        assert_eq!(value, before);
-    }
 
     struct FakeAdapter(&'static str);
 
@@ -4059,41 +3121,6 @@ mod tests {
         }
         async fn start(&self) -> anyhow::Result<()> {
             Ok(())
-        }
-        async fn stop(&self) {}
-    }
-
-    /// Stands in for an adapter that has never been configured -- like a
-    /// fresh HQPlayer instance with no host set. `can_start()` false is the
-    /// normal state of "enabled but not yet set up", not a failure.
-    struct UnconfiguredAdapter(&'static str);
-
-    #[async_trait::async_trait]
-    impl Startable for UnconfiguredAdapter {
-        fn name(&self) -> &'static str {
-            self.0
-        }
-        async fn start(&self) -> anyhow::Result<()> {
-            panic!("start() must not be called when can_start() is false");
-        }
-        async fn stop(&self) {}
-        async fn can_start(&self) -> bool {
-            false
-        }
-    }
-
-    /// Stands in for a *configured* adapter whose runtime genuinely fails to
-    /// start (bad network, crashed process, ...) -- the one case where the
-    /// settings write should still roll back.
-    struct FailingAdapter(&'static str);
-
-    #[async_trait::async_trait]
-    impl Startable for FailingAdapter {
-        fn name(&self) -> &'static str {
-            self.0
-        }
-        async fn start(&self) -> anyhow::Result<()> {
-            Err(anyhow::anyhow!("connection refused"))
         }
         async fn stop(&self) {}
     }
@@ -4192,63 +3219,6 @@ mod tests {
         )
     }
 
-    #[test]
-    fn apple_music_artwork_accepts_only_https_apple_cdn_urls() {
-        assert!(validate_apple_music_artwork_url(
-            "https://is1-ssl.mzstatic.com/image/thumb/example.jpg"
-        )
-        .is_ok());
-        assert!(validate_apple_music_artwork_url(
-            "musicKit://artwork/library/item/512x512?fat=https%3A%2F%2Fis1-ssl.mzstatic.com%2Fimage%2Fthumb%2Fexample.jpg"
-        )
-        .is_ok());
-        for url in [
-            "http://is1-ssl.mzstatic.com/image.jpg",
-            "https://example.com/image.jpg",
-            "file:///etc/passwd",
-            "https://127.0.0.1/image.jpg",
-        ] {
-            assert!(
-                validate_apple_music_artwork_url(url).is_err(),
-                "accepted unsafe artwork URL: {url}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn connector_artwork_stops_streaming_at_its_source_byte_limit() {
-        use axum::{
-            body::{Body, Bytes},
-            http::header,
-            routing::get,
-            Router,
-        };
-        use futures::stream;
-
-        let app = Router::new().route(
-            "/art",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "image/png")],
-                    Body::from_stream(stream::iter([
-                        Ok::<_, std::convert::Infallible>(Bytes::from_static(b"123")),
-                        Ok(Bytes::from_static(b"456")),
-                    ])),
-                )
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let url = reqwest::Url::parse(&format!("http://{address}/art")).unwrap();
-
-        let error = fetch_remote_artwork_url_bounded(url, 4)
-            .await
-            .expect_err("the second chunk must be rejected before the body can grow past 4 bytes");
-        assert!(error.to_string().contains("too large"));
-        server.abort();
-    }
-
     /// Issue #429, proving the wiring itself: calling the real
     /// `POST /api/settings` handler to disable an adapter must remove its
     /// zones. Unlike `stopping_an_adapter_flushes_its_zones_from_the_aggregator`
@@ -4339,45 +3309,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn provider_adapters_are_opt_in_by_default() {
-        let settings = AppSettings::default();
-
-        assert!(!settings.adapters.spotify);
-        assert!(!settings.adapters.applemusic);
-        assert!(!settings.adapters.musicassistant);
-        assert!(!settings.adapters.mqtt);
-    }
-
-    #[test]
-    fn adapter_setting_covers_each_transactional_adapter() {
-        let settings = AdapterSettings {
-            roon: true,
-            lms: true,
-            openhome: true,
-            upnp: true,
-            hqplayer: true,
-            spotify: true,
-            applemusic: true,
-            musicassistant: true,
-            mqtt: true,
-        };
-        for name in [
-            "roon",
-            "lms",
-            "openhome",
-            "upnp",
-            "hqplayer",
-            "spotify",
-            "applemusic",
-            "musicassistant",
-            "mqtt",
-        ] {
-            assert_eq!(adapter_enabled(&settings, name), Some(true), "{name}");
-        }
-        assert_eq!(adapter_enabled(&settings, "not-an-adapter"), None);
-    }
-
     /// The whole reason `hidden_zones` is an `Option`.
     ///
     /// `POST /api/settings` saves its request body wholesale, and the settings page builds its
@@ -4457,100 +3388,6 @@ mod tests {
             after.hidden_zone_ids().is_empty(),
             "an explicit empty list must clear the hide list, got {:?}",
             after.hidden_zone_ids()
-        );
-    }
-
-    /// Issue #544: enabling an adapter that has never been configured (e.g. a
-    /// fresh HQPlayer instance with no host set) must succeed and leave the
-    /// adapter idle, exactly like v3's `if adapter.can_start().await { ... }`
-    /// guard did. The integration merge routed this toggle through
-    /// `start_adapter_and_companions`, which raises "adapter cannot start"
-    /// for an unconfigured adapter and used to trip the settings rollback --
-    /// surfacing a generic error to the user and undoing the whole write.
-    #[tokio::test]
-    #[serial]
-    async fn enabling_an_unconfigured_adapter_succeeds_and_stays_idle() {
-        env::set_var(
-            "UHC_CONFIG_DIR",
-            "/tmp/uhc-test-issue-544-unconfigured-enable",
-        );
-
-        let mut seeded = AppSettings::default();
-        seeded.hidden_zones = Some(vec!["roon:phone".to_string()]);
-        seeded.adapters.hqplayer = false;
-        assert!(save_app_settings(&seeded), "failed to seed test settings");
-
-        let state = app_state_with_startable(Arc::new(UnconfiguredAdapter("hqplayer"))).await;
-        state.coordinator.register("hqplayer", false).await;
-
-        let mut enabling = AppSettings::default();
-        enabling.adapters.hqplayer = true;
-        let response = api_settings_post_handler(State(state.clone()), Json(enabling)).await;
-        let body = response_json(response).await;
-
-        assert_eq!(
-            body["ok"], true,
-            "enabling an unconfigured adapter must not be reported as an error, got {body:?}"
-        );
-
-        let after = load_app_settings();
-        env::remove_var("UHC_CONFIG_DIR");
-
-        assert!(
-            after.adapters.hqplayer,
-            "the toggle itself must still take effect and persist"
-        );
-        assert_eq!(
-            after.hidden_zone_ids(),
-            ["roon:phone".to_string()],
-            "the hide list must survive enabling an unconfigured adapter"
-        );
-        assert!(
-            !state.coordinator.is_running("hqplayer").await,
-            "an unconfigured adapter must stay idle, not be marked running"
-        );
-    }
-
-    /// The other half of issue #544: a *configured* adapter whose runtime
-    /// genuinely fails to start must still roll the settings write back --
-    /// and that rollback must not take the user's hide list down with it.
-    #[tokio::test]
-    #[serial]
-    async fn a_failed_adapter_start_rolls_back_without_erasing_the_hide_list() {
-        env::set_var(
-            "UHC_CONFIG_DIR",
-            "/tmp/uhc-test-issue-544-failed-start-rollback",
-        );
-
-        let mut seeded = AppSettings::default();
-        seeded.hidden_zones = Some(vec!["roon:phone".to_string()]);
-        seeded.adapters.lms = false;
-        assert!(save_app_settings(&seeded), "failed to seed test settings");
-
-        let state = app_state_with_startable(Arc::new(FailingAdapter("lms"))).await;
-        state.coordinator.register("lms", false).await;
-
-        let mut enabling = AppSettings::default();
-        enabling.adapters.lms = true;
-        let response = api_settings_post_handler(State(state.clone()), Json(enabling)).await;
-        let body = response_json(response).await;
-
-        assert_eq!(
-            body["ok"], false,
-            "a genuine start failure of a configured adapter must still be reported"
-        );
-
-        let after = load_app_settings();
-        env::remove_var("UHC_CONFIG_DIR");
-
-        assert!(
-            !after.adapters.lms,
-            "a failed start must roll the toggle back to its previous state"
-        );
-        assert_eq!(
-            after.hidden_zone_ids(),
-            ["roon:phone".to_string()],
-            "rolling back a failed adapter start must not erase the hide list"
         );
     }
 
@@ -4767,7 +3604,7 @@ mod tests {
         let written = load_app_settings();
         let strays: Vec<_> = walk_config_files(&dir)
             .into_iter()
-            .filter(|name| name.ends_with(".json.tmp"))
+            .filter(|name| name.ends_with(".tmp"))
             .collect();
         env::remove_var("UHC_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);
@@ -4827,211 +3664,6 @@ mod tests {
             response.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "a save failure must surface as an HTTP error the client can detect"
-        );
-    }
-
-    /// Issue #548: a tester upgraded a v3 release install (config dir preserved) to the
-    /// integration/streaming-ha-alpha build and found `hidden_zones` emptied while `zone_order`
-    /// stayed intact -- with no explicit edit in between. This seeds a v3-shaped `app-settings.json`
-    /// verbatim (the exact bytes a v3 release writes, not a value round-tripped through this build's
-    /// own `AppSettings`, so a struct-shape or attribute mismatch would actually show up) and drives
-    /// every early write path a freshly-upgraded server hits, asserting all three zone lists survive
-    /// each one:
-    ///
-    /// - the load itself (`load_app_settings`)
-    /// - `POST /api/settings` with the settings page's real partial body (adapter toggle, no zone
-    ///   fields -- see `posting_settings_without_hidden_zones_preserves_the_hide_list`)
-    /// - `POST /api/zones/visibility` (hiding a *different* zone)
-    /// - `POST /api/zones/order` (moving a zone)
-    /// - `POST /api/zones/name` (renaming a zone)
-    ///
-    /// This is a *regression* test: as of this commit it passes, because `mutate_app_settings` reads
-    /// and merges every field through the same `Option<Vec<_>>` / `Option<BTreeMap<_, _>>` shape on
-    /// both sides of the merge, and every handler that is not `POST /api/settings` only ever mutates
-    /// the one field it owns. It exists to catch a *future* regression -- e.g. a merge that
-    /// re-introduces a non-`Option` zone field, drops a `#[serde(default)]`, or adds a write path
-    /// that reconstructs `AppSettings` from scratch instead of mutating the loaded value.
-    #[tokio::test]
-    #[serial]
-    async fn upgrading_a_v3_settings_file_survives_every_early_write_path() {
-        env::set_var(
-            "UHC_CONFIG_DIR",
-            "/tmp/uhc-test-issue-548-upgrade-simulation",
-        );
-
-        // The exact shape a v3 release build persists: snake_case keys, no unknown fields, three
-        // populated zone lists. Written as raw bytes -- not through this build's own `AppSettings` --
-        // so a field-shape mismatch introduced here would actually be exercised by deserialization.
-        let v3_settings_json = serde_json::json!({
-            "hide_knobs_page": false,
-            "hide_hqp_page": false,
-            "hide_lms_page": false,
-            "adapters": {
-                "roon": true,
-                "upnp": false,
-                "openhome": false,
-                "lms": false,
-                "hqplayer": false
-            },
-            "hidden_zones": ["roon:phone"],
-            "zone_order": ["roon:kitchen", "roon:phone", "roon:office"],
-            "zone_names": {"roon:phone": "Upstairs Phone"}
-        });
-        let settings_file = settings_path();
-        std::fs::create_dir_all(settings_file.parent().unwrap())
-            .expect("create config subdirectory");
-        std::fs::write(
-            &settings_file,
-            serde_json::to_string_pretty(&v3_settings_json).unwrap(),
-        )
-        .expect("seed v3-shaped settings.json");
-
-        let assert_zone_lists_intact = |settings: &AppSettings, step: &str| {
-            assert_eq!(
-                settings.hidden_zone_ids(),
-                ["roon:phone".to_string()],
-                "hidden_zones lost after {step}"
-            );
-            assert_eq!(
-                settings.zone_order_ids(),
-                [
-                    "roon:kitchen".to_string(),
-                    "roon:phone".to_string(),
-                    "roon:office".to_string()
-                ],
-                "zone_order lost after {step}"
-            );
-            assert_eq!(
-                settings.custom_zone_name("roon:phone"),
-                Some("Upstairs Phone"),
-                "zone_names lost after {step}"
-            );
-        };
-
-        // Step 1: the load itself, exactly as `load_app_settings()` does at every request and at
-        // startup (`main.rs` calls it to build the adapter coordinator's initial registry).
-        let loaded = load_app_settings();
-        assert_zone_lists_intact(&loaded, "load_app_settings()");
-
-        // Step 2: `POST /api/settings` with the real settings-page body -- an adapter toggle, no
-        // zone fields at all (the client's own `AppSettings` type, in `src/app/api.rs`, does not
-        // declare them). This is the write every "flip a switch" interaction sends.
-        let bus = create_bus();
-        let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
-        let agg_for_task = aggregator.clone();
-        tokio::spawn(async move { agg_for_task.run().await });
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        // Publish the zones referenced above so `manageable_zones` (used by the order/name steps
-        // below) has something to reorder and rename.
-        for (id, source) in [
-            ("roon:kitchen", "roon"),
-            ("roon:phone", "roon"),
-            ("roon:office", "roon"),
-        ] {
-            bus.publish(BusEvent::ZoneDiscovered {
-                zone: fake_zone(id, source),
-            });
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
-        let state = app_state_with_startable(Arc::new(FakeAdapter("lms"))).await;
-        // Reuse the live aggregator with the published zones instead of the empty one
-        // `app_state_with_startable` constructs.
-        let state = AppState {
-            aggregator: aggregator.clone(),
-            ..state
-        };
-
-        let toggle_body: AppSettings = serde_json::from_value(serde_json::json!({
-            "hide_knobs_page": false,
-            "hide_hqp_page": false,
-            "hide_lms_page": false,
-            "adapters": { "roon": true, "upnp": false, "openhome": false, "lms": true, "hqplayer": false }
-        }))
-        .expect("the settings page's own partial body must deserialise");
-        let _ = api_settings_post_handler(State(state.clone()), Json(toggle_body)).await;
-        assert_zone_lists_intact(&load_app_settings(), "POST /api/settings (adapter toggle)");
-
-        // Step 3: `POST /api/zones/visibility`, hiding a zone *other* than the one already hidden.
-        let visibility_response = zone_visibility_post(Json(ZoneVisibilityRequest {
-            zone_id: "roon:office".to_string(),
-            hidden: true,
-        }))
-        .await
-        .into_response();
-        assert_eq!(visibility_response.status(), StatusCode::OK);
-        let after_hide = load_app_settings();
-        // `zone_visibility_post` sorts the hide list before persisting, for a stable on-disk shape.
-        assert_eq!(
-            after_hide.hidden_zone_ids(),
-            ["roon:office".to_string(), "roon:phone".to_string()],
-            "hiding a new zone must add to, not replace, the carried-forward hide list"
-        );
-        assert_eq!(
-            after_hide.zone_order_ids(),
-            [
-                "roon:kitchen".to_string(),
-                "roon:phone".to_string(),
-                "roon:office".to_string()
-            ],
-            "zone_order lost after POST /api/zones/visibility"
-        );
-        assert_eq!(
-            after_hide.custom_zone_name("roon:phone"),
-            Some("Upstairs Phone"),
-            "zone_names lost after POST /api/zones/visibility"
-        );
-
-        // Step 4: `POST /api/zones/order`, moving a zone via the real handler (exercises
-        // `manageable_zones` and the write-lock merge together).
-        let order_response = zone_order_post(
-            State(state.clone()),
-            Json(ZoneOrderRequest {
-                zone_id: "roon:kitchen".to_string(),
-                direction: Some(crate::app::api::MoveDirection::Down),
-                target_zone_id: None,
-            }),
-        )
-        .await
-        .into_response();
-        assert_eq!(order_response.status(), StatusCode::OK);
-        let after_order = load_app_settings();
-        assert_eq!(
-            after_order.hidden_zone_ids(),
-            ["roon:office".to_string(), "roon:phone".to_string()],
-            "hidden_zones lost after POST /api/zones/order"
-        );
-        assert_eq!(
-            after_order.custom_zone_name("roon:phone"),
-            Some("Upstairs Phone"),
-            "zone_names lost after POST /api/zones/order"
-        );
-
-        // Step 5: `POST /api/zones/name`, renaming a different zone.
-        let name_response = zone_name_post(Json(ZoneNameRequest {
-            zone_id: "roon:kitchen".to_string(),
-            name: Some("Kitchen Speaker".to_string()),
-        }))
-        .await
-        .into_response();
-        assert_eq!(name_response.status(), StatusCode::OK);
-        let final_settings = load_app_settings();
-        env::remove_var("UHC_CONFIG_DIR");
-
-        assert_eq!(
-            final_settings.hidden_zone_ids(),
-            ["roon:office".to_string(), "roon:phone".to_string()],
-            "hidden_zones lost after POST /api/zones/name"
-        );
-        assert_eq!(
-            final_settings.custom_zone_name("roon:phone"),
-            Some("Upstairs Phone"),
-            "the original v3-set zone name must survive every step"
-        );
-        assert_eq!(
-            final_settings.custom_zone_name("roon:kitchen"),
-            Some("Kitchen Speaker"),
-            "the new rename made during this simulation must also land"
         );
     }
 }

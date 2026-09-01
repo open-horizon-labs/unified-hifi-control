@@ -218,31 +218,20 @@ pub fn HqPlayer() -> Element {
 
     let zones_state = zones.state();
     use_effect(move || {
-        // `.peek()`, not the tracked call: this effect must run when `zones_state`
-        // flips to Ready, not when `zones_loaded_once` (which it also writes) changes.
-        // A tracked read here would subscribe the effect to its own write, causing an
-        // extra self-triggered run every time the latch flips (reactive-loop-lint).
-        if !*zones_loaded_once.peek() && matches!(*zones_state.read(), UseResourceState::Ready) {
+        if !zones_loaded_once() && matches!(*zones_state.read(), UseResourceState::Ready) {
             zones_loaded_once.set(true);
         }
     });
     let zone_links_state = zone_links.state();
     use_effect(move || {
-        // See zones_loaded_once above: `.peek()` avoids subscribing this effect to
-        // its own latch write.
-        if !*zone_links_loaded_once.peek()
-            && matches!(*zone_links_state.read(), UseResourceState::Ready)
+        if !zone_links_loaded_once() && matches!(*zone_links_state.read(), UseResourceState::Ready)
         {
             zone_links_loaded_once.set(true);
         }
     });
     let instances_state = instances.state();
     use_effect(move || {
-        // See zones_loaded_once above: `.peek()` avoids subscribing this effect to
-        // its own latch write.
-        if !*instances_loaded_once.peek()
-            && matches!(*instances_state.read(), UseResourceState::Ready)
-        {
+        if !instances_loaded_once() && matches!(*instances_state.read(), UseResourceState::Ready) {
             instances_loaded_once.set(true);
         }
     });
@@ -1032,9 +1021,6 @@ fn LinkedZoneCard(
         base_image_url
     };
     let has_image = !image_url.is_empty();
-    // #581: map the origin-absolute art path onto the runtime base path so
-    // it survives an ingress prefix (identity in direct mode).
-    let image_url = crate::app::base_path::href(&image_url);
 
     let (track, artist) = np
         .map(|n| {

@@ -53,8 +53,6 @@ pub struct McpNowPlaying {
     pub album: Option<String>,
     pub volume: Option<f64>,
     pub is_muted: Option<bool>,
-    pub repeat_mode: Option<crate::bus::RepeatMode>,
-    pub shuffle: Option<bool>,
 }
 
 /// A search hit.
@@ -67,32 +65,12 @@ pub struct McpNowPlaying {
 /// results genuinely have no safe way to be addressed later, and minting one
 /// anyway would trade "no ref" for "a ref that might play the wrong thing".
 /// `title`/`subtitle` are unchanged from before this issue.
-///
-/// `path` (#566) is the same addition PR #533/#547 made for
-/// `hifi_collections`: a `RefTarget::RoonBrowse` token, present exactly when
-/// the result is navigable (a real hit that can be browsed into, or a
-/// grouping row like "Albums · 35 Results" that names a bucket in the
-/// search session). `path` and `ref` are independent — a result can carry
-/// either, both, or neither, never conflated into one slot. Only Roon mints
-/// it today: LMS's search drills straight to leaf results server-side and
-/// Spotify/Apple Music/Music Assistant's generic search has no grouping or
-/// browse concept, so they always leave this `None` (see
-/// `crate::mcp::tools::library::handle_search`'s per-route docs).
-/// `image` (#573 defect 10) follows `hifi_collections`' artwork convention
-/// exactly: a same-origin `/api/collections/image?ref=...` path over an
-/// opaque minted token, present only when the provider supplied art for the
-/// hit. Only Roon sets it today -- the other providers' generic search
-/// results carry no image key (see `handle_search`'s per-route mappings).
 #[derive(Debug, Serialize)]
 pub struct McpSearchResult {
     pub title: String,
     pub subtitle: Option<String>,
     #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
     pub r#ref: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
 }
 
 /// `hifi_play`'s structured payload: the adapter's own message about what it
@@ -188,7 +166,5 @@ pub fn now_playing_from_zone(zone: crate::bus::Zone) -> McpNowPlaying {
         album: zone.now_playing.as_ref().map(|n| n.album.clone()),
         volume: zone.volume_control.as_ref().map(|v| v.value as f64),
         is_muted: zone.volume_control.as_ref().map(|v| v.is_muted),
-        repeat_mode: zone.now_playing.as_ref().and_then(|n| n.repeat_mode),
-        shuffle: zone.now_playing.as_ref().and_then(|n| n.shuffle),
     }
 }

@@ -58,8 +58,7 @@ use tracing::{debug, info, warn};
 use crate::adapters::handle::{AdapterHandle, RetryConfig};
 use crate::adapters::lms_discovery::discover_lms_servers;
 use crate::adapters::traits::{
-    AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic, LibraryAdapter,
-    LibrarySearchResult,
+    AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
 };
 use crate::adapters::Startable;
 use crate::bus::runtime::{
@@ -86,33 +85,6 @@ const LMS_MUTE_PREF: &str = "mute";
 /// MCP and aggregator use prefixed IDs (e.g., "lms:00:11:22:33:44:55"), but LMS API expects bare IDs.
 fn strip_lms_prefix(id: &str) -> &str {
     id.strip_prefix("lms:").unwrap_or(id)
-}
-
-/// Require a properly-prefixed LMS zone id and return its bare player id.
-///
-/// Unlike Music Assistant's ids, LMS player ids are MAC addresses and
-/// legitimately contain colons, so (unlike `musicassistant_player_id`) this
-/// does not reject a remainder containing `:`.
-fn lms_player_id(zone_id: &str, parameter: &str) -> Result<String> {
-    zone_id
-        .strip_prefix("lms:")
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| anyhow!("{parameter} must be an LMS zone id"))
-}
-
-/// [`lms_player_id`] over a list, rejecting duplicates the same way the
-/// Music Assistant multiroom contract does.
-fn lms_player_ids(zone_ids: &[String], parameter: &str) -> Result<Vec<String>> {
-    let mut ids = Vec::with_capacity(zone_ids.len());
-    for zone_id in zone_ids {
-        let id = lms_player_id(zone_id, parameter)?;
-        if ids.contains(&id) {
-            return Err(anyhow!("{parameter} must not contain duplicate zones"));
-        }
-        ids.push(id);
-    }
-    Ok(ids)
 }
 
 /// Read an integer that LMS may emit as either a JSON number or a JSON string.
@@ -158,45 +130,6 @@ fn lms_flag(value: Option<&Value>) -> bool {
 /// `search_library()` return an empty vec against every real server.
 fn loop_entity_id(row: &Value, entity: &str) -> Option<i64> {
     lms_i64(row.get(format!("{}_id", entity)).or_else(|| row.get("id"))).filter(|id| *id > 0)
-}
-
-/// This row's artwork handle, for `hifi_collections`' image ref (#549), or
-/// `None` when LMS has none for it (an artist row, or a track/album LMS
-/// never assigned art to) -- absent honestly, not a placeholder.
-///
-/// `coverid` first, `artwork_track_id` second: the same preference
-/// `get_player_status` already applies for now-playing art (`artwork_id`,
-/// this file's docs on #407), here read from `tags:cJ` requested on the
-/// `albums`/`titles`/`playlists tracks` queries this helper serves. Both
-/// tags resolve to a plain id `AppState::get_image`'s LMS branch already
-/// knows how to turn into `/music/<id>/cover.jpg` through
-/// `LmsAdapter::get_artwork` -- no different from a coverid read off
-/// `status`.
-fn row_image_key(row: &Value) -> Option<String> {
-    let read = |key: &str| -> Option<String> {
-        row.get(key).and_then(|v| {
-            v.as_str()
-                .map(str::to_string)
-                .or_else(|| v.as_i64().map(|n| n.to_string()))
-        })
-    };
-    read("coverid").or_else(|| read("artwork_track_id"))
-}
-
-/// The next page's offset for a `hifi_collections` page, or `None` at the
-/// end.
-///
-/// LMS's own `count` field is the total across the whole query (not just
-/// this page), so it is the source of truth when present. A response
-/// missing it (the mock's catch-all shape, or an unmodeled LMS reply) falls
-/// back to "this page was full" as the continue signal -- the same
-/// length-based heuristic Music Assistant's `collections_content` uses for
-/// its `library_items` paging.
-fn next_offset(raw: &Value, offset: usize, limit: usize, page_len: usize) -> Option<u64> {
-    match raw.get("count").and_then(Value::as_u64) {
-        Some(total) => (total > (offset + limit) as u64).then_some((offset + limit) as u64),
-        None => (page_len == limit).then_some((offset + limit) as u64),
-    }
 }
 
 /// What LMS actually does when a request fails, spelled out once.
@@ -1312,146 +1245,6 @@ impl LmsAdapter {
         self.rpc.get_player_status(player_id).await
     }
 
-    // -------------------------------------------------------------------------
-    // Sync groups (#510): LMS's native Squeezebox multi-room, wired to the
-    // multiroom_status / multiroom_set_members / multiroom_ungroup contract
-    // the Music Assistant adapter already implements
-    // (`src/adapters/musicassistant.rs`).
-    //
-    // LMS sync is peer-based -- a group is just a set of players playing the
-    // same stream in lockstep, with no server-side concept of a leader. The
-    // contract, however, is leader/member shaped. This adapter resolves that
-    // mismatch by treating "join the leader's group" literally: every add
-    // is sent as `<leader> sync <member>`. Verified live against Lyrion 9.1.2
-    // (issue #403's investigation): the **addressed** player in a `sync`
-    // command becomes/stays the sync master, and the **argument** player
-    // adopts the addressed player's queue, repeat and shuffle -- destroying
-    // its own. Addressing the leader therefore keeps the leader's queue
-    // intact and makes the member fall in behind it, exactly the semantics
-    // `multiroom_set_members`'s `leader_zone_id` implies. Removal is
-    // leader-independent: `<member> sync -` unsyncs that one player from
-    // whatever group it is currently in.
-    //
-    // Because there is no server-side leader, `multiroom_status` cannot
-    // recover *which* player was originally addressed -- only current group
-    // membership via `syncgroups ?`. This adapter picks the first id LMS
-    // reports for each group as that group's leader for display purposes.
-    // That is a stable-but-arbitrary UHC convention, not an LMS fact.
-
-    /// Read every active LMS sync group from `syncgroups ?` as a raw member
-    /// list (no leader/member split yet). Groups of fewer than two players
-    /// are not sync groups and are dropped.
-    async fn read_sync_groups(&self) -> Result<Vec<Vec<String>>> {
-        let result = self
-            .rpc
-            .execute(None, vec![json!("syncgroups"), json!("?")])
-            .await?;
-        let groups_loop = result
-            .get("syncgroups_loop")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        Ok(groups_loop
-            .iter()
-            .filter_map(|group| group.get("sync_members").and_then(Value::as_str))
-            .map(|members| {
-                members
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|id| !id.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .filter(|members| members.len() >= 2)
-            .collect())
-    }
-
-    /// Report every active LMS sync group in the multiroom contract's shape.
-    ///
-    /// `can_set_members` is always `true`: unlike Music Assistant's per-leader
-    /// `SET_MEMBERS` feature flag, every LMS player accepts `sync`
-    /// unconditionally, so there is no per-group capability to check.
-    pub async fn multiroom_status(&self) -> Result<Value> {
-        let groups = self.read_sync_groups().await?;
-        let groups = groups
-            .into_iter()
-            .filter_map(|members| {
-                let (leader, rest) = members.split_first()?;
-                Some(json!({
-                    "leader_zone_id": PrefixedZoneId::lms(leader).to_string(),
-                    "member_zone_ids": rest
-                        .iter()
-                        .map(|id| PrefixedZoneId::lms(id).to_string())
-                        .collect::<Vec<_>>(),
-                    "can_set_members": true,
-                }))
-            })
-            .collect::<Vec<_>>();
-        Ok(json!({ "groups": groups }))
-    }
-
-    /// Sync `add_zone_ids` into `leader_zone_id`'s group and unsync
-    /// `remove_zone_ids`, then return the refreshed `multiroom_status`.
-    pub async fn set_group_members(
-        &self,
-        leader_zone_id: &str,
-        add_zone_ids: &[String],
-        remove_zone_ids: &[String],
-    ) -> Result<Value> {
-        if add_zone_ids.is_empty() && remove_zone_ids.is_empty() {
-            return Err(anyhow!("LMS group membership needs at least one member"));
-        }
-        let leader_id = lms_player_id(leader_zone_id, "leader_zone_id")?;
-        let add_ids = lms_player_ids(add_zone_ids, "member_zone_ids_to_add")?;
-        let remove_ids = lms_player_ids(remove_zone_ids, "member_zone_ids_to_remove")?;
-        let players = self.rpc.get_players().await?;
-        let player_exists = |id: &str| players.iter().any(|player| player.playerid == id);
-        if !player_exists(&leader_id) {
-            return Err(anyhow!("LMS group leader was not found"));
-        }
-        for player_id in add_ids.iter().chain(remove_ids.iter()) {
-            if player_id == &leader_id {
-                return Err(anyhow!("LMS group leader cannot be its own member input"));
-            }
-            if !player_exists(player_id) {
-                return Err(anyhow!("LMS group member was not found"));
-            }
-        }
-        for member_id in &add_ids {
-            self.rpc
-                .execute(Some(&leader_id), vec![json!("sync"), json!(member_id)])
-                .await?;
-        }
-        for member_id in &remove_ids {
-            self.rpc
-                .execute(Some(member_id), vec![json!("sync"), json!("-")])
-                .await?;
-        }
-        self.multiroom_status().await
-    }
-
-    /// Unsync each of `member_zone_ids` via its own `sync -`, independent of
-    /// which group (if any) it currently belongs to, then return the
-    /// refreshed `multiroom_status`.
-    pub async fn ungroup_members(&self, member_zone_ids: &[String]) -> Result<Value> {
-        let member_ids = lms_player_ids(member_zone_ids, "member_zone_ids")?;
-        if member_ids.is_empty() {
-            return Err(anyhow!("LMS ungroup needs at least one member"));
-        }
-        let players = self.rpc.get_players().await?;
-        for member_id in &member_ids {
-            if !players.iter().any(|player| player.playerid == *member_id) {
-                return Err(anyhow!("LMS group member was not found"));
-            }
-        }
-        for member_id in &member_ids {
-            self.rpc
-                .execute(Some(member_id), vec![json!("sync"), json!("-")])
-                .await?;
-        }
-        self.multiroom_status().await
-    }
-
     /// Start polling for player updates (internal - use Startable trait)
     async fn start_internal(&self) -> Result<()> {
         // Check if already running and set running=true atomically to prevent race
@@ -1652,43 +1445,14 @@ impl LmsAdapter {
         width: Option<u32>,
         height: Option<u32>,
     ) -> Result<(String, Vec<u8>)> {
-        self.get_artwork_with_limit(image_key, width, height, None)
-            .await
-    }
-
-    pub async fn get_artwork_bounded(
-        &self,
-        image_key: &str,
-        width: Option<u32>,
-        height: Option<u32>,
-        max_bytes: usize,
-    ) -> Result<(String, Vec<u8>)> {
-        self.get_artwork_with_limit(image_key, width, height, Some(max_bytes))
-            .await
-    }
-
-    async fn get_artwork_with_limit(
-        &self,
-        image_key: &str,
-        width: Option<u32>,
-        height: Option<u32>,
-        max_bytes: Option<usize>,
-    ) -> Result<(String, Vec<u8>)> {
         let state = self.state.read().await;
         let username = state.username.clone();
         let password = state.password.clone();
         drop(state);
 
-        // If image_key is a URL, fetch directly. #549: a favorite's `icon`
-        // can also be server-relative (a local plugin's own icon path,
-        // unlike the coverid/artwork_track_id ids the collections queries
-        // otherwise hand back) -- same relative-to-absolute rule
-        // docs/lyrion.md already documents for `artwork_url`.
+        // If image_key is a URL, fetch directly
         let url = if image_key.starts_with("http://") || image_key.starts_with("https://") {
             image_key.to_string()
-        } else if let Some(path) = image_key.strip_prefix('/') {
-            let base_url = self.rpc.base_url().await?;
-            format!("{base_url}/{path}")
         } else {
             // Otherwise treat as coverid
             self.get_artwork_url(image_key, width, height).await?
@@ -1704,7 +1468,7 @@ impl LmsAdapter {
             req = req.header("Authorization", format!("Basic {}", auth));
         }
 
-        let mut response = req.send().await?;
+        let response = req.send().await?;
         if !response.status().is_success() {
             return Err(anyhow!("Failed to fetch artwork: {}", response.status()));
         }
@@ -1715,20 +1479,8 @@ impl LmsAdapter {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("image/jpeg")
             .to_string();
-        if max_bytes.is_some_and(|limit| {
-            response
-                .content_length()
-                .is_some_and(|length| length > limit as u64)
-        }) {
-            return Err(anyhow!("Artwork exceeds the source byte limit"));
-        }
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            if max_bytes.is_some_and(|limit| body.len().saturating_add(chunk.len()) > limit) {
-                return Err(anyhow!("Artwork exceeds the source byte limit"));
-            }
-            body.extend_from_slice(&chunk);
-        }
+
+        let body = response.bytes().await?.to_vec();
         Ok((content_type, body))
     }
 
@@ -2098,321 +1850,6 @@ impl LmsAdapter {
         Ok(results)
     }
 
-    // =========================================================================
-    // hifi_collections (#531): provider-neutral browse/playlists/favorites
-    // =========================================================================
-
-    /// Dispatch one `hifi_collections` operation to the matching taggedlist
-    /// query. `params.path` is a plain server-side collection path (never a
-    /// client-visible token -- `hifi_collections` mints/resolves the opaque
-    /// ref around it); `None`/`"root"` means the collection root.
-    ///
-    /// The wire shape returned here is LMS-specific, not the provider-neutral
-    /// `{title, subtitle, path}` shape `hifi_collections` sends to the client:
-    /// a navigable row carries `path` (a collection path for another
-    /// `collections_browse` call); a playable leaf carries `kind`+`id` (an
-    /// [`LmsPlayTarget::Library`]) or `url` (an [`LmsPlayTarget::Url`]) for
-    /// `crate::mcp::tools::collections` to mint a ref over -- mirroring the
-    /// split `LmsPlayTarget` already makes for `hifi_search`.
-    pub async fn collections_content(&self, operation: &str, params: &Value) -> Result<Value> {
-        let limit = params
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(20)
-            .clamp(1, 50) as usize;
-        let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
-        match operation {
-            "collections_browse" => {
-                let path = params.get("path").and_then(Value::as_str).unwrap_or("root");
-                self.browse_collections(path, offset, limit).await
-            }
-            "collections_playlists" => self.list_playlists(offset, limit).await,
-            "collections_favorites" => self.list_favorites(offset, limit).await,
-            _ => Err(anyhow!("unsupported LMS collection operation {operation}")),
-        }
-    }
-
-    /// Walk one level of the LMS collection hierarchy: the synthetic root
-    /// (Albums/Artists/Playlists), an album's or artist's contents, or a
-    /// playlist's tracks. Every navigable path is a plain string this adapter
-    /// invented (`"albums"`, `"album:<id>"`, ...) -- never a raw LMS id handed
-    /// back to a client uninterpreted.
-    async fn browse_collections(&self, path: &str, offset: usize, limit: usize) -> Result<Value> {
-        if path == "root" {
-            // The root menu is invented by this adapter, not read from LMS --
-            // but a caller with no LMS host configured (or one that is
-            // unreachable) must still get that failure here rather than a
-            // synthetic success that never touched the server. `serverstatus`
-            // with a zero-item request is the cheapest real round trip.
-            self.rpc
-                .execute(None, vec![json!("serverstatus"), json!(0), json!(0)])
-                .await?;
-            let categories = [
-                ("Albums", "albums"),
-                ("Artists", "artists"),
-                ("Playlists", "playlists"),
-            ];
-            let items: Vec<Value> = categories
-                .iter()
-                .skip(offset)
-                .take(limit)
-                .map(|(title, path)| json!({"title": title, "path": path}))
-                .collect();
-            let next_offset =
-                (categories.len() > offset + limit).then_some((offset + limit) as u64);
-            return Ok(json!({"items": items, "next_offset": next_offset}));
-        }
-        if path == "albums" {
-            return self.query_albums(offset, limit, None).await;
-        }
-        if path == "artists" {
-            return self.query_artists(offset, limit).await;
-        }
-        if path == "playlists" {
-            return self.list_playlists(offset, limit).await;
-        }
-        if let Some(id) = path
-            .strip_prefix("album:")
-            .and_then(|s| s.parse::<i64>().ok())
-        {
-            return self.query_tracks(offset, limit, "album_id", id).await;
-        }
-        if let Some(id) = path
-            .strip_prefix("artist:")
-            .and_then(|s| s.parse::<i64>().ok())
-        {
-            return self.query_albums(offset, limit, Some(id)).await;
-        }
-        if let Some(id) = path
-            .strip_prefix("playlist:")
-            .and_then(|s| s.parse::<i64>().ok())
-        {
-            return self.query_playlist_tracks(offset, limit, id).await;
-        }
-        Err(anyhow!("unknown LMS collection path {path:?}"))
-    }
-
-    /// `albums <start> <count> [artist_id:<id>]` -- the whole album library,
-    /// or one artist's albums when `artist_id` is given.
-    async fn query_albums(
-        &self,
-        offset: usize,
-        limit: usize,
-        artist_id: Option<i64>,
-    ) -> Result<Value> {
-        // #549: `tags:cJ` requests coverid and artwork_track_id (docs/lyrion.md)
-        // so `row_image_key` has something to read; neither tag changes any
-        // field this method already used.
-        let mut params = vec![
-            json!("albums"),
-            json!(offset),
-            json!(limit),
-            json!("tags:cJ"),
-        ];
-        if let Some(id) = artist_id {
-            params.push(json!(format!("artist_id:{id}")));
-        }
-        let raw = self.rpc.execute(None, params).await?;
-        let items: Vec<Value> = raw
-            .get("albums_loop")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|row| {
-                let id = loop_entity_id(row, "album")?;
-                let title = row.get("album").and_then(Value::as_str)?.to_string();
-                let artist = row.get("artist").and_then(Value::as_str).map(String::from);
-                Some(json!({
-                    "title": title,
-                    "subtitle": artist.map(|a| format!("Album by {a}")),
-                    "path": format!("album:{id}"),
-                    "image_key": row_image_key(row),
-                }))
-            })
-            .collect();
-        let next_offset = next_offset(&raw, offset, limit, items.len());
-        Ok(json!({"items": items, "next_offset": next_offset}))
-    }
-
-    /// `artists <start> <count>` -- the whole artist library.
-    async fn query_artists(&self, offset: usize, limit: usize) -> Result<Value> {
-        let raw = self
-            .rpc
-            .execute(None, vec![json!("artists"), json!(offset), json!(limit)])
-            .await?;
-        let items: Vec<Value> = raw
-            .get("artists_loop")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|row| {
-                let id = loop_entity_id(row, "artist")?;
-                let title = row.get("artist").and_then(Value::as_str)?.to_string();
-                Some(json!({"title": title, "path": format!("artist:{id}")}))
-            })
-            .collect();
-        let next_offset = next_offset(&raw, offset, limit, items.len());
-        Ok(json!({"items": items, "next_offset": next_offset}))
-    }
-
-    /// `titles <start> <count> <filter_key>:<id>` -- tracks under one album
-    /// (or, in principle, another filterable field; only album is used today).
-    async fn query_tracks(
-        &self,
-        offset: usize,
-        limit: usize,
-        filter_key: &str,
-        filter_id: i64,
-    ) -> Result<Value> {
-        let raw = self
-            .rpc
-            .execute(
-                None,
-                vec![
-                    json!("titles"),
-                    json!(offset),
-                    json!(limit),
-                    json!(format!("{filter_key}:{filter_id}")),
-                    // #549: see `row_image_key`'s docs.
-                    json!("tags:cJ"),
-                ],
-            )
-            .await?;
-        let items: Vec<Value> = raw
-            .get("titles_loop")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|row| {
-                let id = loop_entity_id(row, "track")?;
-                let title = row.get("title").and_then(Value::as_str)?.to_string();
-                let artist = row.get("artist").and_then(Value::as_str).map(String::from);
-                Some(json!({
-                    "title": title,
-                    "subtitle": artist,
-                    "kind": "track",
-                    "id": id,
-                    "image_key": row_image_key(row),
-                }))
-            })
-            .collect();
-        let next_offset = next_offset(&raw, offset, limit, items.len());
-        Ok(json!({"items": items, "next_offset": next_offset}))
-    }
-
-    /// `playlists <start> <count>` -- every saved playlist. Both
-    /// `collections_playlists` and browsing into the synthetic `"playlists"`
-    /// node use this, since LMS has exactly one playlist listing.
-    async fn list_playlists(&self, offset: usize, limit: usize) -> Result<Value> {
-        let raw = self
-            .rpc
-            .execute(None, vec![json!("playlists"), json!(offset), json!(limit)])
-            .await?;
-        let items: Vec<Value> = raw
-            .get("playlists_loop")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|row| {
-                let id = loop_entity_id(row, "playlist")?;
-                let title = row.get("playlist").and_then(Value::as_str)?.to_string();
-                Some(json!({"title": title, "path": format!("playlist:{id}")}))
-            })
-            .collect();
-        let next_offset = next_offset(&raw, offset, limit, items.len());
-        Ok(json!({"items": items, "next_offset": next_offset}))
-    }
-
-    /// `playlists tracks <start> <count> playlist_id:<id>` -- one playlist's
-    /// contents.
-    async fn query_playlist_tracks(
-        &self,
-        offset: usize,
-        limit: usize,
-        playlist_id: i64,
-    ) -> Result<Value> {
-        let raw = self
-            .rpc
-            .execute(
-                None,
-                vec![
-                    json!("playlists"),
-                    json!("tracks"),
-                    json!(offset),
-                    json!(limit),
-                    json!(format!("playlist_id:{playlist_id}")),
-                    // #549: see `row_image_key`'s docs.
-                    json!("tags:cJ"),
-                ],
-            )
-            .await?;
-        let items: Vec<Value> = raw
-            .get("playlisttracks_loop")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|row| {
-                let id = loop_entity_id(row, "track")?;
-                let title = row
-                    .get("title")
-                    .or_else(|| row.get("track"))
-                    .and_then(Value::as_str)?
-                    .to_string();
-                let artist = row.get("artist").and_then(Value::as_str).map(String::from);
-                Some(json!({
-                    "title": title,
-                    "subtitle": artist,
-                    "kind": "track",
-                    "id": id,
-                    "image_key": row_image_key(row),
-                }))
-            })
-            .collect();
-        let next_offset = next_offset(&raw, offset, limit, items.len());
-        Ok(json!({"items": items, "next_offset": next_offset}))
-    }
-
-    /// `favorites items <start> <count>` -- the flat favourites list. LMS
-    /// favorites carry no durable entity id, only a `url` (verified live,
-    /// #403's gap-table note); a folder-shaped favorite (`hasitems`) is
-    /// listed but not itself browsable in this slice -- narrower than a full
-    /// walk, called out in #531's PR body rather than silently dropped.
-    async fn list_favorites(&self, offset: usize, limit: usize) -> Result<Value> {
-        let raw = self
-            .rpc
-            .execute(
-                None,
-                vec![
-                    json!("favorites"),
-                    json!("items"),
-                    json!(offset),
-                    json!(limit),
-                ],
-            )
-            .await?;
-        let items: Vec<Value> = raw
-            .get("loop_loop")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|row| {
-                let title = row
-                    .get("name")
-                    .or_else(|| row.get("title"))
-                    .and_then(Value::as_str)?
-                    .to_string();
-                let url = row.get("url").and_then(Value::as_str)?.to_string();
-                // #549: `favorites items` hands back `icon` (usually an
-                // absolute URL) on its own, unlike albums/titles/playlists
-                // tracks -- no `tags:` request needed for it.
-                let image_key = row.get("icon").and_then(Value::as_str).map(str::to_string);
-                Some(json!({"title": title, "url": url, "image_key": image_key}))
-            })
-            .collect();
-        let next_offset = next_offset(&raw, offset, limit, items.len());
-        Ok(json!({"items": items, "next_offset": next_offset}))
-    }
-
     /// Search and play the first matching result
     ///
     /// Searches using globalsearch (includes streaming services), finds the first
@@ -2705,8 +2142,6 @@ fn lms_player_to_zone(player: &LmsPlayer) -> Zone {
                 seek_position: Some(player.time),
                 duration: Some(player.duration),
                 metadata: None,
-                repeat_mode: None,
-                shuffle: None,
             })
         } else {
             None
@@ -3569,14 +3004,6 @@ impl AdapterLogic for LmsAdapter {
                     ),
                 });
             }
-            AdapterCommand::SetRepeat(_) | AdapterCommand::SetShuffle(_) => {
-                return Ok(AdapterCommandResponse {
-                    success: false,
-                    error: Some(
-                        "Repeat and shuffle are not implemented by the LMS adapter".to_string(),
-                    ),
-                });
-            }
         };
 
         match result {
@@ -3645,88 +3072,6 @@ async fn run_lms_command_endpoint(
                 // deadline; the command may have applied even though LMS did not serve readback.
                 tracing::warn!(%error, command_id = command_id.get(), "LMS native write accepted but coherent player readback failed");
             }
-        }
-    }
-}
-
-/// Content-library surface: the multiroom sync-group operations (#510) and
-/// the `hifi_collections` browse operations (#531) are both implemented
-/// here. LMS's own search/play surfaces are reached through their
-/// dedicated paths (`LmsAdapter::search`, `LmsAdapter::control`, ...)
-/// rather than through this trait's `search`/`play_uri` -- LMS's playable
-/// targets are typed (`LmsPlayTarget::{Library,Url,GlobalSearchItem}`),
-/// which is exactly why `hifi_search`/`hifi_play` already call `LmsAdapter`
-/// directly (pre-existing debt, unaffected by this registration). `content`
-/// is what lets the provider-neutral MCP registry
-/// (`AdapterRegistry::library_content`) dispatch `multiroom_status`,
-/// `multiroom_set_members`, `multiroom_ungroup`, `collections_browse`,
-/// `collections_playlists` and `collections_favorites` to LMS the same way
-/// it already dispatches the multiroom operations to Music Assistant
-/// (`src/adapters/musicassistant.rs`).
-#[async_trait]
-impl LibraryAdapter for LmsAdapter {
-    async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<LibrarySearchResult>> {
-        Err(anyhow!(
-            "LMS search is not reachable through the generic library registry; \
-             hifi_search calls LmsAdapter directly because LMS's playable targets are typed, \
-             not a flat URI"
-        ))
-    }
-
-    async fn play_uri(&self, _zone_id: &str, _uri: &str) -> Result<String> {
-        Err(anyhow!(
-            "LMS playback is not reachable through the generic library registry; \
-             hifi_play/hifi_play_ref call LmsAdapter directly for the same reason as search"
-        ))
-    }
-
-    async fn content(&self, operation: &str, params: &Value) -> Result<Value> {
-        match operation {
-            "multiroom_status" => self.multiroom_status().await,
-            "multiroom_set_members" => {
-                let leader = params
-                    .get("leader_zone_id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("LMS group operation requires leader_zone_id"))?;
-                let add = params
-                    .get("member_zone_ids_to_add")
-                    .or_else(|| params.get("member_zone_ids"))
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| anyhow!("LMS group operation requires member_zone_ids"))?
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .collect::<Vec<_>>();
-                let remove = params
-                    .get("member_zone_ids_to_remove")
-                    .and_then(Value::as_array)
-                    .map(|members| {
-                        members
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(ToOwned::to_owned)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                self.set_group_members(leader, &add, &remove).await
-            }
-            "multiroom_ungroup" => {
-                let members = params
-                    .get("member_zone_ids")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| anyhow!("LMS ungroup requires member_zone_ids"))?
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .collect::<Vec<_>>();
-                self.ungroup_members(&members).await
-            }
-            "collections_browse" | "collections_playlists" | "collections_favorites" => {
-                self.collections_content(operation, params).await
-            }
-            _ => Err(anyhow!(
-                "LMS content operation `{operation}` is not supported"
-            )),
         }
     }
 }

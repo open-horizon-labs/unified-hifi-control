@@ -24,16 +24,7 @@ dist/
 public/tailwind.css
 # Note: public/dx-components-theme.css is hand-authored, NOT generated
 .worktrees/
-.impeccable/critique/
 
-# Python (Home Assistant integration test env)
-__pycache__/
-*.pyc
-.venv*/
-.pytest_cache/
-.ruff_cache/
-
-# Swift package build products (companion/*)
-/.build/
-companion/**/.build/
-companion/**/.swiftpm/
+# Regenerable local index cache for the .oh planning artifacts. The artifacts themselves are
+# tracked; this cache is not. Narrow on purpose - `.oh/` must stay tracked.
+.oh/.cache/

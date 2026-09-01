@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 <version> <x86_64|armv8> <binary> <pairing-helper> <output.spk>" >&2
+    echo "Usage: $0 <version> <x86_64|armv8> <binary> <output.spk>" >&2
     exit 2
 }
 
@@ -37,14 +37,13 @@ normalize_version() {
     fi
 }
 
-[[ $# -eq 5 ]] || usage
+[[ $# -eq 4 ]] || usage
 
 SOURCE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SOURCE_VERSION=$1
 ARCH=$2
 BINARY=$3
-PAIRING_HELPER=$4
-OUTPUT=$5
+OUTPUT=$4
 
 case "$ARCH" in
     x86_64 | armv8) ;;
@@ -56,10 +55,6 @@ esac
 
 [[ -f "$BINARY" ]] || {
     echo "Binary not found: $BINARY" >&2
-    exit 2
-}
-[[ -f "$PAIRING_HELPER" ]] || {
-    echo "Pairing helper not found: $PAIRING_HELPER" >&2
     exit 2
 }
 
@@ -77,9 +72,7 @@ cp -R "${SOURCE_DIR}/scripts" "${SOURCE_DIR}/conf" "${STAGE_DIR}/"
 cp -R "${SOURCE_DIR}/package/." "${STAGE_DIR}/package/"
 cp "${SOURCE_DIR}/PACKAGE_ICON.PNG" "${SOURCE_DIR}/PACKAGE_ICON_256.PNG" "${STAGE_DIR}/"
 cp "$BINARY" "${STAGE_DIR}/package/unified-hifi-control"
-cp "$PAIRING_HELPER" "${STAGE_DIR}/package/uhc-hiphi-pair"
-chmod +x "${STAGE_DIR}/package/unified-hifi-control" \
-    "${STAGE_DIR}/package/uhc-hiphi-pair" "${STAGE_DIR}"/scripts/*
+chmod +x "${STAGE_DIR}/package/unified-hifi-control" "${STAGE_DIR}"/scripts/*
 
 sed \
     -e "s/{{VERSION}}/${DSM_VERSION}/g" \

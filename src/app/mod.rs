@@ -6,17 +6,14 @@
 use dioxus::prelude::*;
 
 pub mod api;
-pub mod base_path;
 pub mod components;
-pub mod controller_auth;
 pub mod embedded_assets;
 pub mod pages;
 pub mod settings_context;
 pub mod sse;
 pub mod theme;
 
-use components::BootstrapPrompt;
-use pages::{HqPlayer, Knobs, Library, Lms, Settings, Spotify, Zones};
+use pages::{HqPlayer, Knobs, Lms, Settings, Zones};
 use settings_context::use_settings_provider;
 use sse::use_sse_provider;
 use theme::use_theme_provider;
@@ -85,91 +82,33 @@ pub fn App() -> Element {
     let mcp_endpoint = try_consume_context::<McpEndpoint>().unwrap_or_default();
     use_context_provider(|| mcp_endpoint.clone());
 
-    // HA Ingress (#581): when the document was served behind a subpath
-    // proxy (the server injected a uhc-base-path meta tag), the router must
-    // treat that prefix as its base path -- Link hrefs, pushes, and route
-    // parsing all include it. Provided before Router mounts so it shadows
-    // the default (prefixless) WebHistory the web launch installs at the
-    // root. Direct mode has no meta tag and keeps the default history.
-    #[cfg(all(target_arch = "wasm32", feature = "web"))]
-    use_hook(|| {
-        let base = base_path::base_path();
-        if !base.is_empty() {
-            provide_context::<std::rc::Rc<dyn dioxus::history::History>>(std::rc::Rc::new(
-                dioxus::web::WebHistory::new(Some(base), true),
-            ));
-        }
-    });
-
     // Initialize SSE context at app root (single EventSource for all pages)
     use_sse_provider();
 
     // Initialize theme context at app root (handles localStorage + DOM class)
     use_theme_provider();
 
-    // Initialize navigation visibility from the persisted server snapshot. The
-    // same snapshot is emitted below so WASM hydrates the exact tab set that
-    // SSR rendered, before its asynchronous settings refresh begins.
-    let navigation_visibility = use_settings_provider();
-    let navigation_visibility_json =
-        serde_json::to_string(&navigation_visibility).unwrap_or_else(|_| "{}".to_string());
-    let settings_bootstrap_json = settings_context::settings_bootstrap_json();
+    // Initialize settings context at app root (shared nav visibility state)
+    use_settings_provider();
 
     rsx! {
         document::Meta {
             name: "uhc-mcp-endpoint",
             content: "{mcp_endpoint.url}"
         }
-        document::Meta {
-            name: "uhc-navigation-visibility",
-            content: "{navigation_visibility_json}"
-        }
-        document::Meta {
-            name: "uhc-settings-bootstrap",
-            content: "{settings_bootstrap_json}"
-        }
         Router::<Route> {}
-        // Mounted once at the app root so any page's owner-gated fetch can
-        // open it via `crate::app::controller_auth::open_bootstrap_prompt`
-        // without threading state through every route (#570).
-        BootstrapPrompt {}
     }
 }
 
-/// Application routes.
-///
-/// Library is the home page (#550): a full-page browse/search surface that
-/// replaced the old per-zone-card browse panel. Its state -- which
-/// provider/zone is being browsed, which tab, and the breadcrumb path -- is
-/// carried entirely in the query string so a level is refresh/back/share
-/// safe, per the issue's URL-addressability requirement. `path` is a
-/// base64url-encoded JSON breadcrumb stack (`Vec<(String, Option<String>)>`,
-/// see `pages::library::BreadcrumbEntry`) rather than raw path segments:
-/// provider browse paths are opaque tokens that may contain characters a URL
-/// path segment can't carry safely, and a flat list of segments would lose
-/// the breadcrumb titles on a fresh (deep-linked) load.
+/// Application routes
 #[derive(Clone, Routable, Debug, PartialEq)]
 pub enum Route {
-    #[route("/?:source&:tab&:path&:zone")]
-    Library {
-        source: Option<String>,
-        tab: Option<String>,
-        path: Option<String>,
-        zone: Option<String>,
-    },
-    // #560: was `/zones`, which collides with the JSON protocol route
-    // `GET /zones` (knobs::knob_zones_handler, registered in main.rs) --
-    // that API route wins the axum route table, so the SPA page was
-    // unreachable (the URL just served raw JSON). Moved to a path the API
-    // doesn't own; the API route itself is untouched.
-    #[route("/ui/zones")]
+    #[route("/")]
     Zones {},
     #[route("/hqplayer")]
     HqPlayer {},
     #[route("/lms")]
     Lms {},
-    #[route("/spotify")]
-    Spotify {},
     #[route("/knobs")]
     Knobs {},
     #[route("/settings")]

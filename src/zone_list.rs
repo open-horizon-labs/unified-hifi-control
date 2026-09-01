@@ -295,10 +295,6 @@ mod tests {
                 openhome: true,
                 lms: true,
                 hqplayer: true,
-                spotify: true,
-                applemusic: true,
-                musicassistant: true,
-                mqtt: true,
             },
             ..AppSettings::default()
         }
