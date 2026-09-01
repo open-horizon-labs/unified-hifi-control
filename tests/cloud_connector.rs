@@ -341,6 +341,18 @@ fn canonical_payload_hash_is_key_order_independent() {
 }
 
 #[test]
+fn canonical_payload_hash_normalizes_integral_f64_like_javascript_json() {
+    let wire = json!({"action":"volume.absolute","value":39,"zone_handle":"zone_demo_lounge"});
+    let typed: CommandPayload = serde_json::from_value(wire.clone()).unwrap();
+    let typed_value = serde_json::to_value(&typed).unwrap();
+
+    assert_eq!(
+        canonical_json(&typed_value).unwrap(),
+        canonical_json(&wire).unwrap()
+    );
+}
+
+#[test]
 fn opaque_handles_round_trip_locally_without_provider_id_in_projection() {
     let mut store = StateStore::default();
     let projection = store
