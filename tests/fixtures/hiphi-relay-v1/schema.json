@@ -7,6 +7,7 @@
     {"$ref":"#/$defs/command_result"}, {"$ref":"#/$defs/artwork_response"},
     {"$ref":"#/$defs/challenge"}, {"$ref":"#/$defs/session_established"},
     {"$ref":"#/$defs/command"}, {"$ref":"#/$defs/artwork_request"},
+    {"$ref":"#/$defs/spotify_callback"},
     {"$ref":"#/$defs/revoke"}
   ],
   "$defs": {
@@ -85,6 +86,12 @@
     },
     "session_established": {
       "allOf":[{"$ref":"#/$defs/tagged"},{"properties":{"type":{"const":"session_established"},"body":{"type":"object","additionalProperties":false,"required":["epoch"],"properties":{"epoch":{"$ref":"#/$defs/epoch"}}}}}]
+    },
+    "spotify_callback": {
+      "allOf":[{"$ref":"#/$defs/tagged"},{"properties":{"type":{"const":"spotify_callback"},"body":{"oneOf":[
+        {"type":"object","additionalProperties":false,"required":["protocol_version","request_id","client_id","state_digest","redirect_uri","expires_at","code"],"properties":{"protocol_version":{"const":1},"request_id":{"$ref":"#/$defs/uuid"},"client_id":{"type":"string","minLength":16,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"state_digest":{"type":"string","pattern":"^[A-Za-z0-9_-]{43}$"},"redirect_uri":{"const":"https://app.hiphi.audio/api/spotify/callback"},"expires_at":{"$ref":"#/$defs/timestamp"},"code":{"type":"string","minLength":1,"maxLength":4096}}},
+        {"type":"object","additionalProperties":false,"required":["protocol_version","request_id","client_id","state_digest","redirect_uri","expires_at","error"],"properties":{"protocol_version":{"const":1},"request_id":{"$ref":"#/$defs/uuid"},"client_id":{"type":"string","minLength":16,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"state_digest":{"type":"string","pattern":"^[A-Za-z0-9_-]{43}$"},"redirect_uri":{"const":"https://app.hiphi.audio/api/spotify/callback"},"expires_at":{"$ref":"#/$defs/timestamp"},"error":{"type":"string","minLength":1,"maxLength":256}}}
+      ]}}}}]
     },
     "revoke": {
       "allOf":[{"$ref":"#/$defs/tagged"},{"properties":{"type":{"const":"revoke"},"body":{"type":"object","additionalProperties":false,"required":["reason_code"],"properties":{"reason_code":{"type":"string","maxLength":128}}}}}]

@@ -81,6 +81,15 @@ image. The cloud façade places the opaque capability in the exact
 the watch bearer. Neither UHC nor the cloud logs that path or capability, and
 the relay protocol itself carries no arbitrary URL.
 
+Spotify authorization uses a separate, narrowly typed relay message rather
+than exposing a LAN callback. The owner supplies only a personal Spotify Client
+ID. UHC generates and retains the PKCE verifier, signs a short-lived request
+bound to its installation identity, and sends the browser through HiPhi's fixed
+callback. HiPhi verifies account ownership and the installation signature, then
+delivers the one-use provider code only to the matching authenticated
+installation. HiPhi never receives the PKCE verifier, provider access or refresh
+tokens, a client secret, or an arbitrary callback destination.
+
 ## Consequences
 
 - Open-source UHC can be audited without exposing a cloud signing secret.

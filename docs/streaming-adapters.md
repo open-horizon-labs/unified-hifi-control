@@ -74,15 +74,19 @@ is reachable through a tunnel; put authentication and access control at the
 tunnel/reverse-proxy boundary until the controller-auth contract in #463 is
 implemented.
 
-The first authorization contract is now implemented in UHC. Spotify uses the
-standard authorization-code flow:
+Spotify uses an authorization-code flow with PKCE and a fixed HiPhi callback:
 
-- `GET /api/providers/spotify/oauth/start` creates a single-use, ten-minute
-  state and returns the provider authorization URL.
-- Spotify redirects to `GET /api/providers/spotify/oauth/callback`; UHC
-  exchanges the code server-side and stores the access/refresh token in the
-  Spotify adapter and encrypted credential store. Tokens are never returned
-  by the endpoint.
+- `GET /api/providers/spotify/oauth/start` requires a paired HiPhi Cloud
+  installation, keeps the verifier locally, and returns a short-lived,
+  installation-signed authorization handoff URL.
+- HiPhi confirms the signed-in owner controls that installation, redirects to
+  Spotify, and accepts the provider callback at
+  `https://app.hiphi.audio/api/spotify/callback`.
+- HiPhi sends the one-use authorization code only over the authenticated relay
+  for that installation. UHC checks the request, Client ID, state digest,
+  callback, and expiry before exchanging it with its local PKCE verifier.
+- Access and refresh tokens are stored only in UHC's encrypted credential
+  store. HiPhi receives neither tokens nor the PKCE verifier.
 - `POST /api/providers/spotify/oauth/revoke` clears the adapter and removes
   the durable credential file.
 
@@ -133,20 +137,19 @@ secret-backed volume when the default config directory is not appropriate.
 The key and encrypted file must be backed up together if a restart or package
 upgrade is expected to preserve the connection.
 
-For a hosted UHC deployment, set `SPOTIFY_CLIENT_ID`,
-`SPOTIFY_CLIENT_SECRET`, and optionally
-`SPOTIFY_REDIRECT_URI` (and `SPOTIFY_TOKEN_URL` for a local test server) before
-starting the flow. The callback endpoint must be registered exactly with the
-Spotify application.
+For a hosted UHC deployment, set `SPOTIFY_CLIENT_ID` (and
+`SPOTIFY_TOKEN_URL` only for a local test server). Register the fixed HiPhi
+callback exactly with the Spotify application. A Client Secret and a
+user-managed redirect URI are not required for the supported setup path.
 
 For a local or QNAP install, open Settings in the browser you will use for
 authorization. The Spotify card's "Client settings" pane now walks through the
 whole flow as numbered steps: create/open an app in the Spotify Developer
-Dashboard, copy the exact callback URL shown there (with a one-click copy
-button) into the app's Redirect URIs, paste the Client ID into the field
-below, save, then Connect. The client secret lives in a collapsed "Advanced"
-section and can almost always stay blank — UHC signs in securely without it;
-only fill it in if your Spotify app was specifically set up to require one.
+Dashboard, copy the fixed HiPhi callback shown there (with a one-click copy
+button) into the app's Redirect URIs, paste the Client ID, save, then Connect.
+The installation must first be paired with HiPhi Cloud. HiPhi is used only for
+the owner-approved callback handoff; normal playback requests and token refresh
+remain between UHC and Spotify.
 
 ### First save on a NAS: the owner bootstrap prompt (#570)
 
@@ -173,8 +176,8 @@ step and tells you where to find the token:
 Paste the token into the prompt, which posts it to
 `POST /api/controller/bootstrap`. On success UHC mints a browser session
 cookie plus a CSRF token; the prompt closes and the page reports that owner
-access is unlocked. Click the original button (Save, Connect, Get an HTTPS
-address) again and it now succeeds — the CSRF token is attached automatically
+access is unlocked. Click the original Save or Connect button again and it now
+succeeds — the CSRF token is attached automatically
 to every state-changing request from then on (see
 `crate::app::controller_auth::current_csrf_token`, mirrored into
 `localStorage` so it survives a page reload without a second bootstrap). The
@@ -182,76 +185,18 @@ bootstrap token itself is single-use: once accepted, the same token cannot be
 replayed, and `GET /api/controller/status` reports `bootstrap_required:
 false` afterward.
 
-If the browser is not on the UHC host, Spotify accepts plain HTTP only for
-explicit loopback callbacks (`127.0.0.1` or `::1`); anything else — a remote
-QNAP, a different machine on the LAN — needs HTTPS. The "Using UHC from
-another device or a NAS?" panel below the callback URL has a **Get an HTTPS
-address** button for this: it asks UHC to open a temporary tunnel to a
-separate loopback-only callback listener and shows the resulting `https://…`
-callback URL with a copy button,
-so a first-time user never has to install or run anything. After allocation
-UHC probes its own public URL once and shows the result (reachable or not)
-before the user registers it with Spotify. The Redirect URI field is
-pre-filled with that URL's callback path while it still holds the loopback
-default; a previously saved address is never silently replaced — a
-divergence between the live tunnel and the saved Redirect URI is surfaced
-as a warning (and `oauth/start` refuses with `tunnel_redirect_mismatch`),
-because tunnel providers mint a new subdomain on every start and the
-authorize request always uses the saved Redirect URI verbatim. Paste the
-shown URL into the Spotify dashboard's Redirect URIs, save client settings,
-then Connect. The tunnel closes itself shortly after authorization
-completes (success or failure; teardown is deferred a minute so the
-bounded callback response still travels through it), after 55
-minutes (under pinggy's own 60-minute anonymous-tunnel limit, and long
-enough for a first-time dashboard round trip), or via its own "Stop
-tunnel" button — while it
-is open, the public address terminates at that callback-only listener, not at
-the UHC LAN listener. It permits exactly `GET
-/api/providers/spotify/oauth/callback` and a non-sensitive `GET /healthz`
-probe; every other method and path is denied. The callback still accepts only
-the single in-flight OAuth `state` token, so no extra trust is extended to
-traffic that arrives through it (see `oauth_callback_json` in
-`src/api/provider_auth.rs`).
-
-Under the hood this is a plain `ssh -R` reverse tunnel to that separate
-loopback listener, via
-[pinggy.io](https://pinggy.io)'s free tier — no account and no bundled binary
-beyond the `ssh` client already present on essentially every Linux, macOS, or
-NAS install — falling back automatically to
-[localhost.run](https://localhost.run) if pinggy.io cannot be reached. Both
-providers mint a fresh random subdomain on every connection, so a new tunnel
-always means a newly registered callback URL; that expectation and the retry
-logic live in `SpotifyTunnelManager` (`src/api/spotify_tunnel.rs`), which is
-tested against a scripted fake process rather than a live tunnel provider
-(the pinggy URL-parsing test fixture is an exact capture of a live anonymous
-tunnel's stdout, though, since a first live-smoke pass found the original
-`pinggy.link`-only pattern never matched pinggy's real anonymous-tier hosts —
-`pinggy-free.link` and `free.pinggy.net`). Pinggy's free tier also caps an
-anonymous tunnel at 60 minutes before it expires on its own; UHC's own
-55-minute cap closes it first. If `ssh` is missing,
-both providers are unreachable, or outbound `ssh` traffic is blocked, the
-panel reports why in the same beginner-readable style as the rest of
-Settings, and the collapsed **Advanced: bring your own HTTPS** note
-underneath covers an operator-managed HTTPS proxy only when it independently
-default-denies every route except the exact Spotify callback. Do **not** point
-a manual tunnel, Funnel, or reverse proxy at UHC's main port; that listener
-has intentional LAN-readable and control surfaces. Reauthorizing later always
-needs a new tunnel (built-in or carefully filtered operator-managed route) and
-a newly registered callback URL either way. This is the first-run onboarding
-path tracked in #469, #534, and #538.
-
-New endpoints backing the built-in tunnel — `POST
-/api/providers/spotify/tunnel/start`, `GET
-/api/providers/spotify/tunnel/status`, and `POST
-/api/providers/spotify/tunnel/stop` — are controller-authenticated the same
-as the rest of `/api/providers/*` (see `requires_controller_auth` in
-`src/api/controller_auth.rs`) and registered in
-`tests/fixtures/api_routes.txt`.
+The supported callback is always
+`https://app.hiphi.audio/api/spotify/callback`, whether UHC runs on a NAS,
+Docker, Synology, as an LMS plugin, or as a plain binary. The browser never
+connects back to UHC, and UHC never opens an inbound tunnel or exposes its LAN
+listener. The older callback-only tunnel endpoints remain temporarily for
+compatibility with already-installed alpha builds, but Settings no longer uses
+them and a live legacy tunnel cannot bypass the HiPhi pairing requirement.
 
 If authorization does not complete, Settings shows an actionable message
-instead of a generic failure: an expired or already-used sign-in link, a
-declined consent screen, a callback URL mismatch between the Spotify dashboard
-and the Redirect URI configured here, or a server-side storage/adapter-start
+instead of a generic failure: a missing HiPhi pairing, an expired or
+already-used sign-in link, declined consent, an incorrectly registered fixed
+callback, or a server-side storage/adapter-start
 problem are each called out with what to fix. See
 `spotify_oauth_error_message` in `src/app/pages/settings.rs`, which maps every
 `code` returned by `oauth_callback_json` in `src/api/provider_auth.rs` to one

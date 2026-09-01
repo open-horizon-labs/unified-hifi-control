@@ -142,6 +142,7 @@ or LAN projection.
 | Opaque zone handle, owner-visible zone name, transport state, and bounded volume state | Raw Roon/LMS/OpenHome/UPnP/HQPlayer/Spotify/Apple Music identifiers |
 | Bounded now-playing title, artist, playing state, and opaque image revision | Provider credentials, refresh tokens, cookies, CSRF tokens, and authorization headers |
 | Bounded artwork bytes requested through an opaque capability | Provider artwork URL, arbitrary URL, LAN URL, hostname, or filesystem path |
+| Public Spotify Client ID, PKCE challenge, state digest, and one-use authorization code during an owner-approved setup | PKCE verifier, Spotify access/refresh tokens, client secret, or LAN callback URL |
 | Controller ID in signed grants, command/result status, epoch, revision, and timestamps | General LAN HTTP requests or responses and UHC's local API surface |
 
 This means HiPhi Cloud can learn zone names and now-playing metadata while the
@@ -214,6 +215,13 @@ security decision and an update to this document and ADR 005.
     enrollment secrets, artwork capabilities/paths, provider identifiers,
     command payloads, and artwork bytes must not be placed in application logs,
     analytics, presence records, or error text.
+17. **Provider authorization is a bound handoff, not credential custody.** A
+    Spotify setup request is signed by the paired installation and bound to the
+    owner, installation, request, Client ID, fixed callback, PKCE challenge,
+    state digest, and short expiry. The cloud forwards the one-use provider code
+    only over that installation's authenticated relay. The PKCE verifier and
+    resulting provider tokens never leave UHC, and callbacks fail closed on
+    mismatch, expiry, replay, disconnect, or revocation.
 
 Executable evidence lives primarily in `tests/cloud_connector.rs`,
 `tests/fixtures/hiphi-relay-v1/`, `tests/hiphi_pairing_ui_contract.rs`, package

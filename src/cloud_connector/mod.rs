@@ -20,8 +20,8 @@ pub use config::{CloudConnectorConfig, ConfigError, IssuerVerifyingKeyRing, MAX_
 pub use identity::{InstallationIdentity, ZoneHandleMap};
 pub use protocol::{
     parse_relay_message, AllowedAction, ArtworkChunk, ArtworkRelayRequest, ArtworkRelayResponse,
-    CommandEnvelope, CommandPayload, ConnectorMessage, RelayMessage, StateSnapshot, WireEnvelope,
-    WireType,
+    CommandEnvelope, CommandPayload, ConnectorMessage, RelayMessage, SpotifyCallbackMessage,
+    StateSnapshot, WireEnvelope, WireType,
 };
 pub use session::{
     verify_installation_session_grant, InstallationGrantRequest, InstallationSessionProof,

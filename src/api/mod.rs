@@ -4767,7 +4767,7 @@ mod tests {
         let written = load_app_settings();
         let strays: Vec<_> = walk_config_files(&dir)
             .into_iter()
-            .filter(|name| name.ends_with(".tmp"))
+            .filter(|name| name.ends_with(".json.tmp"))
             .collect();
         env::remove_var("UHC_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);
