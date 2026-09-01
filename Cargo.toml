@@ -39,7 +39,10 @@ server = [
     "dep:ed25519-dalek",
     "dep:uuid",
 ]
-web = ["dioxus/web"]
+# The browser bundle still needs Dioxus fullstack's hydration support so it
+# can attach to SSR markup. This does not enable the server target; that stays
+# behind the separate `server` feature used by native binaries.
+web = ["dioxus/web", "dioxus/fullstack"]
 
 [dependencies]
 # Dioxus UI framework (SSR + client hydration + router)
