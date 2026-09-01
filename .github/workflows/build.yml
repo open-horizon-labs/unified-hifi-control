@@ -384,7 +384,7 @@ jobs:
 
       - name: Cache generated CSS
         id: cache-css
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: public/tailwind.css
           key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
@@ -419,7 +419,7 @@ jobs:
 
       - name: Cache generated CSS
         id: cache-css
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: public/tailwind.css
           key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
@@ -477,7 +477,7 @@ jobs:
 
       - name: Cache WASM build output
         id: cache-wasm
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             target/dx/
@@ -524,7 +524,7 @@ jobs:
       - name: Cache Dioxus CLI
         if: steps.check-cache.outputs.needs_build == 'true'
         id: cache-dx
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/dx
           key: dx-cli-0.7.10
@@ -536,7 +536,7 @@ jobs:
       - name: Cache generated CSS
         if: steps.check-cache.outputs.needs_build == 'true'
         id: cache-css
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: public/tailwind.css
           key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
@@ -604,7 +604,7 @@ jobs:
 
       - name: Cache cargo-zigbuild
         id: cache-zigbuild
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/cargo-zigbuild
           key: cargo-zigbuild-0.20
@@ -621,7 +621,7 @@ jobs:
 
       - name: Cache generated CSS
         id: cache-css
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: public/tailwind.css
           key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
@@ -836,7 +836,7 @@ jobs:
 
       - name: Cache cargo-zigbuild
         id: cache-zigbuild
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/cargo-zigbuild
           key: cargo-zigbuild-0.20
@@ -853,7 +853,7 @@ jobs:
 
       - name: Cache generated CSS
         id: cache-css
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: public/tailwind.css
           key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
@@ -925,7 +925,7 @@ jobs:
 
       - name: Cache generated CSS
         id: cache-css
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: public/tailwind.css
           key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
@@ -983,7 +983,7 @@ jobs:
 
       - name: Cache generated CSS
         id: cache-css
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: public/tailwind.css
           key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
@@ -1201,7 +1201,7 @@ jobs:
 
       - name: Cache generated CSS
         id: cache-css
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: public/tailwind.css
           key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
