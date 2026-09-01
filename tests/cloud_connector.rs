@@ -11,6 +11,24 @@ use rand::rngs::OsRng;
 use serde_json::json;
 use std::time::Duration;
 
+#[test]
+fn spotify_callback_is_a_strict_installation_relay_message() {
+    let message = br#"{"type":"spotify_callback","body":{"protocol_version":1,"request_id":"11111111-1111-4111-8111-111111111111","client_id":"0123456789abcdef0123456789abcdef","state_digest":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","redirect_uri":"https://app.hiphi.audio/api/spotify/callback","expires_at":1800000060000,"code":"one-use-code"}}"#;
+    let parsed = parse_relay_message(message).expect("valid Spotify callback");
+    let RelayMessage::SpotifyCallback(callback) = parsed else {
+        panic!("wrong relay message type");
+    };
+    assert_eq!(
+        callback.request_id,
+        uuid::Uuid::from_u128(0x11111111111141118111111111111111)
+    );
+    assert_eq!(callback.code.as_deref(), Some("one-use-code"));
+    assert!(callback.error.is_none());
+
+    let duplicate = br#"{"type":"spotify_callback","body":{"protocol_version":1,"request_id":"11111111-1111-4111-8111-111111111111","client_id":"0123456789abcdef0123456789abcdef","state_digest":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","redirect_uri":"https://app.hiphi.audio/api/spotify/callback","expires_at":1800000060000,"code":"first","code":"second"}}"#;
+    assert_eq!(parse_relay_message(duplicate), Err("duplicate_object_key"));
+}
+
 fn id(prefix: &str) -> String {
     format!("{prefix}_01234567890")
 }
@@ -251,6 +269,7 @@ fn private_relay_fixture_messages_match_typed_wire_contract() {
                 | RelayMessage::Heartbeat { .. }
                 | RelayMessage::Command(_)
                 | RelayMessage::ArtworkRequest(_)
+                | RelayMessage::SpotifyCallback(_)
                 | RelayMessage::Revoke { .. }
         ));
     }

@@ -14,7 +14,7 @@ use crate::api::credentials::{
     EncryptedCredentialStore, MusicAssistantCredentialRecord, MusicAssistantCredentialStore,
     SpotifyCredentialRecord,
 };
-use crate::api::spotify_tunnel::{SpotifyTunnelManager, TunnelStatus, TunnelStatusResponse};
+use crate::api::spotify_tunnel::{SpotifyTunnelManager, TunnelStatusResponse};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -38,9 +38,9 @@ use super::AppState;
 
 const OAUTH_TTL: Duration = Duration::from_secs(600);
 const MAX_PENDING_OAUTH: usize = 64;
-const SPOTIFY_AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 const SPOTIFY_TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
-const SPOTIFY_SCOPE: &str = "user-read-playback-state user-modify-playback-state user-read-private user-read-email playlist-read-private playlist-read-collaborative playlist-modify-public playlist-modify-private user-library-read user-library-modify";
+const HIPHI_SPOTIFY_CONNECT_URL: &str = "https://app.hiphi.audio/spotify/connect";
+const HIPHI_SPOTIFY_CALLBACK_URI: &str = "https://app.hiphi.audio/api/spotify/callback";
 
 #[derive(Clone)]
 pub struct ProviderAuthState {
@@ -62,6 +62,9 @@ struct PendingOAuth {
     provider: String,
     expires_at: u64,
     code_verifier: Option<String>,
+    cloud_request_id: Option<uuid::Uuid>,
+    client_id: Option<String>,
+    state_digest: Option<String>,
 }
 
 #[derive(Clone)]
@@ -361,9 +364,7 @@ async fn configure_spotify_request(
     let redirect_uri = request
         .redirect_uri
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            "http://127.0.0.1:8088/api/providers/spotify/oauth/callback".to_string()
-        });
+        .unwrap_or_else(|| HIPHI_SPOTIFY_CALLBACK_URI.to_string());
     if !valid_redirect_uri(&redirect_uri) {
         return Err(error(
             StatusCode::BAD_REQUEST,
@@ -654,30 +655,39 @@ pub async fn oauth_start(
             "invalid_client_configuration",
         ));
     }
-    // pinggy (and localhost.run) mint a brand-new subdomain on every tunnel
-    // start, so a tunnel restarted after the user registered an earlier URL
-    // in Spotify's dashboard silently diverges from the saved Redirect URI.
-    // Spotify then rejects the authorize request with "redirect_uri: Not
-    // matching configuration" (#592). Catch the divergence here, before the
-    // user is sent to Spotify: the authorize request always uses the SAVED
-    // redirect URI verbatim, and a live tunnel whose address no longer
-    // matches it is a configuration conflict the user has to resolve first.
-    if let TunnelStatus::Active { url, .. } = state.provider_auth.spotify_tunnel.status().await {
-        let tunnel_callback = format!("{url}/api/providers/spotify/oauth/callback");
-        if config.redirect_uri != tunnel_callback {
-            return Err(error(
-                StatusCode::CONFLICT,
-                "Your HTTPS tunnel address changed and no longer matches the saved Redirect \
-                 URI. Save the new address, update the redirect URI registered in the Spotify \
-                 dashboard to match it, then connect -- or stop the tunnel if you meant to use \
-                 the saved address.",
-                "tunnel_redirect_mismatch",
-            ));
-        }
-    }
-    let code_verifier = config.client_secret.is_none().then(generate_pkce_verifier);
-    let code_challenge = code_verifier.as_deref().map(pkce_challenge);
+    let cloud =
+        crate::cloud_connector::CloudConnectorConfig::from_runtime(crate::config::get_config_dir())
+            .map_err(|_| {
+                error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "HiPhi Cloud pairing is invalid; repair the installation before connecting Spotify",
+            "hiphi_cloud_unavailable",
+        )
+            })?;
+    let cloud = cloud.ok_or_else(|| {
+        error(
+            StatusCode::PRECONDITION_REQUIRED,
+            "Pair this UHC installation with HiPhi Cloud before connecting Spotify",
+            "hiphi_cloud_required",
+        )
+    })?;
+    let identity = crate::cloud_connector::InstallationIdentity::load(
+        &cloud.key_path,
+        cloud.installation_id.clone(),
+    )
+    .map_err(|_| {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "HiPhi Cloud installation identity is unavailable",
+            "hiphi_cloud_unavailable",
+        )
+    })?;
+    let code_verifier = generate_pkce_verifier();
+    let code_challenge = pkce_challenge(&code_verifier);
     let state_token = random_token(32);
+    let state_digest = URL_SAFE_NO_PAD.encode(Sha256::digest(state_token.as_bytes()));
+    let request_id = uuid::Uuid::new_v4();
+    let issued_at = now_millis();
     let expires_at = now_secs() + OAUTH_TTL.as_secs();
     let mut pending = state.provider_auth.pending.write().await;
     let now = now_secs();
@@ -690,32 +700,35 @@ pub async fn oauth_start(
         ));
     }
     pending.insert(
-        state_token.clone(),
+        cloud_pending_key(request_id),
         PendingOAuth {
             provider: provider.clone(),
             expires_at,
-            code_verifier,
+            code_verifier: Some(code_verifier),
+            cloud_request_id: Some(request_id),
+            client_id: Some(config.client_id.clone()),
+            state_digest: Some(state_digest.clone()),
         },
     );
-    let authorization_url = format!(
-        "{SPOTIFY_AUTHORIZE_URL}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}",
-        urlencoding::encode(&config.client_id),
-        urlencoding::encode(&config.redirect_uri),
-        urlencoding::encode(SPOTIFY_SCOPE),
-        urlencoding::encode(&state_token)
-    );
-    let authorization_url = if let Some(challenge) = code_challenge {
-        format!(
-            "{authorization_url}&code_challenge_method=S256&code_challenge={}",
-            urlencoding::encode(&challenge)
+    let authorization_url = hiphi_spotify_authorization_url(
+        &identity,
+        &config.client_id,
+        &code_challenge,
+        &state_digest,
+        request_id,
+        issued_at,
+    )
+    .map_err(|_| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Spotify authorization could not be prepared",
+            "oauth_start_failed",
         )
-    } else {
-        authorization_url
-    };
+    })?;
     Ok(Json(OAuthStartResponse {
         provider,
         authorization_url,
-        state: state_token,
+        state: request_id.to_string(),
         expires_at,
     }))
 }
@@ -870,18 +883,97 @@ async fn oauth_callback_json(
                 "oauth_not_configured",
             )
         })?;
+    complete_spotify_authorization(&state, provider, config, code, pending.code_verifier, true)
+        .await
+}
+
+pub async fn accept_cloud_spotify_callback(
+    state: &AppState,
+    callback: crate::cloud_connector::SpotifyCallbackMessage,
+) -> anyhow::Result<()> {
+    callback
+        .validate(now_millis())
+        .map_err(|reason| anyhow::anyhow!(reason))?;
+    let pending = state
+        .provider_auth
+        .pending
+        .write()
+        .await
+        .remove(&cloud_pending_key(callback.request_id))
+        .ok_or_else(|| anyhow::anyhow!("Spotify callback request is unknown or already used"))?;
+    if pending.provider != "spotify"
+        || pending.expires_at <= now_secs()
+        || pending.cloud_request_id != Some(callback.request_id)
+        || pending.client_id.as_deref() != Some(callback.client_id.as_str())
+        || pending.state_digest.as_deref() != Some(callback.state_digest.as_str())
+    {
+        anyhow::bail!("Spotify callback binding did not match the pending authorization");
+    }
+    if let Some(provider_error) = callback.error {
+        anyhow::bail!("Spotify authorization ended: {provider_error}");
+    }
+    let code = callback
+        .code
+        .ok_or_else(|| anyhow::anyhow!("Spotify callback omitted its authorization code"))?;
+    let verifier = pending
+        .code_verifier
+        .ok_or_else(|| anyhow::anyhow!("Spotify callback lost its local PKCE verifier"))?;
+    let config = state
+        .provider_auth
+        .oauth
+        .read()
+        .await
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Spotify client configuration is not configured"))?;
+    if config.client_id != callback.client_id || callback.redirect_uri != HIPHI_SPOTIFY_CALLBACK_URI
+    {
+        anyhow::bail!("Spotify callback client or redirect binding changed");
+    }
+    complete_spotify_authorization(
+        state,
+        "spotify".to_string(),
+        config,
+        code,
+        Some(verifier),
+        false,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|(status, Json(body))| anyhow::anyhow!("{} {}", status, body.code))
+}
+
+async fn complete_spotify_authorization(
+    state: &AppState,
+    provider: String,
+    config: Arc<SpotifyOAuthConfig>,
+    code: String,
+    code_verifier: Option<String>,
+    allow_client_secret: bool,
+) -> Result<Json<ProviderAuthResponse>, (StatusCode, Json<ErrorBody>)> {
     let mut form = vec![
         ("grant_type", "authorization_code".to_string()),
         ("code", code),
-        ("redirect_uri", config.redirect_uri.clone()),
+        (
+            "redirect_uri",
+            if allow_client_secret {
+                config.redirect_uri.clone()
+            } else {
+                HIPHI_SPOTIFY_CALLBACK_URI.to_string()
+            },
+        ),
     ];
-    if let Some(verifier) = pending.code_verifier {
+    if let Some(verifier) = code_verifier {
         form.push(("client_id", config.client_id.clone()));
         form.push(("code_verifier", verifier));
     }
-    let mut request = reqwest::Client::new().post(&config.token_url).form(&form);
-    if let Some(secret) = &config.client_secret {
-        request = request.basic_auth(&config.client_id, Some(secret));
+    let mut request = reqwest::Client::new()
+        .post(&config.token_url)
+        .timeout(Duration::from_secs(15))
+        .form(&form);
+    if allow_client_secret {
+        if let Some(secret) = &config.client_secret {
+            request = request.basic_auth(&config.client_id, Some(secret));
+        }
     }
     let response = request.send().await.map_err(|e| {
         error(
@@ -922,7 +1014,11 @@ async fn oauth_callback_json(
             token: Some(spotify_token.clone()),
             client_id: config.client_id.clone(),
             client_secret: config.client_secret.clone(),
-            redirect_uri: config.redirect_uri.clone(),
+            redirect_uri: if allow_client_secret {
+                config.redirect_uri.clone()
+            } else {
+                HIPHI_SPOTIFY_CALLBACK_URI.to_string()
+            },
         };
         store.save_record(&record).map_err(|e| {
             error(
@@ -1105,13 +1201,8 @@ fn valid_redirect_uri(value: &str) -> bool {
 }
 
 fn valid_spotify_client_id(value: &str) -> bool {
-    let normalized = value.trim().to_ascii_lowercase();
-    !normalized.is_empty()
-        && !matches!(
-            normalized.as_str(),
-            "test" | "local-test" | "example" | "example-client" | "your-client-id"
-        )
-        && !normalized.contains("example.test")
+    let value = value.trim();
+    (16..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 fn select_client_secret(requested: Option<String>, existing: Option<String>) -> Option<String> {
@@ -1196,6 +1287,52 @@ fn pkce_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(digest)
 }
 
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+fn cloud_pending_key(request_id: uuid::Uuid) -> String {
+    format!("hiphi-cloud:{request_id}")
+}
+
+fn hiphi_spotify_authorization_url(
+    identity: &crate::cloud_connector::InstallationIdentity,
+    client_id: &str,
+    code_challenge: &str,
+    state_digest: &str,
+    request_id: uuid::Uuid,
+    issued_at: i64,
+) -> anyhow::Result<String> {
+    let payload = serde_json::json!({
+        "audience": "hiphi-spotify-broker",
+        "callback_uri": HIPHI_SPOTIFY_CALLBACK_URI,
+        "client_id": client_id,
+        "code_challenge": code_challenge,
+        "installation_id": identity.installation_id(),
+        "issued_at": issued_at,
+        "protocol_version": crate::cloud_connector::protocol::PROTOCOL_VERSION,
+        "request_id": request_id,
+        "state_digest": state_digest,
+    });
+    let signature = identity.sign(&crate::cloud_connector::protocol::canonical_json(&payload)?);
+    let mut url = url::Url::parse(HIPHI_SPOTIFY_CONNECT_URL)?;
+    url.query_pairs_mut()
+        .append_pair("protocol_version", "1")
+        .append_pair("installation_id", identity.installation_id())
+        .append_pair("request_id", &request_id.to_string())
+        .append_pair("client_id", client_id)
+        .append_pair("code_challenge", code_challenge)
+        .append_pair("state_digest", state_digest)
+        .append_pair("issued_at", &issued_at.to_string())
+        .append_pair("signature", &URL_SAFE_NO_PAD.encode(signature.to_bytes()));
+    Ok(url.into())
+}
+
 #[derive(Debug, Deserialize)]
 struct SpotifyTokenResponse {
     access_token: String,
@@ -1233,6 +1370,7 @@ fn error(status: StatusCode, message: &str, code: &'static str) -> (StatusCode, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::spotify_tunnel::TunnelStatus;
     use axum::{
         body::{to_bytes, Body},
         extract::State,
@@ -1241,6 +1379,7 @@ mod tests {
         routing::any,
         Router,
     };
+    use ed25519_dalek::{Signature, Verifier as _};
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
     use tokio::net::TcpListener;
@@ -1286,6 +1425,69 @@ mod tests {
             axum::serve(listener, router).await.unwrap();
         });
         (format!("http://{address}/token"), handle)
+    }
+
+    #[test]
+    fn hiphi_authorization_url_is_installation_signed_and_contains_no_local_secret() {
+        let identity = crate::cloud_connector::InstallationIdentity::generate(
+            "11111111-1111-4111-8111-111111111111".to_string(),
+        )
+        .unwrap();
+        let request_id = uuid::Uuid::from_u128(0x22222222222242228222222222222222);
+        let client_id = "0123456789abcdef0123456789abcdef";
+        let challenge = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state_digest = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let issued_at = 1_788_060_000_000_i64;
+        let authorization_url = hiphi_spotify_authorization_url(
+            &identity,
+            client_id,
+            challenge,
+            state_digest,
+            request_id,
+            issued_at,
+        )
+        .unwrap();
+        let parsed = url::Url::parse(&authorization_url).unwrap();
+        assert_eq!(
+            parsed.origin().ascii_serialization(),
+            "https://app.hiphi.audio"
+        );
+        assert_eq!(parsed.path(), "/spotify/connect");
+        let query: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(query.get("client_id").map(String::as_str), Some(client_id));
+        assert_eq!(
+            query.get("code_challenge").map(String::as_str),
+            Some(challenge)
+        );
+        assert!(!authorization_url.contains("verifier"));
+        assert!(!authorization_url.contains("secret"));
+        assert!(!authorization_url.contains("127.0.0.1"));
+        assert_ne!(cloud_pending_key(request_id), request_id.to_string());
+
+        let payload = serde_json::json!({
+            "audience": "hiphi-spotify-broker",
+            "callback_uri": HIPHI_SPOTIFY_CALLBACK_URI,
+            "client_id": client_id,
+            "code_challenge": challenge,
+            "installation_id": identity.installation_id(),
+            "issued_at": issued_at,
+            "protocol_version": crate::cloud_connector::protocol::PROTOCOL_VERSION,
+            "request_id": request_id,
+            "state_digest": state_digest,
+        });
+        let signature = Signature::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(query.get("signature").unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        identity
+            .verifying_key()
+            .verify(
+                &crate::cloud_connector::protocol::canonical_json(&payload).unwrap(),
+                &signature,
+            )
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1414,6 +1616,8 @@ mod tests {
         assert!(!valid_spotify_client_id(""));
         assert!(!valid_spotify_client_id("local-test"));
         assert!(!valid_spotify_client_id("your-client-id"));
+        assert!(!valid_spotify_client_id("0123456789abcdef/unsafe"));
+        assert!(!valid_spotify_client_id(&"a".repeat(65)));
     }
 
     #[test]
@@ -1583,7 +1787,6 @@ mod tests {
     }
 
     const TUNNEL_A: &str = "https://aaaaa-1-2-3-4.run.pinggy-free.link";
-    const TUNNEL_B: &str = "https://bbbbb-5-6-7-8.run.pinggy-free.link";
 
     fn callback_of(tunnel: &str) -> String {
         format!("{tunnel}/api/providers/spotify/oauth/callback")
@@ -1732,38 +1935,15 @@ mod tests {
         assert_eq!(*ports.lock().unwrap(), vec![19_417]);
     }
 
-    /// #592 pin: the authorize URL always carries the SAVED redirect URI
-    /// verbatim -- the live tunnel state must never be substituted in.
     #[tokio::test]
-    async fn authorize_url_uses_the_saved_redirect_uri_verbatim() {
-        let saved = callback_of(TUNNEL_A);
-        let (state, _dir) = tunnel_test_state(&saved, TUNNEL_A).await;
-        start_tunnel_and_wait_active(&state).await;
-        let response = oauth_start(State(state), Path("spotify".to_string()))
-            .await
-            .expect("oauth_start should succeed when tunnel and saved URI match");
-        let expected = format!("redirect_uri={}", urlencoding::encode(&saved));
-        assert!(
-            response.0.authorization_url.contains(&expected),
-            "authorize URL must embed the saved redirect_uri verbatim: {}",
-            response.0.authorization_url
-        );
-    }
-
-    /// #592: tunnel providers mint a new subdomain per start, so a live
-    /// tunnel that no longer matches the saved Redirect URI means the user
-    /// is about to be bounced by Spotify ("redirect_uri: Not matching
-    /// configuration") or redirected somewhere dead. Refuse before Spotify
-    /// is contacted.
-    #[tokio::test]
-    async fn oauth_start_refuses_when_the_live_tunnel_diverges_from_the_saved_redirect() {
-        let (state, _dir) = tunnel_test_state(&callback_of(TUNNEL_A), TUNNEL_B).await;
+    async fn oauth_start_requires_a_paired_hiphi_installation_even_if_a_legacy_tunnel_is_live() {
+        let (state, _dir) = tunnel_test_state(&callback_of(TUNNEL_A), TUNNEL_A).await;
         start_tunnel_and_wait_active(&state).await;
         let error = oauth_start(State(state), Path("spotify".to_string()))
             .await
-            .expect_err("oauth_start must refuse a diverged tunnel");
-        assert_eq!(error.0, StatusCode::CONFLICT);
-        assert_eq!(error.1 .0.code, "tunnel_redirect_mismatch");
+            .expect_err("a temporary callback tunnel must not bypass cloud pairing");
+        assert_eq!(error.0, StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(error.1 .0.code, "hiphi_cloud_required");
     }
 
     /// #592: a random probe of the public callback URL (internet scanner,
@@ -1793,42 +1973,6 @@ mod tests {
                 TunnelStatus::Active { .. }
             ),
             "an unknown-state probe must not kill the tunnel"
-        );
-    }
-
-    /// #592: a callback that concludes a real pending attempt must NOT stop
-    /// the tunnel inline -- the response (and the settings redirect) still
-    /// travel through it. Teardown happens after a grace period instead.
-    /// The callback is also transport-independent: it is accepted here
-    /// without any tunnel-shaped Host header, matching a live enrollment
-    /// completed by replaying the redirect over the LAN.
-    #[tokio::test]
-    async fn concluded_callback_defers_teardown_past_its_own_response() {
-        let (state, _dir) = tunnel_test_state(&callback_of(TUNNEL_A), TUNNEL_A).await;
-        start_tunnel_and_wait_active(&state).await;
-        let started = oauth_start(State(state.clone()), Path("spotify".to_string()))
-            .await
-            .expect("oauth_start");
-        let response = oauth_callback(
-            State(state.clone()),
-            Path("spotify".to_string()),
-            Query(OAuthCallbackQuery {
-                code: None,
-                state: started.0.state.clone(),
-                error: Some("access_denied".to_string()),
-                error_description: None,
-                format: Some("json".to_string()),
-            }),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            matches!(
-                state.provider_auth.spotify_tunnel.status().await,
-                TunnelStatus::Active { .. }
-            ),
-            "the tunnel must outlive the callback response it is carrying \
-             (teardown is deferred by TUNNEL_CALLBACK_GRACE)"
         );
     }
 }

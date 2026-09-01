@@ -321,6 +321,52 @@ pub struct ArtworkRelayRequest {
     pub max_source_bytes: usize,
 }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpotifyCallbackMessage {
+    pub protocol_version: u16,
+    pub request_id: Uuid,
+    pub client_id: String,
+    pub state_digest: String,
+    pub redirect_uri: String,
+    pub expires_at: TimestampMs,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl SpotifyCallbackMessage {
+    pub fn validate(&self, now_ms: TimestampMs) -> Result<(), &'static str> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let digest_ok = URL_SAFE_NO_PAD
+            .decode(&self.state_digest)
+            .is_ok_and(|value| value.len() == 32);
+        if self.protocol_version != PROTOCOL_VERSION
+            || !(16..=64).contains(&self.client_id.len())
+            || !self
+                .client_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric())
+            || !digest_ok
+            || self.redirect_uri != "https://app.hiphi.audio/api/spotify/callback"
+            || self.expires_at <= now_ms
+            || self.expires_at.saturating_sub(now_ms) > 60_000
+            || (self.code.is_some() == self.error.is_some())
+            || self
+                .code
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.len() > 2_048)
+            || self
+                .error
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.len() > 128)
+        {
+            return Err("invalid_spotify_callback");
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ArtworkRelayResponse {
     pub protocol_version: u16,
     pub message_id: String,
@@ -391,6 +437,7 @@ pub enum RelayMessage {
     Heartbeat { epoch: Epoch, sent_at: TimestampMs },
     Command(CommandEnvelope),
     ArtworkRequest(ArtworkRelayRequest),
+    SpotifyCallback(SpotifyCallbackMessage),
     Revoke { reason_code: String },
 }
 

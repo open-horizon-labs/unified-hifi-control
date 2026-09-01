@@ -640,6 +640,14 @@ where
                         artwork_active.clone(),
                     );
                 }
+                RelayMessage::SpotifyCallback(callback) => {
+                    if let Err(error) =
+                        crate::api::provider_auth::accept_cloud_spotify_callback(state, callback)
+                            .await
+                    {
+                        tracing::warn!("HiPhi Spotify callback was refused: {error}");
+                    }
+                }
                 RelayMessage::Revoke { reason_code } => {
                     tracing::warn!("relay revoked connector: {reason_code}");
                     return Ok(ConnectionExit::Revoked);

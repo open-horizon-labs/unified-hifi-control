@@ -577,8 +577,7 @@ fn callback_feedback() -> Option<CallbackFeedback> {
     spotify_callback_feedback(&current_location_search()?)
 }
 
-const DEFAULT_SPOTIFY_REDIRECT_URI: &str =
-    "http://127.0.0.1:8088/api/providers/spotify/oauth/callback";
+const DEFAULT_SPOTIFY_REDIRECT_URI: &str = "https://app.hiphi.audio/api/spotify/callback";
 
 fn default_spotify_redirect_uri() -> String {
     DEFAULT_SPOTIFY_REDIRECT_URI.to_string()
@@ -681,13 +680,19 @@ fn spotify_oauth_error_message(reason: Option<&str>) -> String {
             "Spotify did not return an authorization code. Click Connect Spotify to try again.".to_string()
         }
         Some("token_exchange_failed") => {
-            "Spotify rejected the sign-in exchange. This usually means the address registered in your Spotify app does not exactly match the one saved in step 2. Fix the mismatch, save, and Connect again.".to_string()
+            "Spotify rejected the sign-in exchange. Confirm that the fixed HiPhi callback shown in step 2 is registered exactly in your Spotify app, then connect again.".to_string()
         }
         Some("token_storage_failed") => {
             "Spotify authorized, but the token could not be saved on this UHC server. Check the server's credential storage and try Connect again.".to_string()
         }
         Some("oauth_not_configured") | Some("invalid_client_configuration") => {
-            "Spotify client settings are missing or invalid. Enter and save the Client ID (and Secret, if used) below before connecting.".to_string()
+            "Spotify client settings are missing or invalid. Enter and save your Client ID below before connecting.".to_string()
+        }
+        Some("hiphi_cloud_required") => {
+            "Spotify setup uses HiPhi Cloud for its secure callback. Pair this UHC installation with HiPhi Cloud, then connect again.".to_string()
+        }
+        Some("hiphi_cloud_unavailable") => {
+            "This UHC installation's HiPhi Cloud pairing is unavailable. Repair the pairing, then connect again.".to_string()
         }
         Some("adapter_unavailable") | Some("adapter_start_failed") => {
             "Spotify authorized, but the adapter could not start. Refresh this page and try again.".to_string()
@@ -885,7 +890,6 @@ pub fn Settings() -> Element {
     // to Save before Connect even when the server is already configured.
     let mut spotify_resave_needed = use_signal(|| false);
     let mut spotify_client_id = use_signal(String::new);
-    let mut spotify_client_secret = use_signal(String::new);
     let mut spotify_redirect_uri = use_signal(default_spotify_redirect_uri);
     let spotify_callback_copy_state = use_signal(CopyState::default);
     // Temporary HTTPS tunnel for the Spotify OAuth callback (#538). Kept
@@ -1488,8 +1492,6 @@ pub fn Settings() -> Element {
     let save_spotify_local = move |_| {
         spotify_action_scope.set(3);
         let client_id = spotify_client_id().trim().to_string();
-        let client_secret = spotify_client_secret().trim().to_string();
-        let redirect_uri = spotify_redirect_uri().trim().to_string();
         if client_id.is_empty() {
             spotify_action.set(ProviderActionState::Failed);
             spotify_error.set(Some("Enter your Client ID first.".to_string()));
@@ -1500,8 +1502,8 @@ pub fn Settings() -> Element {
         spawn(async move {
             let request = SpotifyConfigureRequest {
                 client_id,
-                client_secret: (!client_secret.is_empty()).then_some(client_secret),
-                redirect_uri: (!redirect_uri.is_empty()).then_some(redirect_uri),
+                client_secret: None,
+                redirect_uri: None,
             };
             match crate::app::api::post_json::<SpotifyConfigureRequest, SpotifyConfigureResponse>(
                 "/api/providers/spotify/configure",
@@ -1825,8 +1827,7 @@ pub fn Settings() -> Element {
     // the redirect URI reopens step 2 so the warning is never hidden inside
     // a collapsed step.
     let spotify_step1_complete = spotify_configured || spotify_step_app_done();
-    let spotify_step2_complete =
-        (spotify_configured || spotify_step_callback_done()) && !spotify_tunnel_mismatch;
+    let spotify_step2_complete = spotify_configured || spotify_step_callback_done();
     let spotify_step3_complete = spotify_configured && !spotify_resave_needed();
     let spotify_step4_complete = spotify_connected;
     let spotify_current_step: u8 = if !spotify_step1_complete {
@@ -2296,6 +2297,16 @@ pub fn Settings() -> Element {
                                     span { class: "badge badge-secondary", "Alpha" }
                                 }
                                 p { class: "mt-1 text-sm text-secondary", "Control existing Spotify Connect devices. UHC does not act as a receiver." }
+                                p { class: "mt-2 text-sm text-secondary",
+                                    "New Spotify authorization uses a paired HiPhi Cloud account for the secure callback only. "
+                                    a {
+                                        class: "link",
+                                        href: "https://hiphi.audio/#cloud",
+                                        target: "_blank",
+                                        rel: "noopener noreferrer",
+                                        "Why HiPhi Cloud?"
+                                    }
+                                }
                                 div {
                                     class: "mt-2",
                                     hidden: spotify_account.is_none(),
@@ -2425,9 +2436,7 @@ pub fn Settings() -> Element {
                                 }
                             }
 
-                            // Step 2 -- register the callback address. The tunnel
-                            // button is the primary path when the browser is not on
-                            // the UHC machine; manual entry lives under Advanced.
+                            // Step 2 -- register HiPhi's fixed callback address.
                             li { class: spotify_step_class(2, spotify_step2_complete),
                                 div { class: "flex items-start gap-3",
                                     span {
@@ -2466,8 +2475,8 @@ pub fn Settings() -> Element {
                                             "ⓘ"
                                         }
                                         div { id: "spotify-step-2-info", class: spotify_info_panel_class(2), role: "note",
-                                            p { "After you approve access, Spotify sends your browser back to UHC -- but only to an address on your app's \"Redirect URIs\" list, and (except on the exact machine running UHC) only to a secure https address." }
-                                            p { class: "mt-2", "The address UHC opens for you stays up for about 15 minutes and closes itself once you finish connecting. Connecting again later issues a new address, which then needs to be added to your Spotify app too." }
+                                            p { "Spotify sends your browser to HiPhi's fixed secure callback. HiPhi passes the one-use response to this paired UHC installation; Spotify tokens remain encrypted here." }
+                                            p { class: "mt-2", "The address never changes, so you register it once and never run a tunnel or expose this server." }
                                         }
                                     }
                                 }
@@ -2475,7 +2484,26 @@ pub fn Settings() -> Element {
                                     id: "spotify-step-2-body",
                                     hidden: !spotify_step2_open,
                                     aria_hidden: !spotify_step2_open,
-                                    if spotify_remote_origin() {
+                                    if DEFAULT_SPOTIFY_REDIRECT_URI.starts_with("https://app.hiphi.audio/") {
+                                        div {
+                                            p { class: "mt-2 text-sm text-secondary", "Add this exact address to your Spotify app under Redirect URIs." }
+                                            div { class: "mt-2 flex flex-col gap-2 sm:flex-row sm:items-stretch",
+                                                code {
+                                                    id: "spotify-callback-url-display",
+                                                    class: "block min-w-0 flex-1 overflow-x-auto break-all rounded-md bg-hover px-3 py-3 text-xs select-all",
+                                                    "{DEFAULT_SPOTIFY_REDIRECT_URI}"
+                                                }
+                                                button {
+                                                    r#type: "button",
+                                                    class: "btn btn-outline btn-sm shrink-0",
+                                                    aria_label: "Copy Spotify callback URL",
+                                                    onclick: move |_| copy_to_clipboard(DEFAULT_SPOTIFY_REDIRECT_URI.to_string(), spotify_callback_copy_state),
+                                                    span { aria_live: "polite", "{spotify_callback_copy_state().label(\"Copy URL\")}" }
+                                                }
+                                            }
+                                            p { class: "mt-2 text-xs text-muted", "HiPhi Cloud handles only the callback handoff. Your Spotify sign-in and playback stay on this UHC installation." }
+                                        }
+                                    } else if spotify_remote_origin() {
                                         // Remote/LAN origin -- the common case (a NAS or any
                                         // machine other than the one running the browser).
                                         // Spotify rejects plain-HTTP addresses here, so the
@@ -2667,7 +2695,7 @@ pub fn Settings() -> Element {
                                         }
                                         div { id: "spotify-step-3-info", class: spotify_info_panel_class(3), role: "note",
                                             p { "The Client ID is the long code on your app's page in the Spotify dashboard. It identifies your app; it is not a password, and it is stored on this UHC server -- never in the browser." }
-                                            p { class: "mt-2", "Most setups can leave the Client Secret blank -- UHC signs in securely without it. Only fill it in if you specifically created your app to require one." }
+                                            p { class: "mt-2", "HiPhi never needs your Client Secret. UHC uses PKCE and keeps the verifier and Spotify tokens local." }
                                         }
                                     }
                                 }
@@ -2687,25 +2715,6 @@ pub fn Settings() -> Element {
                                             spotify_resave_needed.set(true);
                                             spotify_client_id.set(event.value());
                                         },
-                                    }
-                                    details { class: "mt-3",
-                                        summary { class: "cursor-pointer text-sm font-medium select-none", "Advanced: client secret" }
-                                        div { class: "mt-2",
-                                            label { class: "block text-sm font-medium", r#for: "spotify-client-secret", "Client secret" }
-                                            input {
-                                                id: "spotify-client-secret",
-                                                class: "input mt-1 min-h-11 w-full",
-                                                r#type: "password",
-                                                value: spotify_client_secret(),
-                                                autocomplete: "new-password",
-                                                oninput: move |event| {
-                                                    spotify_local_setup_saved.set(false);
-                                                    spotify_resave_needed.set(true);
-                                                    spotify_client_secret.set(event.value());
-                                                },
-                                            }
-                                            p { class: "mt-1 text-xs text-muted", "Usually blank. Never shown back to this page once saved." }
-                                        }
                                     }
                                     button {
                                         id: "spotify-save-client-settings",
@@ -2767,8 +2776,8 @@ pub fn Settings() -> Element {
                                             "ⓘ"
                                         }
                                         div { id: "spotify-step-4-info", class: spotify_info_panel_class(4), role: "note",
-                                            p { "Connect opens Spotify's approval page for the app you created. Once you approve, Spotify sends you straight back here and UHC starts discovering your players." }
-                                            p { class: "mt-2", "Your sign-in lives on this UHC server and renews itself automatically; the browser never sees it. Reconnecting later repeats this step -- and needs a fresh address from step 2 first." }
+                                            p { "Connect opens HiPhi's owner check and then Spotify's approval page for the app you created. The response returns only to this paired installation." }
+                                            p { class: "mt-2", "Your sign-in lives on this UHC server and renews itself locally. Reconnecting later uses the same fixed callback address." }
                                         }
                                     }
                                 }
