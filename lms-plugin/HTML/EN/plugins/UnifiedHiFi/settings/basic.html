@@ -51,7 +51,9 @@
     [% title = "PLUGIN_UNIFIED_HIFI" %]
 
     <script TYPE="text/javascript" language="JavaScript">
-        const knobDevicesUrl = '[% webUrl %]/knob/devices';
+        // Same-origin relay (see Plugin.pm knobDevices); the bridge's own URL
+        // is cross-origin from this page and the bridge does not serve CORS.
+        const knobDevicesUrl = '/plugins/UnifiedHiFi/knobs.json';
         const charging = '[% "PLUGIN_UNIFIED_HIFI_KNOB_BATTERY_CHARGING" | string %]';
         const playerIdNameMap = JSON.parse('[% playerIdNameMap | replace("'", "\\'") %]');
 
