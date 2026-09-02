@@ -488,7 +488,7 @@ jobs:
           # Only inputs that can change the generated web assets belong here.
           # Server-only changes (adapters, logging, cloud runtime, packaging) do
           # not require rebuilding the client bundle or its static shell.
-          key: wasm-v4-tw4.1.18-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/lib.rs', 'src/app/**/*.rs', 'src/components/**/*.rs', 'src/adaptive/**/*.rs', 'assets/**', 'src/input.css', 'public/dx-components-theme.css') }}
+          key: wasm-v4-tw4.1.18-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/lib.rs', 'src/app/**/*.rs', 'src/components/**/*.rs', 'src/adaptive/**/*.rs', 'assets/**', 'src/input.css', 'public/**') }}
           restore-keys: |
             wasm-v4-
 

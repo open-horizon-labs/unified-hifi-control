@@ -18,6 +18,11 @@ fn core_owns_one_daily_bounded_file_logging_policy() {
     assert!(LOGGING.contains("DEFAULT_RETENTION_DAYS: usize = 7"));
     assert!(LOGGING.contains("max_log_files"));
     assert!(LOGGING.contains("unified_hifi_control=info"));
+    // A bare `info` default keeps unlisted targets (anything outside the
+    // explicit unified_hifi_control/tower_http/roon_api directives) at info
+    // instead of silently falling back to EnvFilter's implicit error level,
+    // matching the RUST_LOG=info policy set for Docker/systemd.
+    assert!(LOGGING.contains(r#"DEFAULT_FILTER: &str = "info,unified_hifi_control=info"#));
 }
 
 #[test]

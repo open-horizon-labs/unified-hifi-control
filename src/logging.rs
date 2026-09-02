@@ -12,7 +12,7 @@ use tracing_appender::{
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-const DEFAULT_FILTER: &str = "unified_hifi_control=info,tower_http=info,roon_api=info";
+const DEFAULT_FILTER: &str = "info,unified_hifi_control=info,tower_http=info,roon_api=info";
 const DEFAULT_RETENTION_DAYS: usize = 7;
 const MAX_RETENTION_DAYS: usize = 365;
 
