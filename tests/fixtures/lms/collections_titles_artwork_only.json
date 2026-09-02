@@ -1,0 +1,31 @@
+{
+  "id": 217,
+  "method": "slim.request",
+  "params": [
+    "",
+    [
+      "titles",
+      "0",
+      3,
+      "album_id:2",
+      "tags:cJ"
+    ]
+  ],
+  "result": {
+    "titles_loop": [
+      {
+        "id": 4,
+        "title": "First Light"
+      },
+      {
+        "id": 6,
+        "title": "Glass Meadow"
+      },
+      {
+        "id": 7,
+        "title": "Nightfall"
+      }
+    ],
+    "count": 5
+  }
+}

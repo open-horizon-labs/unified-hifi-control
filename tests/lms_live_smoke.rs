@@ -236,3 +236,105 @@ async fn set_mute_on_server(player: &str, muted: bool) {
         Err(e) => panic!("mixer muting failed: {e}"),
     }
 }
+
+// =============================================================================
+// hifi_collections browse, against a real library
+// =============================================================================
+
+/// The Albums level must not be empty on a server that has albums.
+///
+/// This is the shape of defect the `tags:` rule produces: the adapter asked for
+/// artwork alone, LMS replaced the default tag set with it, and every album row
+/// arrived with no title to show. Unit tests passed throughout -- a fixture that
+/// carried the titles agreed with the broken request -- so the tag-keyed replay
+/// in `tests/lms_collection_tags.rs` and this live walk are what hold it down.
+#[tokio::test]
+#[ignore = "requires a live LMS; see module docs"]
+async fn live_albums_level_has_titled_rows() {
+    let adapter = live_adapter().await;
+
+    let page = match adapter
+        .collections_content(
+            "collections_browse",
+            &serde_json::json!({"path": "albums", "limit": 10, "offset": 0}),
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => panic!("collections_browse albums failed: {e:#}"),
+    };
+    let items = page
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    println!("albums level returned {} rows:", items.len());
+    for item in &items {
+        println!("  {item}");
+    }
+    assert!(
+        !items.is_empty(),
+        "the Albums level is empty. If this server has albums, the query is \
+         dropping them -- check the tag string against docs/lyrion.md."
+    );
+    for item in &items {
+        assert!(
+            item.get("title")
+                .and_then(|v| v.as_str())
+                .is_some_and(|t| !t.is_empty()),
+            "album row has no title: {item}"
+        );
+    }
+}
+
+/// Walk one artist to its albums to its tracks, the path a Library click makes.
+#[tokio::test]
+#[ignore = "requires a live LMS; see module docs"]
+async fn live_artist_walk_reaches_tracks_with_subtitles() {
+    let adapter = live_adapter().await;
+    let browse = |path: String| {
+        let adapter = &adapter;
+        async move {
+            match adapter
+                .collections_content(
+                    "collections_browse",
+                    &serde_json::json!({"path": path, "limit": 10, "offset": 0}),
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => panic!("collections_browse {path:?} failed: {e:#}"),
+            }
+        }
+    };
+    let first_path = |page: &serde_json::Value| -> String {
+        page.get("items")
+            .and_then(|v| v.as_array())
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.get("path"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("no navigable row in {page}"))
+    };
+
+    let artists = browse("artists".to_string()).await;
+    let artist_path = first_path(&artists);
+    let albums = browse(artist_path.clone()).await;
+    println!("{artist_path} -> {albums}");
+    let album_path = first_path(&albums);
+    let tracks = browse(album_path.clone()).await;
+    println!("{album_path} -> {tracks}");
+
+    let rows = tracks
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(!rows.is_empty(), "an album's track list is empty: {tracks}");
+    assert!(
+        rows.iter()
+            .all(|r| r.get("subtitle").and_then(|v| v.as_str()).is_some()),
+        "track rows lost their artist subtitle, so the artist tag is missing: {rows:?}"
+    );
+}

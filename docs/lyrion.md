@@ -91,6 +91,18 @@ table below is read from LMS's own `%tagMap` in
 `Slim/Control/Queries.pm` at 9.1.2 and confirmed against a live server; the recorded
 response is `tests/fixtures/lms/status_tags_aAdltKc.json`.
 
+**A `tags:` parameter replaces the query's default tag set, it does not extend it.**
+Every field a caller reads has to be named in the string, including ones the same
+query returns by default when no `tags:` is sent at all. This bit
+`hifi_collections`: `albums` sends `album` by default, and adding `tags:cJ` for
+artwork alone removed it, so every album row arrived with no title and the whole
+Albums level came back empty. Recorded both ways in
+`tests/fixtures/lms/collections_albums_artwork_only.json` and
+`collections_albums_with_display_tags.json`; the adapter's collection tag strings
+are the `ALBUM_DISPLAY_TAGS` / `TRACK_DISPLAY_TAGS` constants in
+`src/adapters/lms.rs`, and `tests/lms_collection_tags.rs` fails if either drops a
+field it reads.
+
 | Tag | Key in the response | Value |
 |-----|--------------------|-------|
 | `a` | `artist` | Track artist name |

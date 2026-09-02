@@ -160,6 +160,25 @@ fn loop_entity_id(row: &Value, entity: &str) -> Option<i64> {
     lms_i64(row.get(format!("{}_id", entity)).or_else(|| row.get("id"))).filter(|id| *id > 0)
 }
 
+/// Tags the `albums` query must request for a browsable album row.
+///
+/// **A `tags:` parameter replaces the default tag set, it does not extend it.**
+/// LMS returns exactly the fields the letters name, so anything the caller
+/// reads has to appear here. `l` album title, `a` artist, `c` coverid,
+/// `J` artwork_track_id (see docs/lyrion.md's tag table).
+///
+/// Recorded proof of both halves, from live Lyrion 9.1.2:
+/// `tests/fixtures/lms/collections_albums_artwork_only.json` (what `tags:cJ`
+/// returns -- no `album` key at all) and
+/// `collections_albums_with_display_tags.json`.
+pub(crate) const ALBUM_DISPLAY_TAGS: &str = "tags:lacJ";
+
+/// Tags the `titles` and `playlists tracks` queries must request.
+///
+/// Both always return `title`, but the artist subtitle is a tagged field like
+/// any other: `tags:cJ` drops it. See [`ALBUM_DISPLAY_TAGS`].
+pub(crate) const TRACK_DISPLAY_TAGS: &str = "tags:acJ";
+
 /// This row's artwork handle, for `hifi_collections`' image ref (#549), or
 /// `None` when LMS has none for it (an artist row, or a track/album LMS
 /// never assigned art to) -- absent honestly, not a placeholder.
@@ -2200,14 +2219,19 @@ impl LmsAdapter {
         limit: usize,
         artist_id: Option<i64>,
     ) -> Result<Value> {
-        // #549: `tags:cJ` requests coverid and artwork_track_id (docs/lyrion.md)
-        // so `row_image_key` has something to read; neither tag changes any
-        // field this method already used.
+        // A `tags:` parameter REPLACES the query's default tag set rather than
+        // adding to it, so every field this method reads has to be named here.
+        // #549 added `tags:cJ` for artwork alone, which dropped `album` from
+        // every row -- the title this method requires -- so `filter_map` below
+        // discarded the whole page and the Albums level (and every artist's
+        // album list) went empty against a real server. `l` album title,
+        // `a` artist, `c` coverid, `J` artwork_track_id; see docs/lyrion.md's
+        // tag table and `tests/lms_collection_tags.rs`.
         let mut params = vec![
             json!("albums"),
             json!(offset),
             json!(limit),
-            json!("tags:cJ"),
+            json!(ALBUM_DISPLAY_TAGS),
         ];
         if let Some(id) = artist_id {
             params.push(json!(format!("artist_id:{id}")));
@@ -2273,8 +2297,10 @@ impl LmsAdapter {
                     json!(offset),
                     json!(limit),
                     json!(format!("{filter_key}:{filter_id}")),
-                    // #549: see `row_image_key`'s docs.
-                    json!("tags:cJ"),
+                    // `a` for the artist subtitle alongside the artwork tags --
+                    // see `ALBUM_DISPLAY_TAGS` on why the artwork tags alone
+                    // silently drop it.
+                    json!(TRACK_DISPLAY_TAGS),
                 ],
             )
             .await?;
@@ -2341,8 +2367,8 @@ impl LmsAdapter {
                     json!(offset),
                     json!(limit),
                     json!(format!("playlist_id:{playlist_id}")),
-                    // #549: see `row_image_key`'s docs.
-                    json!("tags:cJ"),
+                    // Same tag rule as `query_tracks`; see `ALBUM_DISPLAY_TAGS`.
+                    json!(TRACK_DISPLAY_TAGS),
                 ],
             )
             .await?;

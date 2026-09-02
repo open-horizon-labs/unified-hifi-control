@@ -43,6 +43,12 @@ network if you need a player.
 | `players_no_playerprefs.json` | The same `players` query **without** `playerprefs:` — no `mute` key on any player. Proves the tag is what adds it, and that the old call could not have known mute. |
 | `mixer_muting_query_muted.json` / `..._unmuted.json` | `mixer muting ?` → `{"_muting": 1}` / `{"_muting": 0}`. The per-player query, kept as the documented alternative to the batched one. |
 | `status_squeezelite_muted.json` | `status` on a **muted** real squeezelite player carries **no mute key at all**, and reports `"mixer volume": -42` — LMS **negates** the volume once its mute fade completes. Both halves matter: `status` cannot report mute directly, and the raw value it does report goes negative, which the adapter used to hand straight to a `VolumeControl` declared `min: 0.0`. See the timing table below. |
+| `collections_albums_artwork_only.json` | **The collection tag defect.** `albums 0 3 tags:cJ` — the artwork-only string #549 shipped. Rows carry `id`, `performance`, `favorites_url`, and a **null** `favorites_title`, and **no `album` key at all**, so `query_albums`' title guard dropped every row and the Albums level (plus every artist's album list) was empty against a real server, at any library size. |
+| `collections_albums_with_display_tags.json` | The same query as `tags:lacJ`: `album` and `artist` are back alongside the artwork tags. Proves the fields are absent because they were not requested, not because the album lacks them. |
+| `collections_titles_artwork_only.json` | `titles 0 3 album_id:2 tags:cJ` — `title` survives (it is not tag-gated) but `artist` is gone, so track rows lost their subtitle. |
+| `collections_titles_with_display_tags.json` | The same query as `tags:acJ`; `artist` restored. |
+| `collections_playlisttracks_artwork_only.json` | `playlists tracks 0 3 playlist_id:<id> tags:cJ` — same subtitle loss as `titles`, and shows the loop is named `playlisttracks_loop`. |
+| `collections_playlisttracks_with_display_tags.json` | The same query as `tags:acJ`; `artist` restored. |
 | `status_tags_aAdltKc.json` | **Defect 4.** The adapter's exact `tags:aAdltKc` string. `l` yields `"album": "Ember Light"` (album **title**, not `album_id`); `A` yields per-role `albumartist`/`trackartist`; `a` yields `artist`; `d` `duration`; `t` `tracknum`. Also shows `artwork_track_id` is **absent**, because that field is tag `J` which this string does not request. |
 
 ## Mute is immediate; the negated volume lags it (no fixture file — this is timing)
