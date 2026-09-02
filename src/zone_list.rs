@@ -99,30 +99,24 @@ fn apply_custom_name(mut zone: Zone, settings: &AppSettings) -> Zone {
 
 /// Whether the adapter owning `zone_id` is enabled in settings.
 ///
-/// Redundant with the upstream enforcement described in the module docs, and kept anyway: settings
-/// are re-read from disk on every call here, while the aggregator only learns of a change through
-/// the settings endpoint. Editing `app-settings.json` directly — plausible for Docker users
-/// bind-mounting a config directory — leaves the two disagreeing until restart, and this is the
-/// side that reflects what the file actually says.
+/// Redundant with the upstream enforcement described in the module docs, and kept anyway:
+/// settings are re-read from disk on every call here, while the aggregator only learns of a
+/// change through the settings endpoint. Editing `app-settings.json` directly — plausible for
+/// Docker users bind-mounting a config directory — leaves the two disagreeing until restart,
+/// and this is the side that reflects what the file actually says.
+///
+/// The prefix-to-toggle mapping lives on [`AdapterSettings::toggle`] rather than here. It used
+/// to be a `match` local to this function, and every provider added after it was written —
+/// Spotify, Apple Music, Music Assistant — fell through to the default-include arm, so their
+/// settings toggles silently did nothing to a zone list. HQPlayer had already been bitten by
+/// the same drift once (#328, where this tested `hqp:` against a `hqplayer:` prefix).
+///
+/// An unknown prefix is still included: a zone from a provider this build predates is better
+/// shown than silently swallowed.
 fn adapter_enabled(zone_id: &str, settings: &AppSettings) -> bool {
-    let adapters = &settings.adapters;
-    if let Some((prefix, _)) = zone_id.split_once(':') {
-        match prefix {
-            "roon" => adapters.roon,
-            "lms" => adapters.lms,
-            "openhome" => adapters.openhome,
-            "upnp" => adapters.upnp,
-            // `hqplayer:` is the prefix `PrefixedZoneId::hqplayer` emits and the only one HQPlayer
-            // zones ever carry. This tested `hqp:` until #328, so it never matched and HQPlayer
-            // zones fell through to the default-include arm — the settings toggle silently did
-            // nothing for them.
-            "hqplayer" => adapters.hqplayer,
-            // Unknown prefix: include. A zone from a provider this build predates is better shown
-            // than silently swallowed.
-            _ => true,
-        }
-    } else {
-        true
+    match zone_id.split_once(':') {
+        Some((prefix, _)) => settings.adapters.toggle(prefix).unwrap_or(true),
+        None => true,
     }
 }
 
@@ -268,6 +262,46 @@ mod tests {
     use super::*;
     use crate::api::AdapterSettings;
     use crate::bus::PlaybackState;
+
+    /// The adapter filter used to carry its own prefix list, and every provider added
+    /// after it was written fell through to the include-by-default arm — so turning
+    /// Spotify off in Settings left its zones in every list. Now that the mapping lives
+    /// on `AdapterSettings`, a provider is covered by existing.
+    #[test]
+    fn a_provider_added_after_the_filter_was_written_still_honours_its_toggle() {
+        let mut settings = AppSettings::default();
+        settings.adapters.spotify = false;
+        settings.adapters.musicassistant = false;
+        settings.adapters.applemusic = false;
+
+        let listed = apply_zone_list_policy(
+            vec![
+                zone("spotify:device-1", "Phone"),
+                zone("musicassistant:player-1", "Study"),
+                zone("applemusic:bridge-1", "Mac"),
+                zone("roon:kitchen", "Kitchen"),
+            ],
+            &settings,
+        );
+
+        assert_eq!(
+            listed
+                .iter()
+                .map(|z| z.zone_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["roon:kitchen"],
+            "a disabled provider's zones must not be listed"
+        );
+    }
+
+    /// The other half of the same rule: a prefix with no toggle at all is still shown,
+    /// so a zone from a provider this build predates is never silently swallowed.
+    #[test]
+    fn an_unknown_prefix_is_still_listed() {
+        let settings = AppSettings::default();
+        let listed = apply_zone_list_policy(vec![zone("someprovider:one", "New")], &settings);
+        assert_eq!(listed.len(), 1);
+    }
 
     fn zone(zone_id: &str, zone_name: &str) -> Zone {
         Zone {

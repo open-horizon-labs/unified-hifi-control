@@ -32,6 +32,9 @@ pub const AVAILABLE_ADAPTERS: &[&str] = &[
     "musicassistant",
 ];
 
+/// How long a reconfiguration waits for the aggregator to acknowledge a projection flush.
+const FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Registered adapter with its spawn function
 struct RegisteredAdapter {
     /// Adapter prefix (e.g., "lms", "roon")
@@ -314,6 +317,49 @@ impl AdapterCoordinator {
             .await;
     }
 
+    /// [`Self::stop_adapter_and_companions_then_flush`], plus a bounded wait for the
+    /// aggregator to confirm the projection was actually retired.
+    ///
+    /// `AdapterStopping` is a bus event the aggregator applies from its own event
+    /// loop, so the plain stop path returns before any zone has been removed. That
+    /// is correct for shutdown, where nothing publishes afterwards, and wrong for
+    /// reconfiguration, where the caller starts a new observer straight away: the
+    /// pending flush then deletes the first zone the restarted observer published,
+    /// and the adapter appears connected with no zones until its next poll.
+    ///
+    /// The wait is bounded because the acknowledgement is an optimisation, not a
+    /// correctness dependency — a composition with no aggregator running (tests,
+    /// or a process already past aggregator shutdown) must not stall here.
+    pub async fn stop_adapter_and_companions_then_await_flush(
+        &self,
+        adapter: &dyn Startable,
+        projection_adapter: &str,
+        reason: &str,
+    ) {
+        let mut events = self.bus.subscribe();
+        self.stop_adapter_and_companions_then_flush(adapter, projection_adapter, reason)
+            .await;
+        let acknowledged = tokio::time::timeout(FLUSH_ACK_TIMEOUT, async {
+            loop {
+                match events.recv().await {
+                    Ok(BusEvent::ZonesFlushed { adapter, .. }) if adapter == projection_adapter => {
+                        return
+                    }
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => return,
+                }
+            }
+        })
+        .await;
+        if acknowledged.is_err() {
+            debug!(
+                "No ZonesFlushed acknowledgement for {} within {:?}; proceeding",
+                projection_adapter, FLUSH_ACK_TIMEOUT
+            );
+        }
+    }
+
     async fn companion_names(&self) -> Vec<String> {
         self.companions
             .read()
@@ -371,6 +417,27 @@ impl AdapterCoordinator {
 
         info!("Started adapter: {}", prefix);
         Ok(())
+    }
+
+    /// Enable a provider and every companion worker registered under it.
+    ///
+    /// Configuration endpoints enable by provider name, and a provider's companions are
+    /// not independently switchable — `lms-cli` observes the same `lms:` projection as
+    /// the poller. Reading the group from the coordinator's own topology keeps handlers
+    /// from restating a provider's internal worker layout, which is the thing that goes
+    /// stale when a provider gains one.
+    pub async fn enable_with_companions(&self, provider: &str) {
+        self.set_enabled(provider, true).await;
+        let companions = self
+            .companions
+            .read()
+            .await
+            .get(provider)
+            .cloned()
+            .unwrap_or_default();
+        for companion in companions {
+            self.set_enabled(companion.name(), true).await;
+        }
     }
 
     /// Enable/disable an adapter
@@ -637,6 +704,90 @@ mod tests {
         assert!(coord.is_enabled("musicassistant").await);
     }
 
+    /// Reconfiguration restarts an observer the moment the stop returns, so the
+    /// caller must not resume while the aggregator still has the flush queued —
+    /// an unapplied `AdapterStopping` deletes the zone the restarted observer
+    /// publishes, and the adapter then looks connected with no zones until its
+    /// next poll. The wait is on the aggregator's `ZonesFlushed` acknowledgement.
+    #[tokio::test]
+    async fn reconfiguration_waits_for_the_projection_flush_acknowledgement() {
+        let bus = create_bus();
+        let coord = AdapterCoordinator::new(bus.clone());
+        coord.register("lms", true).await;
+        coord.set_running("lms", true).await;
+
+        // Stand in for `ZoneAggregator`: acknowledge only after a scheduling delay,
+        // so a coordinator that returned without waiting would win the race here.
+        let acknowledger = bus.clone();
+        tokio::spawn(async move {
+            let mut events = acknowledger.subscribe();
+            while let Ok(event) = events.recv().await {
+                if let BusEvent::AdapterStopping { adapter, .. } = event {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    acknowledger.publish(BusEvent::ZonesFlushed {
+                        adapter,
+                        zone_ids: vec!["lms:aa:bb".to_string()],
+                    });
+                    return;
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let mut observed = bus.subscribe();
+        let adapter = Arc::new(NamedProbe {
+            name: "lms",
+            stopped: Arc::new(AtomicBool::new(false)),
+        });
+        coord
+            .stop_adapter_and_companions_then_await_flush(
+                adapter.as_ref(),
+                "lms",
+                "test LMS reconfiguration",
+            )
+            .await;
+
+        let mut saw_flush = false;
+        while let Ok(event) = observed.try_recv() {
+            if matches!(event, BusEvent::ZonesFlushed { ref adapter, .. } if adapter == "lms") {
+                saw_flush = true;
+            }
+        }
+        assert!(
+            saw_flush,
+            "stop must not return before the aggregator acknowledged the flush"
+        );
+    }
+
+    /// The acknowledgement is an ordering aid, not a correctness dependency: a
+    /// composition with no aggregator listening (tests, or a process already past
+    /// aggregator shutdown) must proceed rather than stall for the full timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_acknowledgement_does_not_stall_reconfiguration() {
+        let bus = create_bus();
+        let coord = AdapterCoordinator::new(bus);
+        coord.register("lms", true).await;
+        let adapter = Arc::new(NamedProbe {
+            name: "lms",
+            stopped: Arc::new(AtomicBool::new(false)),
+        });
+
+        let started = tokio::time::Instant::now();
+        coord
+            .stop_adapter_and_companions_then_await_flush(
+                adapter.as_ref(),
+                "lms",
+                "test LMS reconfiguration",
+            )
+            .await;
+
+        assert!(
+            started.elapsed() >= FLUSH_ACK_TIMEOUT,
+            "the wait must be the bounded one"
+        );
+        assert!(!coord.is_running("lms").await, "the stop still applied");
+    }
+
     #[tokio::test]
     async fn test_start_adapter() {
         let bus = create_bus();
@@ -689,6 +840,28 @@ mod tests {
 
         assert!(!started.load(Ordering::SeqCst));
         assert!(!coord.is_running("disabled").await);
+    }
+
+    /// A `Startable` that answers to a caller-chosen name, for lifecycle assertions
+    /// about a specific provider's workers rather than a generic probe.
+    struct NamedProbe {
+        name: &'static str,
+        stopped: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Startable for NamedProbe {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn start(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&self) {
+            self.stopped.store(true, Ordering::SeqCst);
+        }
     }
 
     struct LifecycleProbe {

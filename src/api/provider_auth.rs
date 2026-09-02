@@ -519,6 +519,10 @@ async fn configure_musicassistant_request(
             "adapter_start_failed",
         ));
     }
+    // Saving a reachable connection is the enable gesture. Without this the start
+    // below is a no-op whenever the toggle is off, and the response still reports
+    // `configured: true` — the shape this whole change exists to remove.
+    crate::api::mark_adapter_configured(&state, "musicassistant").await;
     let runtime_for_rollback = runtime.clone();
     if state
         .adapter_registry
@@ -1029,25 +1033,24 @@ async fn complete_spotify_authorization(
         })?;
     }
     adapter.set_token(spotify_token).await;
-    if state.coordinator.is_enabled("spotify").await {
-        // Re-authorization is a lifecycle transition too.  Route it through
-        // the coordinator so Spotify follows the same enable/can_start policy
-        // as startup and settings changes.
-        let startable: Arc<dyn crate::adapters::Startable> = adapter.clone();
-        state
-            .coordinator
-            .start_enabled(&startable)
-            .await
-            .map_err(|start_error| {
-                error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &format!("Spotify adapter failed to start: {start_error}"),
-                    "adapter_start_failed",
-                )
-            })?;
-    } else {
-        tracing::info!("Spotify authorization completed while adapter is disabled");
-    }
+    // Completing authorization is the enable gesture; this used to log and skip when
+    // the toggle was off, leaving an authorized account with no zones.
+    crate::api::mark_adapter_configured(state, "spotify").await;
+    // Re-authorization is a lifecycle transition too.  Route it through
+    // the coordinator so Spotify follows the same enable/can_start policy
+    // as startup and settings changes.
+    let startable: Arc<dyn crate::adapters::Startable> = adapter.clone();
+    state
+        .coordinator
+        .start_enabled(&startable)
+        .await
+        .map_err(|start_error| {
+            error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("Spotify adapter failed to start: {start_error}"),
+                "adapter_start_failed",
+            )
+        })?;
     Ok(Json(ProviderAuthResponse {
         provider,
         authorized: true,

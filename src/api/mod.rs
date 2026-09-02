@@ -2573,6 +2573,45 @@ pub struct LmsConfigRequest {
     pub password: Option<String>,
 }
 
+/// Record that the user has finished pointing UHC at a provider.
+///
+/// A provider's configure endpoint is a complete enable gesture on its own: someone
+/// named a server, pasted a token, or paired a bridge, and expects to see its zones.
+/// Both halves of "enabled" have to move for that to be true.
+///
+/// The persisted toggle, because it is what the rest of the system actually reads:
+/// every zone list filters on `adapters.<provider>` re-read from disk on each call
+/// ([`crate::zone_list`]), and the next process start decides what to launch from the
+/// same file. Leaving it alone produces the worst failure shape available — a
+/// configured, connected adapter whose poller publishes correct zones into the
+/// aggregator that no surface will ever show, indistinguishable from a broken
+/// connection at every diagnostic a user can reach, and repaired only by an unrelated
+/// settings write.
+///
+/// And the coordinator's in-memory enabled state, so a later settings reconcile does
+/// not compare against a provider it believes is off and stop a running adapter.
+///
+/// Keyed by provider name rather than by a field selector so this is one rule rather
+/// than one implementation per provider: companion workers come from the coordinator's
+/// own topology (`lms-cli` follows `lms`), and a provider with no settings toggle at
+/// all is a no-op rather than a compile error, which is what lets a new adapter adopt
+/// this by calling it.
+pub async fn mark_adapter_configured(state: &AppState, provider: &str) {
+    let persisted = mutate_app_settings(|settings| {
+        if let Some(toggle) = settings.adapters.toggle_mut(provider) {
+            *toggle = true;
+        }
+    });
+    if !persisted {
+        tracing::warn!(
+            provider,
+            "Could not persist the adapter enable toggle after configuration; \
+             its zones will stay hidden until settings are saved"
+        );
+    }
+    state.coordinator.enable_with_companions(provider).await;
+}
+
 /// POST /lms/configure - Configure LMS connection
 pub async fn lms_configure_handler(
     State(state): State<AppState>,
@@ -2581,9 +2620,17 @@ pub async fn lms_configure_handler(
     // LMS has two concurrent observers of the same `lms:` projection.  Stop
     // both before retirement/reconfiguration so an old CLI callback cannot
     // republish zones from the former server after the projection is flushed.
+    //
+    // Wait for the aggregator's flush acknowledgement rather than only firing the
+    // event: this path restarts the observers immediately, and an unapplied flush
+    // arriving after the first poll deletes the zone it just published.
     state
         .coordinator
-        .stop_adapter_and_companions_then_flush(state.lms.as_ref(), "lms", "LMS reconfiguration")
+        .stop_adapter_and_companions_then_await_flush(
+            state.lms.as_ref(),
+            "lms",
+            "LMS reconfiguration",
+        )
         .await;
 
     // Configure new connection
@@ -2591,6 +2638,11 @@ pub async fn lms_configure_handler(
         .lms
         .configure(req.host.clone(), req.port, req.username, req.password)
         .await;
+
+    // Naming a server is the enable gesture. The CLI companion follows from the
+    // coordinator's topology; it is an observer of the same `lms:` projection, not a
+    // separately switchable feature.
+    mark_adapter_configured(&state, "lms").await;
 
     // Start both observers together; the CLI companion is not an optional
     // feature of a manually configured LMS connection.
@@ -2650,17 +2702,21 @@ pub async fn hqp_configure_handler(
     // Save to instance manager for persistence
     state.hqp_instances.save_to_config().await;
 
-    // An enabled fresh installation may have skipped the HQPlayer lifecycle at process startup
-    // because no endpoint existed yet. Start the idempotent manager after configuration rather than
-    // requiring a process restart, while still honoring the adapter's explicit enabled setting.
-    if state.coordinator.is_enabled("hqplayer").await {
-        match state.hqp_instances.start().await {
-            Ok(()) => state.coordinator.set_running("hqplayer", true).await,
-            Err(error) => {
-                tracing::warn!(
-                    "HQPlayer managed lifecycle could not start after configuration: {error}"
-                )
-            }
+    // Same enable gesture as LMS. This used to start the lifecycle only when the
+    // toggle was already on, which left "configured, connected, invisible" reachable
+    // here too: the manager stayed down, and even once running every zone list would
+    // have filtered `hqplayer:` zones back out.
+    mark_adapter_configured(&state, "hqplayer").await;
+
+    // A fresh installation may have skipped the HQPlayer lifecycle at process startup
+    // because no endpoint existed yet. Start the idempotent manager after configuration
+    // rather than requiring a process restart.
+    match state.hqp_instances.start().await {
+        Ok(()) => state.coordinator.set_running("hqplayer", true).await,
+        Err(error) => {
+            tracing::warn!(
+                "HQPlayer managed lifecycle could not start after configuration: {error}"
+            )
         }
     }
 
@@ -2875,13 +2931,13 @@ pub async fn hqp_add_instance_handler(
         )
         .await;
 
-    if state.coordinator.is_enabled("hqplayer").await {
-        match state.hqp_instances.start().await {
-            Ok(()) => state.coordinator.set_running("hqplayer", true).await,
-            Err(error) => tracing::warn!(
-                "HQPlayer managed lifecycle could not start after adding an instance: {error}"
-            ),
-        }
+    // Adding an instance is the same gesture as configuring the first one.
+    mark_adapter_configured(&state, "hqplayer").await;
+    match state.hqp_instances.start().await {
+        Ok(()) => state.coordinator.set_running("hqplayer", true).await,
+        Err(error) => tracing::warn!(
+            "HQPlayer managed lifecycle could not start after adding an instance: {error}"
+        ),
     }
 
     (
@@ -3339,6 +3395,58 @@ pub struct AdapterSettings {
     /// by default: it needs a broker configured before it can do anything.
     #[serde(default)]
     pub mqtt: bool,
+}
+
+impl AdapterSettings {
+    /// The enable toggle for `provider`, addressed by the same name the coordinator
+    /// and the zone prefixes use.
+    ///
+    /// This exists so there is exactly one list of which providers have a toggle.
+    /// The zone-list filter used to carry its own `match` over prefixes, which drifted
+    /// the moment a provider was added: Spotify, Apple Music and Music Assistant all
+    /// shipped toggles that the filter had never heard of, so it fell through to its
+    /// include-by-default arm and their switches quietly did nothing to a zone list.
+    /// A new provider now joins by adding a field and one arm here.
+    ///
+    /// `None` means "this name has no toggle" — the honest answer for a prefix from a
+    /// provider this build predates, which callers turn into include-by-default rather
+    /// than hiding a zone they cannot reason about.
+    pub fn toggle_mut(&mut self, provider: &str) -> Option<&mut bool> {
+        match provider {
+            "roon" => Some(&mut self.roon),
+            "upnp" => Some(&mut self.upnp),
+            "openhome" => Some(&mut self.openhome),
+            // `lms-cli` is a companion observer of the `lms:` projection and shares its
+            // toggle; it is not independently switchable.
+            "lms" | "lms-cli" => Some(&mut self.lms),
+            "hqplayer" => Some(&mut self.hqplayer),
+            "spotify" => Some(&mut self.spotify),
+            "applemusic" => Some(&mut self.applemusic),
+            "musicassistant" => Some(&mut self.musicassistant),
+            "mqtt" => Some(&mut self.mqtt),
+            _ => None,
+        }
+    }
+
+    /// Whether `provider` is enabled, or `None` when it has no toggle.
+    ///
+    /// Deliberately its own `match` rather than a clone-and-`toggle_mut`, since the
+    /// read side is on every zone-list call. `toggles_agree_for_every_named_adapter`
+    /// holds the two in step.
+    pub fn toggle(&self, provider: &str) -> Option<bool> {
+        match provider {
+            "roon" => Some(self.roon),
+            "upnp" => Some(self.upnp),
+            "openhome" => Some(self.openhome),
+            "lms" | "lms-cli" => Some(self.lms),
+            "hqplayer" => Some(self.hqplayer),
+            "spotify" => Some(self.spotify),
+            "applemusic" => Some(self.applemusic),
+            "musicassistant" => Some(self.musicassistant),
+            "mqtt" => Some(self.mqtt),
+            _ => None,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -4178,6 +4286,46 @@ mod tests {
             "the lms zone should have been flushed, got {remaining:?}"
         );
         assert_eq!(remaining[0].zone_id, "roon:untouched");
+    }
+
+    /// The two accessors carry the same list twice for read-path cost, so hold them in
+    /// step here rather than trusting a reviewer to update both. Every name the
+    /// coordinator can register must resolve, which is what stops a new provider from
+    /// shipping a toggle that the zone-list filter has never heard of — the drift that
+    /// left Spotify, Apple Music and Music Assistant switches doing nothing to a list.
+    #[test]
+    fn toggles_agree_for_every_named_adapter() {
+        let mut settings = AdapterSettings::default();
+        for name in crate::coordinator::AVAILABLE_ADAPTERS
+            .iter()
+            .chain(["mqtt"].iter())
+        {
+            let toggle = settings
+                .toggle_mut(name)
+                .unwrap_or_else(|| panic!("adapter `{name}` has no settings toggle"));
+            *toggle = true;
+            assert_eq!(
+                settings.toggle(name),
+                Some(true),
+                "`{name}` reads back differently than it was written"
+            );
+        }
+        assert_eq!(
+            settings.toggle("a-provider-this-build-predates"),
+            None,
+            "an unknown provider must be reported as having no toggle, not as disabled"
+        );
+    }
+
+    /// `lms-cli` observes the `lms:` projection and has no switch of its own.
+    #[test]
+    fn the_lms_companion_shares_the_lms_toggle() {
+        let mut settings = AdapterSettings::default();
+        *settings.toggle_mut("lms-cli").expect("companion resolves") = true;
+        assert!(
+            settings.lms,
+            "enabling the companion must enable LMS itself"
+        );
     }
 
     async fn app_state_with_startable(startable: Arc<dyn Startable>) -> AppState {

@@ -1095,12 +1095,12 @@ pub async fn claim(
         .claim(request)
         .await
         .map_err(|e| error(StatusCode::BAD_REQUEST, &e.to_string(), "pairing_failed"))?;
-    if state.coordinator.is_enabled("applemusic").await {
-        if let Err(error) = state.adapter_registry.start("applemusic").await {
-            tracing::debug!("Apple Music adapter will start when registered: {error}");
-        }
-    } else {
-        tracing::info!("Apple Music companion paired while adapter is disabled");
+    // Claiming a pairing is a completed setup gesture, so it enables the provider like
+    // every other configure path. It used to only log when the toggle was off, which
+    // left the user with a paired companion, a healthy-looking bridge, and no zones.
+    crate::api::mark_adapter_configured(&state, "applemusic").await;
+    if let Err(error) = state.adapter_registry.start("applemusic").await {
+        tracing::debug!("Apple Music adapter will start when registered: {error}");
     }
     Ok(Json(response))
 }
