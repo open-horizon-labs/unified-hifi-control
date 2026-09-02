@@ -81,7 +81,11 @@ sub knobDevices {
         sub {
             my $http = shift;
             my $body = $http->content;
-            $response->code(RC_OK);
+            # SimpleAsyncHTTP calls this for any HTTP response, 4xx and 5xx
+            # included; only a 2xx is a healthy bridge. Pass the bridge's own
+            # status through so the page's failure path still fires.
+            my $code = $http->code || RC_OK;
+            $response->code($code =~ /^2\d\d$/ ? RC_OK : $code);
             $response->content_type('application/json');
             $callback->($client, $params, \$body, $httpClient, $response);
         },
