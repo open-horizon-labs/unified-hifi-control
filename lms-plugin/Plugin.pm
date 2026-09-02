@@ -108,7 +108,7 @@ sub knobDevices {
             $log->debug("Bridge not reachable at $url: $error");
             $unavailable->();
         },
-        { timeout => 3, cache => 0 },
+        { timeout => 3, cache => 0, maxRedirect => 0 },
     )->get($url);
 
     return;
