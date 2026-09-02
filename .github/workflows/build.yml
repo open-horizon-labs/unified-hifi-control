@@ -2120,7 +2120,15 @@ jobs:
   update-repo-xml:
     name: Update LMS repo.xml
     needs: [plan, upload-release]
-    if: needs.plan.outputs.is_release == 'true' && needs.plan.outputs.is_beta != 'true'
+    # `!cancelled()`: `upload-release` runs under `always()` because the Synology
+    # build is skipped on prerelease tags. Without it, GitHub applies the implicit
+    # success() check transitively and skips this job on every such tag -- which is
+    # how the beta feed stayed at 3.6.1-beta through the v4 alphas.
+    if: |
+      !cancelled() &&
+      needs.plan.outputs.is_release == 'true' &&
+      needs.plan.outputs.is_beta != 'true' &&
+      needs.upload-release.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -2219,7 +2227,12 @@ jobs:
   update-beta-repo-xml:
     name: Update LMS beta repo.xml
     needs: [plan, upload-release]
-    if: needs.plan.outputs.is_release == 'true' && needs.plan.outputs.is_beta == 'true'
+    # See update-repo-xml for why `!cancelled()` is required here.
+    if: |
+      !cancelled() &&
+      needs.plan.outputs.is_release == 'true' &&
+      needs.plan.outputs.is_beta == 'true' &&
+      needs.upload-release.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -2265,7 +2278,15 @@ jobs:
   publish-aur:
     name: Publish to AUR
     needs: [plan, upload-release]
-    if: needs.plan.outputs.is_release == 'true' && needs.plan.outputs.is_beta != 'true'
+    # `!cancelled()`: `upload-release` runs under `always()` because the Synology
+    # build is skipped on prerelease tags. Without it, GitHub applies the implicit
+    # success() check transitively and skips this job on every such tag -- which is
+    # how the beta feed stayed at 3.6.1-beta through the v4 alphas.
+    if: |
+      !cancelled() &&
+      needs.plan.outputs.is_release == 'true' &&
+      needs.plan.outputs.is_beta != 'true' &&
+      needs.upload-release.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
