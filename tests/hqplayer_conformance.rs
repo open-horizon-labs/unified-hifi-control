@@ -8475,9 +8475,27 @@ async fn a_profile_form_post_without_native_confirmation_never_reports_success()
         },
     )
     .await;
+    // Only the *settle* deadline is load-bearing here, and it is the one budget that cannot be
+    // raced: `FakeConfigWeb` never changes the daemon's native active configuration, so
+    // `ConfigurationGet` can never name `semantic-z` and `wait_for_active_configuration` must
+    // reach its deadline however fast or slow the runner is. Both of its exit paths — the deadline
+    // elapsing between polls and a single poll outliving the remaining budget — produce the same
+    // `profile load is indeterminate ... active configuration became "semantic-z"` refusal this
+    // test asserts on.
+    //
+    // The *request* budget, by contrast, must never fire: a loopback round trip to the fake web
+    // server is not the behaviour under test, and when it expired first the refusal became
+    // "profile web request timed out", failing the assertion for a harness reason (seen in CI, GHA
+    // run 33655532768). It was 100ms, which measures at ~1ms locally even with 24 spinners on 12
+    // cores — the sweep only starts failing at 1ms — yet CI blew through 100ms under concurrent
+    // load, so no value derived from local latency is safe. It is therefore set well outside the
+    // range any localhost round trip can reach: at 5s it can only fire if the fake lane is
+    // genuinely broken, while still failing fast rather than hanging the suite. The sibling
+    // profile-lane tests in `hqplayer_operation_lease.rs` already pair whole-second request
+    // budgets with sub-second settle deadlines for the same reason.
     h.adapter
         .set_profile_timeouts(HqpProfileTimeouts {
-            request: Duration::from_millis(100),
+            request: Duration::from_secs(5),
             settle_deadline: Duration::from_millis(100),
             poll_interval: Duration::from_millis(10),
         })
