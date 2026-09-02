@@ -19,7 +19,8 @@ export PATH=$QPKG_ROOT:$PATH
 HIPHI_ENV_FILE=${UHC_CONFIG_DIR}/hiphi.env
 
 export PIDF=${QPKG_ROOT}/unified-hifi-control.pid
-export LOGF=${QPKG_ROOT}/unified-hifi-control.log
+export UHC_LOG_DIR=${UHC_LOG_DIR:-${QPKG_ROOT}/logs}
+export LAUNCH_LOG=${QPKG_ROOT}/unified-hifi-control-launcher.log
 
 # Configuration contains server-side credentials and persistent-operation backups.
 # Do not let a permissive NAS-wide umask make newly-created package state readable
@@ -105,8 +106,9 @@ case "$1" in
 
     load_hiphi_config || { echo "Failed to load HiPhi connector configuration"; exit 1; }
 
-    # Start the static binary (musl-linked, no dependencies)
-    "${QPKG_ROOT}/unified-hifi-control" >> "$LOGF" 2>&1 &
+    # UHC owns daily rotation inside UHC_LOG_DIR. This small launcher file is
+    # truncated on each start and captures only failures before logging starts.
+    "${QPKG_ROOT}/unified-hifi-control" > "$LAUNCH_LOG" 2>&1 &
     echo $! > "$PIDF"
 
     echo "$QPKG_NAME started."

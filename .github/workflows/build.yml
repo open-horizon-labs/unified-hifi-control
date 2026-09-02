@@ -485,7 +485,10 @@ jobs:
           # Version is baked in at compile time, but we accept stale version display
           # for PRs in exchange for cache efficiency. Releases change Cargo.toml anyway.
           # Note: Tailwind version pinned in Makefile - update cache key when upgrading
-          key: wasm-v4-tw4.1.18-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/**/*.rs', 'assets/**', 'src/input.css', 'public/dx-components-theme.css') }}
+          # Only inputs that can change the generated web assets belong here.
+          # Server-only changes (adapters, logging, cloud runtime, packaging) do
+          # not require rebuilding the client bundle or its static shell.
+          key: wasm-v4-tw4.1.18-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/lib.rs', 'src/app/**/*.rs', 'src/components/**/*.rs', 'src/adaptive/**/*.rs', 'assets/**', 'src/input.css', 'public/**') }}
           restore-keys: |
             wasm-v4-
 
@@ -547,9 +550,15 @@ jobs:
 
       - name: Build WASM assets (ADR 002)
         if: steps.check-cache.outputs.needs_build == 'true'
+        # Asset generation does not produce a shipped server binary. Avoid the
+        # project's production LTO/link profile here; native packaging jobs below
+        # retain the optimized release profile when they build the actual binary.
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
         run: |
           # Version is fetched from server at runtime, no need to bake into WASM
-          dx build --fullstack --release @client --no-default-features --features web @server --features server
+          dx build --fullstack=false --release @client --no-default-features --features web
           echo "Generated assets:"
           find target/dx -name "*.wasm" -o -name "*.js" | head -10
 

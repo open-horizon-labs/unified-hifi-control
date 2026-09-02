@@ -7,7 +7,8 @@ VAR_DIR="${PACKAGE_DIR}/var"
 HOME_DIR="${PACKAGE_DIR}/home"
 BINARY="${TARGET_DIR}/unified-hifi-control"
 PID_FILE="${VAR_DIR}/${PACKAGE_NAME}.pid"
-LOG_FILE="${VAR_DIR}/${PACKAGE_NAME}.log"
+LOG_DIR="${VAR_DIR}/logs"
+LAUNCH_LOG="${VAR_DIR}/${PACKAGE_NAME}-launcher.log"
 
 read_pid() {
     cat "$PID_FILE" 2>/dev/null || true
@@ -41,6 +42,7 @@ start_daemon() {
     echo "Starting ${PACKAGE_NAME}..."
 
     mkdir -p "$VAR_DIR"
+    mkdir -p "$LOG_DIR"
 
     if ! cd "$TARGET_DIR"; then
         echo "Failed to change to ${TARGET_DIR}"
@@ -50,9 +52,12 @@ start_daemon() {
     export HOME="$HOME_DIR"
     export UHC_CONFIG_DIR="$VAR_DIR"
     export UHC_DATA_DIR="$VAR_DIR"
+    export UHC_LOG_DIR="$LOG_DIR"
     export RUST_LOG="${RUST_LOG:-info}"
 
-    nohup "$BINARY" >> "$LOG_FILE" 2>&1 &
+    # UHC owns daily rotation. This file is truncated on each start and only
+    # captures failures that occur before the logging subsystem initializes.
+    nohup "$BINARY" > "$LAUNCH_LOG" 2>&1 &
     echo $! > "$PID_FILE"
 
     # Wait for process to start (configurable via STARTUP_WAIT)

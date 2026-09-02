@@ -20,8 +20,12 @@ chmod +x "${QPKG_ROOT}/unified-hifi-control"
 chmod +x "${QPKG_ROOT}/uhc-hiphi-pair"
 chmod +x "${QPKG_ROOT}/unified-hifi-control.sh"
 
-# Create log file
-touch "${QPKG_ROOT}/unified-hifi-control.log"
+# Core UHC logging rotates daily here with bounded retention. The launcher log
+# is truncated on every start and contains only pre-initialization failures.
+mkdir -p "${QPKG_ROOT}/logs"
+chmod 700 "${QPKG_ROOT}/logs"
+touch "${QPKG_ROOT}/unified-hifi-control-launcher.log"
+chmod 600 "${QPKG_ROOT}/unified-hifi-control-launcher.log"
 
 # Keep provider credentials in the package-owned config volume.  The server's
 # config resolver creates the `unified-hifi` subdirectory below this path;

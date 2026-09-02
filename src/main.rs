@@ -2,6 +2,9 @@
 //!
 //! A source-agnostic hi-fi control bridge for hardware surfaces and Home Assistant.
 
+#[cfg(feature = "server")]
+mod logging;
+
 // Server-only: full server implementation
 #[cfg(feature = "server")]
 mod server {
@@ -31,7 +34,6 @@ mod server {
         cors::{AllowOrigin, Any, CorsLayer},
         trace::TraceLayer,
     };
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     /// Same-origin browser requests do not need CORS. Cross-origin browser
     /// access is opt-in because this server also exposes playback, OAuth, and
@@ -175,16 +177,9 @@ mod server {
     }
 
     pub async fn run() -> Result<()> {
-        // Initialize logging
-        // Priority: RUST_LOG > LOG_LEVEL (legacy) > default
-        let log_filter = std::env::var("RUST_LOG")
-            .or_else(|_| std::env::var("LOG_LEVEL"))
-            .unwrap_or_else(|_| "unified_hifi_control=debug,tower_http=debug,roon_api=info".into());
-
-        tracing_subscriber::registry()
-            .with(tracing_subscriber::EnvFilter::new(&log_filter))
-            .with(tracing_subscriber::fmt::layer())
-            .init();
+        // Keep the guard alive for the process lifetime so buffered file logs
+        // flush during graceful shutdown.
+        let _logging_guard = crate::logging::initialize()?;
 
         tracing::info!(
             "Starting Unified Hi-Fi Control (Rust) v{} ({})",
@@ -1354,6 +1349,8 @@ async fn main() -> anyhow::Result<()> {
         println!("    PORT             HTTP server port (default: 8088)");
         println!("    CONFIG_DIR       Configuration directory");
         println!("    LOG_LEVEL        Log level (debug, info, warn, error)");
+        println!("    UHC_LOG_DIR      Enable daily rotating files in this directory");
+        println!("    UHC_LOG_RETENTION_DAYS  Retained days (default: 7, maximum: 365)");
         println!("    LMS_HOST         LMS server host (auto-enables LMS backend)");
         println!("    LMS_PORT         LMS server port (default: 9000)");
         return Ok(());

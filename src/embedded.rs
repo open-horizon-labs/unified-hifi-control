@@ -8,7 +8,7 @@
 //! For assets to be embedded, you must run `dx build` BEFORE `cargo build`:
 //!
 //! ```bash
-//! dx build --fullstack --release @client --no-default-features --features web @server --features server
+//! dx build --fullstack=false --release @client --no-default-features --features web
 //! cargo build --release
 //! ```
 //!

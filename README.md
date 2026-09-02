@@ -130,11 +130,17 @@ docker compose up -d
 |----------|-------------|---------|
 | `UHC_PORT` | Bridge HTTP port | `8088` |
 | `CONFIG_DIR` | Directory for config/state files | `/data` |
-| `RUST_LOG` | Log filter (e.g., `info`, `debug`, `unified_hifi_control=debug`) | `debug` |
+| `RUST_LOG` | Log filter (e.g., `info`, `debug`, `unified_hifi_control=debug`) | `info` |
+| `UHC_LOG_DIR` | Write daily rotating UHC logs here; unset uses stdout | — |
+| `UHC_LOG_RETENTION_DAYS` | Completed daily log files to retain (`1`–`365`) | `7` |
 | `LMS_HOST` | Auto-configure LMS backend (used by LMS plugin) | — |
 | `LMS_PORT` | LMS server port | `9000` |
 
 Legacy aliases: `PORT` (→ `UHC_PORT`), `LOG_LEVEL` (→ `RUST_LOG`)
+
+UHC owns daily rotation and bounded retention whenever `UHC_LOG_DIR` is set.
+Native packages set that destination automatically. Docker and systemd leave it
+unset so the container log driver or journal remains the single log authority.
 
 **Note:** Port 8088 is also HQPlayer's default. If running both on the same host, change one.
 

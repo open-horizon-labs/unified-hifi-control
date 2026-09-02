@@ -22,6 +22,7 @@ use std::sync::Arc;
 /// Note: "lms-cli" is a companion to "lms" and shares its enabled state.
 pub const AVAILABLE_ADAPTERS: &[&str] = &[
     "roon",
+    "hqplayer",
     "lms",
     "lms-cli",
     "openhome",
@@ -92,6 +93,7 @@ impl AdapterCoordinator {
         for &name in AVAILABLE_ADAPTERS {
             let enabled = match name {
                 "roon" => settings.roon,
+                "hqplayer" => settings.hqplayer,
                 "lms" => settings.lms,
                 // lms-cli shares enabled state with lms (companion adapter)
                 "lms-cli" => settings.lms,
