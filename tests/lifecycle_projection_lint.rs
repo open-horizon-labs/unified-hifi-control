@@ -387,12 +387,15 @@ fn lms_reconfiguration_cancels_both_observers_before_retiring_lms_projection() {
 
     let api = parse(include_str!("../src/api/mod.rs"));
     let configure = facts(named_body(&api, "lms_configure_handler"));
+    // Specifically the acknowledgement-waiting variant. Reconfiguration restarts the
+    // observers immediately, so the plain stop path lets an unapplied flush land after
+    // the restarted poller's first publication and delete the zone it just published.
     assert!(
         configure
             .method_calls
             .iter()
-            .any(|call| call == "stop_adapter_and_companions_then_flush"),
-        "LMS reconfiguration must use the paired-observer stop path"
+            .any(|call| call == "stop_adapter_and_companions_then_await_flush"),
+        "LMS reconfiguration must wait for the projection flush acknowledgement"
     );
     assert!(
         configure
