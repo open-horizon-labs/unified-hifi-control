@@ -77,25 +77,36 @@ sub knobDevices {
     my $port = $prefs->get('port') || 8088;
     my $url  = "http://127.0.0.1:$port/knob/devices";
 
+    # One failure shape for "down", "not answering", and "answered with an
+    # error": 503 plus a small JSON body the page can treat as not running.
+    my $unavailable = sub {
+        my $body = '{"error":"bridge unavailable"}';
+        $response->code(RC_SERVICE_UNAVAILABLE);
+        $response->content_type('application/json');
+        $callback->($client, $params, \$body, $httpClient, $response);
+    };
+
     Slim::Networking::SimpleAsyncHTTP->new(
         sub {
             my $http = shift;
-            my $body = $http->content;
             # SimpleAsyncHTTP calls this for any HTTP response, 4xx and 5xx
-            # included; only a 2xx is a healthy bridge. Pass the bridge's own
-            # status through so the page's failure path still fires.
-            my $code = $http->code || RC_OK;
-            $response->code($code =~ /^2\d\d$/ ? RC_OK : $code);
+            # included; only a 2xx is a healthy bridge. Anything else takes
+            # the same 503 path as an unreachable bridge, so the page never
+            # relays a bridge error body as if it were knob data.
+            my $code = $http->code;
+            if (!$code || $code !~ /^2\d\d$/) {
+                $log->debug("Bridge answered $url with status " . ($code // 'none'));
+                return $unavailable->();
+            }
+            my $body = $http->content;
+            $response->code(RC_OK);
             $response->content_type('application/json');
             $callback->($client, $params, \$body, $httpClient, $response);
         },
         sub {
             my ($http, $error) = @_;
             $log->debug("Bridge not reachable at $url: $error");
-            my $body = '{"error":"bridge unreachable"}';
-            $response->code(RC_SERVICE_UNAVAILABLE);
-            $response->content_type('application/json');
-            $callback->($client, $params, \$body, $httpClient, $response);
+            $unavailable->();
         },
         { timeout => 3, cache => 0 },
     )->get($url);
