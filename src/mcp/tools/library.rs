@@ -48,6 +48,7 @@
 use super::spotify::refusal_for_spotify_error;
 use crate::api::AppState;
 use crate::mcp::capabilities::{support, Capability};
+use crate::mcp::collection_locations::{CollectionLocation, CollectionStep, RoonLocationOrigin};
 use crate::mcp::envelope::{Envelope, Observed, Provider, Refusal, Scope};
 use crate::mcp::refs::{RefTarget, RoonRefTarget};
 use crate::mcp::routing::{
@@ -220,6 +221,7 @@ pub async fn handle_search(
                             // grouping row or browsable container in its
                             // response shape to mint a path for.
                             path: None,
+                            location: None,
                             image: None,
                         });
                     }
@@ -252,6 +254,7 @@ pub async fn handle_search(
                             // (`LibrarySearchResult`) has no grouping or
                             // browse concept -- see #566's audit.
                             path: None,
+                            location: None,
                             image: None,
                         });
                     }
@@ -289,6 +292,7 @@ pub async fn handle_search(
                             // exposes MA's real browse hierarchy
                             // separately, via `MusicAssistantBrowse`.)
                             path: None,
+                            location: None,
                             image: None,
                         });
                     }
@@ -332,6 +336,7 @@ pub async fn handle_search(
                             // flat catalog/library hits -- no grouping or
                             // browse concept -- see #566's audit.
                             path: None,
+                            location: None,
                             image: None,
                         });
                     }
@@ -353,7 +358,7 @@ pub async fn handle_search(
             {
                 Ok((session_key, results)) => {
                     let mut mcp_results = Vec::with_capacity(results.len());
-                    for item in results {
+                    for (position, item) in results.into_iter().enumerate() {
                         // #573 defect 10: search hits carry artwork where
                         // Roon supplies it, resolved through the identical
                         // opaque-ref URL browse rows use.
@@ -378,6 +383,7 @@ pub async fn handle_search(
                                 subtitle,
                                 r#ref: None,
                                 path: None,
+                                location: None,
                                 image,
                             });
                             continue;
@@ -443,6 +449,17 @@ pub async fn handle_search(
                                 // claimed without a way to verify it.
                                 (false, true)
                             };
+                        let location_target = CollectionLocation::Roon {
+                            origin: RoonLocationOrigin::Search {
+                                query: args.query.clone(),
+                                source: args.source.clone(),
+                            },
+                            steps: vec![CollectionStep::roon(
+                                title.clone(),
+                                subtitle.clone(),
+                                Some(position as u32),
+                            )],
+                        };
                         let path = if navigable {
                             Some(
                                 state
@@ -450,9 +467,22 @@ pub async fn handle_search(
                                     .mint(RefTarget::RoonBrowse {
                                         target: target.clone(),
                                         title: item.title.clone(),
+                                        location: location_target.clone(),
                                     })
                                     .await,
                             )
+                        } else {
+                            None
+                        };
+                        let location = if navigable {
+                            match state.collection_locations.mint(location_target) {
+                                Ok(token) => Some(token),
+                                Err(error) => {
+                                    return env.failed(format!(
+                                        "Search error: could not preserve location: {error:#}"
+                                    ))
+                                }
+                            }
                         } else {
                             None
                         };
@@ -474,6 +504,7 @@ pub async fn handle_search(
                             subtitle,
                             r#ref: ref_token,
                             path,
+                            location,
                             image,
                         });
                     }

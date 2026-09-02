@@ -1,8 +1,10 @@
 //! Provider-neutral read-only library collections.
 //!
-//! The wire contract deliberately speaks only of collections, paths, pages and
-//! opaque playable refs. Provider adapters translate those concepts to their
-//! native library APIs; no provider URI or identifier is returned to a client.
+//! The wire contract deliberately speaks only of collections, locations,
+//! pages, and opaque refs. Provider adapters translate those concepts to
+//! their native library APIs; no provider URI or identifier is returned to a
+//! client. `location` is durable canonical identity; legacy `path` refs remain
+//! short-lived MCP continuations.
 //!
 //! # #531: per-provider slices, not one blanket gate
 //!
@@ -18,8 +20,12 @@
 //! honestly: reachable through their own provider tools today, not yet wired
 //! to this one. See #531's PR body for what remains.
 
+use crate::adapters::roon::RoonBrowseError;
 use crate::api::AppState;
 use crate::mcp::capabilities::{support, Capability, Support};
+use crate::mcp::collection_locations::{
+    CollectionBreadcrumb, CollectionLocation, CollectionStep, RoonLocationOrigin,
+};
 use crate::mcp::envelope::{Envelope, Refusal, Scope};
 use crate::mcp::refs::{RefTarget, RoonRefTarget};
 use crate::mcp::routing::{LibraryRoute, ZoneTarget};
@@ -86,7 +92,7 @@ pub fn collections_tabs_for_zone(zone_id: &str) -> Vec<&'static str> {
 
 #[mcp_tool(
     name = "hifi_collections",
-    description = "Alpha capability: expect refinement across releases. Browse a provider library or list saved playlists and favorites. Results are paged with limit/offset and playable entries include a short-lived opaque ref for hifi_play_ref. Use path from a browse entry to continue into that collection. Implemented for lms and roon zones; Music Assistant zones (see hifi_queue's provider notes); Spotify and Apple Music are reachable via hifi_spotify and the Apple Music tools today, not yet through this one."
+    description = "Alpha capability: expect refinement across releases. Browse a provider library or list saved playlists and favorites. Results are paged with limit/offset. Navigable entries include a durable opaque location for canonical navigation and a short-lived path for MCP continuation; playable entries include a short-lived opaque ref for hifi_play_ref. Send location or path, never both. Implemented for Roon, LMS, and Music Assistant zones. Spotify and Apple Music are reachable via hifi_spotify and the Apple Music tools today, not yet through this one."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiCollectionsTool {
@@ -94,9 +100,12 @@ pub struct HifiCollectionsTool {
     pub zone_id: String,
     /// browse, playlists, or favorites.
     pub action: String,
-    /// Opaque collection path returned by a preceding browse call.
+    /// Short-lived collection continuation returned by a preceding browse call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Durable provider-neutral collection location returned by a preceding browse call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
     /// Media type when listing favorites (tracks by default).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
@@ -115,6 +124,8 @@ struct CollectionItem {
     subtitle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    location: Option<String>,
     #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
     r#ref: Option<String>,
     /// Artwork URL (#549), present only when the provider has art for this
@@ -153,6 +164,7 @@ pub(crate) async fn mint_image(
 #[derive(Debug, Serialize)]
 struct CollectionPage {
     items: Vec<CollectionItem>,
+    breadcrumbs: Vec<CollectionBreadcrumb>,
     #[serde(skip_serializing_if = "Option::is_none")]
     next_offset: Option<u32>,
 }
@@ -177,6 +189,7 @@ pub async fn handle_collections(
         .param("zone_id", &*args.zone_id)
         .param("action", &*args.action)
         .param_opt("path", args.path.as_deref())
+        .param_opt("location", args.location.as_deref())
         .param_opt("media_type", args.media_type.as_deref())
         .param_opt("limit", args.limit)
         .param_opt("offset", args.offset)
@@ -184,6 +197,17 @@ pub async fn handle_collections(
     let route = target.for_library();
     if let LibraryRoute::Refused(_) = route {
         return env.failed("This zone has no library path");
+    }
+
+    if args.path.is_some() && args.location.is_some() {
+        return env.refused(
+            "path and location cannot be used together.",
+            Refusal::invalid_parameter(
+                "location",
+                &["a durable location without path"],
+                "Use location for canonical Library navigation or path for a short-lived MCP continuation, not both.",
+            ),
+        );
     }
 
     // A `path`'s provider-boundary check runs before anything else,
@@ -200,6 +224,19 @@ pub async fn handle_collections(
             }
             None => return refuse_unknown_path(env),
             Some(_) => {}
+        }
+    }
+    if let Some(token) = args.location.as_deref() {
+        let Some(location) = state.collection_locations.resolve(token) else {
+            return refuse_unknown_location(env);
+        };
+        if !matches!(
+            (location.provider(), target),
+            ("roon", ZoneTarget::Roon)
+                | ("lms", ZoneTarget::Lms)
+                | ("musicassistant", ZoneTarget::MusicAssistant)
+        ) {
+            return refuse_foreign_location(env);
         }
     }
 
@@ -312,14 +349,21 @@ async fn handle_music_assistant(
     // Browse paths are server-side refs, just like playable media refs. MA's
     // native `library://…` paths contain provider implementation details and
     // must not become MCP client input.
-    let provider_path = match args.path.as_deref() {
-        None => None,
-        Some(token) => match state.mcp_refs.resolve(token).await {
-            Some(RefTarget::MusicAssistantBrowse { path, .. }) => Some(path),
+    let parent_location = match (args.location.as_deref(), args.path.as_deref()) {
+        (Some(token), None) => match state.collection_locations.resolve(token) {
+            Some(location @ CollectionLocation::MusicAssistant { .. }) => location,
+            Some(_) => return refuse_foreign_location(env),
+            None => return refuse_unknown_location(env),
+        },
+        (None, Some(token)) => match state.mcp_refs.resolve(token).await {
+            Some(RefTarget::MusicAssistantBrowse { location, .. }) => location,
             Some(_) => return refuse_foreign_path(env),
             None => return refuse_unknown_path(env),
         },
+        (None, None) => CollectionLocation::MusicAssistant { steps: Vec::new() },
+        (Some(_), Some(_)) => unreachable!("path/location exclusivity checked by caller"),
     };
+    let provider_path = parent_location.last_provider_path();
     let operation = format!("collections_{}", args.action);
     let response = match state
         .adapter_registry
@@ -359,17 +403,29 @@ async fn handle_music_assistant(
             .get("subtitle")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
-        let path = match item.get("path").and_then(Value::as_str) {
-            Some(path) => Some(
-                state
+        let (path, location) = match item.get("path").and_then(Value::as_str) {
+            Some(provider_path) => {
+                let target =
+                    parent_location.appended(CollectionStep::new(title.clone(), provider_path));
+                let location = match state.collection_locations.mint(target.clone()) {
+                    Ok(token) => token,
+                    Err(error) => {
+                        return env.failed(format!(
+                            "Collection error: could not preserve location: {error:#}"
+                        ))
+                    }
+                };
+                let path = state
                     .mcp_refs
                     .mint(RefTarget::MusicAssistantBrowse {
-                        path: path.to_string(),
+                        path: provider_path.to_string(),
                         title: title.clone(),
+                        location: target,
                     })
-                    .await,
-            ),
-            None => None,
+                    .await;
+                (Some(path), Some(location))
+            }
+            None => (None, None),
         };
         let r#ref = match item.get("uri").and_then(Value::as_str) {
             Some(uri) => Some(
@@ -393,11 +449,24 @@ async fn handle_music_assistant(
             title,
             subtitle,
             path,
+            location,
             r#ref,
             image,
         });
     }
-    Ok(env.json_result(&CollectionPage { items, next_offset }))
+    let breadcrumbs = match state.collection_locations.breadcrumbs(&parent_location) {
+        Ok(breadcrumbs) => breadcrumbs,
+        Err(error) => {
+            return env.failed(format!(
+                "Collection error: could not preserve breadcrumbs: {error:#}"
+            ))
+        }
+    };
+    Ok(env.json_result(&CollectionPage {
+        items,
+        breadcrumbs,
+        next_offset,
+    }))
 }
 
 // =============================================================================
@@ -415,14 +484,21 @@ async fn handle_lms(
     // Same opaque-path split as Music Assistant: the plain collection path
     // this adapter invents ("albums", "album:<id>", ...) never becomes
     // client-visible; only the ref token is.
-    let provider_path = match args.path.as_deref() {
-        None => None,
-        Some(token) => match state.mcp_refs.resolve(token).await {
-            Some(RefTarget::LmsBrowse { path, .. }) => Some(path),
+    let parent_location = match (args.location.as_deref(), args.path.as_deref()) {
+        (Some(token), None) => match state.collection_locations.resolve(token) {
+            Some(location @ CollectionLocation::Lms { .. }) => location,
+            Some(_) => return refuse_foreign_location(env),
+            None => return refuse_unknown_location(env),
+        },
+        (None, Some(token)) => match state.mcp_refs.resolve(token).await {
+            Some(RefTarget::LmsBrowse { location, .. }) => location,
             Some(_) => return refuse_foreign_path(env),
             None => return refuse_unknown_path(env),
         },
+        (None, None) => CollectionLocation::Lms { steps: Vec::new() },
+        (Some(_), Some(_)) => unreachable!("path/location exclusivity checked by caller"),
     };
+    let provider_path = parent_location.last_provider_path();
     let operation = format!("collections_{}", args.action);
     let response = match state
         .adapter_registry
@@ -466,17 +542,29 @@ async fn handle_lms(
         // `LmsPlayTarget::Library`) or `url` (a favorite, which LMS gives no
         // durable id for -- `LmsPlayTarget::Url`). At most one of the three
         // is ever present on one row.
-        let path = match item.get("path").and_then(Value::as_str) {
-            Some(path) => Some(
-                state
+        let (path, location) = match item.get("path").and_then(Value::as_str) {
+            Some(provider_path) => {
+                let target =
+                    parent_location.appended(CollectionStep::new(title.clone(), provider_path));
+                let location = match state.collection_locations.mint(target.clone()) {
+                    Ok(token) => token,
+                    Err(error) => {
+                        return env.failed(format!(
+                            "Collection error: could not preserve location: {error:#}"
+                        ))
+                    }
+                };
+                let path = state
                     .mcp_refs
                     .mint(RefTarget::LmsBrowse {
-                        path: path.to_string(),
+                        path: provider_path.to_string(),
                         title: title.clone(),
+                        location: target,
                     })
-                    .await,
-            ),
-            None => None,
+                    .await;
+                (Some(path), Some(location))
+            }
+            None => (None, None),
         };
         let r#ref = match (
             item.get("kind").and_then(Value::as_str),
@@ -518,11 +606,24 @@ async fn handle_lms(
             title,
             subtitle,
             path,
+            location,
             r#ref,
             image,
         });
     }
-    Ok(env.json_result(&CollectionPage { items, next_offset }))
+    let breadcrumbs = match state.collection_locations.breadcrumbs(&parent_location) {
+        Ok(breadcrumbs) => breadcrumbs,
+        Err(error) => {
+            return env.failed(format!(
+                "Collection error: could not preserve breadcrumbs: {error:#}"
+            ))
+        }
+    };
+    Ok(env.json_result(&CollectionPage {
+        items,
+        breadcrumbs,
+        next_offset,
+    }))
 }
 
 // =============================================================================
@@ -540,13 +641,34 @@ async fn handle_roon(
     // Roon's continuation is a (item_key, multi_session_key) pair, not a flat
     // string -- resuming it must re-enter that exact session (same reasoning
     // as a playable Roon ref; see `RoonRefTarget`'s docs).
-    let resume = match args.path.as_deref() {
-        None => None,
-        Some(token) => match state.mcp_refs.resolve(token).await {
-            Some(RefTarget::RoonBrowse { target, .. }) => Some(target),
+    let (resume, parent_location) = match (args.location.as_deref(), args.path.as_deref()) {
+        (Some(token), None) => match state.collection_locations.resolve(token) {
+            Some(location @ CollectionLocation::Roon { .. }) => (None, location),
+            Some(_) => return refuse_foreign_location(env),
+            None => return refuse_unknown_location(env),
+        },
+        (None, Some(token)) => match state.mcp_refs.resolve(token).await {
+            Some(RefTarget::RoonBrowse {
+                target, location, ..
+            }) => (Some(target), location),
             Some(_) => return refuse_foreign_path(env),
             None => return refuse_unknown_path(env),
         },
+        (None, None) => {
+            let steps = if args.action == "playlists" {
+                vec![CollectionStep::hidden_roon("Playlists")]
+            } else {
+                Vec::new()
+            };
+            (
+                None,
+                CollectionLocation::Roon {
+                    origin: RoonLocationOrigin::BrowseRoot,
+                    steps,
+                },
+            )
+        }
+        (Some(_), Some(_)) => unreachable!("path/location exclusivity checked by caller"),
     };
 
     let mut params = json!({
@@ -554,7 +676,24 @@ async fn handle_roon(
         "limit": limit,
         "offset": offset,
     });
-    if let Some(RoonRefTarget {
+    if args.location.is_some() {
+        let (session_key, item_key) = match resolve_roon_location(
+            state,
+            &args.zone_id,
+            &parent_location,
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            Err(error) => {
+                return env.failed(format!(
+                    "Collection error: this saved Roon location can no longer be resolved safely: {error:#}"
+                ))
+            }
+        };
+        params["item_key"] = json!(item_key);
+        params["session_key"] = json!(session_key);
+    } else if let Some(RoonRefTarget {
         item_key,
         multi_session_key,
         ..
@@ -566,23 +705,28 @@ async fn handle_roon(
     // #616: the trail this page hangs off. Children extend it by their own
     // title, so every ref minted below carries the full root-to-item walk
     // and can be re-resolved after its session is gone.
-    let parent_trail: Vec<String> = resume
-        .as_ref()
-        .map(|target| target.trail.clone())
-        .unwrap_or_default();
+    let parent_trail: Vec<String> = parent_location
+        .steps()
+        .iter()
+        .map(|step| step.title.clone())
+        .collect();
     // Roon has no separate playlists/favorites protocol feature: both arrive
     // as named nodes in the same browse hierarchy (see the capability
     // table's note on this). `favorites` never reaches here -- `support()`
     // reports it `not_implemented` for Roon and the shared check above
     // already refused it.
-    let operation = match args.action.as_str() {
-        "browse" => "collections_browse",
-        "playlists" => "collections_playlists",
-        other => {
-            return env.failed(format!(
-                "internal routing error: unexpected hifi_collections action {other:?} reached \
-                 Roon dispatch after the capability check. This is a UHC bug."
-            ))
+    let operation = if !parent_location.steps().is_empty() && args.location.is_some() {
+        "collections_browse"
+    } else {
+        match args.action.as_str() {
+            "browse" => "collections_browse",
+            "playlists" => "collections_playlists",
+            other => {
+                return env.failed(format!(
+                    "internal routing error: unexpected hifi_collections action {other:?} reached \
+                     Roon dispatch after the capability check. This is a UHC bug."
+                ))
+            }
         }
     };
     let response = match state
@@ -595,18 +739,25 @@ async fn handle_roon(
             if resume
                 .as_ref()
                 .is_some_and(|target| !target.trail.is_empty())
-                && (error
-                    .to_string()
-                    .contains("no longer valid in this browse session")
-                    || error.to_string().contains("InvalidItemKey")) =>
+                && RoonBrowseError::from_error(&error)
+                    .is_some_and(|rejection| rejection.kind.is_recoverable()) =>
         {
             // Roon item keys are scoped to a Core-side browse session. If the
             // Core reconnects, re-walk the saved breadcrumb trail and retry
             // the same node rather than making the user start at the root.
-            let target = resume.as_ref().expect("resume checked above");
-            let (session_key, item_key) = match state.roon.resolve_trail(&args.zone_id, &target.trail).await {
+            let (session_key, item_key) = match resolve_roon_location(
+                state,
+                &args.zone_id,
+                &parent_location,
+            )
+            .await
+            {
                 Ok(pair) => pair,
-                Err(_) => return env.failed("Collection error: Roon refreshed; this browse page expired. Refresh to continue."),
+                Err(error) => {
+                    return env.failed(format!(
+                        "Collection error: this saved Roon location can no longer be resolved safely: {error:#}"
+                    ))
+                }
             };
             params["item_key"] = json!(item_key);
             params["session_key"] = json!(session_key);
@@ -616,10 +767,10 @@ async fn handle_roon(
                 .await
             {
                 Ok(value) => value,
-                Err(_) => return env.failed("Collection error: Roon refreshed; this browse page expired. Refresh to continue."),
+                Err(error) => return env.failed(format!("Collection error: {error}")),
             }
         }
-        Err(_) => return env.failed("Collection error: Roon is unavailable right now. Try again."),
+        Err(error) => return env.failed(format!("Collection error: {error}")),
     };
 
     let Some(session_key) = response.get("session_key").and_then(Value::as_str) else {
@@ -659,8 +810,17 @@ async fn handle_roon(
             .get("playable")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let (path, r#ref) = match item_key {
-            None => (None, None),
+        let position = item
+            .get("position")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32);
+        let child_location = parent_location.appended(CollectionStep::roon(
+            title.clone(),
+            subtitle.clone(),
+            position,
+        ));
+        let (path, location, r#ref) = match item_key {
+            None => (None, None, None),
             Some(item_key) => {
                 let mut trail = parent_trail.clone();
                 trail.push(title.clone());
@@ -676,9 +836,22 @@ async fn handle_roon(
                             .mint(RefTarget::RoonBrowse {
                                 target: target.clone(),
                                 title: title.clone(),
+                                location: child_location.clone(),
                             })
                             .await,
                     )
+                } else {
+                    None
+                };
+                let location = if navigable {
+                    match state.collection_locations.mint(child_location) {
+                        Ok(token) => Some(token),
+                        Err(error) => {
+                            return env.failed(format!(
+                                "Collection error: could not preserve location: {error:#}"
+                            ))
+                        }
+                    }
                 } else {
                     None
                 };
@@ -695,7 +868,7 @@ async fn handle_roon(
                 } else {
                     None
                 };
-                (path, r#ref)
+                (path, location, r#ref)
             }
         };
         let image = mint_image(
@@ -708,6 +881,7 @@ async fn handle_roon(
             title,
             subtitle,
             path,
+            location,
             r#ref,
             image,
         });
@@ -716,7 +890,46 @@ async fn handle_roon(
         .get("next_offset")
         .and_then(Value::as_u64)
         .map(|v| v as u32);
-    Ok(env.json_result(&CollectionPage { items, next_offset }))
+    let breadcrumbs = match state.collection_locations.breadcrumbs(&parent_location) {
+        Ok(breadcrumbs) => breadcrumbs,
+        Err(error) => {
+            return env.failed(format!(
+                "Collection error: could not preserve breadcrumbs: {error:#}"
+            ))
+        }
+    };
+    Ok(env.json_result(&CollectionPage {
+        items,
+        breadcrumbs,
+        next_offset,
+    }))
+}
+
+async fn resolve_roon_location(
+    state: &AppState,
+    zone_id: &str,
+    location: &CollectionLocation,
+) -> anyhow::Result<(String, String)> {
+    let resolved = state
+        .adapter_registry
+        .library_content(
+            "roon",
+            "collections_resolve_location",
+            &json!({
+                "zone_id": zone_id,
+                "location": location,
+            }),
+        )
+        .await?;
+    let session_key = resolved
+        .get("session_key")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Roon adapter returned no session_key"))?;
+    let item_key = resolved
+        .get("item_key")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Roon adapter returned no item_key"))?;
+    Ok((session_key.to_string(), item_key.to_string()))
 }
 
 // =============================================================================
@@ -731,6 +944,29 @@ fn refuse_foreign_path(env: Envelope) -> Result<CallToolResult, CallToolError> {
             &["a path returned by hifi_collections for this zone"],
             "Browse again from this zone and use that result's path.",
         ),
+    )
+}
+
+fn refuse_foreign_location(env: Envelope) -> Result<CallToolResult, CallToolError> {
+    env.refused(
+        "location does not name a collection for this zone.",
+        Refusal::invalid_parameter(
+            "location",
+            &["a location returned by hifi_collections for this provider"],
+            "Open the collection from the matching provider.",
+        ),
+    )
+}
+
+fn refuse_unknown_location(env: Envelope) -> Result<CallToolResult, CallToolError> {
+    env.refused(
+        "location is unknown.",
+        Refusal::UnknownTarget {
+            parameter: "location",
+            discover_with: "hifi_collections",
+            detail: "Open the collection from its provider root to create a durable location."
+                .to_string(),
+        },
     )
 }
 

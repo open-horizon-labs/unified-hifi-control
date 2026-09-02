@@ -12,7 +12,7 @@ mod zones;
 
 pub use hqplayer::HqPlayer;
 pub use knobs::Knobs;
-pub use library::Library;
+pub use library::{LibraryHome, LibraryLocation, LibrarySource, LibraryView};
 pub use lms::Lms;
 pub use settings::Settings;
 pub use spotify::Spotify;

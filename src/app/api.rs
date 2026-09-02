@@ -822,8 +822,10 @@ pub struct NowPlaying {
 // deserialize away harmlessly.
 // =============================================================================
 
-/// One item from a `hifi_collections` page: either a folder (`path` set,
+/// One item from a `hifi_collections` page: either a folder (`location` set,
 /// browse only) or a playable entry (`r#ref` set, usable with `/api/play_ref`).
+/// `path` remains for non-web MCP clients that want a short-lived
+/// continuation; the web Library always navigates with `location`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct CollectionItem {
     pub title: String,
@@ -831,6 +833,9 @@ pub struct CollectionItem {
     pub subtitle: Option<String>,
     #[serde(default)]
     pub path: Option<String>,
+    /// Durable provider-neutral identity used in canonical Library URLs.
+    #[serde(default)]
+    pub location: Option<String>,
     #[serde(rename = "ref", default)]
     pub item_ref: Option<String>,
     /// Artwork URL, used verbatim as an `<img src>`. The server sends the
@@ -847,7 +852,15 @@ pub struct CollectionPage {
     #[serde(default)]
     pub items: Vec<CollectionItem>,
     #[serde(default)]
+    pub breadcrumbs: Vec<CollectionBreadcrumb>,
+    #[serde(default)]
     pub next_offset: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct CollectionBreadcrumb {
+    pub title: String,
+    pub location: String,
 }
 
 /// The `reason`-tagged refusal shape from `crate::mcp::envelope::Refusal`.
@@ -894,6 +907,8 @@ pub struct CollectionsRequest {
     pub action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -951,11 +966,14 @@ pub struct SearchResult {
     pub subtitle: Option<String>,
     #[serde(rename = "ref", default)]
     pub item_ref: Option<String>,
-    /// Opaque browse-continuation ref (#566), present when this result is
-    /// navigable -- same convention as `CollectionItem::path`, consumed the
-    /// same way (open into browse, push a breadcrumb).
+    /// Short-lived browse-continuation ref (#566), present when this result
+    /// is navigable. Retained for MCP compatibility; the web Library uses the
+    /// durable `location` below.
     #[serde(default)]
     pub path: Option<String>,
+    /// Durable collection location for navigable search hits.
+    #[serde(default)]
+    pub location: Option<String>,
     /// Artwork URL (#573 defect 10) -- same contract as
     /// `CollectionItem::image`: a complete same-origin path, used verbatim
     /// as an `<img src>`.

@@ -177,6 +177,7 @@ pub enum RefTarget {
     MusicAssistantBrowse {
         path: String,
         title: String,
+        location: crate::mcp::collection_locations::CollectionLocation,
     },
     /// An LMS browse continuation (#531): a server-side collection path
     /// (`"albums"`, `"album:<id>"`, ...), never a raw entity id handed to a
@@ -185,6 +186,7 @@ pub enum RefTarget {
     LmsBrowse {
         path: String,
         title: String,
+        location: crate::mcp::collection_locations::CollectionLocation,
     },
     /// A Roon browse continuation (#531): the `item_key` **and**
     /// `multi_session_key` a collection list was loaded under, so resuming it
@@ -194,6 +196,7 @@ pub enum RefTarget {
     RoonBrowse {
         target: RoonRefTarget,
         title: String,
+        location: crate::mcp::collection_locations::CollectionLocation,
     },
     /// An Apple Music catalog/library identifier resolved by the paired native
     /// companion. Clients only receive the opaque token.

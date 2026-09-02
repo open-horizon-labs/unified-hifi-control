@@ -67,7 +67,7 @@ pub fn Nav(props: NavProps) -> Element {
             div { class: "nav-inner",
                 // Logo / Brand
                 div { class: "flex items-center",
-                    Link { class: "nav-brand flex items-center", to: Route::Library { source: None, tab: None, path: None, zone: None },
+                    Link { class: "nav-brand flex items-center", to: Route::LibraryHome {},
                         img {
                             // base-path-ok: an inlined data: URL carries no path to map.
                             src: "{*LOGO_DATA_URL}",
@@ -81,7 +81,7 @@ pub fn Nav(props: NavProps) -> Element {
                 div { class: "hidden lg:flex items-center space-x-4",
                     Link {
                         class: nav_link_class("library"),
-                        to: Route::Library { source: None, tab: None, path: None, zone: None },
+                        to: Route::LibraryHome {},
                         "Library"
                     }
                     Link { class: nav_link_class("zones"), to: Route::Zones {}, "Zones" }
@@ -149,7 +149,7 @@ pub fn Nav(props: NavProps) -> Element {
                 div { class: "px-2 pt-2 pb-3 space-y-1",
                     Link {
                         class: nav_link_class("library"),
-                        to: Route::Library { source: None, tab: None, path: None, zone: None },
+                        to: Route::LibraryHome {},
                         onclick: move |_| menu_open.set(false),
                         "Library"
                     }

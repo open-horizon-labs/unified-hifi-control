@@ -53,6 +53,7 @@ use unified_hifi_control::api::AppState;
 use unified_hifi_control::bus::create_bus;
 use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::knobs::KnobStore;
+use unified_hifi_control::mcp::tools::collections::{handle_collections, HifiCollectionsTool};
 use unified_hifi_control::mcp::tools::library::{
     handle_play_ref, handle_search, HifiPlayRefTool, HifiSearchTool,
 };
@@ -116,6 +117,13 @@ fn search_results_of(result: &ToolResult) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+fn collection_page_of(result: &ToolResult) -> Value {
+    structured_of(result)
+        .get("data")
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
 // =============================================================================
 // Roon: FakeRoonCore-backed AppState
 // =============================================================================
@@ -177,8 +185,8 @@ async fn app_state_with_roon(roon: Arc<RoonAdapter>) -> AppState {
     let upnp = Arc::new(UPnPAdapter::new(bus.clone()));
     let startable: Vec<Arc<dyn Startable>> = vec![roon.clone()];
 
-    AppState::new(
-        roon,
+    let state = AppState::new(
+        roon.clone(),
         hqplayer,
         hqp_instances,
         hqp_zone_links,
@@ -192,7 +200,9 @@ async fn app_state_with_roon(roon: Arc<RoonAdapter>) -> AppState {
         startable,
         Instant::now(),
         CancellationToken::new(),
-    )
+    );
+    state.adapter_registry.register_library("roon", roon).await;
+    state
 }
 
 /// Same shape, but with a real (connected) LMS adapter and disconnected Roon
@@ -498,6 +508,79 @@ async fn roon_search_result_with_zone_context_mints_both_ref_and_path() {
         ref_token, path_token,
         "the play ref and the browse path are minted from the same target but are \
          distinct tokens"
+    );
+
+    core.stop().await;
+}
+
+/// A canonical Roon Library URL holds a durable `location`, not the Core's
+/// session-scoped browse key. Losing every Core session between mint and
+/// refresh must therefore reconstruct the page and its breadcrumbs.
+#[tokio::test]
+async fn roon_collection_location_survives_core_session_loss() {
+    let core = FakeRoonCore::start().await;
+    core.set_item_key_scope(ItemKeyScope::PerSessionSilentRootReset)
+        .await;
+    let adapter = connected_roon(&core).await;
+    let state = app_state_with_roon(adapter).await;
+
+    let root = handle_collections(
+        &state,
+        HifiCollectionsTool {
+            zone_id: "roon:zone_fake_1".to_string(),
+            action: "browse".to_string(),
+            path: None,
+            location: None,
+            media_type: None,
+            limit: Some(20),
+            offset: Some(0),
+        },
+    )
+    .await;
+    assert_eq!(outcome_of(&root), "ok", "{}", text_of(&root));
+    let root_page = collection_page_of(&root);
+    let local_library = root_page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["title"] == "Local Library")
+        .expect("root must expose Local Library");
+    let location = local_library["location"]
+        .as_str()
+        .expect("navigable row must carry a durable location")
+        .to_string();
+    assert!(location.starts_with("loc_"));
+    assert!(
+        location.len() <= 27,
+        "location leaked URL noise: {location}"
+    );
+
+    core.drop_all_sessions().await;
+
+    let refreshed = handle_collections(
+        &state,
+        HifiCollectionsTool {
+            zone_id: "roon:zone_fake_1".to_string(),
+            action: "browse".to_string(),
+            path: None,
+            location: Some(location.clone()),
+            media_type: None,
+            limit: Some(20),
+            offset: Some(0),
+        },
+    )
+    .await;
+    assert_eq!(outcome_of(&refreshed), "ok", "{}", text_of(&refreshed));
+    let page = collection_page_of(&refreshed);
+    assert_eq!(page["breadcrumbs"][0]["title"], "Local Library");
+    assert_eq!(page["breadcrumbs"][0]["location"], location);
+    assert!(
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["title"] == "Artists"),
+        "freshly resolved page must contain the Library children: {page}"
     );
 
     core.stop().await;
