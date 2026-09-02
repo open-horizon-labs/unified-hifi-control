@@ -1,0 +1,50 @@
+{
+  "id": 217,
+  "method": "slim.request",
+  "params": [
+    "",
+    [
+      "favorites",
+      "items",
+      "0",
+      "20"
+    ]
+  ],
+  "result": {
+    "title": "Favorites",
+    "loop_loop": [
+      {
+        "id": "b2bb7a02.0",
+        "name": "Groove Salad",
+        "type": "audio",
+        "image": "html/images/radio.png",
+        "isaudio": 1,
+        "hasitems": 0
+      },
+      {
+        "id": "b2bb7a02.1",
+        "name": "Drone Zone",
+        "type": "audio",
+        "image": "html/images/radio.png",
+        "isaudio": 1,
+        "hasitems": 0
+      },
+      {
+        "id": "b2bb7a02.2",
+        "name": "First Light Fav",
+        "type": "audio",
+        "image": "html/images/favorites.png",
+        "isaudio": 1,
+        "hasitems": 0
+      },
+      {
+        "id": "b2bb7a02.3",
+        "name": "Test Folder",
+        "image": "html/images/favorites.png",
+        "isaudio": 0,
+        "hasitems": 1
+      }
+    ],
+    "count": 4
+  }
+}

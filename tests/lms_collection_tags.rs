@@ -15,6 +15,11 @@
 //! came back empty from a real server at any library size. Tracks and playlist
 //! tracks kept their titles but lost the artist subtitle.
 //!
+//! `favorites items` is the same rule wearing different clothes: it omits `url`
+//! unless the request asks `want_url:1`, and a favorite has no other playback
+//! handle, so the `url` guard in `list_favorites` discarded every row and the
+//! Favorites and Radio tabs came back empty too.
+//!
 //! # Why the replay server is tag-aware
 //!
 //! A fixture server that always returns the fully tagged response would pass
@@ -153,6 +158,18 @@ async fn replay(State(state): State<ReplayState>, Json(body): Json<Value>) -> Js
                 fixture_result("collections_titles_with_display_tags")
             } else {
                 fixture_result("collections_titles_artwork_only")
+            }
+        }
+        // `favorites items` sends `url` only when asked, and a favorite has no
+        // other handle to play.
+        ("favorites", "items") => {
+            let asked_for_url = cmd
+                .as_array()
+                .is_some_and(|a| a.iter().any(|p| p.as_str() == Some("want_url:1")));
+            if asked_for_url {
+                fixture_result("collections_favorites_with_want_url")
+            } else {
+                fixture_result("collections_favorites_without_want_url")
             }
         }
         ("playlists", "tracks") => {
@@ -320,6 +337,87 @@ async fn playlist_tracks_keep_their_artist_subtitle() {
             .iter()
             .all(|i| i.get("subtitle").and_then(Value::as_str).is_some()),
         "playlist track rows lost their artist subtitle: {items:?}"
+    );
+    server.stop();
+}
+
+// =============================================================================
+// Favorites (and the Radio tab, which is the same query)
+// =============================================================================
+
+async fn favorites(adapter: &LmsAdapter) -> Value {
+    match adapter
+        .collections_content("collections_favorites", &json!({"limit": 20, "offset": 0}))
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => panic!("collections_favorites failed: {e:#}"),
+    }
+}
+
+/// Favorites must arrive playable. A favorite carries no durable entity id, so
+/// the url is its only handle -- and LMS withholds it unless asked.
+#[tokio::test]
+async fn favorites_arrive_with_a_playback_url() {
+    let server = TagReplayServer::start().await;
+    let adapter = adapter_for(server.addr()).await;
+
+    let page = favorites(&adapter).await;
+    let items = rows(&page);
+
+    assert!(
+        !items.is_empty(),
+        "the Favorites level came back empty; LMS omits `url` unless the request \
+         asks `want_url:1`, and `list_favorites` drops any row without one"
+    );
+    for item in &items {
+        assert!(
+            item.get("url")
+                .and_then(Value::as_str)
+                .is_some_and(|u| !u.is_empty()),
+            "favorite row has no playback url, so nothing can play it: {item}"
+        );
+    }
+    server.stop();
+}
+
+/// Assert on the request as well: the url is a *requested* field, and a future
+/// edit that drops the flag would empty both tabs again.
+#[tokio::test]
+async fn favorites_query_asks_for_the_url() {
+    let server = TagReplayServer::start().await;
+    let adapter = adapter_for(server.addr()).await;
+
+    favorites(&adapter).await;
+
+    let asked = server.commands().iter().any(|cmd| {
+        cmd.as_array()
+            .is_some_and(|a| a.iter().any(|p| p.as_str() == Some("want_url:1")))
+    });
+    assert!(
+        asked,
+        "the favorites query never asked for `want_url:1`: {:?}",
+        server.commands()
+    );
+    server.stop();
+}
+
+/// A folder-shaped favorite (`hasitems: 1`) has no url of its own. It is
+/// deliberately not browsable in this slice, so it must be dropped rather than
+/// listed as a dead end -- the recorded fixture contains one.
+#[tokio::test]
+async fn folder_shaped_favorites_are_not_listed_as_dead_ends() {
+    let server = TagReplayServer::start().await;
+    let adapter = adapter_for(server.addr()).await;
+
+    let items = rows(&favorites(&adapter).await);
+
+    assert!(
+        !items.iter().any(|i| i
+            .get("title")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t == "Test Folder")),
+        "a folder favorite was listed with no url and no way in: {items:?}"
     );
     server.stop();
 }

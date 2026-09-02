@@ -2413,6 +2413,15 @@ impl LmsAdapter {
                     json!("items"),
                     json!(offset),
                     json!(limit),
+                    // `favorites items` omits `url` unless the request asks for
+                    // it, and a favorite has no other playback handle -- LMS
+                    // gives them no durable entity id. Without this every row
+                    // failed the `url` guard below and the Favorites and Radio
+                    // tabs came back empty. Same rule as the `tags:` constants
+                    // above: a field that is not requested is simply absent.
+                    // Recorded both ways in
+                    // `tests/fixtures/lms/collections_favorites_*.json`.
+                    json!("want_url:1"),
                 ],
             )
             .await?;

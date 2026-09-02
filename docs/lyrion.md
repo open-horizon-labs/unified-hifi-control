@@ -103,6 +103,13 @@ are the `ALBUM_DISPLAY_TAGS` / `TRACK_DISPLAY_TAGS` constants in
 `src/adapters/lms.rs`, and `tests/lms_collection_tags.rs` fails if either drops a
 field it reads.
 
+The same rule reaches beyond `tags:`. `favorites items` omits `url` unless the
+request asks `want_url:1`, and a favorite has no durable entity id, so the url is
+its only playback handle — without the flag every favorite row is unplayable and
+UHC drops it. Recorded both ways in
+`tests/fixtures/lms/collections_favorites_without_want_url.json` and
+`collections_favorites_with_want_url.json`.
+
 | Tag | Key in the response | Value |
 |-----|--------------------|-------|
 | `a` | `artist` | Track artist name |

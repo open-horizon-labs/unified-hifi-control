@@ -49,6 +49,8 @@ network if you need a player.
 | `collections_titles_with_display_tags.json` | The same query as `tags:acJ`; `artist` restored. |
 | `collections_playlisttracks_artwork_only.json` | `playlists tracks 0 3 playlist_id:<id> tags:cJ` — same subtitle loss as `titles`, and shows the loop is named `playlisttracks_loop`. |
 | `collections_playlisttracks_with_display_tags.json` | The same query as `tags:acJ`; `artist` restored. |
+| `collections_favorites_without_want_url.json` | **The favorites defect.** `favorites items 0 20` — the query the adapter shipped. Rows carry `id`, `name`, `type`, `image`, `isaudio`, `hasitems` and **no `url`**. A favorite has no durable entity id, so `list_favorites`' url guard dropped every row and the Favorites and Radio tabs were empty. Also shows the artwork field is `image` (a server-relative icon path like `html/images/radio.png`), **not** the `icon` absolute URL the adapter reads — so favorites carry no artwork either way. |
+| `collections_favorites_with_want_url.json` | The same query plus `want_url:1`: every non-folder row gains `url` (`http://…` for a stream, `db:track.titlesearch=…` for a library favorite). The folder row (`hasitems: 1`) still has none, which is why it is dropped rather than listed as a dead end. |
 | `status_tags_aAdltKc.json` | **Defect 4.** The adapter's exact `tags:aAdltKc` string. `l` yields `"album": "Ember Light"` (album **title**, not `album_id`); `A` yields per-role `albumartist`/`trackartist`; `a` yields `artist`; `d` `duration`; `t` `tracknum`. Also shows `artwork_track_id` is **absent**, because that field is tag `J` which this string does not request. |
 
 ## Mute is immediate; the negated volume lags it (no fixture file — this is timing)
