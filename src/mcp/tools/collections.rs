@@ -85,6 +85,13 @@ pub fn collections_tabs_for_zone(zone_id: &str) -> Vec<&'static str> {
     }
     if matches!(support(target, Capability::Favorites), Support::Supported) {
         tabs.push("favorites");
+    }
+    // Radio is its own capability, not a second reading of Favorites. Deriving
+    // both tabs from the favorites cell claimed radio wherever favorites
+    // existed -- so LMS showed two identical tabs -- and hid it wherever they
+    // did not, which is how Roon ended up with no Radio tab despite having a
+    // My Live Radio node all along. See `Capability::Radio`.
+    if matches!(support(target, Capability::Radio), Support::Supported) {
         tabs.push("radio");
     }
     tabs
@@ -180,9 +187,14 @@ pub async fn handle_collections(
         );
     }
     let target = ZoneTarget::classify(&args.zone_id);
-    let capability = match args.action.as_str() {
-        "browse" => Capability::Browse,
-        "playlists" => Capability::SavedPlaylists,
+    // The Library page asks for radio as the favorites action carrying
+    // `media_type: radio` (`crate::app::pages::library`'s `Tab`), so the gate
+    // reads the pair. Reading the action alone measured a Roon radio request
+    // against Roon's favorites cell, which is a gap, and refused it.
+    let capability = match (args.action.as_str(), args.media_type.as_deref()) {
+        ("browse", _) => Capability::Browse,
+        ("playlists", _) => Capability::SavedPlaylists,
+        (_, Some("radio")) => Capability::Radio,
         _ => Capability::Favorites,
     };
     let env = Envelope::read("hifi_collections", &args.action)
@@ -508,6 +520,11 @@ async fn handle_lms(
             &json!({
                 "path": provider_path,
                 "media_type": args.media_type,
+                // LMS radio is XMLBrowser, which refuses a server-level
+                // request, so the zone has to reach the adapter (see
+                // `LmsAdapter::browse_radio`). Every other LMS collection
+                // query is server-level and ignores this.
+                "zone_id": args.zone_id,
                 "limit": limit,
                 "offset": offset,
             }),
@@ -662,6 +679,16 @@ async fn handle_lms(
 /// The cache is deliberately not durable: it holds live-session material, so
 /// the first request per location after a restart re-walks once and every
 /// later one is cheap again.
+/// Roon's own internet-radio browse node, as its root lists it.
+///
+/// A title, not a protocol feature: Roon exposes live radio as a named row at
+/// the browse root (visible in the Library UI as "My Live Radio"), the same
+/// shape as "Playlists". Both are reached with
+/// [`RoonAdapter::browse_named_root_node`], which refuses rather than guesses
+/// when the row is absent -- so a Core whose root is localised, or one with no
+/// radio configured, produces a clear refusal instead of a wrong node.
+pub(crate) const ROON_RADIO_NODE: &str = "My Live Radio";
+
 async fn handle_roon(
     state: &AppState,
     env: Envelope,
@@ -700,8 +727,14 @@ async fn handle_roon(
                 None => return refuse_unknown_path(env),
             },
             (None, None) => {
+                // Both named roots are browse nodes, not separate protocols,
+                // so each is recorded as a hidden first step: breadcrumbs stay
+                // clean while `resolve_collection_location` can still re-walk
+                // into them by name after a session loss.
                 let steps = if args.action == "playlists" {
                     vec![CollectionStep::hidden_roon("Playlists")]
+                } else if args.media_type.as_deref() == Some("radio") {
+                    vec![CollectionStep::hidden_roon(ROON_RADIO_NODE)]
                 } else {
                     Vec::new()
                 };
@@ -758,6 +791,10 @@ async fn handle_roon(
         match args.action.as_str() {
             "browse" => "collections_browse",
             "playlists" => "collections_playlists",
+            // Roon has no favorites surface (`Capability::Favorites` is a gap
+            // for it), but it does have My Live Radio -- reached the same way
+            // Playlists is, by name from the browse root.
+            "favorites" if args.media_type.as_deref() == Some("radio") => "collections_radio",
             other => {
                 return env.failed(format!(
                     "internal routing error: unexpected hifi_collections action {other:?} reached \
@@ -1055,10 +1092,14 @@ mod tab_gating_tests {
     /// and Radio (both the `favorites` capability) are not wired, so the
     /// Library page must not render those tabs for Roon zones.
     #[test]
-    fn roon_zones_serve_browse_and_playlists_only() {
+    fn roon_zones_serve_browse_playlists_and_radio() {
+        // No Favorites tab -- Roon exposes no favorites surface UHC reaches --
+        // but it does have My Live Radio, so the Radio tab belongs. Deriving
+        // radio from the favorites cell hid it here for exactly as long as
+        // that shortcut existed.
         assert_eq!(
             collections_tabs_for_zone("roon:zone_1"),
-            vec!["browse", "playlists"]
+            vec!["browse", "playlists", "radio"]
         );
     }
 
@@ -1070,13 +1111,45 @@ mod tab_gating_tests {
         assert!(collections_tabs_for_zone("hqplayer:main").is_empty());
     }
 
-    /// Music Assistant keeps all four tabs (favorites supported implies the
-    /// Radio tab, which is the same capability under `media_type: radio`).
+    /// Music Assistant serves all four: it has both a favorites surface and a
+    /// radio one (`music/radio/library_items`).
     #[test]
     fn music_assistant_serves_all_tabs() {
         assert_eq!(
             collections_tabs_for_zone("musicassistant:player_1"),
             vec!["browse", "playlists", "favorites", "radio"]
+        );
+    }
+
+    /// LMS serves all four too, and its Favorites and Radio tabs are two
+    /// unrelated surfaces rather than one list shown twice.
+    #[test]
+    fn lms_serves_all_tabs() {
+        assert_eq!(
+            collections_tabs_for_zone("lms:00:11:22:33:44:55"),
+            vec!["browse", "playlists", "favorites", "radio"]
+        );
+    }
+
+    /// The Radio tab is asked for as the favorites action plus
+    /// `media_type: radio`, so the gate must measure it against the radio
+    /// cell. Roon is the case that proves it: favorites is a gap there, radio
+    /// is not, and reading the action alone refused the request.
+    #[test]
+    fn a_radio_request_is_measured_against_the_radio_capability() {
+        for zone in ["roon:zone_1", "lms:00:11:22:33:44:55", "musicassistant:p1"] {
+            let target = ZoneTarget::classify(zone);
+            assert!(
+                matches!(support(target, Capability::Radio), Support::Supported),
+                "{zone} should serve radio"
+            );
+        }
+        assert!(
+            !matches!(
+                support(ZoneTarget::classify("roon:zone_1"), Capability::Favorites),
+                Support::Supported
+            ),
+            "Roon still has no favorites surface; if it gains one, say so deliberately"
         );
     }
 }

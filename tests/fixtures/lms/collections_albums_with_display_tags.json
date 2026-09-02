@@ -1,0 +1,42 @@
+{
+  "id": 217,
+  "method": "slim.request",
+  "params": [
+    "",
+    [
+      "albums",
+      "0",
+      3,
+      "tags:lacJ"
+    ]
+  ],
+  "result": {
+    "albums_loop": [
+      {
+        "id": 1,
+        "performance": "",
+        "favorites_url": "db:album.title=Greatest%20Hits&contributor.name=Aurora%20Fields",
+        "favorites_title": "Greatest Hits",
+        "album": "Greatest Hits",
+        "artist": "Aurora Fields"
+      },
+      {
+        "id": 4,
+        "performance": "",
+        "favorites_url": "db:album.title=Greatest%20Hits&contributor.name=Cosmic%20Drift",
+        "favorites_title": "Greatest Hits",
+        "album": "Greatest Hits",
+        "artist": "Cosmic Drift"
+      },
+      {
+        "id": 166,
+        "performance": "",
+        "favorites_url": "db:album.title=Label%20Sampler%20Vol.%201&contributor.name=Various%20Artists",
+        "favorites_title": "Label Sampler Vol. 1",
+        "album": "Label Sampler Vol. 1",
+        "artist": "Various Artists"
+      }
+    ],
+    "count": 166
+  }
+}

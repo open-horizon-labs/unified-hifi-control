@@ -1,0 +1,54 @@
+{
+  "id": 217,
+  "method": "slim.request",
+  "params": [
+    "",
+    [
+      "favorites",
+      "items",
+      "0",
+      20,
+      "want_url:1"
+    ]
+  ],
+  "result": {
+    "title": "Favorites",
+    "loop_loop": [
+      {
+        "id": "4f437447.0",
+        "name": "Groove Salad",
+        "type": "audio",
+        "image": "html/images/radio.png",
+        "url": "http://ice1.somafm.com/groovesalad-128-mp3",
+        "isaudio": 1,
+        "hasitems": 0
+      },
+      {
+        "id": "4f437447.1",
+        "name": "Drone Zone",
+        "type": "audio",
+        "image": "html/images/radio.png",
+        "url": "http://ice1.somafm.com/dronezone-128-mp3",
+        "isaudio": 1,
+        "hasitems": 0
+      },
+      {
+        "id": "4f437447.2",
+        "name": "First Light Fav",
+        "type": "audio",
+        "image": "html/images/favorites.png",
+        "url": "db:track.titlesearch=FIRST LIGHT",
+        "isaudio": 1,
+        "hasitems": 0
+      },
+      {
+        "id": "4f437447.3",
+        "name": "Test Folder",
+        "image": "html/images/favorites.png",
+        "isaudio": 0,
+        "hasitems": 1
+      }
+    ],
+    "count": 4
+  }
+}

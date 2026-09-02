@@ -91,6 +91,25 @@ table below is read from LMS's own `%tagMap` in
 `Slim/Control/Queries.pm` at 9.1.2 and confirmed against a live server; the recorded
 response is `tests/fixtures/lms/status_tags_aAdltKc.json`.
 
+**A `tags:` parameter replaces the query's default tag set, it does not extend it.**
+Every field a caller reads has to be named in the string, including ones the same
+query returns by default when no `tags:` is sent at all. This bit
+`hifi_collections`: `albums` sends `album` by default, and adding `tags:cJ` for
+artwork alone removed it, so every album row arrived with no title and the whole
+Albums level came back empty. Recorded both ways in
+`tests/fixtures/lms/collections_albums_artwork_only.json` and
+`collections_albums_with_display_tags.json`; the adapter's collection tag strings
+are the `ALBUM_DISPLAY_TAGS` / `TRACK_DISPLAY_TAGS` constants in
+`src/adapters/lms.rs`, and `tests/lms_collection_tags.rs` fails if either drops a
+field it reads.
+
+The same rule reaches beyond `tags:`. `favorites items` omits `url` unless the
+request asks `want_url:1`, and a favorite has no durable entity id, so the url is
+its only playback handle — without the flag every favorite row is unplayable and
+UHC drops it. Recorded both ways in
+`tests/fixtures/lms/collections_favorites_without_want_url.json` and
+`collections_favorites_with_want_url.json`.
+
 | Tag | Key in the response | Value |
 |-----|--------------------|-------|
 | `a` | `artist` | Track artist name |
@@ -145,3 +164,27 @@ LMS supports HTTP Basic Auth. Include credentials in requests:
 const auth = Buffer.from(`${username}:${password}`).toString('base64');
 headers['Authorization'] = `Basic ${auth}`;
 ```
+
+## Internet radio
+
+`radios <start> <count>` is the top of the radio hierarchy; on a stock server the
+rows come from the bundled TuneIn plugin. Each row names a menu in `cmd`
+(`presets`, `local`, `music`, `search`, …) and the loop is `radioss_loop` — the
+doubled `s` the command name produces.
+
+Walk a menu with `<cmd> items <start> <count> [item_id:<id>] want_url:1`:
+
+- **It needs a player.** A server-level `<cmd> items` is the bad-params failure —
+  a closed socket, no body. Every library query in the adapter is server-level;
+  this one is not.
+- **`want_url:1` is required for playback.** A station's stream url is a
+  requested field and its only handle; LMS gives radio rows no durable entity id.
+- **`hasitems` and `isaudio` are independent.** Categories are navigable and play
+  nothing, stations play and contain nothing, and a category still carries a
+  `Browse.ashx` url when `want_url` is on — so a url does not mean playable.
+- **Item ids are per-request.** They carry a session prefix (`4f1345bf.0`, then
+  `755cb784.0` for the same row) and cannot outlive a server restart.
+
+Saved favorites are a different surface: a flat `favorites items` list that may
+contain streams. The Library page's Radio tab serves this hierarchy and its
+Favorites tab serves that list; see `LmsAdapter::collections_content`.

@@ -160,6 +160,28 @@ fn loop_entity_id(row: &Value, entity: &str) -> Option<i64> {
     lms_i64(row.get(format!("{}_id", entity)).or_else(|| row.get("id"))).filter(|id| *id > 0)
 }
 
+/// The collection path for the top of LMS's internet-radio hierarchy.
+pub(crate) const RADIO_ROOT_PATH: &str = "radio";
+
+/// Tags the `albums` query must request for a browsable album row.
+///
+/// **A `tags:` parameter replaces the default tag set, it does not extend it.**
+/// LMS returns exactly the fields the letters name, so anything the caller
+/// reads has to appear here. `l` album title, `a` artist, `c` coverid,
+/// `J` artwork_track_id (see docs/lyrion.md's tag table).
+///
+/// Recorded proof of both halves, from live Lyrion 9.1.2:
+/// `tests/fixtures/lms/collections_albums_artwork_only.json` (what `tags:cJ`
+/// returns -- no `album` key at all) and
+/// `collections_albums_with_display_tags.json`.
+pub(crate) const ALBUM_DISPLAY_TAGS: &str = "tags:lacJ";
+
+/// Tags the `titles` and `playlists tracks` queries must request.
+///
+/// Both always return `title`, but the artist subtitle is a tagged field like
+/// any other: `tags:cJ` drops it. See [`ALBUM_DISPLAY_TAGS`].
+pub(crate) const TRACK_DISPLAY_TAGS: &str = "tags:acJ";
+
 /// This row's artwork handle, for `hifi_collections`' image ref (#549), or
 /// `None` when LMS has none for it (an artist row, or a track/album LMS
 /// never assigned art to) -- absent honestly, not a placeholder.
@@ -2121,13 +2143,29 @@ impl LmsAdapter {
             .unwrap_or(20)
             .clamp(1, 50) as usize;
         let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+        // Radio is player-scoped: LMS's XMLBrowser `<cmd> items` queries close the
+        // socket on a server-level request (the documented bad-params failure),
+        // unlike every library query above them.
+        let player = params
+            .get("zone_id")
+            .and_then(Value::as_str)
+            .map(strip_lms_prefix);
         match operation {
             "collections_browse" => {
                 let path = params.get("path").and_then(Value::as_str).unwrap_or("root");
-                self.browse_collections(path, offset, limit).await
+                self.browse_collections(path, player, offset, limit).await
             }
             "collections_playlists" => self.list_playlists(offset, limit).await,
-            "collections_favorites" => self.list_favorites(offset, limit).await,
+            // The Library page's Favorites and Radio tabs are the same action
+            // told apart by `media_type` (`crate::app::pages::library`). LMS
+            // keeps them in two unrelated places: saved favorites are a flat
+            // list, while radio is TuneIn's own browse hierarchy behind
+            // `radios`. Serving the favorites list for both -- which is what
+            // ignoring `media_type` did -- made the two tabs identical.
+            "collections_favorites" => match params.get("media_type").and_then(Value::as_str) {
+                Some("radio") => self.list_radio_root(player, offset, limit).await,
+                _ => self.list_favorites(offset, limit).await,
+            },
             _ => Err(anyhow!("unsupported LMS collection operation {operation}")),
         }
     }
@@ -2137,7 +2175,13 @@ impl LmsAdapter {
     /// playlist's tracks. Every navigable path is a plain string this adapter
     /// invented (`"albums"`, `"album:<id>"`, ...) -- never a raw LMS id handed
     /// back to a client uninterpreted.
-    async fn browse_collections(&self, path: &str, offset: usize, limit: usize) -> Result<Value> {
+    async fn browse_collections(
+        &self,
+        path: &str,
+        player: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Value> {
         if path == "root" {
             // The root menu is invented by this adapter, not read from LMS --
             // but a caller with no LMS host configured (or one that is
@@ -2189,6 +2233,21 @@ impl LmsAdapter {
         {
             return self.query_playlist_tracks(offset, limit, id).await;
         }
+        if path == RADIO_ROOT_PATH {
+            return self.list_radio_root(player, offset, limit).await;
+        }
+        if let Some(rest) = path.strip_prefix("radio:") {
+            // `radio:<cmd>` is a menu named by `radios`; `radio:<cmd>:<item_id>`
+            // is a level inside it. The item id is XMLBrowser's own, and only
+            // its owning menu can interpret it.
+            let (menu, item_id) = match rest.split_once(':') {
+                Some((menu, item)) => (menu, Some(item)),
+                None => (rest, None),
+            };
+            return self
+                .browse_radio(menu, item_id, player, offset, limit)
+                .await;
+        }
         Err(anyhow!("unknown LMS collection path {path:?}"))
     }
 
@@ -2200,14 +2259,19 @@ impl LmsAdapter {
         limit: usize,
         artist_id: Option<i64>,
     ) -> Result<Value> {
-        // #549: `tags:cJ` requests coverid and artwork_track_id (docs/lyrion.md)
-        // so `row_image_key` has something to read; neither tag changes any
-        // field this method already used.
+        // A `tags:` parameter REPLACES the query's default tag set rather than
+        // adding to it, so every field this method reads has to be named here.
+        // #549 added `tags:cJ` for artwork alone, which dropped `album` from
+        // every row -- the title this method requires -- so `filter_map` below
+        // discarded the whole page and the Albums level (and every artist's
+        // album list) went empty against a real server. `l` album title,
+        // `a` artist, `c` coverid, `J` artwork_track_id; see docs/lyrion.md's
+        // tag table and `tests/lms_collection_tags.rs`.
         let mut params = vec![
             json!("albums"),
             json!(offset),
             json!(limit),
-            json!("tags:cJ"),
+            json!(ALBUM_DISPLAY_TAGS),
         ];
         if let Some(id) = artist_id {
             params.push(json!(format!("artist_id:{id}")));
@@ -2273,8 +2337,10 @@ impl LmsAdapter {
                     json!(offset),
                     json!(limit),
                     json!(format!("{filter_key}:{filter_id}")),
-                    // #549: see `row_image_key`'s docs.
-                    json!("tags:cJ"),
+                    // `a` for the artist subtitle alongside the artwork tags --
+                    // see `ALBUM_DISPLAY_TAGS` on why the artwork tags alone
+                    // silently drop it.
+                    json!(TRACK_DISPLAY_TAGS),
                 ],
             )
             .await?;
@@ -2341,8 +2407,8 @@ impl LmsAdapter {
                     json!(offset),
                     json!(limit),
                     json!(format!("playlist_id:{playlist_id}")),
-                    // #549: see `row_image_key`'s docs.
-                    json!("tags:cJ"),
+                    // Same tag rule as `query_tracks`; see `ALBUM_DISPLAY_TAGS`.
+                    json!(TRACK_DISPLAY_TAGS),
                 ],
             )
             .await?;
@@ -2372,6 +2438,123 @@ impl LmsAdapter {
         Ok(json!({"items": items, "next_offset": next_offset}))
     }
 
+    /// `radios <start> <count>` -- the top of LMS's internet-radio hierarchy.
+    ///
+    /// Each row names a menu (`cmd`: `local`, `music`, `news`, `search`, ...)
+    /// served by whichever radio plugin is installed; on a stock server that is
+    /// TuneIn. The rows are navigable only -- nothing at this level plays --
+    /// so each becomes a `radio:<cmd>` collection path.
+    ///
+    /// Distinct from [`Self::list_favorites`] on purpose: a saved favorite that
+    /// happens to be a stream lives in the favorites list, while this is the
+    /// provider's own station directory. See `collections_content` on why the
+    /// Radio tab reaches this and the Favorites tab does not.
+    async fn list_radio_root(
+        &self,
+        player: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Value> {
+        let raw = self
+            .rpc
+            .execute(player, vec![json!("radios"), json!(offset), json!(limit)])
+            .await?;
+        // LMS spells this loop with the doubled `s` its command name produces.
+        let items: Vec<Value> = raw
+            .get("radioss_loop")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|row| {
+                let title = row.get("name").and_then(Value::as_str)?.to_string();
+                let menu = row.get("cmd").and_then(Value::as_str)?;
+                Some(json!({"title": title, "path": format!("radio:{menu}")}))
+            })
+            .collect();
+        let next_offset = next_offset(&raw, offset, limit, items.len());
+        Ok(json!({"items": items, "next_offset": next_offset}))
+    }
+
+    /// `<menu> items <start> <count> [item_id:<id>] want_url:1` -- one level of
+    /// a radio menu.
+    ///
+    /// # Two things this level needs that it must ask for
+    ///
+    /// `want_url:1` for the same reason [`Self::list_favorites`] sends it: a
+    /// station's stream url is a requested field, and it is the only playback
+    /// handle a station has. And the query needs a **player**, unlike every
+    /// library query in this file -- a server-level XMLBrowser request is the
+    /// bad-params failure that closes the socket (`tests/fixtures/lms/PROVENANCE.md`).
+    ///
+    /// # Why the ids are not durable
+    ///
+    /// XMLBrowser item ids are minted per request (`4f1345bf.0` one call,
+    /// `755cb784.0` the next) and mean nothing outside the feed LMS cached for
+    /// them. They resolve for as long as that cache lives -- which is how LMS's
+    /// own web UI walks this tree -- but they cannot outlive a server restart,
+    /// so a bookmarked deep radio location can go stale where a library one
+    /// cannot. The location this path hangs off records each step's **title**
+    /// as well, so re-walking the trail by name is possible later without
+    /// changing any token already handed out.
+    async fn browse_radio(
+        &self,
+        menu: &str,
+        item_id: Option<&str>,
+        player: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Value> {
+        let player = player.ok_or_else(|| {
+            anyhow!("LMS radio browsing needs a zone: XMLBrowser refuses a server-level request")
+        })?;
+        let mut params = vec![
+            json!(menu),
+            json!("items"),
+            json!(offset),
+            json!(limit),
+            json!("want_url:1"),
+        ];
+        if let Some(id) = item_id {
+            params.push(json!(format!("item_id:{id}")));
+        }
+        let raw = self.rpc.execute(Some(player), params).await?;
+        let items: Vec<Value> = raw
+            .get("loop_loop")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|row| {
+                let title = row
+                    .get("name")
+                    .or_else(|| row.get("title"))
+                    .and_then(Value::as_str)?
+                    .to_string();
+                let id = row.get("id").and_then(Value::as_str);
+                // `hasitems` and `isaudio` are independent: a station can be
+                // playable with nothing inside it, a genre is navigable and
+                // plays nothing, and TuneIn serves rows that are both.
+                let navigable = lms_flag(row.get("hasitems"));
+                let playable = lms_flag(row.get("isaudio"));
+                let mut item = json!({"title": title});
+                if navigable {
+                    if let Some(id) = id {
+                        item["path"] = json!(format!("radio:{menu}:{id}"));
+                    }
+                }
+                if playable {
+                    if let Some(url) = row.get("url").and_then(Value::as_str) {
+                        item["url"] = json!(url);
+                    }
+                }
+                // A row with neither is a label or a dead end; listing it would
+                // be a row that does nothing when tapped.
+                (item.get("path").is_some() || item.get("url").is_some()).then_some(item)
+            })
+            .collect();
+        let next_offset = next_offset(&raw, offset, limit, items.len());
+        Ok(json!({"items": items, "next_offset": next_offset}))
+    }
+
     /// `favorites items <start> <count>` -- the flat favourites list. LMS
     /// favorites carry no durable entity id, only a `url` (verified live,
     /// #403's gap-table note); a folder-shaped favorite (`hasitems`) is
@@ -2387,6 +2570,15 @@ impl LmsAdapter {
                     json!("items"),
                     json!(offset),
                     json!(limit),
+                    // `favorites items` omits `url` unless the request asks for
+                    // it, and a favorite has no other playback handle -- LMS
+                    // gives them no durable entity id. Without this every row
+                    // failed the `url` guard below and the Favorites and Radio
+                    // tabs came back empty. Same rule as the `tags:` constants
+                    // above: a field that is not requested is simply absent.
+                    // Recorded both ways in
+                    // `tests/fixtures/lms/collections_favorites_*.json`.
+                    json!("want_url:1"),
                 ],
             )
             .await?;

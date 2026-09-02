@@ -1,0 +1,87 @@
+{
+  "id": 217,
+  "method": "slim.request",
+  "params": [
+    "02:00:00:00:00:01",
+    [
+      "radios",
+      "0",
+      "20"
+    ]
+  ],
+  "result": {
+    "count": 10,
+    "radioss_loop": [
+      {
+        "weight": 5,
+        "icon": "/plugins/TuneIn/html/images/radiopresets.png",
+        "name": "My Presets",
+        "type": "xmlbrowser",
+        "cmd": "presets"
+      },
+      {
+        "cmd": "local",
+        "weight": 20,
+        "icon": "/plugins/TuneIn/html/images/radiolocal.png",
+        "type": "xmlbrowser",
+        "name": "Local Radio"
+      },
+      {
+        "weight": 30,
+        "icon": "/plugins/TuneIn/html/images/radiomusic.png",
+        "type": "xmlbrowser",
+        "name": "Music",
+        "cmd": "music"
+      },
+      {
+        "cmd": "sports",
+        "weight": 40,
+        "icon": "/plugins/TuneIn/html/images/radiosports.png",
+        "type": "xmlbrowser",
+        "name": "Sports"
+      },
+      {
+        "cmd": "news",
+        "weight": 45,
+        "icon": "/plugins/TuneIn/html/images/radionews.png",
+        "name": "News",
+        "type": "xmlbrowser"
+      },
+      {
+        "icon": "/plugins/TuneIn/html/images/radiotalk.png",
+        "weight": 50,
+        "type": "xmlbrowser",
+        "name": "Talk",
+        "cmd": "talk"
+      },
+      {
+        "cmd": "location",
+        "type": "xmlbrowser",
+        "name": "By Location",
+        "weight": 55,
+        "icon": "/plugins/TuneIn/html/images/radioworld.png"
+      },
+      {
+        "cmd": "language",
+        "weight": 56,
+        "icon": "/plugins/TuneIn/html/images/radioworld.png",
+        "name": "By Language",
+        "type": "xmlbrowser"
+      },
+      {
+        "cmd": "podcast",
+        "weight": 70,
+        "icon": "/plugins/TuneIn/html/images/podcasts.png",
+        "type": "xmlbrowser",
+        "name": "Podcasts"
+      },
+      {
+        "weight": 110,
+        "icon": "/plugins/TuneIn/html/images/radiosearch.png",
+        "type": "xmlbrowser_search",
+        "name": "Search TuneIn",
+        "cmd": "search"
+      }
+    ]
+  }
+}

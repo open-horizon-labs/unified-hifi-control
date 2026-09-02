@@ -1,0 +1,39 @@
+{
+  "id": 217,
+  "method": "slim.request",
+  "params": [
+    "",
+    [
+      "playlists",
+      "tracks",
+      "0",
+      3,
+      "playlist_id:482",
+      "tags:acJ"
+    ]
+  ],
+  "result": {
+    "__playlistTitle": "Mixed Test",
+    "playlisttracks_loop": [
+      {
+        "playlist index": "0",
+        "id": 1,
+        "title": "Best Of One",
+        "artist": "Aurora Fields"
+      },
+      {
+        "playlist index": 1,
+        "id": 2,
+        "title": "Best Of Two",
+        "artist": "Aurora Fields"
+      },
+      {
+        "playlist index": 2,
+        "id": 3,
+        "title": "Best Of Three",
+        "artist": "Aurora Fields"
+      }
+    ],
+    "count": 14
+  }
+}

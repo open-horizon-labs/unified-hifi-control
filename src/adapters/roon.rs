@@ -3708,8 +3708,8 @@ impl LibraryAdapter for RoonAdapter {
     }
 
     /// `operation` is one of `multiroom_status`, `multiroom_set_members`,
-    /// `multiroom_ungroup`, `collections_browse`, `collections_playlists`, or
-    /// `collections_resolve_location`
+    /// `multiroom_ungroup`, `collections_browse`, `collections_playlists`,
+    /// `collections_radio`, or `collections_resolve_location`
     /// (never `collections_favorites` -- Roon's favorites capability is not
     /// wired, see `crate::mcp::capabilities`). The collections response is
     /// this adapter's own shape, not `hifi_collections`' wire shape:
@@ -3764,7 +3764,7 @@ impl LibraryAdapter for RoonAdapter {
                     .collect::<Vec<_>>();
                 self.ungroup_members(&members).await
             }
-            "collections_browse" | "collections_playlists" => {
+            "collections_browse" | "collections_playlists" | "collections_radio" => {
                 let zone_id = params
                     .get("zone_id")
                     .and_then(Value::as_str)
@@ -3781,6 +3781,8 @@ impl LibraryAdapter for RoonAdapter {
                 // `browse_collection`'s `None => pop_all` branch).
                 // `collections_playlists` always enters the named
                 // "Playlists" node instead, so it is never at this root.
+                // `collections_playlists` and `collections_radio` both enter a
+                // named node, so neither is ever at the true collection root.
                 let at_collection_root =
                     operation == "collections_browse" && request_item_key.is_none();
                 let (session_key, items, total) = if operation == "collections_browse" {
@@ -3788,7 +3790,14 @@ impl LibraryAdapter for RoonAdapter {
                     self.browse_collection(zone_id, request_item_key, session_key, offset, limit)
                         .await?
                 } else {
-                    self.browse_named_root_node(zone_id, "Playlists", offset, limit)
+                    // Playlists and radio are both named rows at the browse
+                    // root, so they differ only by which title to enter.
+                    let node = if operation == "collections_radio" {
+                        crate::mcp::tools::collections::ROON_RADIO_NODE
+                    } else {
+                        "Playlists"
+                    };
+                    self.browse_named_root_node(zone_id, node, offset, limit)
                         .await?
                 };
                 let mut mapped: Vec<Value> = Vec::new();

@@ -1,0 +1,36 @@
+{
+  "id": 217,
+  "method": "slim.request",
+  "params": [
+    "",
+    [
+      "albums",
+      "0",
+      3,
+      "tags:cJ"
+    ]
+  ],
+  "result": {
+    "albums_loop": [
+      {
+        "id": 1,
+        "performance": "",
+        "favorites_url": "db:album.title=&contributor.name=Aurora%20Fields",
+        "favorites_title": null
+      },
+      {
+        "id": 4,
+        "performance": "",
+        "favorites_url": "db:album.title=&contributor.name=Cosmic%20Drift",
+        "favorites_title": null
+      },
+      {
+        "id": 166,
+        "performance": "",
+        "favorites_url": "db:album.title=&contributor.name=Various%20Artists",
+        "favorites_title": null
+      }
+    ],
+    "count": 166
+  }
+}

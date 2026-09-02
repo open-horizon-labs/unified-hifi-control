@@ -227,6 +227,7 @@ Two things this table does **not** claim:
 | `shuffle_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | ✅ | 🚧 #462 | ✅ | ✅ |
 | `saved_playlists` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 | 🚧 #482 | ✅ | ✅ |
 | `favorites` | 🚧 #531 | ✅ | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #482 | ✅ | ✅ |
+| `radio` | ✅ | ✅ | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #462 | 🚧 #462 | ✅ |
 | `multiroom_sync` | ✅ | ✅ | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #462 | ⛔ | ✅ |
 
 ✅ supported · ⛔ the provider's protocol cannot do it · 🚧 the provider can, UHC has not wired it (issue that will)
@@ -323,6 +324,11 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - ⛔ **upnp / `favorites`** — AVTransport:1 and RenderingControl:1 store nothing; a MediaRenderer has no favourites. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `favorites`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `favorites`** (#482) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
+- 🚧 **openhome / `radio`** (#392) — OpenHome's Radio:1 service is exactly this capability -- it carries station presets and a channel URI. UHC discovers neither the service nor its presets. Verified from the OpenHome service definitions, not from a device.
+- ⛔ **upnp / `radio`** — A plain UPnP AV renderer stores nothing: AVTransport plays a URI a control point hands it, and no service in the AV set enumerates stations. Radio on such a device is whatever the control point remembers, which is not a provider surface UHC can browse. Verified from the UPnP AV service definitions, not from a device.
+- 🚧 **hqplayer / `radio`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
+- 🚧 **applemusic / `radio`** (#462) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
+- 🚧 **spotify / `radio`** (#462) — the Spotify adapter has no routed implementation for this capability; the provider-neutral streaming follow-up tracks it.
 - 🚧 **openhome / `multiroom_sync`** (#392) — OpenHome's Sender:1 and Receiver:1 services are Songcast multiroom -- exactly this capability. UHC discovers neither. Verified from the OpenHome service definitions, not from a device.
 - ⛔ **upnp / `multiroom_sync`** — UPnP AV defines no synchronised-playback service; multiroom on UPnP renderers is vendor-specific and outside the two services UHC speaks. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `multiroom_sync`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
