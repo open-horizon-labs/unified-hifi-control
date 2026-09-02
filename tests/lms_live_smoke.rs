@@ -338,3 +338,68 @@ async fn live_artist_walk_reaches_tracks_with_subtitles() {
         "track rows lost their artist subtitle, so the artist tag is missing: {rows:?}"
     );
 }
+
+/// Walk the radio hierarchy on a real server: menus, then a level inside one.
+///
+/// Skips itself when the server has no radio plugin (a bare `radios` with no
+/// rows), so it cannot fail for a reason that is not UHC's.
+#[tokio::test]
+#[ignore = "requires a live LMS with a radio plugin; see module docs"]
+async fn live_radio_hierarchy_walks_into_a_menu() {
+    let adapter = live_adapter().await;
+    let zone = std::env::var("LMS_LIVE_PLAYER").unwrap_or_default();
+    if zone.is_empty() {
+        println!("set LMS_LIVE_PLAYER to a player id to run this");
+        return;
+    }
+
+    let root = match adapter
+        .collections_content(
+            "collections_favorites",
+            &serde_json::json!({"media_type": "radio", "zone_id": zone, "limit": 20, "offset": 0}),
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => panic!("radio root failed: {e:#}"),
+    };
+    let menus = root
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if menus.is_empty() {
+        println!("no radio menus on this server; skipping");
+        return;
+    }
+    println!("radio menus: {menus:?}");
+
+    let path = menus
+        .iter()
+        .find_map(|m| m.get("path").and_then(|v| v.as_str()))
+        .unwrap_or_else(|| panic!("no navigable radio menu in {menus:?}"))
+        .to_string();
+    let level = match adapter
+        .collections_content(
+            "collections_browse",
+            &serde_json::json!({"path": path, "zone_id": zone, "limit": 20, "offset": 0}),
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => panic!("radio menu {path:?} failed: {e:#}"),
+    };
+    let rows = level
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    println!("{path} -> {} rows", rows.len());
+    assert!(!rows.is_empty(), "radio menu {path:?} came back empty");
+    for row in &rows {
+        assert!(
+            row.get("path").is_some() || row.get("url").is_some(),
+            "radio row is neither navigable nor playable, so it does nothing: {row}"
+        );
+    }
+}

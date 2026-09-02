@@ -1,0 +1,68 @@
+{
+  "id": 217,
+  "method": "slim.request",
+  "params": [
+    "02:00:00:00:00:01",
+    [
+      "music",
+      "items",
+      "0",
+      6,
+      "item_id:b4426ee5.0.1"
+    ]
+  ],
+  "result": {
+    "title": "Stations",
+    "loop_loop": [
+      {
+        "id": "b4426ee5.0.1.0",
+        "name": "CountryLine Radio (UK)",
+        "type": "audio",
+        "image": "/imageproxy/http%3A%2F%2Fcdn-profiles.tunein.com%2Fs196675%2Fimages%2Flogoq.jpg%3Ft%3D1/image.jpg",
+        "isaudio": 1,
+        "hasitems": 0
+      },
+      {
+        "id": "b4426ee5.0.1.1",
+        "name": "America's Country",
+        "type": "audio",
+        "image": "/imageproxy/http%3A%2F%2Fcdn-radiotime-logos.tunein.com%2Fs126270q.png/image.png",
+        "isaudio": 1,
+        "hasitems": 0
+      },
+      {
+        "id": "b4426ee5.0.1.2",
+        "name": "KX 94.7 (Hamilton, Canada)",
+        "type": "audio",
+        "image": "/imageproxy/http%3A%2F%2Fcdn-radiotime-logos.tunein.com%2Fs7723q.png/image.png",
+        "isaudio": 1,
+        "hasitems": 0
+      },
+      {
+        "id": "b4426ee5.0.1.3",
+        "name": "Highway 65 Radio",
+        "type": "audio",
+        "image": "/imageproxy/http%3A%2F%2Fcdn-radiotime-logos.tunein.com%2Fs174864q.png/image.png",
+        "isaudio": 1,
+        "hasitems": 0
+      },
+      {
+        "id": "b4426ee5.0.1.4",
+        "name": "100.9/107.1 The Cat (Albany, NY)",
+        "type": "audio",
+        "image": "/imageproxy/http%3A%2F%2Fcdn-profiles.tunein.com%2Fs30267%2Fimages%2Flogoq.png%3Ft%3D2/image.png",
+        "isaudio": 1,
+        "hasitems": 0
+      },
+      {
+        "id": "b4426ee5.0.1.5",
+        "name": "The Ranch - Classic Country",
+        "type": "audio",
+        "image": "/imageproxy/http%3A%2F%2Fcdn-profiles.tunein.com%2Fs135419%2Fimages%2Flogoq.png%3Ft%3D4/image.png",
+        "isaudio": 1,
+        "hasitems": 0
+      }
+    ],
+    "count": 23
+  }
+}

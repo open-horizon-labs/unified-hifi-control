@@ -508,6 +508,11 @@ async fn handle_lms(
             &json!({
                 "path": provider_path,
                 "media_type": args.media_type,
+                // LMS radio is XMLBrowser, which refuses a server-level
+                // request, so the zone has to reach the adapter (see
+                // `LmsAdapter::browse_radio`). Every other LMS collection
+                // query is server-level and ignores this.
+                "zone_id": args.zone_id,
                 "limit": limit,
                 "offset": offset,
             }),

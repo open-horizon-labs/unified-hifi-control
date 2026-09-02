@@ -1,0 +1,68 @@
+{
+  "id": 217,
+  "method": "slim.request",
+  "params": [
+    "02:00:00:00:00:01",
+    [
+      "music",
+      "items",
+      "0",
+      6,
+      "want_url:1"
+    ]
+  ],
+  "result": {
+    "title": "Music",
+    "loop_loop": [
+      {
+        "id": "167b1b35.0",
+        "name": "Country",
+        "type": "link",
+        "url": "http://opml.radiotime.com/Browse.ashx?id=c57940&formats=aac,ogg,mp3,wmpro,wma,wmvoice&partnerId=15&serial=664af1a949e673a78e2e548696f69cd8",
+        "isaudio": 0,
+        "hasitems": 1
+      },
+      {
+        "id": "167b1b35.1",
+        "name": "Powerhitz",
+        "type": "link",
+        "url": "http://opml.radiotime.com/Browse.ashx?id=c100035612&formats=aac,ogg,mp3,wmpro,wma,wmvoice&partnerId=15&serial=664af1a949e673a78e2e548696f69cd8",
+        "isaudio": 0,
+        "hasitems": 1
+      },
+      {
+        "id": "167b1b35.2",
+        "name": "World Music",
+        "type": "link",
+        "url": "http://opml.radiotime.com/Browse.ashx?id=g22&formats=aac,ogg,mp3,wmpro,wma,wmvoice&partnerId=15&serial=664af1a949e673a78e2e548696f69cd8",
+        "isaudio": 0,
+        "hasitems": 1
+      },
+      {
+        "id": "167b1b35.3",
+        "name": "Top 40 & Pop Music",
+        "type": "link",
+        "url": "http://opml.radiotime.com/Browse.ashx?id=c57943&formats=aac,ogg,mp3,wmpro,wma,wmvoice&partnerId=15&serial=664af1a949e673a78e2e548696f69cd8",
+        "isaudio": 0,
+        "hasitems": 1
+      },
+      {
+        "id": "167b1b35.4",
+        "name": "Soul & R&B",
+        "type": "link",
+        "url": "http://opml.radiotime.com/Browse.ashx?id=c1367173&formats=aac,ogg,mp3,wmpro,wma,wmvoice&partnerId=15&serial=664af1a949e673a78e2e548696f69cd8",
+        "isaudio": 0,
+        "hasitems": 1
+      },
+      {
+        "id": "167b1b35.5",
+        "name": "Rock Music",
+        "type": "link",
+        "url": "http://opml.radiotime.com/Browse.ashx?id=c57951&formats=aac,ogg,mp3,wmpro,wma,wmvoice&partnerId=15&serial=664af1a949e673a78e2e548696f69cd8",
+        "isaudio": 0,
+        "hasitems": 1
+      }
+    ],
+    "count": 25
+  }
+}

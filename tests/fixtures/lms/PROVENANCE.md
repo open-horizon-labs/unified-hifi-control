@@ -51,6 +51,10 @@ network if you need a player.
 | `collections_playlisttracks_with_display_tags.json` | The same query as `tags:acJ`; `artist` restored. |
 | `collections_favorites_without_want_url.json` | **The favorites defect.** `favorites items 0 20` — the query the adapter shipped. Rows carry `id`, `name`, `type`, `image`, `isaudio`, `hasitems` and **no `url`**. A favorite has no durable entity id, so `list_favorites`' url guard dropped every row and the Favorites and Radio tabs were empty. Also shows the artwork field is `image` (a server-relative icon path like `html/images/radio.png`), **not** the `icon` absolute URL the adapter reads — so favorites carry no artwork either way. |
 | `collections_favorites_with_want_url.json` | The same query plus `want_url:1`: every non-folder row gains `url` (`http://…` for a stream, `db:track.titlesearch=…` for a library favorite). The folder row (`hasitems: 1`) still has none, which is why it is dropped rather than listed as a dead end. |
+| `collections_radios_root.json` | `radios 0 20` — the top of LMS's internet-radio hierarchy on a stock server (TuneIn): My Presets, Local Radio, Music, Sports, News, Talk, By Location, By Language, Podcasts, Search TuneIn. Each row is a menu named by `cmd`, with **no `id` and no `url`** — nothing here plays. Note the loop is `radioss_loop`, with the doubled `s` the command name produces. |
+| `collections_radio_menu_items.json` | `music items 0 6 want_url:1` — one menu's top level. Rows are categories (`hasitems: 1`, `isaudio: 0`) that **also carry a `Browse.ashx` url**, which is why "has a url" cannot mean "is playable": treating it that way puts a play button on a genre. |
+| `collections_radio_stations_with_want_url.json` | `music items 0 6 item_id:<id> want_url:1` — a station level. Rows are `isaudio: 1`, `hasitems: 0`, each with a `Tune.ashx` stream url, the only playback handle a station has. |
+| `collections_radio_stations_without_want_url.json` | The same query with the flag dropped: identical rows, **no `url` on any of them**. Third recorded instance of the rule that a field LMS is not asked for is simply absent (see the `tags:` and favorites entries above). |
 | `status_tags_aAdltKc.json` | **Defect 4.** The adapter's exact `tags:aAdltKc` string. `l` yields `"album": "Ember Light"` (album **title**, not `album_id`); `A` yields per-role `albumartist`/`trackartist`; `a` yields `artist`; `d` `duration`; `t` `tracknum`. Also shows `artwork_track_id` is **absent**, because that field is tag `J` which this string does not request. |
 
 ## Mute is immediate; the negated volume lags it (no fixture file — this is timing)
@@ -106,3 +110,19 @@ Source: `Slim::Web::JSONRPC::requestMethod` calls `closeHTTPSocket()` on any
 Because there is nothing to record, `tests/lms_transport.rs` reproduces this
 behaviour with a local TCP listener that accepts, reads the request, and closes
 without writing — the exact wire behaviour in the table above.
+
+## Radio item ids are per-request, and radio needs a player
+
+`radios` answers a server-level request, but every `<menu> items` query below it
+does not: addressed to `""` it is the bad-params failure above — 9 bytes and a
+closed socket. It must carry a player id, unlike every library query in
+`lms.rs`.
+
+XMLBrowser item ids are also minted per request. Two `music items 0 1` calls a
+second apart returned `4f1345bf.0` and `755cb784.0` for the same row. An older
+id still resolved after unrelated traffic, so they are not single-use — LMS is
+addressing the feed it cached — but they carry a session prefix and cannot
+outlive a server restart. That is why a deep radio location can go stale where a
+library one (`album:42`) cannot. The collection location records each step's
+title as well as its path, so re-walking a radio trail by name is possible later
+without changing any token already handed out.
