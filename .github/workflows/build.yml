@@ -2120,7 +2120,21 @@ jobs:
   update-repo-xml:
     name: Update LMS repo.xml
     needs: [plan, upload-release]
-    if: needs.plan.outputs.is_release == 'true' && needs.plan.outputs.is_beta != 'true'
+    # `!cancelled()`: `upload-release` runs under `always()` because the Synology
+    # build is skipped on prerelease tags. Without it, GitHub applies the implicit
+    # success() check transitively and skips this job on every such tag -- which is
+    # how the beta feed stayed at 3.6.1-beta through the v4 alphas.
+    if: |
+      !cancelled() &&
+      needs.plan.outputs.is_release == 'true' &&
+      needs.plan.outputs.is_beta != 'true' &&
+      needs.upload-release.result == 'success'
+    # Serialize across tag runs: the workflow group is per-ref, so two tags can
+    # run at once, and both jobs push the same fixed PR branch. Queue, never
+    # cancel, so the newest release metadata is what lands last.
+    concurrency:
+      group: lms-repo-feed-update
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -2191,7 +2205,8 @@ jobs:
           commit-message: "chore: Update LMS plugin to v${{ steps.version.outputs.version }}"
           title: "chore: Update LMS plugin to v${{ steps.version.outputs.version }}"
           body: "Auto-generated PR to update LMS plugin metadata for release v${{ steps.version.outputs.version }}."
-          branch: chore/lms-update-${{ steps.version.outputs.version }}
+          # Fixed branch for the same reason as the beta feed job below.
+          branch: chore/lms-update
           base: v4
           add-paths: |
             lms-plugin/repo.xml
@@ -2219,7 +2234,18 @@ jobs:
   update-beta-repo-xml:
     name: Update LMS beta repo.xml
     needs: [plan, upload-release]
-    if: needs.plan.outputs.is_release == 'true' && needs.plan.outputs.is_beta == 'true'
+    # See update-repo-xml for why `!cancelled()` is required here.
+    if: |
+      !cancelled() &&
+      needs.plan.outputs.is_release == 'true' &&
+      needs.plan.outputs.is_beta == 'true' &&
+      needs.upload-release.result == 'success'
+    # Serialize across tag runs: the workflow group is per-ref, so two tags can
+    # run at once, and both jobs push the same fixed PR branch. Queue, never
+    # cancel, so the newest release metadata is what lands last.
+    concurrency:
+      group: lms-beta-feed-update
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -2252,7 +2278,10 @@ jobs:
           commit-message: "chore: Point LMS beta feed at v${{ needs.plan.outputs.version }}"
           title: "chore: Point LMS beta feed at v${{ needs.plan.outputs.version }}"
           body: "Auto-generated. Updates `lms-plugin/repo-beta.xml` so the beta repository URL serves v${{ needs.plan.outputs.version }}."
-          branch: chore/lms-beta-feed-${{ needs.plan.outputs.version }}
+          # One fixed branch, not one per version: create-pull-request then updates
+          # the existing PR in place, so two prerelease tags in quick succession
+          # cannot race two PRs into a conflict over the same file.
+          branch: chore/lms-beta-feed
           base: v4
           add-paths: lms-plugin/repo-beta.xml
 
@@ -2265,7 +2294,15 @@ jobs:
   publish-aur:
     name: Publish to AUR
     needs: [plan, upload-release]
-    if: needs.plan.outputs.is_release == 'true' && needs.plan.outputs.is_beta != 'true'
+    # `!cancelled()`: `upload-release` runs under `always()` because the Synology
+    # build is skipped on prerelease tags. Without it, GitHub applies the implicit
+    # success() check transitively and skips this job on every such tag -- which is
+    # how the beta feed stayed at 3.6.1-beta through the v4 alphas.
+    if: |
+      !cancelled() &&
+      needs.plan.outputs.is_release == 'true' &&
+      needs.plan.outputs.is_beta != 'true' &&
+      needs.upload-release.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
