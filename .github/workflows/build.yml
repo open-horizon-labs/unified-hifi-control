@@ -2199,7 +2199,8 @@ jobs:
           commit-message: "chore: Update LMS plugin to v${{ steps.version.outputs.version }}"
           title: "chore: Update LMS plugin to v${{ steps.version.outputs.version }}"
           body: "Auto-generated PR to update LMS plugin metadata for release v${{ steps.version.outputs.version }}."
-          branch: chore/lms-update-${{ steps.version.outputs.version }}
+          # Fixed branch for the same reason as the beta feed job below.
+          branch: chore/lms-update
           base: v4
           add-paths: |
             lms-plugin/repo.xml
@@ -2265,7 +2266,10 @@ jobs:
           commit-message: "chore: Point LMS beta feed at v${{ needs.plan.outputs.version }}"
           title: "chore: Point LMS beta feed at v${{ needs.plan.outputs.version }}"
           body: "Auto-generated. Updates `lms-plugin/repo-beta.xml` so the beta repository URL serves v${{ needs.plan.outputs.version }}."
-          branch: chore/lms-beta-feed-${{ needs.plan.outputs.version }}
+          # One fixed branch, not one per version: create-pull-request then updates
+          # the existing PR in place, so two prerelease tags in quick succession
+          # cannot race two PRs into a conflict over the same file.
+          branch: chore/lms-beta-feed
           base: v4
           add-paths: lms-plugin/repo-beta.xml
 
