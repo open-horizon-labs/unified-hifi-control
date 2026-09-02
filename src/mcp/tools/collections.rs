@@ -631,6 +631,37 @@ async fn handle_lms(
 // drives (src/adapters/roon.rs), exposed as hierarchy walking.
 // =============================================================================
 
+/// Browse one Roon collection level.
+///
+/// # Cheap in the steady state, correct after a session loss
+///
+/// Roon's continuation is a `(item_key, multi_session_key)` pair, not a flat
+/// string, and both halves only mean anything inside the Core-side browse
+/// session that minted them (same reasoning as a playable Roon ref; see
+/// [`RoonRefTarget`]'s docs). A durable `location` therefore cannot carry that
+/// pair -- it names the walk, and the pair has to be reconstructed.
+///
+/// Reconstructing it means `collections_resolve_location`: a root browse plus
+/// a paged scan per trail step. That is far too expensive to pay on every
+/// request, and the Library page sends `location` for every level *and* every
+/// "Load more" page. So the pair is treated as a cache, not as something to
+/// recompute:
+///
+/// 1. Every navigable child minted below gets its `(session_key, item_key)`
+///    written into [`AppState::collection_location_keys`] alongside its
+///    location token -- free, since this response already holds both.
+/// 2. A `location` request looks that pair up and browses with it directly.
+///    A `path` request takes the same pair from its `RoonRefTarget`. From here
+///    the two branches are one code path.
+/// 3. If the Core rejects the pair *recoverably* (the session is gone), the
+///    stale entry is evicted, the saved trail is re-walked once, the fresh
+///    pair is cached, and the same node is retried -- rather than throwing the
+///    user back to the root. A cache miss (first request for a location after
+///    a restart, or an entry aged out) simply re-walks up front.
+///
+/// The cache is deliberately not durable: it holds live-session material, so
+/// the first request per location after a restart re-walks once and every
+/// later one is cheap again.
 async fn handle_roon(
     state: &AppState,
     env: Envelope,
@@ -638,69 +669,75 @@ async fn handle_roon(
     limit: u32,
     offset: u32,
 ) -> Result<CallToolResult, CallToolError> {
-    // Roon's continuation is a (item_key, multi_session_key) pair, not a flat
-    // string -- resuming it must re-enter that exact session (same reasoning
-    // as a playable Roon ref; see `RoonRefTarget`'s docs).
-    let (resume, parent_location) = match (args.location.as_deref(), args.path.as_deref()) {
-        (Some(token), None) => match state.collection_locations.resolve(token) {
-            Some(location @ CollectionLocation::Roon { .. }) => (None, location),
-            Some(_) => return refuse_foreign_location(env),
-            None => return refuse_unknown_location(env),
-        },
-        (None, Some(token)) => match state.mcp_refs.resolve(token).await {
-            Some(RefTarget::RoonBrowse {
-                target, location, ..
-            }) => (Some(target), location),
-            Some(_) => return refuse_foreign_path(env),
-            None => return refuse_unknown_path(env),
-        },
-        (None, None) => {
-            let steps = if args.action == "playlists" {
-                vec![CollectionStep::hidden_roon("Playlists")]
-            } else {
-                Vec::new()
-            };
-            (
-                None,
-                CollectionLocation::Roon {
-                    origin: RoonLocationOrigin::BrowseRoot,
-                    steps,
-                },
-            )
-        }
-        (Some(_), Some(_)) => unreachable!("path/location exclusivity checked by caller"),
-    };
+    // Both entry shapes reduce to the same thing: the parent trail this page
+    // hangs off, plus (maybe) a session-scoped key pair to resume it with.
+    // `can_rewalk` is whether that trail has anything to re-walk -- a root
+    // browse has no saved node to recover.
+    let (mut resume_pair, parent_location, can_rewalk) =
+        match (args.location.as_deref(), args.path.as_deref()) {
+            (Some(token), None) => match state.collection_locations.resolve(token) {
+                Some(location @ CollectionLocation::Roon { .. }) => {
+                    let cached = state.collection_location_keys.get(token);
+                    let can_rewalk = !location.steps().is_empty();
+                    (cached, location, can_rewalk)
+                }
+                Some(_) => return refuse_foreign_location(env),
+                None => return refuse_unknown_location(env),
+            },
+            (None, Some(token)) => match state.mcp_refs.resolve(token).await {
+                Some(RefTarget::RoonBrowse {
+                    target, location, ..
+                }) => {
+                    let can_rewalk = !target.trail.is_empty();
+                    let RoonRefTarget {
+                        item_key,
+                        multi_session_key,
+                        ..
+                    } = target;
+                    (Some((multi_session_key, item_key)), location, can_rewalk)
+                }
+                Some(_) => return refuse_foreign_path(env),
+                None => return refuse_unknown_path(env),
+            },
+            (None, None) => {
+                let steps = if args.action == "playlists" {
+                    vec![CollectionStep::hidden_roon("Playlists")]
+                } else {
+                    Vec::new()
+                };
+                (
+                    None,
+                    CollectionLocation::Roon {
+                        origin: RoonLocationOrigin::BrowseRoot,
+                        steps,
+                    },
+                    false,
+                )
+            }
+            (Some(_), Some(_)) => unreachable!("path/location exclusivity checked by caller"),
+        };
 
     let mut params = json!({
         "zone_id": args.zone_id,
         "limit": limit,
         "offset": offset,
     });
-    if args.location.is_some() {
-        let (session_key, item_key) = match resolve_roon_location(
-            state,
-            &args.zone_id,
-            &parent_location,
-        )
-        .await
+    // Cache miss on a saved location: nothing to try, so re-walk up front.
+    if resume_pair.is_none() && args.location.is_some() && can_rewalk {
+        match resolve_and_cache_roon_location(state, &args.zone_id, &parent_location, args.location.as_deref())
+            .await
         {
-            Ok(pair) => pair,
+            Ok(pair) => resume_pair = Some(pair),
             Err(error) => {
                 return env.failed(format!(
                     "Collection error: this saved Roon location can no longer be resolved safely: {error:#}"
                 ))
             }
-        };
+        }
+    }
+    if let Some((session_key, item_key)) = &resume_pair {
         params["item_key"] = json!(item_key);
         params["session_key"] = json!(session_key);
-    } else if let Some(RoonRefTarget {
-        item_key,
-        multi_session_key,
-        ..
-    }) = &resume
-    {
-        params["item_key"] = json!(item_key);
-        params["session_key"] = json!(multi_session_key);
     }
     // #616: the trail this page hangs off. Children extend it by their own
     // title, so every ref minted below carries the full root-to-item walk
@@ -736,19 +773,25 @@ async fn handle_roon(
     {
         Ok(value) => value,
         Err(error)
-            if resume
-                .as_ref()
-                .is_some_and(|target| !target.trail.is_empty())
+            if can_rewalk
+                && resume_pair.is_some()
                 && RoonBrowseError::from_error(&error)
                     .is_some_and(|rejection| rejection.kind.is_recoverable()) =>
         {
             // Roon item keys are scoped to a Core-side browse session. If the
-            // Core reconnects, re-walk the saved breadcrumb trail and retry
-            // the same node rather than making the user start at the root.
-            let (session_key, item_key) = match resolve_roon_location(
+            // Core reconnects, the cached pair is dead: drop it, re-walk the
+            // saved breadcrumb trail, and retry the same node rather than
+            // making the user start at the root. This arm is shared by
+            // `location` and `path` requests -- both arrive here holding a
+            // pair whose session may have expired.
+            if let Some(token) = args.location.as_deref() {
+                state.collection_location_keys.evict(token);
+            }
+            let (session_key, item_key) = match resolve_and_cache_roon_location(
                 state,
                 &args.zone_id,
                 &parent_location,
+                args.location.as_deref(),
             )
             .await
             {
@@ -845,7 +888,16 @@ async fn handle_roon(
                 };
                 let location = if navigable {
                     match state.collection_locations.mint(child_location) {
-                        Ok(token) => Some(token),
+                        Ok(token) => {
+                            // Free cache fill: this response already holds the
+                            // session-scoped pair behind the token we just
+                            // minted, so opening this row costs one browse
+                            // instead of a re-walk of its trail.
+                            state
+                                .collection_location_keys
+                                .insert(&token, session_key, item_key);
+                            Some(token)
+                        }
                         Err(error) => {
                             return env.failed(format!(
                                 "Collection error: could not preserve location: {error:#}"
@@ -903,6 +955,31 @@ async fn handle_roon(
         breadcrumbs,
         next_offset,
     }))
+}
+
+/// [`resolve_roon_location`] plus the cache write every caller wants: a fresh
+/// pair is only useful to the *next* request if it is remembered.
+///
+/// `token` is the location token this walk was performed for, when the request
+/// carried one. A `path`-driven re-walk has no token in hand, so it derives the
+/// canonical one for the same trail -- minting is deterministic and idempotent,
+/// and the breadcrumb pass below mints this very location anyway.
+async fn resolve_and_cache_roon_location(
+    state: &AppState,
+    zone_id: &str,
+    location: &CollectionLocation,
+    token: Option<&str>,
+) -> anyhow::Result<(String, String)> {
+    let (session_key, item_key) = resolve_roon_location(state, zone_id, location).await?;
+    let token = token
+        .map(ToOwned::to_owned)
+        .or_else(|| state.collection_locations.mint(location.clone()).ok());
+    if let Some(token) = token {
+        state
+            .collection_location_keys
+            .insert(token, &session_key, &item_key);
+    }
+    Ok((session_key, item_key))
 }
 
 async fn resolve_roon_location(

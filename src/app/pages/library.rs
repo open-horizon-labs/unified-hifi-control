@@ -904,13 +904,27 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
             div { class: "library-provider-down",
                 p { "{heading}" }
                 p { class: "text-sm text-muted", "{detail}" }
-                button {
-                    class: "btn btn-outline",
-                    r#type: "button",
-                    onclick: move |_| {
-                        refresh(false);
-                    },
-                    "Retry"
+                div { class: "flex flex-wrap items-center justify-center gap-2",
+                    button {
+                        class: "btn btn-outline",
+                        r#type: "button",
+                        onclick: move |_| {
+                            refresh(false);
+                        },
+                        "Retry"
+                    }
+                    // Retrying in place is right for a level that is merely
+                    // stale -- the server re-walks the saved trail. A node
+                    // that is permanently gone would strand the user there,
+                    // so this is the deliberate way out, not an automatic one.
+                    button {
+                        class: "btn btn-ghost",
+                        r#type: "button",
+                        onclick: move |_| {
+                            navigate(selected_source(), Some(current_tab.as_str().to_string()), None);
+                        },
+                        "Back to library"
+                    }
                 }
             }
         }

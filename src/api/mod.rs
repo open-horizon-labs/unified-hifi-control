@@ -302,6 +302,15 @@ pub struct AppState {
     /// `/library/<source>/<view>/loc_…` URLs. Unlike `mcp_refs`, these survive
     /// process and provider-session restarts.
     pub collection_locations: crate::mcp::collection_locations::CollectionLocationStore,
+    /// Bounded in-process cache from a durable collection location token to
+    /// the provider-session-scoped `(session_key, item_key)` pair that last
+    /// served it. Purely an optimisation for Roon browsing: it turns the
+    /// steady state (each level, each "Load more" page) into one browse call
+    /// instead of a full re-walk of the saved trail, and is evicted the moment
+    /// the provider rejects a pair. Deliberately not durable -- the pairs it
+    /// holds are only meaningful inside a live provider session.
+    pub collection_location_keys:
+        std::sync::Arc<crate::mcp::collection_locations::LocationKeyCache>,
     /// Opaque image refs (#549): what a `hifi_collections`/`/api/collections`
     /// item's `image` field resolves through, so a collection browse row can
     /// carry a per-item artwork reference without ever handing a client the
@@ -387,6 +396,9 @@ impl AppState {
             mcp_refs: crate::mcp::refs::RefTable::new(),
             collection_locations:
                 crate::mcp::collection_locations::CollectionLocationStore::default(),
+            collection_location_keys: std::sync::Arc::new(
+                crate::mcp::collection_locations::LocationKeyCache::new(),
+            ),
             image_refs: crate::mcp::refs::ImageRefTable::new(),
             eink_artwork_cache: crate::knobs::image::EinkArtworkCache::default(),
             listening_plans: crate::mcp::listening_plan::ListeningPlanStore::from_config(),

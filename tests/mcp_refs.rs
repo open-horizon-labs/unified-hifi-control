@@ -1160,3 +1160,276 @@ async fn lms_a_valid_ref_beyond_the_validation_search_limit_still_resolves() {
 async fn lms_stop(state: &AppState) {
     state.lms.stop().await;
 }
+
+// =============================================================================
+// Roon: the location -> (session_key, item_key) cache (#677 review)
+// =============================================================================
+//
+// `FakeRoonCore` proves the *protocol*; these tests prove the *call shape* --
+// how many `collections_resolve_location` walks `handle_collections` pays for
+// an ordinary browse, and when it pays for one. That is invisible at the
+// protocol layer (a re-walk is just more browse traffic), so they drive a
+// counting `LibraryAdapter` registered under the `roon` prefix, exactly where
+// production registers `RoonAdapter`. The counter is the assertion.
+
+/// A `LibraryAdapter` that answers Roon's collections operations from a tiny
+/// canned hierarchy and counts what it was asked to do.
+///
+/// `poison` arms one recoverable Core rejection for a specific
+/// `(session_key, item_key)` pair -- the exact failure a browse session that
+/// expired between requests produces.
+#[derive(Default)]
+struct CountingRoonLibrary {
+    resolve_calls: std::sync::atomic::AtomicUsize,
+    browse_calls: std::sync::atomic::AtomicUsize,
+    session: std::sync::Mutex<String>,
+    poison: std::sync::Mutex<Option<(String, String)>>,
+}
+
+impl CountingRoonLibrary {
+    fn new() -> Self {
+        Self {
+            session: std::sync::Mutex::new("session_1".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn resolve_calls(&self) -> usize {
+        self.resolve_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn browse_calls(&self) -> usize {
+        self.browse_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn session(&self) -> String {
+        self.session.lock().unwrap().clone()
+    }
+
+    /// Arm exactly one recoverable rejection for this pair, as a Core that
+    /// dropped the session would produce.
+    fn expire(&self, session_key: &str, item_key: &str) {
+        *self.poison.lock().unwrap() = Some((session_key.to_string(), item_key.to_string()));
+    }
+
+    fn page(&self, item_key: Option<&str>) -> Value {
+        let items = match item_key {
+            // Root: one navigable child, so a browse response mints a
+            // location token (and, with it, a cache entry).
+            None => vec![serde_json::json!({
+                "title": "Local Library",
+                "item_key": "key_library",
+                "navigable": true,
+                "playable": false,
+                "position": 0,
+            })],
+            Some(_) => vec![serde_json::json!({
+                "title": "Artists",
+                "item_key": "key_artists",
+                "navigable": true,
+                "playable": false,
+                "position": 0,
+            })],
+        };
+        serde_json::json!({ "session_key": self.session(), "items": items })
+    }
+}
+
+#[async_trait::async_trait]
+impl unified_hifi_control::adapters::traits::LibraryAdapter for CountingRoonLibrary {
+    async fn search(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<unified_hifi_control::adapters::traits::LibrarySearchResult>> {
+        Ok(Vec::new())
+    }
+
+    async fn play_uri(&self, _zone_id: &str, _uri: &str) -> anyhow::Result<String> {
+        Err(anyhow::anyhow!("not used by these tests"))
+    }
+
+    async fn content(&self, operation: &str, params: &Value) -> anyhow::Result<Value> {
+        match operation {
+            "collections_browse" | "collections_playlists" => {
+                self.browse_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let session_key = params.get("session_key").and_then(Value::as_str);
+                let item_key = params.get("item_key").and_then(Value::as_str);
+                let armed = self.poison.lock().unwrap().clone();
+                if let (Some(session_key), Some(item_key), Some((bad_session, bad_item))) =
+                    (session_key, item_key, armed)
+                {
+                    if session_key == bad_session && item_key == bad_item {
+                        // One-shot, and the Core comes back on a new session:
+                        // the re-walk must produce a *different* pair or the
+                        // retry would fail the same way.
+                        *self.poison.lock().unwrap() = None;
+                        *self.session.lock().unwrap() = "session_2".to_string();
+                        return Err(anyhow::Error::new(
+                            unified_hifi_control::adapters::roon::RoonBrowseError {
+                                kind: unified_hifi_control::adapters::roon::RoonBrowseErrorKind::InvalidItemKey,
+                                session_key: Some(session_key.to_string()),
+                            },
+                        ));
+                    }
+                }
+                Ok(self.page(item_key))
+            }
+            "collections_resolve_location" => {
+                self.resolve_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(serde_json::json!({
+                    "session_key": self.session(),
+                    "item_key": "key_library",
+                }))
+            }
+            other => Err(anyhow::anyhow!("unexpected operation {other}")),
+        }
+    }
+}
+
+/// `AppState` whose `roon` library route is the counting fake above.
+async fn app_state_with_counting_roon(library: Arc<CountingRoonLibrary>) -> AppState {
+    let _ = isolate_config_dir();
+    let bus = create_bus();
+    let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
+    let hqp_instances = Arc::new(HqpInstanceManager::new(bus.clone()));
+    let hqplayer = hqp_instances.get_default().await;
+    let hqp_zone_links = Arc::new(HqpZoneLinkService::new(hqp_instances.clone()));
+    let lms = Arc::new(LmsAdapter::new(bus.clone()));
+    let openhome = Arc::new(OpenHomeAdapter::new(bus.clone()));
+    let upnp = Arc::new(UPnPAdapter::new(bus.clone()));
+
+    let state = AppState::new(
+        roon,
+        hqplayer,
+        hqp_instances,
+        hqp_zone_links,
+        lms,
+        openhome,
+        upnp,
+        KnobStore::new(),
+        bus.clone(),
+        Arc::new(ZoneAggregator::new(bus.clone())),
+        Arc::new(AdapterCoordinator::new(bus)),
+        Vec::new(),
+        Instant::now(),
+        CancellationToken::new(),
+    );
+    state
+        .adapter_registry
+        .register_library("roon", library)
+        .await;
+    state
+}
+
+fn collections_args(location: Option<&str>, offset: u32) -> HifiCollectionsTool {
+    HifiCollectionsTool {
+        zone_id: "roon:zone_fake_1".to_string(),
+        action: "browse".to_string(),
+        path: None,
+        location: location.map(ToOwned::to_owned),
+        media_type: None,
+        limit: Some(20),
+        offset: Some(offset),
+    }
+}
+
+/// Browse the root and return the durable location its one navigable child
+/// carries -- the token the UI puts in the canonical URL.
+async fn browse_root_for_location(state: &AppState) -> String {
+    let root = handle_collections(state, collections_args(None, 0)).await;
+    assert_eq!(outcome_of(&root), "ok", "{}", text_of(&root));
+    collection_page_of(&root)["items"][0]["location"]
+        .as_str()
+        .expect("a navigable row must carry a durable location")
+        .to_string()
+}
+
+/// The steady state. A location token minted by a browse response already has
+/// its `(session_key, item_key)` pair in hand, so opening it costs one browse
+/// and no trail re-walk at all.
+#[tokio::test]
+async fn opening_a_freshly_minted_location_never_re_walks_the_trail() {
+    let library = Arc::new(CountingRoonLibrary::new());
+    let state = app_state_with_counting_roon(library.clone()).await;
+
+    let location = browse_root_for_location(&state).await;
+    assert_eq!(library.resolve_calls(), 0, "the root browse walks nothing");
+
+    let level = handle_collections(&state, collections_args(Some(&location), 0)).await;
+
+    assert_eq!(outcome_of(&level), "ok", "{}", text_of(&level));
+    assert_eq!(
+        library.resolve_calls(),
+        0,
+        "a cached location must be browsed directly, not re-resolved"
+    );
+    assert_eq!(library.browse_calls(), 2, "root browse + one level browse");
+    assert_eq!(
+        collection_page_of(&level)["items"][0]["title"],
+        Value::from("Artists")
+    );
+}
+
+/// Paging is the same location again. "Load more" must not turn into a re-walk
+/// per page -- that was the whole cost this cache exists to remove.
+#[tokio::test]
+async fn paging_the_same_location_costs_no_extra_trail_walks() {
+    let library = Arc::new(CountingRoonLibrary::new());
+    let state = app_state_with_counting_roon(library.clone()).await;
+
+    let location = browse_root_for_location(&state).await;
+    for offset in [0, 20] {
+        let page = handle_collections(&state, collections_args(Some(&location), offset)).await;
+        assert_eq!(outcome_of(&page), "ok", "{}", text_of(&page));
+    }
+
+    assert_eq!(
+        library.resolve_calls(),
+        0,
+        "neither page may re-walk the saved trail"
+    );
+}
+
+/// The recovery arm, now reachable for `location` requests too: the cached pair
+/// is tried first, the Core's recoverable rejection evicts it, the trail is
+/// re-walked exactly once, and the same node is retried and served.
+#[tokio::test]
+async fn a_rejected_cached_pair_re_walks_once_and_retries_in_place() {
+    let library = Arc::new(CountingRoonLibrary::new());
+    let state = app_state_with_counting_roon(library.clone()).await;
+
+    let location = browse_root_for_location(&state).await;
+    let minting_session = library.session();
+    library.expire(&minting_session, "key_library");
+
+    let level = handle_collections(&state, collections_args(Some(&location), 0)).await;
+
+    assert_eq!(
+        outcome_of(&level),
+        "ok",
+        "a recoverable rejection must be recovered in place, not surfaced: {}",
+        text_of(&level)
+    );
+    assert_eq!(
+        library.resolve_calls(),
+        1,
+        "exactly one re-walk, triggered by the rejection"
+    );
+    assert_eq!(
+        collection_page_of(&level)["items"][0]["title"],
+        Value::from("Artists"),
+        "the retry must serve the node the user asked for"
+    );
+
+    // The re-walk repopulated the cache, so the next request is cheap again.
+    let again = handle_collections(&state, collections_args(Some(&location), 0)).await;
+    assert_eq!(outcome_of(&again), "ok", "{}", text_of(&again));
+    assert_eq!(
+        library.resolve_calls(),
+        1,
+        "the fresh pair must have been cached by the re-walk"
+    );
+}
