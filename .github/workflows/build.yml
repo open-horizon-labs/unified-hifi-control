@@ -2129,6 +2129,12 @@ jobs:
       needs.plan.outputs.is_release == 'true' &&
       needs.plan.outputs.is_beta != 'true' &&
       needs.upload-release.result == 'success'
+    # Serialize across tag runs: the workflow group is per-ref, so two tags can
+    # run at once, and both jobs push the same fixed PR branch. Queue, never
+    # cancel, so the newest release metadata is what lands last.
+    concurrency:
+      group: lms-repo-feed-update
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -2234,6 +2240,12 @@ jobs:
       needs.plan.outputs.is_release == 'true' &&
       needs.plan.outputs.is_beta == 'true' &&
       needs.upload-release.result == 'success'
+    # Serialize across tag runs: the workflow group is per-ref, so two tags can
+    # run at once, and both jobs push the same fixed PR branch. Queue, never
+    # cancel, so the newest release metadata is what lands last.
+    concurrency:
+      group: lms-beta-feed-update
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: write
