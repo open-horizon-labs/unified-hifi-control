@@ -2,7 +2,7 @@
 //!
 //! Connects to Roon Core via SOOD discovery and WebSocket protocol.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use roon_api::{
     browse::{
@@ -41,6 +41,7 @@ use crate::bus::{
 };
 use crate::config::get_config_file_path;
 use crate::knobs::KnobStore;
+use crate::mcp::collection_locations::{CollectionLocation, CollectionStep, RoonLocationOrigin};
 
 const ROON_STATE_FILE: &str = "roon_state.json";
 
@@ -2499,10 +2500,11 @@ impl RoonAdapter {
         zone_id: &str,
         session_key: &str,
         items: Vec<BrowseItem>,
+        raw_offset: usize,
         at_collection_root: bool,
         mapped: &mut Vec<Value>,
     ) -> Result<()> {
-        for item in items {
+        for (index, item) in items.into_iter().enumerate() {
             // #573 defect 3: the exact-title category filter
             // (`is_category`) was verified for *search result* levels only,
             // but the Library node's real children are titled exactly
@@ -2568,6 +2570,10 @@ impl RoonAdapter {
                 "item_key": item.item_key,
                 "navigable": navigable,
                 "playable": playable,
+                // Stable-location recovery uses the original raw row
+                // position only to disambiguate duplicate title/subtitle
+                // pairs. A unique semantic match wins even if rows reorder.
+                "position": raw_offset + index,
                 // #549: Roon's own image_key, resolved through the same
                 // `RoonAdapter::get_image` now-playing art already uses --
                 // `hifi_collections` mints an opaque ref over this rather
@@ -3193,6 +3199,131 @@ impl RoonAdapter {
         Ok((session_key, item_key))
     }
 
+    /// Resolve a durable Library location in a fresh Roon browse session.
+    /// A unique title+subtitle identity survives row reordering. The recorded
+    /// raw position is consulted only when Roon presents duplicate semantic
+    /// identities; if neither rule identifies exactly one row, recovery fails
+    /// instead of choosing plausible-but-wrong content.
+    pub(crate) async fn resolve_collection_location(
+        &self,
+        zone_id: &str,
+        location: &CollectionLocation,
+    ) -> Result<(String, String)> {
+        let CollectionLocation::Roon { origin, steps } = location else {
+            return Err(anyhow::anyhow!(
+                "collection location is not a Roon location"
+            ));
+        };
+        if steps.is_empty() {
+            return Err(anyhow::anyhow!(
+                "cannot resolve an empty collection location"
+            ));
+        }
+        let bare_zone_id = strip_roon_prefix(zone_id);
+        let session_key = match origin {
+            RoonLocationOrigin::BrowseRoot => {
+                let session_key = format!(
+                    "location_{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                );
+                self.browse(BrowseOpts {
+                    multi_session_key: Some(session_key.clone()),
+                    zone_or_output_id: Some(bare_zone_id.to_string()),
+                    pop_all: true,
+                    ..Default::default()
+                })
+                .await?;
+                session_key
+            }
+            RoonLocationOrigin::Search { query, source } => {
+                let source = match source.as_deref() {
+                    Some("tidal") => SearchSource::Tidal,
+                    Some("qobuz") => SearchSource::Qobuz,
+                    _ => SearchSource::Library,
+                };
+                let (session_key, _) = self
+                    .search_with_session(query, Some(zone_id), Some(TRAIL_PAGE_SIZE), source)
+                    .await?;
+                session_key
+            }
+        };
+
+        let mut found_key: Option<String> = None;
+        for (depth, step) in steps.iter().enumerate() {
+            if let Some(parent_key) = found_key.take() {
+                self.browse(BrowseOpts {
+                    multi_session_key: Some(session_key.clone()),
+                    item_key: Some(parent_key),
+                    zone_or_output_id: Some(bare_zone_id.to_string()),
+                    ..Default::default()
+                })
+                .await?;
+            }
+            found_key = Some(
+                self.find_location_row(
+                    &session_key,
+                    step,
+                    depth == 0 && matches!(origin, RoonLocationOrigin::BrowseRoot),
+                )
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "collection location lost row {:?} at depth {depth}",
+                        step.title
+                    )
+                })?,
+            );
+        }
+
+        let item_key = found_key.ok_or_else(|| {
+            anyhow::anyhow!("collection location resolution produced no final row")
+        })?;
+        Ok((session_key, item_key))
+    }
+
+    async fn find_location_row(
+        &self,
+        session_key: &str,
+        step: &CollectionStep,
+        at_root: bool,
+    ) -> Result<Option<String>> {
+        let mut offset = 0usize;
+        let mut matches = Vec::<(usize, String)>::new();
+        loop {
+            let page = self
+                .load(LoadOpts {
+                    multi_session_key: Some(session_key.to_string()),
+                    offset,
+                    count: Some(TRAIL_PAGE_SIZE),
+                    ..Default::default()
+                })
+                .await?;
+            let fetched = page.items.len();
+            for (index, item) in page.items.into_iter().enumerate() {
+                let shown_title = if at_root && item.title == "Library" {
+                    "Local Library".to_string()
+                } else {
+                    strip_roon_link_markup(&item.title)
+                };
+                let shown_subtitle = item.subtitle.as_deref().map(strip_roon_link_markup);
+                if shown_title == step.title && shown_subtitle == step.subtitle {
+                    if let Some(key) = item.item_key {
+                        matches.push((offset + index, key));
+                    }
+                }
+            }
+            offset += fetched;
+            if fetched == 0 || offset >= page.list.count.min(TRAIL_SCAN_LIMIT) {
+                break;
+            }
+        }
+
+        select_location_match(&matches, step)
+    }
+
     /// Page through the level `session_key` is currently on, looking for a
     /// row whose title matches `title`. `Ok(None)` means the level was read
     /// to its end (or to [`TRAIL_SCAN_LIMIT`]) without a match.
@@ -3518,6 +3649,33 @@ impl RoonAdapter {
     }
 }
 
+fn select_location_match(
+    matches: &[(usize, String)],
+    step: &CollectionStep,
+) -> Result<Option<String>> {
+    match matches {
+        [] => Ok(None),
+        [(_, key)] => Ok(Some(key.clone())),
+        many => {
+            if let Some(position) = step.position.map(|value| value as usize) {
+                let at_position = many
+                    .iter()
+                    .filter(|(candidate, _)| *candidate == position)
+                    .collect::<Vec<_>>();
+                if let [(_, key)] = at_position.as_slice() {
+                    return Ok(Some((*key).clone()));
+                }
+            }
+            Err(anyhow::anyhow!(
+                "collection location is ambiguous: {} rows match {:?} / {:?}",
+                many.len(),
+                step.title,
+                step.subtitle
+            ))
+        }
+    }
+}
+
 /// Content-library surface: the multiroom grouping operations (#509) and
 /// the `hifi_collections` browse operations (#531) are both implemented
 /// here. Roon's own search/play surfaces are reached through their
@@ -3529,8 +3687,8 @@ impl RoonAdapter {
 /// (pre-existing debt, unaffected by this registration). `content` is what
 /// lets the provider-neutral MCP registry (`AdapterRegistry::library_content`)
 /// dispatch `multiroom_status`, `multiroom_set_members`,
-/// `multiroom_ungroup`, `collections_browse` and `collections_playlists` to
-/// Roon the same way it already dispatches the multiroom operations to
+/// `multiroom_ungroup`, `collections_browse`, `collections_playlists`, and
+/// durable collection-location recovery to Roon the same way it already dispatches the multiroom operations to
 /// Music Assistant (`src/adapters/musicassistant.rs`).
 #[async_trait]
 impl LibraryAdapter for RoonAdapter {
@@ -3550,7 +3708,8 @@ impl LibraryAdapter for RoonAdapter {
     }
 
     /// `operation` is one of `multiroom_status`, `multiroom_set_members`,
-    /// `multiroom_ungroup`, `collections_browse` or `collections_playlists`
+    /// `multiroom_ungroup`, `collections_browse`, `collections_playlists`, or
+    /// `collections_resolve_location`
     /// (never `collections_favorites` -- Roon's favorites capability is not
     /// wired, see `crate::mcp::capabilities`). The collections response is
     /// this adapter's own shape, not `hifi_collections`' wire shape:
@@ -3637,6 +3796,7 @@ impl LibraryAdapter for RoonAdapter {
                     zone_id,
                     &session_key,
                     items,
+                    offset,
                     at_collection_root,
                     &mut mapped,
                 )
@@ -3665,11 +3825,13 @@ impl LibraryAdapter for RoonAdapter {
                         consumed = total;
                         break;
                     }
+                    let chunk_offset = consumed;
                     consumed = (consumed + chunk.items.len()).min(total);
                     self.map_collection_page(
                         zone_id,
                         &session_key,
                         chunk.items,
+                        chunk_offset,
                         at_collection_root,
                         &mut mapped,
                     )
@@ -3681,6 +3843,24 @@ impl LibraryAdapter for RoonAdapter {
                     "session_key": session_key,
                     "items": mapped,
                     "next_offset": next_offset,
+                }))
+            }
+            "collections_resolve_location" => {
+                let zone_id = params
+                    .get("zone_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("zone_id is required"))?;
+                let location = params
+                    .get("location")
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("location is required"))?;
+                let location: CollectionLocation =
+                    serde_json::from_value(location).context("decode Roon collection location")?;
+                let (session_key, item_key) =
+                    self.resolve_collection_location(zone_id, &location).await?;
+                Ok(serde_json::json!({
+                    "session_key": session_key,
+                    "item_key": item_key,
                 }))
             }
             _ => Err(anyhow::anyhow!(
@@ -4915,6 +5095,37 @@ mod defect_573_row_classification {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_location_uses_unique_semantic_match_even_after_reorder() {
+        let step = CollectionStep::roon("Kind of Blue", Some("Miles Davis".to_string()), Some(0));
+        let matches = vec![(7, "correct-key".to_string())];
+
+        assert_eq!(
+            select_location_match(&matches, &step).unwrap(),
+            Some("correct-key".to_string())
+        );
+    }
+
+    #[test]
+    fn durable_location_uses_recorded_position_only_for_true_duplicates() {
+        let step = CollectionStep::roon("Greatest Hits", Some("Various".to_string()), Some(9));
+        let matches = vec![(3, "wrong-key".to_string()), (9, "right-key".to_string())];
+
+        assert_eq!(
+            select_location_match(&matches, &step).unwrap(),
+            Some("right-key".to_string())
+        );
+    }
+
+    #[test]
+    fn durable_location_refuses_ambiguous_duplicates_without_a_matching_position() {
+        let step = CollectionStep::roon("Greatest Hits", Some("Various".to_string()), Some(4));
+        let matches = vec![(3, "first-key".to_string()), (9, "second-key".to_string())];
+
+        let error = select_location_match(&matches, &step).unwrap_err();
+        assert!(error.to_string().contains("ambiguous"), "{error:#}");
+    }
 
     /// Create a test zone with specified volume parameters
     fn make_test_zone(

@@ -114,7 +114,7 @@
     }
   },
   "hifi_collections": {
-    "description": "Alpha capability: expect refinement across releases. Browse a provider library or list saved playlists and favorites. Results are paged with limit/offset and playable entries include a short-lived opaque ref for hifi_play_ref. Use path from a browse entry to continue into that collection. Implemented for lms and roon zones; Music Assistant zones (see hifi_queue's provider notes); Spotify and Apple Music are reachable via hifi_spotify and the Apple Music tools today, not yet through this one.",
+    "description": "Alpha capability: expect refinement across releases. Browse a provider library or list saved playlists and favorites. Results are paged with limit/offset. Navigable entries include a durable opaque location for canonical navigation and a short-lived path for MCP continuation; playable entries include a short-lived opaque ref for hifi_play_ref. Send location or path, never both. Implemented for Roon, LMS, and Music Assistant zones. Spotify and Apple Music are reachable via hifi_spotify and the Apple Music tools today, not yet through this one.",
     "inputSchema": {
       "properties": {
         "action": {
@@ -125,6 +125,11 @@
           "description": "Maximum entries to return (1-50; default 20).",
           "nullable": true,
           "type": "integer"
+        },
+        "location": {
+          "description": "Durable provider-neutral collection location returned by a preceding browse call.",
+          "nullable": true,
+          "type": "string"
         },
         "media_type": {
           "description": "Media type when listing favorites (tracks by default).",
@@ -137,7 +142,7 @@
           "type": "integer"
         },
         "path": {
-          "description": "Opaque collection path returned by a preceding browse call.",
+          "description": "Short-lived collection continuation returned by a preceding browse call.",
           "nullable": true,
           "type": "string"
         },

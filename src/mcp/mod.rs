@@ -34,6 +34,7 @@
 //! ```
 
 pub mod capabilities;
+pub mod collection_locations;
 pub mod envelope;
 pub mod feedback;
 pub mod handler;

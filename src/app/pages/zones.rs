@@ -506,16 +506,17 @@ fn ZoneCard(
             // actually implements this zone's provider -- so LMS and Roon
             // zones light up as their slices land without a web change.
             if zone.browse_supported {
-                div { class: "mt-3 border-t border-subtle pt-3",
-                    Link {
-                        class: "btn btn-ghost text-sm",
-                        to: Route::Library {
-                            source: zone.source.clone(),
-                            tab: None,
-                            path: None,
-                            zone: Some(zone.zone_id.clone()),
-                        },
-                        "Browse →"
+                if let Some(source) = zone.source.clone() {
+                    div { class: "mt-3 border-t border-subtle pt-3",
+                        Link {
+                            class: "btn btn-ghost text-sm",
+                            onclick: {
+                                let zone_id = zone.zone_id.clone();
+                                move |_| super::library::save_last_zone(&zone_id)
+                            },
+                            to: Route::LibrarySource { source },
+                            "Browse →"
+                        }
                     }
                 }
             }

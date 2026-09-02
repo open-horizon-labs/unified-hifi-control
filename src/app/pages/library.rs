@@ -10,22 +10,17 @@
 //!
 //! # URL-addressability
 //!
-//! Every piece of state a user would want to refresh, go back through, or
-//! share -- source, tab, breadcrumb path, armed zone -- lives in the route's
-//! query string (`Route::Library`). `path` is a base64url-encoded JSON
-//! breadcrumb stack rather than raw segments: a provider browse path is an
-//! opaque token (see `crate::app::api::CollectionItem::path`) that may not
-//! be a safe URL path segment, and a flat segment list would lose each
-//! breadcrumb's title on a fresh (deep-linked) load.
+//! Source, view, and the durable provider-neutral collection location use
+//! canonical path segments. Provider paths and Roon browse-session keys stay
+//! behind `/api/collections`; the browser sees only a short `loc_…` identity.
 
 use crate::app::api::{
-    self, source_label, CollectionItem, CollectionsRequest, NowPlaying, PlayRefRequest,
-    SearchRequest, SearchResult, Zone, ZonesResponse,
+    self, source_label, CollectionBreadcrumb, CollectionItem, CollectionsRequest, NowPlaying,
+    PlayRefRequest, SearchRequest, SearchResult, Zone, ZonesResponse,
 };
 use crate::app::components::{Layout, ZonesStrip};
 use crate::app::sse::{use_sse, SseEvent};
 use crate::app::Route;
-use base64::Engine;
 use dioxus::prelude::*;
 use std::collections::HashMap;
 
@@ -33,6 +28,22 @@ const PAGE_LIMIT: u32 = 30;
 const SEARCH_DEBOUNCE_MS: u64 = 300;
 #[cfg(target_arch = "wasm32")]
 const ARMED_ZONE_STORAGE_KEY: &str = "uhc.armed_zone";
+
+fn library_route(source: Option<String>, view: Option<String>, location: Option<String>) -> Route {
+    let Some(source) = source else {
+        return Route::LibraryHome {};
+    };
+    let view = view.filter(|value| !value.is_empty());
+    match (view, location) {
+        (Some(view), Some(location)) => Route::LibraryLocation {
+            source,
+            view,
+            location,
+        },
+        (Some(view), None) if view != "browse" => Route::LibraryView { source, view },
+        _ => Route::LibrarySource { source },
+    }
+}
 
 /// Control request body, mirrors `pages::zones`.
 #[derive(Clone, serde::Serialize)]
@@ -119,7 +130,7 @@ fn visible_tabs_for(library_tabs: &[String]) -> Vec<Tab> {
 }
 
 /// The tab actually shown: the route's tab when this provider serves it,
-/// otherwise Browse -- so a deep link to `?tab=favorites` on a Roon zone
+/// otherwise Browse -- so a deep link to `/library/roon/favorites`
 /// lands on a working tab instead of a permanent refusal page.
 fn effective_tab(requested: Tab, visible: &[Tab]) -> Tab {
     if visible.contains(&requested) {
@@ -145,34 +156,6 @@ fn image_src(image: &str) -> String {
     crate::app::base_path::href(image)
 }
 
-/// One breadcrumb: what the user picked, and the opaque path it opened.
-/// The root ("Library") is implicit and never stored -- an empty stack
-/// means "at the root of this tab".
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-struct BreadcrumbEntry {
-    title: String,
-    path: Option<String>,
-}
-
-fn encode_path(stack: &[BreadcrumbEntry]) -> Option<String> {
-    if stack.is_empty() {
-        return None;
-    }
-    let json = serde_json::to_string(stack).ok()?;
-    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json))
-}
-
-fn decode_path(encoded: Option<&str>) -> Vec<BreadcrumbEntry> {
-    let Some(encoded) = encoded.filter(|s| !s.is_empty()) else {
-        return Vec::new();
-    };
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(encoded)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
-}
-
 /// Last-used armed zone, read only from client-side effects (never as part
 /// of a signal's *initial* value) so SSR and the pre-hydration WASM render
 /// stay identical -- see this module's doc comment and the pattern already
@@ -192,28 +175,23 @@ fn load_last_zone() -> Option<String> {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn save_last_zone(zone_id: &str) {
+pub(crate) fn save_last_zone(zone_id: &str) {
     if let Some(Ok(Some(storage))) = web_sys::window().map(|w| w.local_storage()) {
         let _ = storage.set_item(ARMED_ZONE_STORAGE_KEY, zone_id);
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn save_last_zone(_zone_id: &str) {}
+pub(crate) fn save_last_zone(_zone_id: &str) {}
 
-/// Resolve which zone is armed: the URL wins (deep link), then the last
-/// zone the user picked, then whichever zone is currently playing, then
-/// simply the first zone. Never `None` when `zones` is non-empty.
+/// Resolve which zone is armed: the last zone the user picked wins, then
+/// whichever zone is currently playing, then simply the first zone. Zone
+/// selection is client preference state and deliberately never enters the
+/// canonical library URL.
 fn resolve_armed_zone<'a>(
-    route_zone: Option<&str>,
     zones: &'a [Zone],
     now_playing: &HashMap<String, NowPlaying>,
 ) -> Option<&'a Zone> {
-    if let Some(id) = route_zone {
-        if let Some(zone) = zones.iter().find(|z| z.zone_id == id) {
-            return Some(zone);
-        }
-    }
     if let Some(last) = load_last_zone() {
         if let Some(zone) = zones.iter().find(|z| z.zone_id == last) {
             return Some(zone);
@@ -308,7 +286,7 @@ fn missing_now_playing_zones(
 ///
 /// `unreachable` is true only when the HTTP request itself failed -- the one
 /// case "«source» isn't reachable right now." is true of. A well-formed
-/// refusal envelope (a capability gap, an expired path, ...) reaches the
+/// refusal envelope (a capability gap, an unknown location, ...) reaches the
 /// server fine; rendering it under unreachability copy told users the
 /// provider was down when it wasn't.
 #[derive(Clone, Debug, PartialEq)]
@@ -323,7 +301,7 @@ async fn load_page(
     zone_id: String,
     action: String,
     media_type: Option<String>,
-    path: Option<String>,
+    location: Option<String>,
     request_offset: u32,
     append: bool,
     mut items: Signal<Vec<CollectionItem>>,
@@ -331,13 +309,15 @@ async fn load_page(
     mut offset: Signal<u32>,
     mut loading: Signal<bool>,
     mut error: Signal<Option<LevelError>>,
+    mut breadcrumbs: Signal<Vec<CollectionBreadcrumb>>,
 ) {
     loading.set(true);
     error.set(None);
     let req = CollectionsRequest {
         zone_id,
         action,
-        path,
+        path: None,
+        location,
         media_type,
         limit: Some(PAGE_LIMIT),
         offset: Some(request_offset),
@@ -349,6 +329,7 @@ async fn load_page(
                 items.with_mut(|list| list.extend(page.items));
             } else {
                 items.set(page.items);
+                breadcrumbs.set(page.breadcrumbs);
             }
             next_offset.set(page.next_offset);
             offset.set(request_offset);
@@ -364,6 +345,7 @@ async fn load_page(
                 // under the error panel.
                 items.set(Vec::new());
                 next_offset.set(None);
+                breadcrumbs.set(Vec::new());
             }
         }
         Err(message) => {
@@ -374,6 +356,7 @@ async fn load_page(
             if !append {
                 items.set(Vec::new());
                 next_offset.set(None);
+                breadcrumbs.set(Vec::new());
             }
         }
     }
@@ -382,16 +365,10 @@ async fn load_page(
 
 /// The Library page.
 #[component]
-pub fn Library(
-    source: Option<String>,
-    tab: Option<String>,
-    path: Option<String>,
-    zone: Option<String>,
-) -> Element {
+fn Library(source: Option<String>, tab: Option<String>, location: Option<String>) -> Element {
     let route_source = source.clone();
     let route_tab = tab.clone().unwrap_or_default();
-    let route_path = path.clone();
-    let route_zone = zone.clone();
+    let route_location = location.clone();
 
     let sse = use_sse();
     let navigator = use_navigator();
@@ -502,37 +479,28 @@ pub fn Library(
         }
     });
 
-    // Armed target zone: resolved from the URL / last-used / now-playing,
-    // written back into the URL and localStorage so it survives a refresh
-    // and shows up in shared links.
-    //
-    // `use_reactive!` on `route_zone` is load-bearing, same hazard class as
-    // #566's breadcrumb resync: `zone` is a plain route prop, so an effect
-    // that merely captures it has no reactive dependency on it. A zone-strip
-    // click (`arm_zone`) pushes a new `zone` query param and re-renders this
-    // component, but without `use_reactive!` nothing this effect *tracks*
-    // changed -- it wouldn't rerun until some unrelated zones/now-playing
-    // update, so the click read as a no-op whenever nothing was playing.
-    let mut armed_zone_id = use_signal(|| route_zone.clone());
-    use_effect(use_reactive!(|route_zone| {
+    // Armed target zone is client preference state. Persist it locally so
+    // refreshes keep the user's target without polluting shareable URLs.
+    let mut armed_zone_id = use_signal(|| None::<String>);
+    use_effect(move || {
         let list = zones_list();
         if list.is_empty() {
             return;
         }
-        let resolved = resolve_armed_zone(route_zone.as_deref(), &list, &now_playing());
+        let resolved = resolve_armed_zone(&list, &now_playing());
         if let Some(zone) = resolved {
             if armed_zone_id.peek().as_deref() != Some(zone.zone_id.as_str()) {
                 armed_zone_id.set(Some(zone.zone_id.clone()));
             }
             save_last_zone(&zone.zone_id);
         }
-    }));
+    });
 
     // Selected browse source. `use_reactive!` on `route_source` is
-    // load-bearing (same class as the `route_zone` effect above): `source`
+    // load-bearing: `source`
     // is a plain route prop, so without it this memo recomputes only when
     // the zone list or armed zone changes. A source-picker click
-    // (`select_source`) changes only the `source` query param -- the memo
+    // (`select_source`) changes only the `source` route segment -- the memo
     // kept returning the old source and the click read as a no-op.
     let selected_source = use_memo(use_reactive!(|route_source| {
         let list = zones_list();
@@ -571,31 +539,9 @@ pub fn Library(
         visible_tabs_for(&tabs)
     });
     let current_tab = effective_tab(Tab::parse(&route_tab), &visible_tabs());
-    let breadcrumbs = use_signal(|| decode_path(route_path.as_deref()));
-
-    // Re-sync local breadcrumb signal when navigation (a row click's
-    // `navigator.push`, back/forward, or a deep link) changes the route's
-    // `path` out from under us.
-    //
-    // #566 (live probe): `use_reactive!` is load-bearing. `path` is a plain
-    // route prop, not a signal -- an effect that merely *captures* it has no
-    // tracked dependency and runs exactly once, at mount. In-app navigation
-    // keeps this component mounted, so every breadcrumb-changing click
-    // (browse rows and the new search-result chevrons alike) updated the URL
-    // while the visible level never changed -- the click read as a no-op.
-    // Deep links appeared to work only because a fresh mount seeds the
-    // signal's initial value. `use_reactive!` diffs the prop across renders
-    // and re-runs this effect when it actually changes.
-    {
-        let mut breadcrumbs = breadcrumbs;
-        let route_path_for_effect = path.clone();
-        use_effect(use_reactive!(|route_path_for_effect| {
-            let decoded = decode_path(route_path_for_effect.as_deref());
-            if *breadcrumbs.peek() != decoded {
-                breadcrumbs.set(decoded);
-            }
-        }));
-    }
+    // Breadcrumb labels are reconstructed by the server from the durable
+    // location. They are display data, not URL state.
+    let breadcrumbs = use_signal(Vec::<CollectionBreadcrumb>::new);
 
     let items = use_signal(Vec::<CollectionItem>::new);
     let offset = use_signal(|| 0u32);
@@ -606,19 +552,20 @@ pub fn Library(
     // Monotonic guard so a delayed auto-clear never erases a NEWER toast.
     let mut status_generation = use_signal(|| 0u64);
 
+    let route_location_for_refresh = route_location.clone();
     let refresh = use_callback(move |append: bool| {
         let Some(zone_id) = browse_zone_id() else {
             return;
         };
-        let path = breadcrumbs.read().last().and_then(|e| e.path.clone());
+        let location = route_location_for_refresh.clone();
         // #573 (visual pass V2b root cause): a tab's action ("playlists",
-        // "favorites") lists that tab's ROOT and ignores `path` -- so once
+        // "favorites") lists that tab's ROOT and ignores navigation state -- so once
         // the user opened a playlist, every reload re-listed the parent
         // under an advanced breadcrumb (an empty playlist looked like the
         // playlists list itself). Any level below a tab's root is reached
-        // by its opaque `path`, and the documented way to continue into a
-        // path is the `browse` action, whatever tab it started from.
-        let (action, media_type) = if path.is_some() {
+        // by its durable `location`, and continuing into one uses the
+        // `browse` action, whatever tab it started from.
+        let (action, media_type) = if location.is_some() {
             ("browse".to_string(), None)
         } else {
             (
@@ -631,7 +578,7 @@ pub fn Library(
             zone_id,
             action,
             media_type,
-            path,
+            location,
             request_offset,
             append,
             items,
@@ -639,24 +586,26 @@ pub fn Library(
             offset,
             loading,
             error,
+            breadcrumbs,
         ));
     });
 
-    // Reload the level whenever source, tab, browse zone, or breadcrumb
-    // path changes.
+    // Reload the level whenever source, tab, browse zone, or durable
+    // location changes.
     //
     // `use_reactive!` on `route_tab` is load-bearing (same class as the
-    // `route_zone` effect above): `tab` is a plain route prop, and the old
+    // source route effect above): `tab` is a plain route prop, and the old
     // `let _ = route_tab.clone();` captured it without tracking anything. A
     // tab switch at the breadcrumb root (e.g. Browse -> Playlists, stack
     // [] == [], source and zone unchanged) changed no tracked dependency,
     // so this effect never reran and the old tab's items stayed on screen
     // under the new tab's header.
-    use_effect(use_reactive!(|route_tab| {
+    let route_location_for_effect = route_location.clone();
+    use_effect(use_reactive!(|(route_tab, route_location_for_effect)| {
         let _ = selected_source();
         let _ = browse_zone_id();
         let _ = route_tab;
-        let _ = breadcrumbs.read().clone();
+        let _ = route_location_for_effect;
         // The play-status toast ("Playing", "Added to queue") describes an
         // action taken on the level the user was on -- it must not follow
         // them around the library (live report: a lone "Playing" haunting
@@ -671,19 +620,12 @@ pub fn Library(
         }
     }));
 
-    // Navigate helper: push a fresh URL for the given state, keeping the
-    // rest of the query intact.
-    let navigate = move |new_source: Option<String>,
-                         new_tab: Option<String>,
-                         new_path: Option<String>,
-                         new_zone: Option<String>| {
-        navigator.push(Route::Library {
-            source: new_source,
-            tab: new_tab,
-            path: new_path,
-            zone: new_zone,
-        });
-    };
+    // Navigate with canonical route state only. The armed zone remains a
+    // client-side preference and provider-native paths remain server-side.
+    let navigate =
+        move |new_source: Option<String>, new_tab: Option<String>, new_location: Option<String>| {
+            navigator.push(library_route(new_source, new_tab, new_location));
+        };
 
     // The search box's text. Declared before `open_folder` (its consumers --
     // the input binding and the search effect -- live in the "Unified search"
@@ -691,7 +633,7 @@ pub fn Library(
     let mut search_query = use_signal(String::new);
 
     let open_folder = {
-        move |(title, folder_path): (String, String)| {
+        move |(_title, location): (String, String)| {
             // #566 (live probe): a non-empty query keeps the search-results
             // view mounted, so opening a search hit navigated the route (URL
             // and breadcrumbs updated) while the visible page stayed on the
@@ -705,16 +647,10 @@ pub fn Library(
             // components' handler props don't accept.)
             let mut search_query = search_query;
             search_query.set(String::new());
-            let mut stack = breadcrumbs();
-            stack.push(BreadcrumbEntry {
-                title,
-                path: Some(folder_path),
-            });
             navigate(
                 selected_source(),
                 Some(current_tab.as_str().to_string()),
-                encode_path(&stack),
-                armed_zone_id(),
+                Some(location),
             );
         }
     };
@@ -726,31 +662,27 @@ pub fn Library(
     // stale crumbs afterwards desyncs from the provider's browse session.
     // Opening a search hit starts a FRESH trail rooted at the hit itself.
     let open_search_hit = {
-        move |(title, folder_path): (String, String)| {
+        move |(_title, location): (String, String)| {
             let mut search_query = search_query;
             search_query.set(String::new());
-            let stack = vec![BreadcrumbEntry {
-                title,
-                path: Some(folder_path),
-            }];
             navigate(
                 selected_source(),
                 Some(current_tab.as_str().to_string()),
-                encode_path(&stack),
-                armed_zone_id(),
+                Some(location),
             );
         }
     };
 
     let go_to_crumb = {
         move |index: usize| {
-            let mut stack = breadcrumbs();
-            stack.truncate(index);
+            let location = index
+                .checked_sub(1)
+                .and_then(|crumb_index| breadcrumbs().get(crumb_index).cloned())
+                .map(|crumb| crumb.location);
             navigate(
                 selected_source(),
                 Some(current_tab.as_str().to_string()),
-                encode_path(&stack),
-                armed_zone_id(),
+                location,
             );
         }
     };
@@ -761,19 +693,13 @@ pub fn Library(
                 Some(new_source),
                 Some(current_tab.as_str().to_string()),
                 None,
-                armed_zone_id(),
             );
         }
     };
 
     let select_tab = {
         move |new_tab: Tab| {
-            navigate(
-                selected_source(),
-                Some(new_tab.as_str().to_string()),
-                None,
-                armed_zone_id(),
-            );
+            navigate(selected_source(), Some(new_tab.as_str().to_string()), None);
         }
     };
 
@@ -789,12 +715,9 @@ pub fn Library(
             // type-check here -- the closure is required.
             #[allow(clippy::redundant_closure)]
             let source = zone_source.or_else(|| selected_source());
-            navigate(
-                source,
-                Some(current_tab.as_str().to_string()),
-                None,
-                Some(zone_id),
-            );
+            armed_zone_id.set(Some(zone_id.clone()));
+            save_last_zone(&zone_id);
+            navigate(source, Some(current_tab.as_str().to_string()), None);
         }
     };
 
@@ -964,11 +887,10 @@ pub fn Library(
             }
         }
     } else if let Some(level_error) = current_error.clone() {
-        let retry_source = current_source.clone();
         // #573 visual pass V3: unreachability copy is reserved for actual
-        // network failures; a genuine refusal (a capability gap, an expired
-        // path) renders its own reason instead of claiming the provider is
-        // down.
+        // network failures; a genuine refusal renders its own reason instead
+        // of claiming the provider is down. Durable locations are retried in
+        // place; the UI never silently throws the user back to the root.
         let heading = if level_error.unreachable {
             format!(
                 "{} isn't reachable right now.",
@@ -977,18 +899,37 @@ pub fn Library(
         } else {
             "This view isn't available.".to_string()
         };
+        let detail = level_error.message.clone();
         rsx! {
             div { class: "library-provider-down",
                 p { "{heading}" }
-                p { class: "text-sm text-muted", "{level_error.message}" }
-                button {
-                    class: "btn btn-outline",
-                    r#type: "button",
-                    onclick: move |_| {
-                        let _ = retry_source.clone();
-                        refresh(false);
-                    },
-                    "Retry"
+                p { class: "text-sm text-muted", "{detail}" }
+                div { class: "flex flex-wrap items-center justify-center gap-2",
+                    button {
+                        class: "btn btn-outline",
+                        r#type: "button",
+                        onclick: move |_| {
+                            refresh(false);
+                        },
+                        "Retry"
+                    }
+                    // Retrying in place is right for a level that is merely
+                    // stale -- the server re-walks the saved trail. A node
+                    // that is permanently gone would strand the user there,
+                    // so this is the deliberate way out, not an automatic one.
+                    button {
+                        class: "btn btn-ghost",
+                        r#type: "button",
+                        onclick: move |_| {
+                            // Same rule as `open_folder`: leaving for the root
+                            // ends the search, or the results view would stay
+                            // mounted over the level we just navigated to.
+                            let mut search_query = search_query;
+                            search_query.set(String::new());
+                            navigate(selected_source(), Some(current_tab.as_str().to_string()), None);
+                        },
+                        "Back to library"
+                    }
                 }
             }
         }
@@ -1038,11 +979,11 @@ pub fn Library(
                                     // row opens a navigable hit, same as
                                     // browse rows.
                                     onclick: {
-                                        let path = result.path.clone();
+                                        let location = result.location.clone();
                                         let title = result.title.clone();
                                         move |_| {
-                                            if let Some(path) = path.clone() {
-                                                open_search_hit((title.clone(), path.clone()));
+                                            if let Some(location) = location.clone() {
+                                                open_search_hit((title.clone(), location));
                                             }
                                         }
                                     },
@@ -1082,27 +1023,27 @@ pub fn Library(
                                         // #566: a navigable result (a real
                                         // hit like an artist, or a grouping
                                         // row like "Albums · 35 Results")
-                                        // carries a `path` -- open it the
+                                        // carries a durable `location` -- open it the
                                         // same way a browse row does: push a
                                         // breadcrumb and navigate into it,
                                         // rather than leaving the row a dead
                                         // end. Independent of the play
                                         // button above: a result can have
                                         // either, both, or neither.
-                                        if let Some(path) = result.path.clone() {
+                                        if let Some(location) = result.location.clone() {
                                             button {
                                                 class: "library-chevron-btn",
                                                 aria_label: "Open {result.title}",
                                                 r#type: "button",
                                                 onclick: {
                                                     let title = result.title.clone();
-                                                    let path = path.clone();
+                                                    let location = location.clone();
                                                     // stop_propagation: the row's
                                                     // own click does the same
                                                     // navigation.
                                                     move |evt: Event<MouseData>| {
                                                         evt.stop_propagation();
-                                                        open_search_hit((title.clone(), path.clone()));
+                                                        open_search_hit((title.clone(), location.clone()));
                                                     }
                                                 },
                                                 svg { class: "w-5 h-5", fill: "none", view_box: "0 0 24 24", stroke: "currentColor", "stroke-width": "2",
@@ -1239,6 +1180,26 @@ pub fn Library(
     }
 }
 
+#[component]
+pub fn LibraryHome() -> Element {
+    rsx! { Library { source: None, tab: None, location: None } }
+}
+
+#[component]
+pub fn LibrarySource(source: String) -> Element {
+    rsx! { Library { source: Some(source), tab: None, location: None } }
+}
+
+#[component]
+pub fn LibraryView(source: String, view: String) -> Element {
+    rsx! { Library { source: Some(source), tab: Some(view), location: None } }
+}
+
+#[component]
+pub fn LibraryLocation(source: String, view: String, location: String) -> Element {
+    rsx! { Library { source: Some(source), tab: Some(view), location: Some(location) } }
+}
+
 fn empty_state_heading(tab: Tab) -> &'static str {
     match tab {
         Tab::Browse => "Nothing here yet",
@@ -1262,9 +1223,9 @@ fn empty_state_body(tab: Tab) -> &'static str {
 /// Per-level layout follows the design brief's "art-first, list otherwise"
 /// split: a page made mostly of playable leaves (tracks/albums, `ref` set)
 /// renders as an artwork-forward grid; a page made mostly of folders
-/// (`path` set, no `ref`) renders as compact navigable rows. `CollectionItem`
-/// has no artwork field yet (that's the sibling companion issue, #549) so
-/// the grid tile falls back to a text placeholder until it does.
+/// (`location` set, no `ref`) renders as compact navigable rows. `CollectionItem`
+/// carries artwork when a provider has it; the grid tile falls back to a
+/// text placeholder for rows without art.
 #[component]
 fn LibraryRows(
     items: Vec<CollectionItem>,
@@ -1281,7 +1242,7 @@ fn LibraryRows(
             ul { class: "library-grid",
                 for (index , item) in items.iter().cloned().enumerate() {
                     LibraryTile {
-                        key: "{item.title}-{item.path.clone().unwrap_or_default()}-{item.item_ref.clone().unwrap_or_default()}",
+                        key: "{item.title}-{item.location.clone().unwrap_or_default()}-{item.item_ref.clone().unwrap_or_default()}",
                         item: item,
                         index: index,
                         tab: tab,
@@ -1297,7 +1258,7 @@ fn LibraryRows(
             ul { class: "library-list",
                 for (index , item) in items.iter().cloned().enumerate() {
                     LibraryRow {
-                        key: "{item.title}-{item.path.clone().unwrap_or_default()}-{item.item_ref.clone().unwrap_or_default()}",
+                        key: "{item.title}-{item.location.clone().unwrap_or_default()}-{item.item_ref.clone().unwrap_or_default()}",
                         item: item,
                         index: index,
                         tab: tab,
@@ -1333,11 +1294,11 @@ fn LibraryRow(
             // buttons stop propagation so their own actions stay separate
             // hit areas.
             onclick: {
-                let path = item.path.clone();
+                let location = item.location.clone();
                 let title = item.title.clone();
                 move |_| {
-                    if let Some(path) = path.clone() {
-                        on_open((title.clone(), path.clone()));
+                    if let Some(location) = location.clone() {
+                        on_open((title.clone(), location.clone()));
                     }
                 }
             },
@@ -1423,19 +1384,19 @@ fn LibraryRow(
                         }
                     }
                 }
-                if let Some(path) = item.path.clone() {
+                if let Some(location) = item.location.clone() {
                     button {
                         class: "library-chevron-btn",
                         aria_label: "Open {item.title}",
                         r#type: "button",
                         onclick: {
                             let title = item.title.clone();
-                            let path = path.clone();
+                            let location = location.clone();
                             // stop_propagation so the row's own click
                             // handler (same navigation) doesn't fire twice.
                             move |evt: Event<MouseData>| {
                                 evt.stop_propagation();
-                                on_open((title.clone(), path.clone()));
+                                on_open((title.clone(), location.clone()));
                             }
                         },
                         svg { class: "w-5 h-5", fill: "none", view_box: "0 0 24 24", stroke: "currentColor", "stroke-width": "2",
@@ -1459,7 +1420,7 @@ fn LibraryTile(
 ) -> Element {
     let stagger_style = format!("--library-stagger-index: {index};");
     let has_ref = item.item_ref.is_some();
-    let has_path = item.path.is_some();
+    let has_location = item.location.is_some();
 
     rsx! {
         li {
@@ -1469,11 +1430,11 @@ fn LibraryTile(
             // subtitle alike), not just the art block -- the play button
             // below stops propagation to stay its own hit area.
             onclick: {
-                let path = item.path.clone();
+                let location = item.location.clone();
                 let title = item.title.clone();
                 move |_| {
-                    if let Some(path) = path.clone() {
-                        on_open((title.clone(), path.clone()));
+                    if let Some(location) = location.clone() {
+                        on_open((title.clone(), location.clone()));
                     }
                 }
             },
@@ -1514,7 +1475,7 @@ fn LibraryTile(
                         "▶"
                     }
                 }
-                if has_path {
+                if has_location {
                     span { class: "library-tile-chevron",
                         svg { class: "w-4 h-4", fill: "none", view_box: "0 0 24 24", stroke: "currentColor", "stroke-width": "2",
                             path { "stroke-linecap": "round", "stroke-linejoin": "round", d: "M9 5l7 7-7 7" }

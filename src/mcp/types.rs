@@ -68,16 +68,13 @@ pub struct McpNowPlaying {
 /// anyway would trade "no ref" for "a ref that might play the wrong thing".
 /// `title`/`subtitle` are unchanged from before this issue.
 ///
-/// `path` (#566) is the same addition PR #533/#547 made for
-/// `hifi_collections`: a `RefTarget::RoonBrowse` token, present exactly when
-/// the result is navigable (a real hit that can be browsed into, or a
-/// grouping row like "Albums · 35 Results" that names a bucket in the
-/// search session). `path` and `ref` are independent — a result can carry
-/// either, both, or neither, never conflated into one slot. Only Roon mints
-/// it today: LMS's search drills straight to leaf results server-side and
-/// Spotify/Apple Music/Music Assistant's generic search has no grouping or
-/// browse concept, so they always leave this `None` (see
-/// `crate::mcp::tools::library::handle_search`'s per-route docs).
+/// `path` (#566) is a short-lived `RefTarget::RoonBrowse` continuation,
+/// present exactly when a Roon result is navigable. `location` is its durable,
+/// provider-neutral counterpart and is what canonical Library URLs consume.
+/// Both are independent from `ref`: a result may be navigable, playable,
+/// both, or neither. LMS search drills straight to leaves, while the generic
+/// Spotify/Apple Music/Music Assistant search mappings have no grouping
+/// concept, so only Roon search mints either navigation field today.
 /// `image` (#573 defect 10) follows `hifi_collections`' artwork convention
 /// exactly: a same-origin `/api/collections/image?ref=...` path over an
 /// opaque minted token, present only when the provider supplied art for the
@@ -91,6 +88,8 @@ pub struct McpSearchResult {
     pub r#ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
 }

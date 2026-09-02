@@ -869,6 +869,7 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
             ("zone_id", true),
             ("action", true),
             ("path", false),
+            ("location", false),
             ("media_type", false),
             ("limit", false),
             ("offset", false),
@@ -2420,6 +2421,11 @@ async fn musicassistant_collections_are_paged_and_mint_opaque_playable_refs() {
         .expect("browse folder must return an opaque continuation path");
     assert!(path.starts_with("ref_"));
     assert_ne!(path, "library://jazz", "MA path must stay server-side");
+    let location = root_page["items"][0]["location"]
+        .as_str()
+        .expect("browse folder must return a durable canonical location");
+    assert!(location.starts_with("loc_"));
+    assert!(!location.contains("jazz"));
     // #549: the folder-shaped root row has no MA image_url, so it must carry
     // no image field at all -- absent honestly, not a placeholder.
     assert!(
@@ -2445,12 +2451,14 @@ async fn musicassistant_collections_are_paged_and_mint_opaque_playable_refs() {
     let browse = app
         .call_tool(
             "hifi_collections",
-            json!({"zone_id": zone_id, "action": "browse", "path": path, "limit": 1, "offset": 1}),
+            json!({"zone_id": zone_id, "action": "browse", "location": location, "limit": 1, "offset": 1}),
         )
         .await;
     assert_eq!(browse["structuredContent"]["outcome"], "ok");
     let browse_page: Value = serde_json::from_str(&result_text(&browse)).expect("browse page JSON");
     assert_eq!(browse_page["items"][0]["title"], "So What");
+    assert_eq!(browse_page["breadcrumbs"][0]["title"], "Jazz");
+    assert_eq!(browse_page["breadcrumbs"][0]["location"], location);
     assert!(browse_page["items"][0]["ref"].as_str().is_some());
     assert!(
         browse_page["items"][0].get("uri").is_none(),
@@ -2584,18 +2592,25 @@ async fn lms_collections_browse_walks_albums_into_tracks() {
         .expect("root must list Albums");
     let albums_path = albums_entry["path"].as_str().expect("Albums has a path");
     assert!(albums_path.starts_with("ref_"));
+    let albums_location = albums_entry["location"]
+        .as_str()
+        .expect("Albums has a durable canonical location");
+    assert!(albums_location.starts_with("loc_"));
+    assert!(!albums_location.contains("albums"));
 
     let albums = h
         .app
         .call_tool(
             "hifi_collections",
-            json!({"zone_id": zone_id, "action": "browse", "path": albums_path}),
+            json!({"zone_id": zone_id, "action": "browse", "location": albums_location}),
         )
         .await;
     assert_eq!(albums["structuredContent"]["outcome"], "ok");
     let albums_page: Value = serde_json::from_str(&result_text(&albums)).expect("albums page JSON");
     assert_eq!(albums_page["items"][0]["title"], "Kind of Blue");
     assert_eq!(albums_page["items"][0]["subtitle"], "Album by Miles Davis");
+    assert_eq!(albums_page["breadcrumbs"][0]["title"], "Albums");
+    assert_eq!(albums_page["breadcrumbs"][0]["location"], albums_location);
     let album_image = albums_page["items"][0]["image"]
         .as_str()
         .expect("an album with a seeded coverid must carry an image field");
@@ -2610,17 +2625,24 @@ async fn lms_collections_browse_walks_albums_into_tracks() {
     let album_path = albums_page["items"][0]["path"]
         .as_str()
         .expect("an album is itself browsable, into its tracks");
+    let album_location = albums_page["items"][0]["location"]
+        .as_str()
+        .expect("a browsable album has a durable canonical location");
+    assert!(album_path.starts_with("ref_"));
+    assert!(album_location.starts_with("loc_"));
 
     let tracks = h
         .app
         .call_tool(
             "hifi_collections",
-            json!({"zone_id": zone_id, "action": "browse", "path": album_path}),
+            json!({"zone_id": zone_id, "action": "browse", "location": album_location}),
         )
         .await;
     assert_eq!(tracks["structuredContent"]["outcome"], "ok");
     let tracks_page: Value = serde_json::from_str(&result_text(&tracks)).expect("tracks page JSON");
     assert_eq!(tracks_page["items"][0]["title"], "So What");
+    assert_eq!(tracks_page["breadcrumbs"][0]["title"], "Albums");
+    assert_eq!(tracks_page["breadcrumbs"][1]["title"], "Kind of Blue");
     let track_ref = tracks_page["items"][0]["ref"]
         .as_str()
         .expect("a track is playable, not a browsable path");
@@ -2743,12 +2765,12 @@ async fn lms_collections_playlists_and_favorites() {
     h.stop().await;
 }
 
-/// #531: an opaque path minted for one zone's provider must never resolve
-/// against a different provider's zone -- same safety property #492 already
-/// pins for Music Assistant, now proven for LMS.
+/// #531: opaque collection handles minted for one zone's provider must never
+/// resolve against a different provider's zone -- same safety property #492
+/// already pins for Music Assistant, now proven for LMS.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
-async fn lms_collections_path_does_not_cross_provider_boundaries() {
+async fn lms_collection_handles_do_not_cross_provider_boundaries() {
     let h = LmsHarness::start().await;
     let zone_id = h.zone_id();
     h.mock
@@ -2767,16 +2789,61 @@ async fn lms_collections_path_does_not_cross_provider_boundaries() {
         .as_str()
         .expect("root item has a path")
         .to_string();
+    let location = root_page["items"][0]["location"]
+        .as_str()
+        .expect("root item has a durable location")
+        .to_string();
 
     let cross = h
         .app
         .call_tool(
             "hifi_collections",
-            json!({"zone_id": "roon:not-lms", "action": "browse", "path": path}),
+            json!({"zone_id": "roon:not-lms", "action": "browse", "path": &path}),
         )
         .await;
     assert_eq!(cross["structuredContent"]["outcome"], "invalid", "{cross}");
     assert_eq!(cross["structuredContent"]["refusal"]["parameter"], "path");
+
+    let cross_location = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({
+                "zone_id": "roon:not-lms",
+                "action": "browse",
+                "location": &location,
+            }),
+        )
+        .await;
+    assert_eq!(
+        cross_location["structuredContent"]["outcome"], "invalid",
+        "{cross_location}"
+    );
+    assert_eq!(
+        cross_location["structuredContent"]["refusal"]["parameter"],
+        "location"
+    );
+
+    let conflicting_handles = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({
+                "zone_id": zone_id,
+                "action": "browse",
+                "path": &path,
+                "location": &location,
+            }),
+        )
+        .await;
+    assert_eq!(
+        conflicting_handles["structuredContent"]["outcome"], "invalid",
+        "{conflicting_handles}"
+    );
+    assert_eq!(
+        conflicting_handles["structuredContent"]["refusal"]["parameter"],
+        "location"
+    );
 
     let stale = h
         .app
@@ -3422,6 +3489,30 @@ const FIELD_ROLES: &[(&str, FieldRole)] = &[
         ),
     ),
     (
+        "location",
+        Consumed(
+            "hifi_collections.location — the durable provider-neutral collection identity used by canonical Library URLs. Navigable collection and Roon search rows return it; clients pass it back to hifi_collections instead of depending on the short-lived path cursor.",
+        ),
+    ),
+    (
+        "breadcrumbs",
+        DisplayOnly(
+            "server-reconstructed labels and durable locations for the current collection lineage; the web Library renders them and navigates using each entry's location.",
+        ),
+    ),
+    (
+        "items",
+        DisplayOnly(
+            "collection page wrapper; actionable child fields close their own loops through location, path, and ref.",
+        ),
+    ),
+    (
+        "next_offset",
+        Consumed(
+            "hifi_collections.offset — the continuation position for the next page of the same collection location.",
+        ),
+    ),
+    (
         "image",
         DisplayOnly(
             "artwork URL (#549 for hifi_collections rows, #573 for hifi_search hits): a \
@@ -3817,11 +3908,22 @@ async fn no_tool_returns_an_unclassified_field() {
             // #566: same reasoning as `ref` above -- `Some` so `path` is
             // collected and must be classified below too.
             path: Some(String::new()),
+            // Durable canonical Library location, separate from the
+            // short-lived MCP browse continuation above.
+            location: Some(String::new()),
             // #573 defect 10: same again -- `Some` so `image` is collected
             // and must be classified below.
             image: Some(String::new()),
         })
         .expect("McpSearchResult must serialize"),
+        &mut returned,
+    );
+    // Collection pages are not otherwise exercised in this inventory test.
+    // Serialize the web API's exact mirror so its page wrappers and durable
+    // breadcrumb field remain classified.
+    collect_keys(
+        &serde_json::to_value(unified_hifi_control::app::api::CollectionPage::default())
+            .expect("CollectionPage must serialize"),
         &mut returned,
     );
     collect_keys(

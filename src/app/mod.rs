@@ -16,7 +16,10 @@ pub mod sse;
 pub mod theme;
 
 use components::BootstrapPrompt;
-use pages::{HqPlayer, Knobs, Library, Lms, Settings, Spotify, Zones};
+use pages::{
+    HqPlayer, Knobs, LibraryHome, LibraryLocation, LibrarySource, LibraryView, Lms, Settings,
+    Spotify, Zones,
+};
 use settings_context::use_settings_provider;
 use sse::use_sse_provider;
 use theme::use_theme_provider;
@@ -138,24 +141,23 @@ pub fn App() -> Element {
 
 /// Application routes.
 ///
-/// Library is the home page (#550): a full-page browse/search surface that
-/// replaced the old per-zone-card browse panel. Its state -- which
-/// provider/zone is being browsed, which tab, and the breadcrumb path -- is
-/// carried entirely in the query string so a level is refresh/back/share
-/// safe, per the issue's URL-addressability requirement. `path` is a
-/// base64url-encoded JSON breadcrumb stack (`Vec<(String, Option<String>)>`,
-/// see `pages::library::BreadcrumbEntry`) rather than raw path segments:
-/// provider browse paths are opaque tokens that may contain characters a URL
-/// path segment can't carry safely, and a flat list of segments would lose
-/// the breadcrumb titles on a fresh (deep-linked) load.
+/// Library is the home page (#550). Source, view, and durable collection
+/// location use one readable path grammar for every provider. The armed
+/// playback zone is client preference, not content identity, so it never
+/// appears in these URLs.
 #[derive(Clone, Routable, Debug, PartialEq)]
 pub enum Route {
-    #[route("/?:source&:tab&:path&:zone")]
-    Library {
-        source: Option<String>,
-        tab: Option<String>,
-        path: Option<String>,
-        zone: Option<String>,
+    #[route("/")]
+    LibraryHome {},
+    #[route("/library/:source")]
+    LibrarySource { source: String },
+    #[route("/library/:source/:view")]
+    LibraryView { source: String, view: String },
+    #[route("/library/:source/:view/:location")]
+    LibraryLocation {
+        source: String,
+        view: String,
+        location: String,
     },
     // #560: was `/zones`, which collides with the JSON protocol route
     // `GET /zones` (knobs::knob_zones_handler, registered in main.rs) --
@@ -178,7 +180,36 @@ pub enum Route {
 
 #[cfg(test)]
 mod tests {
-    use super::McpEndpoint;
+    use super::{McpEndpoint, Route};
+
+    #[test]
+    fn library_routes_are_canonical_and_provider_neutral() {
+        assert_eq!(Route::LibraryHome {}.to_string(), "/");
+        assert_eq!(
+            Route::LibrarySource {
+                source: "roon".to_string(),
+            }
+            .to_string(),
+            "/library/roon"
+        );
+        assert_eq!(
+            Route::LibraryView {
+                source: "lms".to_string(),
+                view: "playlists".to_string(),
+            }
+            .to_string(),
+            "/library/lms/playlists"
+        );
+        assert_eq!(
+            Route::LibraryLocation {
+                source: "musicassistant".to_string(),
+                view: "browse".to_string(),
+                location: "loc_4fNE3TqO1n0Yzg".to_string(),
+            }
+            .to_string(),
+            "/library/musicassistant/browse/loc_4fNE3TqO1n0Yzg"
+        );
+    }
 
     #[test]
     fn mcp_endpoint_uses_reachable_ipv4_address_in_agent_config() {
