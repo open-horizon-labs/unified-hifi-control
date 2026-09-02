@@ -127,6 +127,16 @@ pub enum Capability {
     SavedPlaylists,
     /// List and play saved favourites.
     Favorites,
+    /// Browse and play the provider's internet-radio surface.
+    ///
+    /// Deliberately its own cell rather than a shade of [`Self::Favorites`].
+    /// The two are unrelated on every provider that has both: LMS keeps saved
+    /// favorites in a flat list and radio in the radio plugin's hierarchy, and
+    /// Roon has a My Live Radio browse node but exposes no favorites surface at
+    /// all. Deriving a Radio tab from the Favorites cell -- which the Library
+    /// page used to do -- claimed radio wherever favorites existed and hid it
+    /// wherever they did not, which is precisely backwards for Roon.
+    Radio,
     /// Group and ungroup zones for synchronised playback.
     MultiroomSync,
 }
@@ -155,6 +165,7 @@ impl Capability {
         Self::ShuffleMode,
         Self::SavedPlaylists,
         Self::Favorites,
+        Self::Radio,
         Self::MultiroomSync,
     ];
 
@@ -180,6 +191,7 @@ impl Capability {
             Self::ShuffleMode => "shuffle_mode",
             Self::SavedPlaylists => "saved_playlists",
             Self::Favorites => "favorites",
+            Self::Radio => "radio",
             Self::MultiroomSync => "multiroom_sync",
         }
     }
@@ -392,6 +404,16 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
                 ZoneTarget::Spotify | ZoneTarget::MusicAssistant | ZoneTarget::Lms
             )
         }
+        // Roon reaches My Live Radio through the same named-root-node walk its
+        // Playlists tab already uses; LMS reaches the radio plugin's hierarchy
+        // behind `radios`; Music Assistant serves radio library items. Three
+        // different surfaces, one capability.
+        Capability::Radio => {
+            matches!(
+                target,
+                ZoneTarget::Roon | ZoneTarget::Lms | ZoneTarget::MusicAssistant
+            )
+        }
     };
     supported.then_some(Support::Supported)
 }
@@ -585,6 +607,10 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
          (Read/Insert/DeleteId/DeleteAll) with no save or recall action, and stored playlists \
          live on whatever media server the control point uses. Verified from the OpenHome \
          service definitions, not from a device.")),
+    (ZoneTarget::OpenHome, Capability::Radio, Gap::NotWired("#392",
+        "OpenHome's Radio:1 service is exactly this capability -- it carries station presets \
+         and a channel URI. UHC discovers neither the service nor its presets. Verified from \
+         the OpenHome service definitions, not from a device.")),
     (ZoneTarget::OpenHome, Capability::Favorites, Gap::NotWired("#392",
         "OpenHome devices carry stored presets (Radio:1 presets, and a Pins service on newer \
          firmware). UHC discovers neither. Reported as a gap rather than a limit because the \
@@ -625,6 +651,11 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     (ZoneTarget::Upnp, Capability::SavedPlaylists, Gap::ProviderCannot(
         "AVTransport:1 and RenderingControl:1 store nothing; a MediaRenderer has no playlist \
          storage. Verified from the UPnP AV service definitions, not from a device.")),
+    (ZoneTarget::Upnp, Capability::Radio, Gap::ProviderCannot(
+        "A plain UPnP AV renderer stores nothing: AVTransport plays a URI a control point \
+         hands it, and no service in the AV set enumerates stations. Radio on such a device \
+         is whatever the control point remembers, which is not a provider surface UHC can \
+         browse. Verified from the UPnP AV service definitions, not from a device.")),
     (ZoneTarget::Upnp, Capability::Favorites, Gap::ProviderCannot(
         "AVTransport:1 and RenderingControl:1 store nothing; a MediaRenderer has no favourites. \
          Verified from the UPnP AV service definitions, not from a device.")),
@@ -657,6 +688,7 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     (ZoneTarget::HqPlayer, Capability::QueueTransfer, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::PlayNext, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::SavedPlaylists, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
+    (ZoneTarget::HqPlayer, Capability::Radio, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::Favorites, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::MultiroomSync, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
 ];
@@ -872,16 +904,20 @@ mod tests {
                                 | Capability::SavedPlaylists
                                 | Capability::Favorites
                                 | Capability::MultiroomSync
-                        ) || (matches!(target, &ZoneTarget::AppleMusic)
-                            && matches!(
-                                capability,
-                                Capability::Search
-                                    | Capability::PlayByQuery
-                                    | Capability::PlayByRef
-                                    | Capability::QueueRead
-                                    | Capability::RepeatMode
-                                    | Capability::ShuffleMode
-                            ))));
+                        ) || (matches!(
+                            target,
+                            &ZoneTarget::AppleMusic | &ZoneTarget::Spotify
+                        ) && matches!(capability, Capability::Radio))
+                            || (matches!(target, &ZoneTarget::AppleMusic)
+                                && matches!(
+                                    capability,
+                                    Capability::Search
+                                        | Capability::PlayByQuery
+                                        | Capability::PlayByRef
+                                        | Capability::QueueRead
+                                        | Capability::RepeatMode
+                                        | Capability::ShuffleMode
+                                ))));
                 if !routed && !listed {
                     missing.push((target.label(), capability.name()));
                 }
@@ -1073,7 +1109,7 @@ mod tests {
                 capability.name()
             );
         }
-        assert_eq!(seen.len(), 19, "the vocabulary changed size: {seen:?}");
+        assert_eq!(seen.len(), 20, "the vocabulary changed size: {seen:?}");
     }
 
     /// A refusal built from a capability state must carry the same

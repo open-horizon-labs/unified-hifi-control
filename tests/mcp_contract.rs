@@ -5644,6 +5644,7 @@ const EXPECTED_CAPABILITIES: &[&str] = &[
     "shuffle_mode",
     "saved_playlists",
     "favorites",
+    "radio",
     "multiroom_sync",
 ];
 
@@ -6039,9 +6040,23 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
                     }),
                 ))
             }
+            // Radio is asked for the way the Library page asks: the favorites
+            // action carrying `media_type: radio`. Every provider that reports
+            // it supported must route that pair to its own radio surface --
+            // Roon's My Live Radio node, LMS's `radios` hierarchy, Music
+            // Assistant's radio library items.
+            "radio" => Some((
+                "hifi_collections",
+                json!({
+                    "zone_id": zone_id,
+                    "action": "favorites",
+                    "media_type": "radio",
+                }),
+            )),
             // Roon's favorites cell is not (yet) supported, so only browse
             // and saved_playlists (mapped to Playlists, its browse-hierarchy
-            // node) are probed here.
+            // node) are probed here. Radio is handled above: Roon has that
+            // surface even though it has no favorites one.
             "browse" | "saved_playlists" if provider == "roon" => Some((
                 "hifi_collections",
                 json!({
@@ -6169,8 +6184,8 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
     // stopped being reported as supported, which is the direction that hides a
     // capability rather than inventing one.
     assert_eq!(
-        proved, 52,
-        "{proved} supported cells were proved end to end, expected 52. If a capability was deliberately wired or unwired, change this number in the same commit."
+        proved, 55,
+        "{proved} supported cells were proved end to end, expected 55. If a capability was deliberately wired or unwired, change this number in the same commit."
     );
 }
 
