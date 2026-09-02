@@ -2596,20 +2596,82 @@ pub struct LmsConfigRequest {
 /// own topology (`lms-cli` follows `lms`), and a provider with no settings toggle at
 /// all is a no-op rather than a compile error, which is what lets a new adapter adopt
 /// this by calling it.
-pub async fn mark_adapter_configured(state: &AppState, provider: &str) {
+///
+/// Returns an error when the toggle could not be written. Callers must fail the
+/// configuration rather than continue, because the alternative is reporting success
+/// while leaving the user in precisely the state this function exists to prevent — a
+/// connected provider publishing zones that no surface will list. A full disk is the
+/// realistic way to get here, and it is silent everywhere else.
+pub async fn mark_adapter_configured(
+    state: &AppState,
+    provider: &str,
+) -> Result<(), AdapterToggleUnwritable> {
+    set_adapter_enabled(state, provider, true).await
+}
+
+/// The settings file could not record a provider's enable toggle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterToggleUnwritable {
+    /// The provider whose toggle could not be written.
+    pub provider: String,
+}
+
+impl std::fmt::Display for AdapterToggleUnwritable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} was configured but its enable setting could not be saved, so its zones \
+             would not be listed; check that the config directory is writable",
+            self.provider
+        )
+    }
+}
+
+impl std::error::Error for AdapterToggleUnwritable {}
+
+/// Whether `provider` is enabled according to the settings on disk right now.
+///
+/// Callers that enable a provider before a fallible start read this first so they can
+/// put the toggle back if the start fails.
+pub fn adapter_enabled_in_settings(provider: &str) -> bool {
+    load_app_settings()
+        .adapters
+        .toggle(provider)
+        .unwrap_or(false)
+}
+
+async fn set_adapter_enabled(
+    state: &AppState,
+    provider: &str,
+    enabled: bool,
+) -> Result<(), AdapterToggleUnwritable> {
     let persisted = mutate_app_settings(|settings| {
         if let Some(toggle) = settings.adapters.toggle_mut(provider) {
-            *toggle = true;
+            *toggle = enabled;
         }
     });
     if !persisted {
-        tracing::warn!(
-            provider,
-            "Could not persist the adapter enable toggle after configuration; \
-             its zones will stay hidden until settings are saved"
-        );
+        return Err(AdapterToggleUnwritable {
+            provider: provider.to_string(),
+        });
     }
-    state.coordinator.enable_with_companions(provider).await;
+    if enabled {
+        state.coordinator.enable_with_companions(provider).await;
+    } else {
+        state.coordinator.set_enabled(provider, false).await;
+    }
+    Ok(())
+}
+
+/// Put a provider's enable toggle back after a configuration step failed downstream.
+///
+/// Best-effort by construction: the caller is already on an error path and has a more
+/// useful failure to report than this one, so a failed restore is logged rather than
+/// replacing that error.
+pub async fn restore_adapter_enabled(state: &AppState, provider: &str, enabled: bool) {
+    if let Err(error) = set_adapter_enabled(state, provider, enabled).await {
+        tracing::warn!(%error, "Could not restore the adapter enable toggle after a failed start");
+    }
 }
 
 /// POST /lms/configure - Configure LMS connection
@@ -2642,7 +2704,19 @@ pub async fn lms_configure_handler(
     // Naming a server is the enable gesture. The CLI companion follows from the
     // coordinator's topology; it is an observer of the same `lms:` projection, not a
     // separately switchable feature.
-    mark_adapter_configured(&state, "lms").await;
+    //
+    // Fail before starting if the toggle could not be saved. Starting anyway would
+    // reproduce the reported bug exactly — a connected LMS whose zones no list shows —
+    // while answering `200 ok`.
+    if let Err(error) = mark_adapter_configured(&state, "lms").await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response();
+    }
 
     // Start both observers together; the CLI companion is not an optional
     // feature of a manually configured LMS connection.
@@ -2706,7 +2780,15 @@ pub async fn hqp_configure_handler(
     // toggle was already on, which left "configured, connected, invisible" reachable
     // here too: the manager stayed down, and even once running every zone list would
     // have filtered `hqplayer:` zones back out.
-    mark_adapter_configured(&state, "hqplayer").await;
+    if let Err(error) = mark_adapter_configured(&state, "hqplayer").await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response();
+    }
 
     // A fresh installation may have skipped the HQPlayer lifecycle at process startup
     // because no endpoint existed yet. Start the idempotent manager after configuration
@@ -2932,7 +3014,15 @@ pub async fn hqp_add_instance_handler(
         .await;
 
     // Adding an instance is the same gesture as configuring the first one.
-    mark_adapter_configured(&state, "hqplayer").await;
+    if let Err(error) = mark_adapter_configured(&state, "hqplayer").await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response();
+    }
     match state.hqp_instances.start().await {
         Ok(()) => state.coordinator.set_running("hqplayer", true).await,
         Err(error) => tracing::warn!(

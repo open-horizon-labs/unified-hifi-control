@@ -1098,9 +1098,24 @@ pub async fn claim(
     // Claiming a pairing is a completed setup gesture, so it enables the provider like
     // every other configure path. It used to only log when the toggle was off, which
     // left the user with a paired companion, a healthy-looking bridge, and no zones.
-    crate::api::mark_adapter_configured(&state, "applemusic").await;
-    if let Err(error) = state.adapter_registry.start("applemusic").await {
-        tracing::debug!("Apple Music adapter will start when registered: {error}");
+    crate::api::mark_adapter_configured(&state, "applemusic")
+        .await
+        .map_err(|e| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+                "enable_failed",
+            )
+        })?;
+    // Through the coordinator rather than straight at the registry, so Apple Music
+    // records its running state and honours the same enable/can_start policy as every
+    // other start path. A build where the adapter is not registered still only logs.
+    if let Err(start_error) = state
+        .adapter_registry
+        .start_registered_if_enabled(&state.coordinator, "applemusic")
+        .await
+    {
+        tracing::debug!("Apple Music adapter will start when registered: {start_error}");
     }
     Ok(Json(response))
 }

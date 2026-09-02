@@ -522,7 +522,21 @@ async fn configure_musicassistant_request(
     // Saving a reachable connection is the enable gesture. Without this the start
     // below is a no-op whenever the toggle is off, and the response still reports
     // `configured: true` — the shape this whole change exists to remove.
-    crate::api::mark_adapter_configured(&state, "musicassistant").await;
+    //
+    // Captured first because this handler rolls back everything it touched when the
+    // start fails; the toggle has to roll back with the credentials and the runtime,
+    // or a failed setup silently leaves the provider switched on.
+    let previously_enabled = crate::api::adapter_enabled_in_settings("musicassistant");
+    crate::api::mark_adapter_configured(&state, "musicassistant")
+        .await
+        .map_err(|enable_error| {
+            restore_musicassistant_record(&store, existing.as_ref());
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &enable_error.to_string(),
+                "enable_failed",
+            )
+        })?;
     let runtime_for_rollback = runtime.clone();
     if state
         .adapter_registry
@@ -533,6 +547,7 @@ async fn configure_musicassistant_request(
         restore_musicassistant_record(&store, existing.as_ref());
         restore_musicassistant_runtime(&state.bus, &runtime_for_rollback, previous_runtime_config)
             .await;
+        crate::api::restore_adapter_enabled(&state, "musicassistant", previously_enabled).await;
         return Err(error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Music Assistant could not be started",
@@ -1035,22 +1050,28 @@ async fn complete_spotify_authorization(
     adapter.set_token(spotify_token).await;
     // Completing authorization is the enable gesture; this used to log and skip when
     // the toggle was off, leaving an authorized account with no zones.
-    crate::api::mark_adapter_configured(state, "spotify").await;
+    let previously_enabled = crate::api::adapter_enabled_in_settings("spotify");
+    crate::api::mark_adapter_configured(state, "spotify")
+        .await
+        .map_err(|enable_error| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &enable_error.to_string(),
+                "enable_failed",
+            )
+        })?;
     // Re-authorization is a lifecycle transition too.  Route it through
     // the coordinator so Spotify follows the same enable/can_start policy
     // as startup and settings changes.
     let startable: Arc<dyn crate::adapters::Startable> = adapter.clone();
-    state
-        .coordinator
-        .start_enabled(&startable)
-        .await
-        .map_err(|start_error| {
-            error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &format!("Spotify adapter failed to start: {start_error}"),
-                "adapter_start_failed",
-            )
-        })?;
+    if let Err(start_error) = state.coordinator.start_enabled(&startable).await {
+        crate::api::restore_adapter_enabled(state, "spotify", previously_enabled).await;
+        return Err(error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!("Spotify adapter failed to start: {start_error}"),
+            "adapter_start_failed",
+        ));
+    }
     Ok(Json(ProviderAuthResponse {
         provider,
         authorized: true,

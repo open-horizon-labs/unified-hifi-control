@@ -215,3 +215,58 @@ async fn configuring_hqplayer_at_runtime_enables_it() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The whole point of persisting the toggle is that the zones become visible, so a
+/// configure that could not persist it must not answer `200 ok`. Reporting success
+/// while the toggle stayed off puts the user back in the reported bug with no signal
+/// at all — a connected provider whose zones no list shows. A read-only config
+/// directory is the realistic way to reach this.
+#[tokio::test]
+#[serial_test::serial(lms_config)]
+async fn a_configure_that_cannot_persist_the_toggle_reports_failure() {
+    let dir = std::env::temp_dir().join("uhc-test-lms-unwritable-settings");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("unified-hifi")).expect("create config dir");
+    std::env::set_var("UHC_CONFIG_DIR", &dir);
+
+    let mock = mock_servers::lms::MockLmsServer::start().await;
+    mock.add_player("aa:bb:cc:dd:ee:ff", "Kitchen").await;
+    let addr = mock.addr();
+
+    let (state, _aggregator) = app_state_with_live_lms_projection().await;
+
+    // Take the settings directory away from the process after the state is built, so
+    // only the settings write fails and everything before it behaves normally.
+    let mut permissions = std::fs::metadata(dir.join("unified-hifi"))
+        .expect("config dir metadata")
+        .permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(dir.join("unified-hifi"), permissions).expect("make dir read-only");
+
+    let response = unified_hifi_control::api::lms_configure_handler(
+        State(state.clone()),
+        Json(LmsConfigRequest {
+            host: addr.ip().to_string(),
+            port: Some(addr.port()),
+            username: None,
+            password: None,
+        }),
+    )
+    .await;
+    let status = axum::response::IntoResponse::into_response(response).status();
+
+    let mut permissions = std::fs::metadata(dir.join("unified-hifi"))
+        .expect("config dir metadata")
+        .permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    let _ = std::fs::set_permissions(dir.join("unified-hifi"), permissions);
+
+    assert_eq!(
+        status,
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "a configure whose enable toggle could not be saved must not report success"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
