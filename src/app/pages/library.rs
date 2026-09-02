@@ -921,6 +921,11 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
                         class: "btn btn-ghost",
                         r#type: "button",
                         onclick: move |_| {
+                            // Same rule as `open_folder`: leaving for the root
+                            // ends the search, or the results view would stay
+                            // mounted over the level we just navigated to.
+                            let mut search_query = search_query;
+                            search_query.set(String::new());
                             navigate(selected_source(), Some(current_tab.as_str().to_string()), None);
                         },
                         "Back to library"
