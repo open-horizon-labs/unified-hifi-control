@@ -1423,12 +1423,20 @@ jobs:
   build-synology:
     name: Build Synology SPK (${{ matrix.arch }})
     needs: [plan, build-linux-x64, build-linux-arm, synology-package-test]
-    # DSM rejects prerelease version strings (e.g. 3.7.0-alpha.1), so skip
-    # Synology entirely on prerelease tags rather than failing the matrix.
+    # Prereleases build an SPK like every other tag. This used to carry
+    # `!contains(version, '-')`, which skipped Synology on *every* prerelease
+    # because DSM's `version` field cannot hold a semver prerelease string
+    # literally -- but `build-spk.sh` already encodes that into DSM's numeric
+    # build field, so the blanket skip was working around a gap that only ever
+    # affected `alpha` (see `normalize_version`). The result was an alpha
+    # release page silently missing its `.spk` while every other artifact was
+    # present, which reads as a broken build rather than a deliberate choice.
+    #
+    # An unsupported tag now fails this job loudly instead of dropping the
+    # package: a missing artifact nobody is told about is the worse failure.
     if: |
       always() &&
       needs.plan.outputs.build_synology == 'true' &&
-      !contains(needs.plan.outputs.version, '-') &&
       needs.build-linux-x64.result == 'success' &&
       needs.synology-package-test.result == 'success'
     runs-on: ubuntu-latest
