@@ -95,7 +95,7 @@ impl SessionEpochGuard {
 /// command execute, but it must eventually release a black-holed session.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-pub const PEER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
+pub const PEER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 pub const PEER_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
