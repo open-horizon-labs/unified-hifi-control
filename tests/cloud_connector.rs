@@ -1127,10 +1127,11 @@ fn peer_watchdog_expires_only_after_bounded_silence() {
         10_000,
         cloud_connector::transport::PEER_HEARTBEAT_TIMEOUT,
     );
-    assert!(!watchdog.expired(10_000 + 89_999));
-    watchdog.observe(100_000);
-    assert!(!watchdog.expired(100_000 + 89_999));
-    assert!(watchdog.expired(100_000 + 90_000));
+    // Sparse steady heartbeats must survive; silence is bounded at 45 minutes.
+    assert!(!watchdog.expired(10_000 + 15 * 60_000));
+    watchdog.observe(1_000_000);
+    assert!(!watchdog.expired(1_000_000 + 45 * 60_000 - 1));
+    assert!(watchdog.expired(1_000_000 + 45 * 60_000));
 }
 
 #[test]
