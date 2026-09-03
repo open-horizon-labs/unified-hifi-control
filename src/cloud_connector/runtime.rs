@@ -2007,9 +2007,10 @@ mod tests {
             let snapshot: ConnectorMessage = serde_json::from_str(&snapshot).unwrap();
             assert!(matches!(snapshot, ConnectorMessage::Snapshot(ref value)
                 if value.installation_id == installation_id && value.epoch == epoch));
+            // Buffer one burst before flushing; closure during the burst is the expected outcome.
             for _ in 0..200 {
                 server
-                    .send(Message::Text(
+                    .feed(Message::Text(
                         serde_json::to_string(&RelayMessage::Heartbeat {
                             epoch,
                             sent_at: super::now_ms(),
@@ -2020,6 +2021,7 @@ mod tests {
                     .await
                     .unwrap();
             }
+            server.flush().await.unwrap();
             let reply = tokio::time::timeout(std::time::Duration::from_secs(1), server.next())
                 .await
                 .unwrap()
