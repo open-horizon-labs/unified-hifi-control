@@ -59,7 +59,7 @@ else
     printf '#!/bin/sh\nexit 0\n' > "$test_binary"
     chmod +x "$test_binary"
 
-    for version_case in '3.4.1:3.4.1-10000' '3.5.1-beta:3.5.1-8000' '3.5.1-beta.08:3.5.1-8008' '3.5.0-rc.2:3.5.0-9002' '0.0.0-pr171:0.0.0-0171' '0.0.0-dev:0.0.0-0001'; do
+    for version_case in '3.4.1:3.4.1-10000' '4.0.0-alpha:4.0.0-7000' '4.0.0-alpha.5:4.0.0-7005' '3.5.1-beta:3.5.1-8000' '3.5.1-beta.08:3.5.1-8008' '3.5.0-rc.2:3.5.0-9002' '0.0.0-pr171:0.0.0-0171' '0.0.0-dev:0.0.0-0001'; do
         input_version=${version_case%%:*}
         expected_version=${version_case#*:}
         output_spk="${test_tmp}/${input_version}.spk"
@@ -93,10 +93,37 @@ else
     arm_spk="${test_tmp}/armv8.spk"
     "${SYNOLOGY_DIR}/build-spk.sh" 3.4.1 armv8 "$test_binary" "$test_binary" "$arm_spk" \
         || fail "build-spk.sh failed for armv8"
+    # DSM compares the numeric build field, so the encoding has to reproduce semver
+    # precedence or an upgrade shows up in Package Center as a downgrade and is refused.
+    # Asserted as one ascending chain rather than per-case constants, so a future band
+    # cannot be added in the wrong order while every individual case still passes.
+    previous_build=""
+    for ordered_version in 4.0.0-alpha 4.0.0-alpha.5 4.0.0-beta 4.0.0-beta.5 4.0.0-rc.1 4.0.0; do
+        ordered_spk="${test_tmp}/order-${ordered_version}.spk"
+        "${SYNOLOGY_DIR}/build-spk.sh" "$ordered_version" x86_64 "$test_binary" "$test_binary" "$ordered_spk" >/dev/null \
+            || fail "build-spk.sh failed for ${ordered_version}"
+        build=$(tar -xOf "$ordered_spk" INFO | sed -n 's/^version="[^-]*-\([0-9]*\)"$/\1/p')
+        if [[ -n "$previous_build" ]] && ((10#$build <= 10#$previous_build)); then
+            fail "${ordered_version} encodes to build ${build}, which does not sort after ${previous_build}"
+        fi
+        previous_build=$build
+    done
+
+    # The release workflow must not reintroduce a blanket prerelease skip: that is what
+    # silently shipped alpha releases with no .spk at all.
+    if grep -q "!contains(needs.plan.outputs.version, '-')" "${ROOT_DIR}/.github/workflows/build.yml"; then
+        fail "the Synology job must not skip every prerelease; build-spk.sh encodes prerelease versions"
+    fi
+
     arm_arch=$(tar -xOf "$arm_spk" INFO | sed -n 's/^arch="\([^"]*\)"$/\1/p')
     [[ "$arm_arch" == 'armv8' ]] || fail "ARM SPK arch is ${arm_arch}, expected armv8"
 
-    if "${SYNOLOGY_DIR}/build-spk.sh" 3.5.0-alpha.1 x86_64 "$test_binary" "$test_binary" "${test_tmp}/invalid.spk" 2>/dev/null; then
+    # `alpha` used to be the example of an unhandled prerelease here, which is exactly
+    # why alpha releases shipped without a package; it is a supported band now. The rule
+    # this guards is unchanged: a prerelease form with no assigned DSM ordering band is
+    # refused rather than guessed at, because a wrong guess makes Package Center treat
+    # an upgrade as a downgrade.
+    if "${SYNOLOGY_DIR}/build-spk.sh" 3.5.0-nightly.1 x86_64 "$test_binary" "$test_binary" "${test_tmp}/invalid.spk" 2>/dev/null; then
         fail "build-spk.sh must reject prerelease formats without an explicit DSM ordering rule"
     fi
 fi

@@ -7,11 +7,32 @@ usage() {
     exit 2
 }
 
+# DSM's `version` field is `X.Y.Z-BUILD` with a numeric build, so a semver prerelease
+# tag has to be encoded into that build number rather than carried literally. The bands
+# are chosen so DSM's own numeric comparison reproduces semver precedence -- an upgrade
+# never looks like a downgrade in Package Center:
+#
+#   alpha.N   -> 7000+N
+#   beta.N    -> 8000+N
+#   rc.N      -> 9000+N
+#   release   -> 10000
+#
+# Anything unrecognised is an error, not a silently skipped package: an unbuilt SPK is
+# invisible on the release page, which is exactly how alpha releases quietly shipped
+# without one.
 normalize_version() {
     local version=$1
 
     if [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
         printf '%s-10000\n' "${BASH_REMATCH[1]}"
+    elif [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-alpha(\.([0-9]+))?$ ]]; then
+        local alpha_number=${BASH_REMATCH[3]:-0}
+        alpha_number=$((10#$alpha_number))
+        if ((alpha_number > 999)); then
+            echo "Alpha number is too large for Synology version encoding: $version" >&2
+            return 1
+        fi
+        printf '%s-%04d\n' "${BASH_REMATCH[1]}" "$((7000 + alpha_number))"
     elif [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-beta(\.([0-9]+))?$ ]]; then
         local beta_number=${BASH_REMATCH[3]:-0}
         beta_number=$((10#$beta_number))
