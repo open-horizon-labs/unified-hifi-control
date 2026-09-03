@@ -222,6 +222,13 @@ async fn run(
             .await;
         let delay = backoff.next_delay();
         tokio::select! { _ = shutdown.cancelled() => break, _ = tokio::time::sleep(delay) => {} }
+        match super::safety::admit_reconnect(&config.epoch_path, now_ms() as u64) {
+            Ok(true) => {}
+            result => {
+                tracing::error!(event = "cloud_cost_quarantined", "HiPhi remote access stopped: reconnect budget or persisted safety state unavailable; inspect connector safety files before recovery ({result:?})");
+                break;
+            }
+        }
         let grant = match tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
@@ -300,6 +307,9 @@ async fn run(
                     }
                     Ok(ConnectionExit::Shutdown) => break,
                     Err(error) => {
+                        if error.is::<SafetyPersistenceFailure>() {
+                            break;
+                        }
                         supervisor
                             .set_phase(generation, ConnectorPhase::Offline)
                             .await;
@@ -500,7 +510,11 @@ where
         std::sync::Arc::new(Semaphore::new(ARTWORK_QUEUE_CAPACITY + ARTWORK_CONCURRENCY));
     let artwork_active = std::sync::Arc::new(Semaphore::new(ARTWORK_CONCURRENCY));
     let mut refresh = tokio::time::interval(std::time::Duration::from_secs(20));
-    let mut heartbeat_check = tokio::time::interval(PEER_HEARTBEAT_CHECK_INTERVAL);
+    let mut watchdog_check = tokio::time::interval(PEER_HEARTBEAT_CHECK_INTERVAL);
+    let mut heartbeat_step = 0u32;
+    let heartbeat_check = tokio::time::sleep(super::safety::heartbeat_delay(heartbeat_step));
+    tokio::pin!(heartbeat_check);
+    let mut traffic = super::safety::TrafficBudget::default();
     let mut peer_watchdog = PeerWatchdog::new(now_ms() as u64, PEER_HEARTBEAT_TIMEOUT);
     refresh.tick().await;
     loop {
@@ -510,16 +524,22 @@ where
                 close_socket_for_shutdown(&mut socket).await;
                 return Ok(ConnectionExit::Shutdown);
             }
-            message = socket.next() => {
-                let Some(message) = message else { break; };
-                message?
+            _ = watchdog_check.tick() => {
+                if peer_watchdog.expired(now_ms() as u64) { anyhow::bail!("relay heartbeat timed out"); }
+                continue;
             }
-            _ = heartbeat_check.tick() => {
+            _ = &mut heartbeat_check => {
                 if peer_watchdog.expired(now_ms() as u64) {
                     anyhow::bail!("relay heartbeat timed out");
                 }
                 send_json(&mut socket, &ConnectorMessage::Heartbeat { epoch, sent_at: now_ms() }).await?;
+                heartbeat_step = heartbeat_step.saturating_add(1);
+                heartbeat_check.as_mut().reset(tokio::time::Instant::now() + super::safety::heartbeat_delay(heartbeat_step));
                 continue;
+            }
+            message = socket.next() => {
+                let Some(message) = message else { break; };
+                message?
             }
             _ = refresh.tick() => {
                 let projection = snapshot_from_aggregator(state, store, config.installation_id.clone(), epoch, store.latest().map_or(1, |p| p.revision.saturating_add(1)), now_ms() as u64).await?;
@@ -539,6 +559,10 @@ where
             close_socket_for_shutdown(&mut socket).await;
             return Ok(ConnectionExit::Shutdown);
         }
+        if !traffic.admit(now_ms() as u64, message.len()) {
+            quarantine_connection(&mut socket, &config.epoch_path).await?;
+            return Ok(ConnectionExit::Disconnected);
+        }
         match message {
             Message::Text(text) if text.len() > MAX_COMMAND_BYTES => {
                 anyhow::bail!("relay command frame exceeds the command bound");
@@ -551,14 +575,6 @@ where
                     ..
                 } if message_epoch == epoch => {
                     peer_watchdog.observe(now_ms() as u64);
-                    send_json(
-                        &mut socket,
-                        &ConnectorMessage::Heartbeat {
-                            epoch,
-                            sent_at: now_ms(),
-                        },
-                    )
-                    .await?;
                 }
                 RelayMessage::Command(command) => {
                     let request_id = command.request_id;
@@ -629,6 +645,10 @@ where
                     .await?;
                 }
                 RelayMessage::ArtworkRequest(request) => {
+                    if !traffic.artwork() {
+                        quarantine_connection(&mut socket, &config.epoch_path).await?;
+                        return Ok(ConnectionExit::Disconnected);
+                    }
                     schedule_artwork(
                         state,
                         store,
@@ -656,6 +676,10 @@ where
             },
             Message::Ping(bytes) => {
                 send_message(&mut socket, Message::Pong(bytes)).await?;
+            }
+            Message::Close(Some(ref frame)) if u16::from(frame.code) == 4008 => {
+                quarantine_connection(&mut socket, &config.epoch_path).await?;
+                return Ok(ConnectionExit::Disconnected);
             }
             Message::Close(_) => break,
             Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
@@ -758,6 +782,35 @@ where
         })??;
     Ok(())
 }
+async fn quarantine_connection<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    epoch_path: &std::path::Path,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let persisted = super::safety::quarantine(epoch_path);
+    tracing::error!(event = "cloud_cost_quarantined", "HiPhi remote traffic stopped; local playback remains available. Inspect the relay before removing the quarantine file.");
+    let _ = tokio::time::timeout(
+        SHUTDOWN_CLOSE_TIMEOUT,
+        socket.send(Message::Close(Some(CloseFrame {
+            code: CloseCode::Library(4008),
+            reason: "cloud cost guard".into(),
+        }))),
+    )
+    .await;
+    // Failure to persist must still stop reconnects in this process.
+    if let Err(error) = persisted {
+        tracing::error!("Unable to persist cloud quarantine: {error}");
+        anyhow::bail!(SafetyPersistenceFailure);
+    }
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("cloud quarantine persistence failed")]
+struct SafetyPersistenceFailure;
+
 async fn send_json<S, T: serde::Serialize>(
     socket: &mut tokio_tungstenite::WebSocketStream<S>,
     value: &T,
@@ -1712,6 +1765,295 @@ mod tests {
         .unwrap();
         assert_eq!(exit, ConnectionExit::Revoked);
         assert_eq!(ledger.len(), 1, "the command authority grant was accepted");
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn received_heartbeat_does_not_create_an_echo_loop() {
+        let installation_id = Uuid::new_v4().to_string();
+        let identity = InstallationIdentity::generate(installation_id.clone()).unwrap();
+        let previous_session_issuer = SigningKey::from_bytes(&[28; 32]);
+        let session_issuer = SigningKey::from_bytes(&[30; 32]);
+        let previous_command_issuer = SigningKey::from_bytes(&[29; 32]);
+        let command_issuer = SigningKey::from_bytes(&[31; 32]);
+        let temp = tempfile::tempdir().unwrap();
+        let endpoint = "wss://cloud.invalid/v1/relay/connect";
+        let config = CloudConnectorConfig {
+            endpoint: RelayEndpoint::parse(endpoint).unwrap(),
+            installation_id: installation_id.clone(),
+            key_path: temp.path().join("installation.key"),
+            epoch_path: temp.path().join("epoch"),
+            session_issuer_keys: IssuerVerifyingKeyRing::from_entries([
+                (
+                    "session-issuer-1".into(),
+                    previous_session_issuer.verifying_key(),
+                ),
+                ("session-issuer-2".into(), session_issuer.verifying_key()),
+            ])
+            .unwrap(),
+            command_issuer_keys: IssuerVerifyingKeyRing::from_entries([
+                (
+                    "command-issuer-1".into(),
+                    previous_command_issuer.verifying_key(),
+                ),
+                ("command-issuer-2".into(), command_issuer.verifying_key()),
+            ])
+            .unwrap(),
+        };
+        let state = empty_app_state().await;
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let now = super::now_ms();
+        let challenge = RelayMessage::Challenge(SessionChallengeMessage {
+            protocol_version: PROTOCOL_VERSION,
+            challenge_id: Uuid::new_v4(),
+            endpoint: endpoint.into(),
+            nonce: "nonce_012345678901234567890123456789".into(),
+            expires_at: now + 30_000,
+        });
+        let epoch = u64::try_from(now).unwrap();
+        let command = signed_command(
+            "command-issuer-2",
+            &command_issuer,
+            &installation_id,
+            epoch,
+            0,
+            now,
+        );
+        let server_task = tokio::spawn(async move {
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&challenge).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+            let Message::Text(proof) = server.next().await.unwrap().unwrap() else {
+                panic!("expected installation proof")
+            };
+            let proof: InstallationSessionProof = serde_json::from_str(&proof).unwrap();
+            assert_eq!(proof.grant, "test.session.grant");
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&RelayMessage::SessionEstablished { epoch })
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let Message::Text(hello) = server.next().await.unwrap().unwrap() else {
+                panic!("expected connector hello")
+            };
+            let hello: ConnectorMessage = serde_json::from_str(&hello).unwrap();
+            assert!(matches!(hello, ConnectorMessage::Hello(ref value)
+                if value.installation_id == installation_id
+                    && value.connector_version == env!("UHC_VERSION")));
+            let Message::Text(snapshot) = server.next().await.unwrap().unwrap() else {
+                panic!("expected initial snapshot")
+            };
+            let snapshot: ConnectorMessage = serde_json::from_str(&snapshot).unwrap();
+            assert!(matches!(snapshot, ConnectorMessage::Snapshot(ref value)
+                if value.installation_id == installation_id && value.epoch == epoch));
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&RelayMessage::Heartbeat {
+                        epoch,
+                        sent_at: super::now_ms(),
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), server.next())
+                    .await
+                    .is_err(),
+                "receiving a heartbeat must not immediately echo another heartbeat"
+            );
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&RelayMessage::Command(command))
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let Message::Text(result) = server.next().await.unwrap().unwrap() else {
+                panic!("expected command result")
+            };
+            let result: ConnectorMessage = serde_json::from_str(&result).unwrap();
+            assert!(matches!(result, ConnectorMessage::CommandResult(_)));
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&RelayMessage::Revoke {
+                        reason_code: "owner_revoked".into(),
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+        let mut store = StateStore::default();
+        let mut epoch_guard = SessionEpochGuard::load(&config.epoch_path).unwrap();
+        let mut ledger = CommandLedger::default();
+        let supervisor = ConnectorSupervisor::default();
+        let exit = run_connection(
+            &state,
+            &config,
+            &identity,
+            "test.session.grant",
+            0,
+            &mut store,
+            &mut epoch_guard,
+            &mut ledger,
+            ConnectionLifecycle {
+                supervisor: &supervisor,
+                generation: 1,
+            },
+            client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(exit, ConnectionExit::Revoked);
+        assert_eq!(ledger.len(), 1, "the command authority grant was accepted");
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_flood_is_quarantined_before_processing_unbounded_messages() {
+        let installation_id = Uuid::new_v4().to_string();
+        let identity = InstallationIdentity::generate(installation_id.clone()).unwrap();
+        let previous_session_issuer = SigningKey::from_bytes(&[28; 32]);
+        let session_issuer = SigningKey::from_bytes(&[30; 32]);
+        let previous_command_issuer = SigningKey::from_bytes(&[29; 32]);
+        let command_issuer = SigningKey::from_bytes(&[31; 32]);
+        let temp = tempfile::tempdir().unwrap();
+        let endpoint = "wss://cloud.invalid/v1/relay/connect";
+        let config = CloudConnectorConfig {
+            endpoint: RelayEndpoint::parse(endpoint).unwrap(),
+            installation_id: installation_id.clone(),
+            key_path: temp.path().join("installation.key"),
+            epoch_path: temp.path().join("epoch"),
+            session_issuer_keys: IssuerVerifyingKeyRing::from_entries([
+                (
+                    "session-issuer-1".into(),
+                    previous_session_issuer.verifying_key(),
+                ),
+                ("session-issuer-2".into(), session_issuer.verifying_key()),
+            ])
+            .unwrap(),
+            command_issuer_keys: IssuerVerifyingKeyRing::from_entries([
+                (
+                    "command-issuer-1".into(),
+                    previous_command_issuer.verifying_key(),
+                ),
+                ("command-issuer-2".into(), command_issuer.verifying_key()),
+            ])
+            .unwrap(),
+        };
+        let state = empty_app_state().await;
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let now = super::now_ms();
+        let challenge = RelayMessage::Challenge(SessionChallengeMessage {
+            protocol_version: PROTOCOL_VERSION,
+            challenge_id: Uuid::new_v4(),
+            endpoint: endpoint.into(),
+            nonce: "nonce_012345678901234567890123456789".into(),
+            expires_at: now + 30_000,
+        });
+        let epoch = u64::try_from(now).unwrap();
+        let _command = signed_command(
+            "command-issuer-2",
+            &command_issuer,
+            &installation_id,
+            epoch,
+            0,
+            now,
+        );
+        let server_task = tokio::spawn(async move {
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&challenge).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+            let Message::Text(proof) = server.next().await.unwrap().unwrap() else {
+                panic!("expected installation proof")
+            };
+            let proof: InstallationSessionProof = serde_json::from_str(&proof).unwrap();
+            assert_eq!(proof.grant, "test.session.grant");
+            server
+                .send(Message::Text(
+                    serde_json::to_string(&RelayMessage::SessionEstablished { epoch })
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let Message::Text(hello) = server.next().await.unwrap().unwrap() else {
+                panic!("expected connector hello")
+            };
+            let hello: ConnectorMessage = serde_json::from_str(&hello).unwrap();
+            assert!(matches!(hello, ConnectorMessage::Hello(ref value)
+                if value.installation_id == installation_id
+                    && value.connector_version == env!("UHC_VERSION")));
+            let Message::Text(snapshot) = server.next().await.unwrap().unwrap() else {
+                panic!("expected initial snapshot")
+            };
+            let snapshot: ConnectorMessage = serde_json::from_str(&snapshot).unwrap();
+            assert!(matches!(snapshot, ConnectorMessage::Snapshot(ref value)
+                if value.installation_id == installation_id && value.epoch == epoch));
+            for _ in 0..200 {
+                server
+                    .send(Message::Text(
+                        serde_json::to_string(&RelayMessage::Heartbeat {
+                            epoch,
+                            sent_at: super::now_ms(),
+                        })
+                        .unwrap()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(1), server.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(reply, Message::Close(Some(ref frame)) if u16::from(frame.code) == 4008),
+                "a flood must close and quarantine the session, got {reply:?}"
+            );
+        });
+        let mut store = StateStore::default();
+        let mut epoch_guard = SessionEpochGuard::load(&config.epoch_path).unwrap();
+        let mut ledger = CommandLedger::default();
+        let supervisor = ConnectorSupervisor::default();
+        let exit = run_connection(
+            &state,
+            &config,
+            &identity,
+            "test.session.grant",
+            0,
+            &mut store,
+            &mut epoch_guard,
+            &mut ledger,
+            ConnectionLifecycle {
+                supervisor: &supervisor,
+                generation: 1,
+            },
+            client,
+        )
+        .await
+        .unwrap();
+        assert!(config.epoch_path.with_extension("quarantine").exists());
+        assert_eq!(exit, ConnectionExit::Disconnected);
+        assert_eq!(ledger.len(), 0);
         server_task.await.unwrap();
     }
 

@@ -10,6 +10,7 @@ pub mod identity;
 pub mod pairing;
 pub mod protocol;
 pub mod runtime;
+mod safety;
 pub mod session;
 pub mod state;
 pub mod transport;
