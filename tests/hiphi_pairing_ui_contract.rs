@@ -80,3 +80,13 @@ fn browser_handoff_explicitly_clears_inherited_group_and_other_permissions() {
         "the QNAP config volume may inherit ACL mode bits despite create mode 0600"
     );
 }
+
+#[test]
+fn recovery_is_reachable_and_uses_the_controller_gate() {
+    let route = "/api/hiphi/connection/resume";
+    assert!(MAIN.contains(route));
+    assert!(SETTINGS.contains(route));
+    assert!(SETTINGS.contains("Resume Cloud connection"));
+    let auth = include_str!("../src/api/controller_auth.rs");
+    assert!(auth.contains("path.starts_with(\"/api/hiphi/connection/\")"));
+}

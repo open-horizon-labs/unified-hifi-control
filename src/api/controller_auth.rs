@@ -331,7 +331,7 @@ fn is_native_bridge(path: &str) -> bool {
 }
 
 fn is_protected(path: &str, method: &axum::http::Method) -> bool {
-    if path.starts_with("/api/hiphi/pairing/") {
+    if path.starts_with("/api/hiphi/pairing/") || path.starts_with("/api/hiphi/connection/") {
         return true;
     }
     if path.starts_with("/api/providers/") && path != "/api/providers/spotify/oauth/callback"
@@ -509,6 +509,10 @@ mod tests {
 
     #[test]
     fn protected_surface_keeps_read_only_lan_pages_available() {
+        assert!(is_protected(
+            "/api/hiphi/connection/resume",
+            &axum::http::Method::POST
+        ));
         assert!(is_protected(
             "/api/providers/spotify/account",
             &axum::http::Method::GET

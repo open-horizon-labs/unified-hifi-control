@@ -880,6 +880,7 @@ mod server {
             .route("/api/controller/bootstrap", post(controller_bootstrap))
             .route("/api/controller/status", get(controller_status))
             .route("/api/hiphi/pairing/status", get(api::hiphi_pairing::status))
+            .route("/api/hiphi/connection/resume", post(api::hiphi_pairing::resume))
             .route("/api/hiphi/pairing/prepare", post(api::hiphi_pairing::prepare))
             .route("/api/hiphi/pairing/initiate", post(api::hiphi_pairing::initiate))
             .route("/api/hiphi/pairing/complete", post(api::hiphi_pairing::complete))
