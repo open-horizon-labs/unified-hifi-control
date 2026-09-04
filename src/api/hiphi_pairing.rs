@@ -84,6 +84,8 @@ pub struct PairingStatusResponse {
     pub paired: bool,
     pub installation_id: Option<String>,
     pub connector_state: &'static str,
+    pub pause_reason: Option<&'static str>,
+    pub can_resume: bool,
 }
 
 fn helper_path() -> anyhow::Result<PathBuf> {
@@ -274,11 +276,29 @@ pub async fn status(State(state): State<crate::api::AppState>) -> axum::response
             paired: status.configured,
             installation_id: status.installation_id,
             connector_state: status.phase.as_str(),
+            pause_reason: status.pause_reason,
+            can_resume: status.can_resume,
         })
         .into_response(),
         Err(error_value) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "pairing_status_failed",
+            error_value.to_string(),
+        ),
+    }
+}
+
+/// Explicit local recovery; controller auth and CSRF use the same policy as pairing.
+pub async fn resume(State(state): State<crate::api::AppState>) -> axum::response::Response {
+    match state
+        .hiphi_connector
+        .resume_from_runtime(state.clone(), crate::config::get_config_dir())
+        .await
+    {
+        Ok(_) => status(State(state)).await,
+        Err(error_value) => error(
+            StatusCode::CONFLICT,
+            "cloud_resume_failed",
             error_value.to_string(),
         ),
     }

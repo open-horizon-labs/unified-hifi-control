@@ -68,6 +68,8 @@ pub enum ConnectorPhase {
     Connecting,
     Online,
     Revoked,
+    Paused,
+    SafetyError,
 }
 
 impl ConnectorPhase {
@@ -78,6 +80,7 @@ impl ConnectorPhase {
             Self::Connecting => "connecting",
             Self::Online => "online",
             Self::Revoked => "revoked",
+            Self::Paused | Self::SafetyError => "paused",
         }
     }
 }
@@ -87,6 +90,8 @@ pub struct ConnectorStatus {
     pub configured: bool,
     pub installation_id: Option<String>,
     pub phase: ConnectorPhase,
+    pub pause_reason: Option<&'static str>,
+    pub can_resume: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,6 +115,7 @@ struct SupervisorState {
 #[derive(Clone, Default)]
 pub struct ConnectorSupervisor {
     inner: std::sync::Arc<Mutex<SupervisorState>>,
+    operation: std::sync::Arc<Mutex<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -124,6 +130,7 @@ impl ConnectorSupervisor {
         state: crate::api::AppState,
         config_dir: impl Into<std::path::PathBuf>,
     ) -> anyhow::Result<ConnectorStart> {
+        let _operation = self.operation.lock().await;
         let Some(config) = CloudConnectorConfig::from_runtime(config_dir)? else {
             return Ok(ConnectorStart::NotConfigured);
         };
@@ -132,6 +139,36 @@ impl ConnectorSupervisor {
                 anyhow::anyhow!("paired HiPhi installation key is unavailable: {error}")
             })?;
 
+        self.start_config(state, config, identity).await
+    }
+
+    pub async fn resume_from_runtime(
+        &self,
+        state: crate::api::AppState,
+        config_dir: impl Into<std::path::PathBuf>,
+    ) -> anyhow::Result<ConnectorStart> {
+        let _operation = self.operation.lock().await;
+        anyhow::ensure!(
+            !self.inner.lock().await.active,
+            "Cloud connector is already running."
+        );
+        anyhow::ensure!(!state.shutdown.is_cancelled(), "UHC is shutting down.");
+        let config = CloudConnectorConfig::from_runtime(config_dir)?
+            .ok_or_else(|| anyhow::anyhow!("This installation is not paired."))?;
+        // Validate identity and replay protection before changing containment.
+        let identity =
+            InstallationIdentity::load(&config.key_path, config.installation_id.clone())?;
+        SessionEpochGuard::load(&config.epoch_path)?;
+        super::safety::resume(&config.epoch_path, now_ms() as u64)?;
+        self.start_config(state, config, identity).await
+    }
+
+    async fn start_config(
+        &self,
+        state: crate::api::AppState,
+        config: CloudConnectorConfig,
+        identity: InstallationIdentity,
+    ) -> anyhow::Result<ConnectorStart> {
         let generation = {
             let mut inner = self.inner.lock().await;
             if inner.active {
@@ -164,20 +201,41 @@ impl ConnectorSupervisor {
                 configured: false,
                 installation_id: None,
                 phase: ConnectorPhase::Unconfigured,
+                pause_reason: None,
+                can_resume: false,
             });
         };
         let inner = self.inner.lock().await;
-        let phase = if inner.active
-            && inner.installation_id.as_deref() == Some(config.installation_id.as_str())
-        {
+        let same_installation =
+            inner.installation_id.as_deref() == Some(config.installation_id.as_str());
+        let active = inner.active && same_installation;
+        let mut phase = if same_installation {
             inner.phase.unwrap_or(ConnectorPhase::Offline)
         } else {
             ConnectorPhase::Offline
         };
+        let mut pause_reason = if active {
+            None
+        } else if phase == ConnectorPhase::SafetyError {
+            Some("safety_state_unavailable")
+        } else {
+            super::safety::pause_reason(&config.epoch_path)
+        };
+        if !active && SessionEpochGuard::load(&config.epoch_path).is_err() {
+            pause_reason = Some("safety_state_unavailable");
+        }
+        if pause_reason.is_some() {
+            phase = ConnectorPhase::Paused;
+        }
+        let can_resume = !active
+            && pause_reason == Some("cost_limit")
+            && super::safety::can_resume(&config.epoch_path, now_ms() as u64);
         Ok(ConnectorStatus {
             configured: true,
             installation_id: Some(config.installation_id),
             phase,
+            pause_reason,
+            can_resume,
         })
     }
 
@@ -211,7 +269,7 @@ async fn run(
         Ok(guard) => guard,
         Err(error) => {
             tracing::error!("HiPhi Cloud epoch state is unavailable: {error}");
-            return ConnectorPhase::Offline;
+            return ConnectorPhase::SafetyError;
         }
     };
     let mut ledger = CommandLedger::default();
@@ -226,6 +284,11 @@ async fn run(
             Ok(true) => {}
             result => {
                 tracing::error!(event = "cloud_cost_quarantined", "HiPhi remote access stopped: reconnect budget or persisted safety state unavailable; inspect connector safety files before recovery ({result:?})");
+                final_phase = if result.is_err() {
+                    ConnectorPhase::SafetyError
+                } else {
+                    ConnectorPhase::Paused
+                };
                 break;
             }
         }
@@ -308,6 +371,7 @@ async fn run(
                     Ok(ConnectionExit::Shutdown) => break,
                     Err(error) => {
                         if error.is::<SafetyPersistenceFailure>() {
+                            final_phase = ConnectorPhase::SafetyError;
                             break;
                         }
                         supervisor
@@ -1208,8 +1272,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn persisted_pairing_survives_restart_and_supervisor_is_duplicate_safe() {
+    fn paired_directory() -> (tempfile::TempDir, String) {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir().unwrap();
@@ -1246,6 +1309,13 @@ mod tests {
         std::fs::set_permissions(&environment_path, std::fs::Permissions::from_mode(0o600))
             .unwrap();
 
+        (directory, installation_id)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persisted_pairing_survives_restart_and_supervisor_is_duplicate_safe() {
+        let (directory, installation_id) = paired_directory();
         let supervisor = ConnectorSupervisor::default();
         let status = supervisor
             .status_from_runtime(directory.path())
@@ -1297,6 +1367,97 @@ mod tests {
         })
         .await
         .expect("connector should stop on process shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_serializes_clicks_preserves_identity_and_exposes_terminal_pause() {
+        let (directory, installation_id) = paired_directory();
+        let key_path = directory.path().join("hiphi-installation.key");
+        InstallationIdentity::generate(installation_id)
+            .unwrap()
+            .save(&key_path)
+            .unwrap();
+        let key_before = std::fs::read(&key_path).unwrap();
+        let epoch = directory.path().join("hiphi-relay-epoch");
+        let now = super::now_ms() as u64;
+        super::SessionEpochGuard::load(&epoch)
+            .unwrap()
+            .accept_at(now, now)
+            .unwrap();
+        super::super::safety::quarantine(&epoch).unwrap();
+        let supervisor = ConnectorSupervisor::default();
+        let status = supervisor
+            .status_from_runtime(directory.path())
+            .await
+            .unwrap();
+        assert_eq!(status.phase.as_str(), "paused");
+        assert_eq!(status.pause_reason, Some("cost_limit"));
+        assert!(status.can_resume);
+        let state = empty_app_state().await;
+        supervisor
+            .start_from_runtime(state.clone(), directory.path())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while supervisor.inner.lock().await.active {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let stopped = supervisor
+            .status_from_runtime(directory.path())
+            .await
+            .unwrap();
+        assert_eq!(stopped.phase.as_str(), "paused");
+        assert_eq!(stopped.pause_reason, Some("cost_limit"));
+        let (first, second) = tokio::join!(
+            supervisor.resume_from_runtime(state.clone(), directory.path()),
+            supervisor.resume_from_runtime(state.clone(), directory.path()),
+        );
+        assert_ne!(
+            first.is_ok(),
+            second.is_ok(),
+            "only one click may reset the budget"
+        );
+        assert_eq!(supervisor.inner.lock().await.generation, 2);
+        assert_eq!(std::fs::read(&key_path).unwrap(), key_before);
+        assert!(
+            !state.shutdown.is_cancelled(),
+            "recovery must not stop local playback"
+        );
+        assert!(supervisor.inner.lock().await.active);
+        let mut replay = super::SessionEpochGuard::load(&epoch).unwrap();
+        assert_eq!(replay.last(), now);
+        assert!(
+            replay.accept_at(now, now).is_err(),
+            "resume must not allow replay"
+        );
+        state.shutdown.cancel();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_rejects_damaged_replay_state_without_clearing_quarantine() {
+        let (directory, installation_id) = paired_directory();
+        InstallationIdentity::generate(installation_id)
+            .unwrap()
+            .save(&directory.path().join("hiphi-installation.key"))
+            .unwrap();
+        let epoch = directory.path().join("hiphi-relay-epoch");
+        std::fs::write(&epoch, "invalid replay state").unwrap();
+        super::super::safety::quarantine(&epoch).unwrap();
+        let supervisor = ConnectorSupervisor::default();
+        let state = empty_app_state().await;
+        assert!(supervisor
+            .resume_from_runtime(state.clone(), directory.path())
+            .await
+            .is_err());
+        assert!(epoch.with_extension("quarantine").exists());
+        assert!(!epoch.with_extension("resume").exists());
+        assert!(!supervisor.inner.lock().await.active);
+        state.shutdown.cancel();
     }
 
     #[derive(Default)]

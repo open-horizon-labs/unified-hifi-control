@@ -150,6 +150,10 @@ pub struct HiphiPairingStatus {
     pub paired: bool,
     pub installation_id: Option<String>,
     pub connector_state: String,
+    #[serde(default)]
+    pub pause_reason: Option<String>,
+    #[serde(default)]
+    pub can_resume: bool,
 }
 
 impl HiphiPairingStatus {
@@ -157,7 +161,11 @@ impl HiphiPairingStatus {
         match self.connector_state.as_str() {
             "online" => "Connected to HiPhi Cloud",
             "connecting" => "Paired · connecting",
-            "offline" => "Paired · reconnecting",
+            "offline" => "Paired · offline",
+            "paused" if self.pause_reason.as_deref() == Some("cost_limit") => {
+                "Cloud paused · cost protection"
+            }
+            "paused" => "Cloud paused · safety state needs attention",
             "revoked" => "Cloud access revoked",
             _ => "Not paired",
         }

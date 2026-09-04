@@ -1,6 +1,7 @@
 //! Local containment remains independent of cloud availability and remote identity.
 //!
-//! Recovery is deliberately manual: stop UHC, resolve the incident, then remove
+//! Prefer Settings → Resume Cloud connection after resolving the incident.
+//! For manual recovery, stop UHC, resolve the incident, then remove
 //! `hiphi-relay-epoch.quarantine` in the configuration directory. Wait for the
 //! reconnect window to expire or explicitly remove `hiphi-relay-epoch.attempts`
 //! during the same recovery. Never remove the epoch replay ledger or identity key.
@@ -73,6 +74,99 @@ pub fn quarantine(epoch_path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Inspect persisted containment without making a network attempt. Invalid
+/// state is not a cost quarantine and must not be erased by the resume action.
+pub fn pause_reason(epoch_path: &Path) -> Option<&'static str> {
+    match inspect(epoch_path) {
+        Ok(true) => Some("cost_limit"),
+        Ok(false) => None,
+        Err(_) => Some("safety_state_unavailable"),
+    }
+}
+
+fn read_regular(path: &Path) -> std::io::Result<Option<String>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => std::fs::read_to_string(path).map(Some),
+        Ok(_) => Err(std::io::Error::other("safety state is not a regular file")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn inspect(epoch_path: &Path) -> std::io::Result<bool> {
+    if let Some(previous) = read_regular(&epoch_path.with_extension("resume"))? {
+        previous.parse::<u64>().map_err(std::io::Error::other)?;
+    }
+    if let Some(attempts) = read_regular(&epoch_path.with_extension("attempts"))? {
+        serde_json::from_str::<(u64, u32)>(&attempts).map_err(std::io::Error::other)?;
+    }
+    Ok(read_regular(&epoch_path.with_extension("quarantine"))?.is_some())
+}
+
+const RESUME_COOLDOWN_MS: u64 = 15 * 60 * 1000;
+
+fn check_resume_cooldown(epoch_path: &Path, now: u64) -> std::io::Result<()> {
+    if let Some(previous) = read_regular(&epoch_path.with_extension("resume"))? {
+        let previous: u64 = previous.parse().map_err(std::io::Error::other)?;
+        if now.saturating_sub(previous) < RESUME_COOLDOWN_MS {
+            return Err(std::io::Error::other(
+                "Wait 15 minutes between Cloud recovery attempts.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn can_resume(epoch_path: &Path, now: u64) -> bool {
+    pause_reason(epoch_path) == Some("cost_limit") && check_resume_cooldown(epoch_path, now).is_ok()
+}
+
+/// Called only while the supervisor excludes startup and the connector is
+/// stopped. Commit the cooldown before clearing counters; remove the stop flag
+/// last, so failed writes/removals never accidentally release containment.
+pub fn resume(epoch_path: &Path, now: u64) -> std::io::Result<()> {
+    if !inspect(epoch_path)? {
+        return Err(std::io::Error::other(
+            "Cloud is not paused by a cost limit.",
+        ));
+    }
+    check_resume_cooldown(epoch_path, now)?;
+    let path = epoch_path.with_extension("resume");
+    let temporary = epoch_path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(now.to_string().as_bytes())?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        if let Some(parent) = epoch_path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        match std::fs::remove_file(epoch_path.with_extension("attempts")) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+        std::fs::remove_file(epoch_path.with_extension("quarantine"))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
 /// Reserve each attempt on disk before doing network work. Restart is not a refill.
 pub fn admit_reconnect(epoch_path: &Path, now: u64) -> std::io::Result<bool> {
     use std::io::Write;
@@ -112,6 +206,47 @@ pub fn admit_reconnect(epoch_path: &Path, now: u64) -> std::io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn deliberate_resume_preserves_replay_and_retrips_with_persistent_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let epoch = dir.path().join("hiphi-relay-epoch");
+        std::fs::write(&epoch, "replay ledger must survive").unwrap();
+        let now = 1_000_000;
+        for _ in 0..32 {
+            assert!(admit_reconnect(&epoch, now).unwrap());
+        }
+        assert!(!admit_reconnect(&epoch, now).unwrap());
+        assert_eq!(pause_reason(&epoch), Some("cost_limit"));
+        resume(&epoch, now).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&epoch).unwrap(),
+            "replay ledger must survive"
+        );
+        assert_eq!(pause_reason(&epoch), None);
+        for _ in 0..32 {
+            assert!(admit_reconnect(&epoch, now).unwrap());
+        }
+        assert!(!admit_reconnect(&epoch, now).unwrap());
+        assert!(resume(&epoch, now + 1).is_err());
+        assert_eq!(pause_reason(&epoch), Some("cost_limit"));
+        resume(&epoch, now + 900_000).unwrap();
+    }
+
+    #[test]
+    fn resume_does_not_hide_corrupt_state_or_failed_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let epoch = dir.path().join("hiphi-relay-epoch");
+        quarantine(&epoch).unwrap();
+        std::fs::write(epoch.with_extension("attempts"), "broken").unwrap();
+        assert_eq!(pause_reason(&epoch), Some("safety_state_unavailable"));
+        assert!(resume(&epoch, 1_000_000).is_err());
+        assert!(epoch.with_extension("quarantine").exists());
+        std::fs::remove_file(epoch.with_extension("attempts")).unwrap();
+        std::fs::create_dir(epoch.with_extension("resume")).unwrap();
+        assert!(resume(&epoch, 1_000_000).is_err());
+        assert!(epoch.with_extension("quarantine").exists());
+    }
+
     #[test]
     fn heartbeat_cadence_slows_and_stays_bounded() {
         assert_eq!(

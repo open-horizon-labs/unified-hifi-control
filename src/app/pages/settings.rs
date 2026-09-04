@@ -225,6 +225,29 @@ fn HiphiCloudPairing() -> Element {
         });
     };
 
+    let resume_cloud = move |_| {
+        if matches!(action(), ProviderActionState::Loading) {
+            return;
+        }
+        action.set(ProviderActionState::Loading);
+        error.set(None);
+        spawn(async move {
+            match crate::app::api::post_json::<serde_json::Value, HiphiPairingStatus>(
+                "/api/hiphi/connection/resume",
+                &serde_json::json!({}),
+            )
+            .await
+            {
+                Ok(_) => action.set(ProviderActionState::Success),
+                Err(message) => {
+                    action.set(ProviderActionState::Failed);
+                    error.set(crate::app::api::suppress_controller_unauthorized(message));
+                }
+            }
+            pairing_status.restart();
+        });
+    };
+
     let status_snapshot = pairing_status.read().as_ref().cloned();
     let status_pending = status_snapshot.is_none();
     let paired_status = status_snapshot
@@ -244,9 +267,23 @@ fn HiphiCloudPairing() -> Element {
                 if status_pending {
                     p { class: "text-sm text-secondary", "Checking this installation’s HiPhi Cloud connection…" }
                 } else if let Some(status) = paired_status {
-                    div { class: "status-ok", role: "status",
+                    div { class: if status.connector_state == "online" { "status-ok" } else { "text-secondary" }, role: "status",
                         p { class: "font-medium", "This UHC installation is paired." }
                         p { class: "mt-1", "{status.display_state()}" }
+                        if status.pause_reason.as_deref() == Some("cost_limit") {
+                            p { class: "mt-2 text-sm", "Cloud traffic or repeated connection attempts reached a safety limit. Local playback is unaffected. Resume after the Cloud issue is resolved; cost protection stays enabled." }
+                            button {
+                                r#type: "button", class: "btn-primary mt-3",
+                                disabled: !status.can_resume || matches!(action(), ProviderActionState::Loading),
+                                onclick: resume_cloud,
+                                "Resume Cloud connection"
+                            }
+                            if !status.can_resume {
+                                p { class: "mt-2 text-sm", "Recovery attempts are limited to once every 15 minutes. If this persists, the saved recovery state needs attention." }
+                            }
+                        } else if status.pause_reason.is_some() {
+                            p { class: "mt-2 text-sm", "Cloud safety or replay state could not be read or saved. Check the UHC logs and configuration storage before resuming. Pairing and local playback are preserved." }
+                        }
                         if let Some(installation_id) = status.installation_id {
                             p { class: "mt-2 text-xs text-muted break-all", "Installation ID: {installation_id}" }
                         }
@@ -345,8 +382,8 @@ fn HiphiCloudPairing() -> Element {
                     }
                 }
 
-                if let Some(message) = error() { p { class: "status-err", role: "alert", "{message}" } }
                 }
+                if let Some(message) = error() { p { class: "status-err", role: "alert", "{message}" } }
             }
         }
     }
