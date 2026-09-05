@@ -19,7 +19,8 @@ permissions:
 
 jobs:
   uhckit:
-    runs-on: macos-15
+    # Persistent self-hosted runners must not execute code from forks.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","artium-codex"]') || 'macos-15' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -45,7 +46,7 @@ jobs:
           swift build --package-path "$RUNNER_TEMP/uhc-remote" --target UHCKit
 
   apple-companion:
-    runs-on: macos-15
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","artium-codex"]') || 'macos-15' }}
     steps:
       - uses: actions/checkout@v4
         with:
