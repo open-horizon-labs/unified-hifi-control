@@ -230,6 +230,14 @@ fn allows_explicit_drop_before_await() {
 /// Allowlist for known-correct patterns where holding locks across awaits is intentional.
 /// Format: (file suffix, guard name, reason)
 const ALLOWLIST: &[(&str, &str, &str)] = &[
+    // Starting or resuming is one lifecycle transaction. The lease spans runtime identity and
+    // replay-state validation, safety-budget reset and task activation so concurrent resume
+    // requests cannot both reset containment before either marks the connector active.
+    (
+        "cloud_connector/runtime.rs",
+        "_operation_guard",
+        "Cloud connector start and resume transactions must be serialized",
+    ),
     // HQPlayer protocol requires exclusive connection access during entire command/response cycle.
     // Releasing the lock between send and receive would allow interleaving from other tasks.
     (

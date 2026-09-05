@@ -130,7 +130,7 @@ impl ConnectorSupervisor {
         state: crate::api::AppState,
         config_dir: impl Into<std::path::PathBuf>,
     ) -> anyhow::Result<ConnectorStart> {
-        let _operation = self.operation.lock().await;
+        let _operation_guard = self.operation.lock().await;
         let Some(config) = CloudConnectorConfig::from_runtime(config_dir)? else {
             return Ok(ConnectorStart::NotConfigured);
         };
@@ -147,7 +147,7 @@ impl ConnectorSupervisor {
         state: crate::api::AppState,
         config_dir: impl Into<std::path::PathBuf>,
     ) -> anyhow::Result<ConnectorStart> {
-        let _operation = self.operation.lock().await;
+        let _operation_guard = self.operation.lock().await;
         anyhow::ensure!(
             !self.inner.lock().await.active,
             "Cloud connector is already running."
