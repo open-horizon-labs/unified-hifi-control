@@ -681,8 +681,13 @@ jobs:
     name: Smoke Test Binary
     needs: [plan, build-linux-x64]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
