@@ -902,6 +902,13 @@
 
   .zones-strip-picker-list {
     @apply flex flex-col gap-1;
+    /* A large player list must scroll inside the fixed picker. The viewport
+       bound also keeps the picker reachable on short mobile screens. Keep
+       wheel/touch scrolling at the list edges from chaining into the page. */
+    max-height: 50vh;
+    max-height: min(50vh, calc(100dvh - 15rem), 24rem);
+    overflow-y: auto;
+    overscroll-behavior: contain;
   }
 
   /* Owner feedback on #585: rows read as inert text. `.zones-strip-picker-item`
