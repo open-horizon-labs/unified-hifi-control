@@ -295,6 +295,17 @@ struct LevelError {
     unreachable: bool,
 }
 
+/// Select the offset for a level load. Continuation pages must consume the
+/// provider's advertised cursor; the previous request offset is not a cursor
+/// and would fetch the same page again.
+fn next_request_offset(append: bool, next_offset: Option<u32>) -> Option<u32> {
+    if append {
+        next_offset
+    } else {
+        Some(0)
+    }
+}
+
 /// Fetch one page of the current level and apply it.
 #[allow(clippy::too_many_arguments)]
 async fn load_page(
@@ -306,7 +317,6 @@ async fn load_page(
     append: bool,
     mut items: Signal<Vec<CollectionItem>>,
     mut next_offset: Signal<Option<u32>>,
-    mut offset: Signal<u32>,
     mut loading: Signal<bool>,
     mut error: Signal<Option<LevelError>>,
     mut breadcrumbs: Signal<Vec<CollectionBreadcrumb>>,
@@ -332,7 +342,6 @@ async fn load_page(
                 breadcrumbs.set(page.breadcrumbs);
             }
             next_offset.set(page.next_offset);
-            offset.set(request_offset);
         }
         Ok(env) => {
             error.set(Some(LevelError {
@@ -544,7 +553,6 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
     let breadcrumbs = use_signal(Vec::<CollectionBreadcrumb>::new);
 
     let items = use_signal(Vec::<CollectionItem>::new);
-    let offset = use_signal(|| 0u32);
     let next_offset = use_signal(|| None::<u32>);
     let loading = use_signal(|| false);
     let error = use_signal(|| None::<LevelError>);
@@ -573,7 +581,12 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
                 current_tab.media_type().map(ToOwned::to_owned),
             )
         };
-        let request_offset = if append { offset() } else { 0 };
+        let Some(request_offset) = next_request_offset(append, next_offset()) else {
+            // A stale click can arrive after the previous page has completed
+            // and cleared the continuation. Never turn that into offset zero,
+            // which would append the first page a second time.
+            return;
+        };
         spawn(load_page(
             zone_id,
             action,
@@ -583,7 +596,6 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
             append,
             items,
             next_offset,
-            offset,
             loading,
             error,
             breadcrumbs,
@@ -1671,5 +1683,31 @@ mod library_defect_pins {
         assert_eq!(effective_tab(Tab::Favorites, &visible), Tab::Browse);
         assert_eq!(effective_tab(Tab::Radio, &visible), Tab::Browse);
         assert_eq!(effective_tab(Tab::Playlists, &visible), Tab::Playlists);
+    }
+
+    /// The Bridge's Load more button must use the continuation returned by the
+    /// provider. Reusing the request offset makes every click fetch page one.
+    #[test]
+    fn loaded_page_advances_to_provider_continuation() {
+        let mut continuation = None;
+        let mut requests = Vec::new();
+
+        for append in [false, true, true, true, false] {
+            let Some(offset) = next_request_offset(append, continuation) else {
+                continue;
+            };
+            requests.push(offset);
+            continuation = match offset {
+                0 => Some(30),
+                30 => Some(60),
+                60 => None,
+                _ => unreachable!("unexpected test page offset"),
+            };
+        }
+
+        assert_eq!(requests, vec![0, 30, 60, 0]);
+        assert_eq!(next_request_offset(true, None), None);
+        assert_eq!(next_request_offset(false, None), Some(0));
+        assert_eq!(next_request_offset(false, Some(60)), Some(0));
     }
 }
