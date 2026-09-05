@@ -681,7 +681,25 @@ jobs:
     name: Smoke Test Binary
     needs: [plan, build-linux-x64]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
       - name: Download binary
         uses: actions/download-artifact@v8
         with:
@@ -807,6 +825,24 @@ jobs:
 
           echo ""
           echo "All smoke tests passed!"
+
+      - name: Run library pagination browser regression
+        env:
+          UHC_URL: http://127.0.0.1:8088
+        run: |
+          npx playwright test e2e/library_pagination.spec.ts \
+            --project='Desktop Chrome' \
+            --reporter=line \
+            --output="$RUNNER_TEMP/playwright-test-results"
+
+      - name: Upload browser regression diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-test-playwright-diagnostics
+          path: ${{ runner.temp }}/playwright-test-results/
+          if-no-files-found: ignore
+          retention-days: 5
 
       - name: Stop server
         if: always()
