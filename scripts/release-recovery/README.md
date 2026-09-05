@@ -25,8 +25,9 @@ ALPHA8_RECOVERY_ROOT=/srv/agent-data/work/unified-hifi-control/alpha8-recovery \
 
 `ALPHA8_RECOVERY_ROOT` is configurable for another validated workspace.
 `ALPHA8_MAC_ARTIFACT_ROOT` can point to a different fallback artifact tree.
-The script validates the exact source tag, five bridge/pair payloads, the
-macOS universal slices, the LMS archive preservation rules, the alpha8
-`install.xml`, the known Linux x86_64 SHA256, and the 17-asset final inventory.
+The recovery workflow pins the exact source commit. The script validates five
+bridge/pair payloads, the macOS universal slices, the LMS archive preservation
+rules, the alpha8 `install.xml`, the known Linux x86_64 SHA256, and the
+17-asset final inventory.
 It generates the external LMS beta feed and SHA256SUMS, but performs no GitHub
 upload or release mutation.
