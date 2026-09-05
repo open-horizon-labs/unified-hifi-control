@@ -2,15 +2,15 @@
 <extensions>
   <plugins>
     <plugin name="UnifiedHiFi"
-            version="4.0.0-alpha.6"
+            version="4.0.0-alpha.7"
             minTarget="8.0"
             maxTarget="*">
       <title lang="EN">Unified Hi-Fi Control (Beta)</title>
       <desc lang="EN">Beta builds of Unified Hi-Fi Control for testing.</desc>
-      <url>https://github.com/open-horizon-labs/unified-hifi-control/releases/download/v4.0.0-alpha.6/lms-unified-hifi-control-4.0.0-alpha.6.zip</url>
-      <sha>2eefbc14a433815d9ba8f61affb5fe730b0b4fa6</sha>
+      <url>https://github.com/open-horizon-labs/unified-hifi-control/releases/download/v4.0.0-alpha.7/lms-unified-hifi-control-4.0.0-alpha.7.zip</url>
+      <sha>cf11dabd95c5c047910130417466e3b509da8336</sha>
       <creator>Muness Castle</creator>
-      <link>https://github.com/open-horizon-labs/unified-hifi-control/releases/tag/v4.0.0-alpha.6</link>
+      <link>https://github.com/open-horizon-labs/unified-hifi-control/releases/tag/v4.0.0-alpha.7</link>
     </plugin>
   </plugins>
 </extensions>
