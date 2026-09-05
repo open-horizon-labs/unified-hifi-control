@@ -27,6 +27,8 @@ use std::collections::HashMap;
 const PAGE_LIMIT: u32 = 30;
 const SEARCH_DEBOUNCE_MS: u64 = 300;
 #[cfg(target_arch = "wasm32")]
+const LIBRARY_LAYOUT_STORAGE_KEY: &str = "uhc.library.view";
+#[cfg(target_arch = "wasm32")]
 const ARMED_ZONE_STORAGE_KEY: &str = "uhc.armed_zone";
 
 fn library_route(source: Option<String>, view: Option<String>, location: Option<String>) -> Route {
@@ -61,6 +63,53 @@ enum Tab {
     Favorites,
     Radio,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LibraryLayout {
+    #[default]
+    Auto,
+    List,
+    Cards,
+}
+
+impl LibraryLayout {
+    #[cfg(target_arch = "wasm32")]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::List => "list",
+            Self::Cards => "cards",
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn parse(value: &str) -> Self {
+        match value {
+            "list" => Self::List,
+            "cards" => Self::Cards,
+            _ => Self::Auto,
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_library_layout() -> LibraryLayout {
+    web_sys::window()
+        .and_then(|window| window.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(LIBRARY_LAYOUT_STORAGE_KEY).ok().flatten())
+        .map(|value| LibraryLayout::parse(&value))
+        .unwrap_or_default()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn save_library_layout(layout: LibraryLayout) {
+    if let Some(Ok(Some(storage))) = web_sys::window().map(|window| window.local_storage()) {
+        let _ = storage.set_item(LIBRARY_LAYOUT_STORAGE_KEY, layout.as_str());
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn save_library_layout(_layout: LibraryLayout) {}
 
 impl Tab {
     fn parse(value: &str) -> Self {
@@ -554,6 +603,11 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
 
     let items = use_signal(Vec::<CollectionItem>::new);
     let next_offset = use_signal(|| None::<u32>);
+    let mut library_layout = use_signal(LibraryLayout::default);
+    #[cfg(target_arch = "wasm32")]
+    use_effect(move || {
+        library_layout.set(load_library_layout());
+    });
     let loading = use_signal(|| false);
     let error = use_signal(|| None::<LevelError>);
     let mut status = use_signal(|| None::<String>);
@@ -886,6 +940,8 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
     let current_error = error();
     let is_loading = loading();
     let current_items = items();
+    let current_layout = library_layout();
+    let cards_active = library_uses_cards(current_layout, &current_items);
     let can_load_more = next_offset.read().is_some();
     let current_status = status();
     let crumbs = breadcrumbs();
@@ -972,6 +1028,7 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
                     } else {
                         LibraryRows {
                             items: local_matches.clone(),
+                            layout: current_layout,
                             tab: current_tab,
                             currently_playing_title: currently_playing_title.clone(),
                             on_open: open_folder,
@@ -1088,6 +1145,7 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
         rsx! {
             LibraryRows {
                 items: current_items.clone(),
+                layout: current_layout,
                 tab: current_tab,
                 currently_playing_title: currently_playing_title.clone(),
                 on_open: open_folder,
@@ -1153,6 +1211,31 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    div { class: "library-view-toggle", role: "group", aria_label: "Library layout",
+                        button {
+                            class: if !cards_active { "library-view-toggle-btn library-view-toggle-btn--active" } else { "library-view-toggle-btn" },
+                            r#type: "button",
+                            aria_label: "List view",
+                            aria_pressed: !cards_active,
+                            onclick: move |_| {
+                                library_layout.set(LibraryLayout::List);
+                                save_library_layout(LibraryLayout::List);
+                            },
+                            "List"
+                        }
+                        button {
+                            class: if cards_active { "library-view-toggle-btn library-view-toggle-btn--active" } else { "library-view-toggle-btn" },
+                            r#type: "button",
+                            aria_label: "Cards view",
+                            aria_pressed: cards_active,
+                            onclick: move |_| {
+                                library_layout.set(LibraryLayout::Cards);
+                                save_library_layout(LibraryLayout::Cards);
+                            },
+                            "Cards"
                         }
                     }
 
@@ -1236,6 +1319,17 @@ fn empty_state_body(tab: Tab) -> &'static str {
     }
 }
 
+fn library_uses_cards(layout: LibraryLayout, items: &[CollectionItem]) -> bool {
+    match layout {
+        LibraryLayout::Cards => true,
+        LibraryLayout::List => false,
+        LibraryLayout::Auto => {
+            let playable_count = items.iter().filter(|item| item.item_ref.is_some()).count();
+            !items.is_empty() && playable_count * 2 >= items.len()
+        }
+    }
+}
+
 /// Rows for one page of browse/playlists/favorites/radio results.
 ///
 /// Per-level layout follows the design brief's "art-first, list otherwise"
@@ -1247,13 +1341,13 @@ fn empty_state_body(tab: Tab) -> &'static str {
 #[component]
 fn LibraryRows(
     items: Vec<CollectionItem>,
+    layout: LibraryLayout,
     tab: Tab,
     currently_playing_title: Option<String>,
     on_open: EventHandler<(String, String)>,
     on_play: EventHandler<(String, &'static str)>,
 ) -> Element {
-    let playable_count = items.iter().filter(|i| i.item_ref.is_some()).count();
-    let grid_shaped = !items.is_empty() && playable_count * 2 >= items.len();
+    let grid_shaped = library_uses_cards(layout, &items);
 
     if grid_shaped {
         rsx! {
@@ -1715,5 +1809,24 @@ mod library_defect_pins {
         assert_eq!(next_request_offset(true, None), None);
         assert_eq!(next_request_offset(false, None), Some(0));
         assert_eq!(next_request_offset(false, Some(60)), Some(0));
+    }
+
+    #[test]
+    fn layout_preference_overrides_automatic_shape_without_changing_items() {
+        let folders = vec![CollectionItem {
+            title: "Folder".to_string(),
+            location: Some("loc_folder".to_string()),
+            ..CollectionItem::default()
+        }];
+        let tracks = vec![CollectionItem {
+            title: "Track".to_string(),
+            item_ref: Some("ref_track".to_string()),
+            ..CollectionItem::default()
+        }];
+
+        assert!(!library_uses_cards(LibraryLayout::Auto, &folders));
+        assert!(library_uses_cards(LibraryLayout::Auto, &tracks));
+        assert!(library_uses_cards(LibraryLayout::Cards, &folders));
+        assert!(!library_uses_cards(LibraryLayout::List, &tracks));
     }
 }

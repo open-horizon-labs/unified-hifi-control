@@ -495,6 +495,23 @@
     background: var(--surface-elevated);
   }
 
+  .library-view-toggle {
+    @apply flex gap-1 mb-3;
+  }
+  .library-view-toggle-btn {
+    @apply rounded-md border px-3 py-1.5 text-sm;
+    color: var(--text-secondary);
+    border-color: var(--border-subtle);
+  }
+  .library-view-toggle-btn:hover,
+  .library-view-toggle-btn--active {
+    color: var(--text-primary);
+    background: var(--surface-elevated);
+  }
+  .library-view-toggle-btn--active {
+    border-color: var(--border-default);
+  }
+
   .library-breadcrumbs {
     @apply flex flex-wrap items-center gap-1 mb-4 text-sm;
     color: var(--text-muted);
