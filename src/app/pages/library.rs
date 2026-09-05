@@ -581,7 +581,13 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
                 current_tab.media_type().map(ToOwned::to_owned),
             )
         };
-        let Some(request_offset) = next_request_offset(append, next_offset()) else {
+        // A fresh route load must not subscribe this callback/effect to the
+        // pagination cursor: load_page updates `next_offset`, and that update
+        // would otherwise retrigger the route effect and erase appended rows
+        // with a new offset-0 request. The append path is an event handler, so
+        // it may read the cursor without creating that subscription.
+        let continuation = if append { *next_offset.peek() } else { None };
+        let Some(request_offset) = next_request_offset(append, continuation) else {
             // A stale click can arrive after the previous page has completed
             // and cleared the continuation. Never turn that into offset zero,
             // which would append the first page a second time.
