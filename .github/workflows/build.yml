@@ -388,6 +388,9 @@ jobs:
   lint:
     name: Lint
     runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest' }}
+    env:
+      CARGO_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/cargo
+      RUSTUP_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/rustup
     steps:
       - uses: actions/checkout@v6
 
@@ -423,6 +426,9 @@ jobs:
   test:
     name: Test
     runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest' }}
+    env:
+      CARGO_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/cargo
+      RUSTUP_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/rustup
     steps:
       - uses: actions/checkout@v6
 
@@ -481,6 +487,9 @@ jobs:
   build-wasm:
     name: Build WASM Assets
     runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest' }}
+    env:
+      CARGO_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/cargo
+      RUSTUP_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/rustup
     steps:
       - uses: actions/checkout@v6
 
@@ -538,7 +547,7 @@ jobs:
         id: cache-dx
         uses: actions/cache@v5
         with:
-          path: ~/.cargo/bin/dx
+          path: ${{ env.CARGO_HOME }}/bin/dx
           key: dx-cli-0.7.10
 
       - name: Install Dioxus CLI
@@ -601,6 +610,9 @@ jobs:
     name: Build Linux x64
     needs: [plan, build-wasm]
     runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest' }}
+    env:
+      CARGO_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/cargo
+      RUSTUP_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/rustup
     steps:
       - uses: actions/checkout@v6
 
@@ -630,7 +642,7 @@ jobs:
         id: cache-zigbuild
         uses: actions/cache@v5
         with:
-          path: ~/.cargo/bin/cargo-zigbuild
+          path: ${{ env.CARGO_HOME }}/bin/cargo-zigbuild
           key: cargo-zigbuild-0.20
 
       - name: Install cargo-zigbuild

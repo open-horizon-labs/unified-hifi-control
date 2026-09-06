@@ -92,3 +92,16 @@ fn linux_x64_tool_install_is_safe_on_a_persistent_runner() {
     assert!(linux_x64.contains("RUNNER_TOOL_CACHE"));
     assert!(!linux_x64.contains("sudo mv zig-linux"));
 }
+
+#[test]
+fn parallel_nuc_workers_do_not_share_mutable_rust_toolchains() {
+    let source = workflow("build.yml");
+
+    for name in ["lint", "test", "build-wasm", "build-linux-x64"] {
+        let body = job(&source, name);
+        assert!(body.contains("CARGO_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/cargo"));
+        assert!(
+            body.contains("RUSTUP_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/rustup")
+        );
+    }
+}
