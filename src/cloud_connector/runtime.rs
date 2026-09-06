@@ -46,6 +46,13 @@ const ARTWORK_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_mil
 const MAX_SESSION_GRANT_RESPONSE_BYTES: usize = 16 * 1024;
 const SHUTDOWN_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
+fn snapshot_refresh_interval() -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(20));
+    // A stalled task needs one current snapshot, not a burst of every missed tick.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GrantResponse {
@@ -573,7 +580,7 @@ where
     let artwork_slots =
         std::sync::Arc::new(Semaphore::new(ARTWORK_QUEUE_CAPACITY + ARTWORK_CONCURRENCY));
     let artwork_active = std::sync::Arc::new(Semaphore::new(ARTWORK_CONCURRENCY));
-    let mut refresh = tokio::time::interval(std::time::Duration::from_secs(20));
+    let mut refresh = snapshot_refresh_interval();
     let mut watchdog_check = tokio::time::interval(PEER_HEARTBEAT_CHECK_INTERVAL);
     let mut heartbeat_step = 0u32;
     let heartbeat_check = tokio::time::sleep(super::safety::heartbeat_delay(heartbeat_step));
@@ -1269,6 +1276,20 @@ mod tests {
             Instant::now(),
             CancellationToken::new(),
         )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missed_snapshot_ticks_do_not_burst_after_a_stall() {
+        let mut refresh = super::snapshot_refresh_interval();
+        refresh.tick().await;
+        tokio::time::advance(std::time::Duration::from_secs(10 * 60)).await;
+        refresh.tick().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), refresh.tick())
+                .await
+                .is_err(),
+            "missed snapshots must not catch up back-to-back"
+        );
     }
 
     #[cfg(unix)]
