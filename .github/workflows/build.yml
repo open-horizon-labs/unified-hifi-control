@@ -989,7 +989,8 @@ jobs:
     name: Build macOS (x86_64)
     needs: [plan, build-wasm]
     if: needs.plan.outputs.build_macos == 'true'
-    runs-on: macos-latest
+    # Persistent self-hosted runners must not execute code from forks.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","artium-codex"]') || 'macos-15' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -1047,7 +1048,7 @@ jobs:
     name: Build macOS (arm64)
     needs: [plan, build-wasm]
     if: needs.plan.outputs.build_macos == 'true'
-    runs-on: macos-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","artium-codex"]') || 'macos-15' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -1109,7 +1110,7 @@ jobs:
       needs.plan.outputs.build_macos == 'true' &&
       needs.build-macos-x64.result == 'success' &&
       needs.build-macos-arm64.result == 'success'
-    runs-on: macos-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","artium-codex"]') || 'macos-15' }}
     steps:
       - name: Download x86_64 binary
         uses: actions/download-artifact@v8
@@ -1148,7 +1149,7 @@ jobs:
     name: Build Apple Music Companion DMG (macOS arm64)
     needs: [plan]
     if: needs.plan.outputs.build_applemusic_macos == 'true'
-    runs-on: macos-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","artium-codex"]') || 'macos-15' }}
     # `secrets` isn't allowed directly in step `if:` conditions, so surface
     # presence checks as job-level env vars instead.
     env:
