@@ -69,17 +69,22 @@ fn trusted_expensive_linux_jobs_use_the_nuc_with_a_hosted_fork_fallback() {
     let source = workflow("build.yml");
     let selector = r#"vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest'"#;
 
-    for name in [
-        "lint",
-        "test",
-        "build-wasm",
-        "build-linux-x64",
-        "smoke-test",
-        "build-qnap-x64",
-    ] {
+    for name in ["lint", "test", "build-wasm", "build-linux-x64"] {
         assert!(
             job(&source, name).contains(selector),
             "{name} must use nuc14 for trusted work and ubuntu-latest for fork PRs"
+        );
+    }
+}
+
+#[test]
+fn jobs_that_need_playwright_or_docker_stay_on_hosted_ubuntu() {
+    let source = workflow("build.yml");
+
+    for name in ["smoke-test", "build-qnap-x64"] {
+        assert!(
+            job(&source, name).contains("runs-on: ubuntu-latest"),
+            "{name} requires tooling absent from the nuc14 runner image"
         );
     }
 }

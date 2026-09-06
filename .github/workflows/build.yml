@@ -706,7 +706,7 @@ jobs:
   smoke-test:
     name: Smoke Test Binary
     needs: [plan, build-linux-x64]
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       actions: read
@@ -1566,7 +1566,7 @@ jobs:
     if: |
       needs.plan.outputs.build_qnap == 'true' &&
       needs.qnap-package-test.result == 'success'
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     # `secrets` isn't allowed directly in step `if:` conditions, so surface
     # the presence check as a job-level env var instead.
     env:
