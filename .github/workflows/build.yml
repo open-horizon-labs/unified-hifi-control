@@ -638,12 +638,21 @@ jobs:
         run: |
           ZIG_ROOT="${RUNNER_TOOL_CACHE:-$HOME/.cache/uhc-tools}/zig/0.13.0/x64"
           if [ ! -x "$ZIG_ROOT/zig" ]; then
-            mkdir -p "$(dirname "$ZIG_ROOT")"
-            TEMP_DIR=$(mktemp -d)
-            curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ -C "$TEMP_DIR"
-            mv "$TEMP_DIR/zig-linux-x86_64-0.13.0" "$ZIG_ROOT"
+            ZIG_PARENT=$(dirname "$ZIG_ROOT")
+            mkdir -p "$ZIG_PARENT"
+            TEMP_DIR=$(mktemp -d "$ZIG_PARENT/.zig-install.XXXXXX")
+            trap 'rm -rf "$TEMP_DIR"' EXIT
+            curl --fail --show-error --location \
+              https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | \
+              tar -xJ -C "$TEMP_DIR"
+            STAGED_ROOT="$TEMP_DIR/zig-linux-x86_64-0.13.0"
+            test -x "$STAGED_ROOT/zig"
+            rm -rf "$ZIG_ROOT"
+            mv "$STAGED_ROOT" "$ZIG_ROOT"
             rm -rf "$TEMP_DIR"
+            trap - EXIT
           fi
+          test -x "$ZIG_ROOT/zig"
           echo "$ZIG_ROOT" >> "$GITHUB_PATH"
 
       - name: Cache cargo-zigbuild

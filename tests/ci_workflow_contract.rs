@@ -96,6 +96,8 @@ fn linux_x64_tool_install_is_safe_on_a_persistent_runner() {
 
     assert!(linux_x64.contains("RUNNER_TOOL_CACHE"));
     assert!(!linux_x64.contains("sudo mv zig-linux"));
+    assert!(linux_x64.contains(r#"test -x "$STAGED_ROOT/zig""#));
+    assert!(linux_x64.contains(r#"rm -rf "$ZIG_ROOT""#));
 }
 
 #[test]
