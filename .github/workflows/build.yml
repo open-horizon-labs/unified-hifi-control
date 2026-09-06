@@ -388,11 +388,13 @@ jobs:
   lint:
     name: Lint
     runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest' }}
-    env:
-      CARGO_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/cargo
-      RUSTUP_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/rustup
     steps:
       - uses: actions/checkout@v6
+
+      - name: Isolate mutable tool state
+        run: |
+          echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
 
       - name: Cache generated CSS
         id: cache-css
@@ -426,11 +428,13 @@ jobs:
   test:
     name: Test
     runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest' }}
-    env:
-      CARGO_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/cargo
-      RUSTUP_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/rustup
     steps:
       - uses: actions/checkout@v6
+
+      - name: Isolate mutable tool state
+        run: |
+          echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
 
       - name: Cache generated CSS
         id: cache-css
@@ -487,11 +491,13 @@ jobs:
   build-wasm:
     name: Build WASM Assets
     runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest' }}
-    env:
-      CARGO_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/cargo
-      RUSTUP_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/rustup
     steps:
       - uses: actions/checkout@v6
+
+      - name: Isolate mutable tool state
+        run: |
+          echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
 
       - name: Cache WASM build output
         id: cache-wasm
@@ -610,11 +616,13 @@ jobs:
     name: Build Linux x64
     needs: [plan, build-wasm]
     runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest' }}
-    env:
-      CARGO_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/cargo
-      RUSTUP_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/rustup
     steps:
       - uses: actions/checkout@v6
+
+      - name: Isolate mutable tool state
+        run: |
+          echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable

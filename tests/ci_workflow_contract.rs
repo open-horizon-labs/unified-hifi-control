@@ -99,9 +99,11 @@ fn parallel_nuc_workers_do_not_share_mutable_rust_toolchains() {
 
     for name in ["lint", "test", "build-wasm", "build-linux-x64"] {
         let body = job(&source, name);
-        assert!(body.contains("CARGO_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/cargo"));
-        assert!(
-            body.contains("RUSTUP_HOME: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/rustup")
-        );
+        assert!(body.contains(
+            r#"echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV""#
+        ));
+        assert!(body.contains(
+            r#"echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV""#
+        ));
     }
 }
