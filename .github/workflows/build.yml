@@ -387,9 +387,14 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
+
+      - name: Isolate mutable tool state
+        run: |
+          echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
 
       - name: Cache generated CSS
         id: cache-css
@@ -422,9 +427,14 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
+
+      - name: Isolate mutable tool state
+        run: |
+          echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
 
       - name: Cache generated CSS
         id: cache-css
@@ -480,9 +490,14 @@ jobs:
   # Uses content-based caching to skip build when source unchanged
   build-wasm:
     name: Build WASM Assets
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
+
+      - name: Isolate mutable tool state
+        run: |
+          echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
 
       - name: Cache WASM build output
         id: cache-wasm
@@ -538,7 +553,7 @@ jobs:
         id: cache-dx
         uses: actions/cache@v5
         with:
-          path: ~/.cargo/bin/dx
+          path: ${{ env.CARGO_HOME }}/bin/dx
           key: dx-cli-0.7.10
 
       - name: Install Dioxus CLI
@@ -600,9 +615,14 @@ jobs:
   build-linux-x64:
     name: Build Linux x64
     needs: [plan, build-wasm]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
+
+      - name: Isolate mutable tool state
+        run: |
+          echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -616,15 +636,30 @@ jobs:
 
       - name: Install zig
         run: |
-          curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ
-          sudo mv zig-linux-x86_64-0.13.0 /opt/zig
-          echo "/opt/zig" >> $GITHUB_PATH
+          ZIG_ROOT="${RUNNER_TOOL_CACHE:-$HOME/.cache/uhc-tools}/zig/0.13.0/x64"
+          if [ ! -x "$ZIG_ROOT/zig" ]; then
+            ZIG_PARENT=$(dirname "$ZIG_ROOT")
+            mkdir -p "$ZIG_PARENT"
+            TEMP_DIR=$(mktemp -d "$ZIG_PARENT/.zig-install.XXXXXX")
+            trap 'rm -rf "$TEMP_DIR"' EXIT
+            curl --fail --show-error --location \
+              https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | \
+              tar -xJ -C "$TEMP_DIR"
+            STAGED_ROOT="$TEMP_DIR/zig-linux-x86_64-0.13.0"
+            test -x "$STAGED_ROOT/zig"
+            rm -rf "$ZIG_ROOT"
+            mv "$STAGED_ROOT" "$ZIG_ROOT"
+            rm -rf "$TEMP_DIR"
+            trap - EXIT
+          fi
+          test -x "$ZIG_ROOT/zig"
+          echo "$ZIG_ROOT" >> "$GITHUB_PATH"
 
       - name: Cache cargo-zigbuild
         id: cache-zigbuild
         uses: actions/cache@v5
         with:
-          path: ~/.cargo/bin/cargo-zigbuild
+          path: ${{ env.CARGO_HOME }}/bin/cargo-zigbuild
           key: cargo-zigbuild-0.20
 
       - name: Install cargo-zigbuild
