@@ -412,7 +412,12 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # GitHub-hosted only. Self-hosted fleet runners are ephemeral containers
+      # with a persistent sccache mounted by the fleet's placement policy, so a
+      # target/ upload to GitHub's cache costs minutes of egress per job and
+      # buys nothing on the next one.
       - name: Cache cargo
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "native-build"
@@ -450,17 +455,22 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # On self-hosted fleet runners sccache is already in the image and
+      # RUSTC_WRAPPER/SCCACHE_DIR point at a persistent local cache; the GHA
+      # backend would override that and ship objects to GitHub instead.
       - name: Setup sccache
+        if: runner.environment == 'github-hosted'
         uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Cache Rust
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "test-build"
 
       - name: Run tests
         env:
-          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_ENABLED: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
           RUSTC_WRAPPER: "sccache"
         run: cargo test --workspace
 
@@ -541,7 +551,7 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Cache Rust dependencies
-        if: steps.check-cache.outputs.needs_build == 'true'
+        if: steps.check-cache.outputs.needs_build == 'true' && runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "wasm-build"
@@ -630,6 +640,7 @@ jobs:
           targets: x86_64-unknown-linux-musl
 
       - name: Cache Rust
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: zigbuild-x86_64-unknown-linux-musl
