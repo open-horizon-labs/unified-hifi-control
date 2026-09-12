@@ -905,7 +905,7 @@ jobs:
     name: Build Linux ARM (${{ matrix.arch }})
     needs: [plan, build-wasm]
     if: needs.plan.outputs.build_linux_arm == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_ARM_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","ARM64","linux-arm64"]') || 'ubuntu-latest' }}
     strategy:
       matrix:
         include:
@@ -930,9 +930,12 @@ jobs:
 
       - name: Install zig
         run: |
-          curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ
-          sudo mv zig-linux-x86_64-0.13.0 /opt/zig
-          echo "/opt/zig" >> $GITHUB_PATH
+          # Arch-derived, not hardcoded: this job now runs natively on aarch64
+          # fleet hardware, and falls back to x86_64 hosted runners.
+          ZIG_ARCH="$(uname -m)"
+          curl -L "https://ziglang.org/download/0.13.0/zig-linux-${ZIG_ARCH}-0.13.0.tar.xz" | tar -xJ
+          mv "zig-linux-${ZIG_ARCH}-0.13.0" "$HOME/zig"
+          echo "$HOME/zig" >> $GITHUB_PATH
 
       - name: Cache cargo-zigbuild
         id: cache-zigbuild
@@ -1000,7 +1003,7 @@ jobs:
     name: Build macOS (x86_64)
     needs: [plan, build-wasm]
     if: needs.plan.outputs.build_macos == 'true'
-    runs-on: macos-latest
+    runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-latest' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -1058,7 +1061,7 @@ jobs:
     name: Build macOS (arm64)
     needs: [plan, build-wasm]
     if: needs.plan.outputs.build_macos == 'true'
-    runs-on: macos-latest
+    runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-latest' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -1120,7 +1123,7 @@ jobs:
       needs.plan.outputs.build_macos == 'true' &&
       needs.build-macos-x64.result == 'success' &&
       needs.build-macos-arm64.result == 'success'
-    runs-on: macos-latest
+    runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-latest' }}
     steps:
       - name: Download x86_64 binary
         uses: actions/download-artifact@v8
@@ -1159,7 +1162,7 @@ jobs:
     name: Build Apple Music Companion DMG (macOS arm64)
     needs: [plan]
     if: needs.plan.outputs.build_applemusic_macos == 'true'
-    runs-on: macos-latest
+    runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-latest' }}
     # `secrets` isn't allowed directly in step `if:` conditions, so surface
     # presence checks as job-level env vars instead.
     env:
@@ -1669,7 +1672,7 @@ jobs:
       always() &&
       needs.plan.outputs.build_qnap_arm == 'true' &&
       needs.build-linux-arm.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_ARM_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","ARM64","linux-arm64"]') || 'ubuntu-latest' }}
     # `secrets` isn't allowed directly in step `if:` conditions, so surface
     # the presence check as a job-level env var instead.
     env:

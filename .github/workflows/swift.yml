@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   uhckit:
-    runs-on: macos-15
+    runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-15' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -45,7 +45,7 @@ jobs:
           swift build --package-path "$RUNNER_TEMP/uhc-remote" --target UHCKit
 
   apple-companion:
-    runs-on: macos-15
+    runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-15' }}
     steps:
       - uses: actions/checkout@v4
         with:
