@@ -90,7 +90,11 @@ fn trusted_expensive_linux_jobs_ask_for_a_capability_with_a_hosted_fork_fallback
 fn jobs_that_need_playwright_or_docker_stay_on_hosted_ubuntu() {
     let source = workflow("build.yml");
 
-    for name in ["smoke-test", "build-qnap-x64"] {
+    // synology-package-test joined this list after a fleet migration moved it and
+    // its lifecycle script died on `docker: command not found`. The job runs
+    // inside a container with no docker CLI and no host socket; granting one
+    // would hand every job the container engine, so the job stays hosted.
+    for name in ["smoke-test", "build-qnap-x64", "synology-package-test"] {
         assert!(
             job(&source, name).contains("runs-on: ubuntu-latest"),
             "{name} requires tooling absent from the ephemeral fleet runner image"
