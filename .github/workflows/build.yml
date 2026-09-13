@@ -91,7 +91,7 @@ jobs:
 
   plan:
     name: Plan
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     outputs:
       is_release: ${{ steps.decide.outputs.is_release }}
       is_beta: ${{ steps.decide.outputs.is_beta }}
@@ -476,7 +476,7 @@ jobs:
 
   synology-package-test:
     name: Synology Package Contract
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -488,7 +488,7 @@ jobs:
 
   qnap-package-test:
     name: QNAP x86_64 Package Contract
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -726,7 +726,7 @@ jobs:
   smoke-test:
     name: Smoke Test Binary
     needs: [plan, build-linux-x64]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     permissions:
       contents: read
       actions: read
@@ -1385,7 +1385,7 @@ jobs:
       always() &&
       needs.plan.outputs.build_lms == 'true' &&
       needs.build-linux-x64.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -1533,7 +1533,7 @@ jobs:
       needs.plan.outputs.build_synology == 'true' &&
       needs.build-linux-x64.result == 'success' &&
       needs.synology-package-test.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -1589,7 +1589,7 @@ jobs:
     if: |
       needs.plan.outputs.build_qnap == 'true' &&
       needs.qnap-package-test.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     # `secrets` isn't allowed directly in step `if:` conditions, so surface
     # the presence check as a job-level env var instead.
     env:
@@ -1750,7 +1750,7 @@ jobs:
     needs: [plan, build-linux-x64]
     # Only for PRs/branches - releases use build-docker-release
     if: needs.plan.outputs.build_docker == 'true' && needs.plan.outputs.is_release != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     permissions:
       packages: write
     steps:
@@ -1956,7 +1956,7 @@ jobs:
       always() &&
       needs.plan.outputs.build_linux_packages == 'true' &&
       needs.build-linux-x64.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -2237,7 +2237,7 @@ jobs:
     concurrency:
       group: lms-repo-feed-update
       cancel-in-progress: false
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     permissions:
       contents: write
       pull-requests: write
@@ -2348,7 +2348,7 @@ jobs:
     concurrency:
       group: lms-beta-feed-update
       cancel-in-progress: false
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     permissions:
       contents: write
       pull-requests: write
@@ -2405,7 +2405,7 @@ jobs:
       needs.plan.outputs.is_release == 'true' &&
       needs.plan.outputs.is_beta != 'true' &&
       needs.upload-release.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -2483,7 +2483,7 @@ jobs:
       - build-docker-release
       - build-linux-packages
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v8
@@ -2523,7 +2523,7 @@ jobs:
     name: Post Artifact Links
     needs: [summary]
     if: always() && github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     permissions:
       pull-requests: write
     steps:
