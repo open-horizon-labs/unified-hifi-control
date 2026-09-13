@@ -24,7 +24,7 @@ on:
 
 jobs:
   test:
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         # Home Assistant's current minimum is Python 3.13; 3.12 also trips a
@@ -48,7 +48,7 @@ jobs:
         run: pytest custom_components/unified_hifi_control/tests -v
 
   hacs-validate:
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: HACS validation
@@ -62,7 +62,7 @@ jobs:
           ignore: "brands topics license"
 
   hassfest:
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: home-assistant/actions/hassfest@master
