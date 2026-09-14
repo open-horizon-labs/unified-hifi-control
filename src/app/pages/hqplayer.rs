@@ -9,7 +9,8 @@ use crate::app::api::{
     Zone, ZonesResponse,
 };
 use crate::app::components::{
-    HqpMatrixSelect, HqpOutputRoutingSection, HqpProfileSelect, Layout, VolumeControlsCompact,
+    HqpMatrixSelect, HqpOutputInstance, HqpOutputRoutingSection, HqpProfileSelect, Layout,
+    VolumeControlsCompact,
 };
 use crate::app::sse::use_sse;
 
@@ -723,7 +724,13 @@ pub fn HqPlayer() -> Element {
             // only makes sense once at least one instance is configured and reachable.
             if is_connected && instances_loaded_once() {
                 HqpOutputRoutingSection {
-                    instances: instances_list.iter().map(|i| i.name.clone()).collect::<Vec<_>>(),
+                    instances: instances_list
+                        .iter()
+                        .map(|i| HqpOutputInstance {
+                            name: i.name.clone(),
+                            host: i.host.clone(),
+                        })
+                        .collect::<Vec<_>>(),
                 }
             }
 

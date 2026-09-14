@@ -14,7 +14,7 @@ pub use bootstrap_prompt::BootstrapPrompt;
 pub use error_alert::ErrorAlert;
 pub use form_inputs::{PowerModeInput, ToggleInput};
 pub use hqp_controls::{HqpControlsCompact, HqpMatrixSelect, HqpProfileSelect};
-pub use hqp_outputs::HqpOutputRoutingSection;
+pub use hqp_outputs::{HqpOutputInstance, HqpOutputRoutingSection};
 pub use layout::Layout;
 pub use nav::Nav;
 pub use volume::{VolumeControlsCompact, VolumeControlsFull};

@@ -551,8 +551,14 @@ use crate::app::sse::use_sse;
 /// fixtures only: this never claims to select a physical household DAC on its own — it renders
 /// whatever the aggregate projection reports and lets the operator choose among the routes/devices
 /// the backend has actually observed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HqpOutputInstance {
+    pub name: String,
+    pub host: Option<String>,
+}
+
 #[component]
-pub fn HqpOutputRoutingSection(instances: Vec<String>) -> Element {
+pub fn HqpOutputRoutingSection(instances: Vec<HqpOutputInstance>) -> Element {
     let mut selected_instance = use_signal(String::new);
 
     // Default to the first known instance once the list arrives; do not clobber an operator's
@@ -561,7 +567,7 @@ pub fn HqpOutputRoutingSection(instances: Vec<String>) -> Element {
     use_effect(use_reactive!(|instances_for_default| {
         if selected_instance.peek().is_empty() {
             if let Some(first) = instances_for_default.first() {
-                selected_instance.set(first.clone());
+                selected_instance.set(first.name.clone());
             }
         }
     }));
@@ -586,8 +592,16 @@ pub fn HqpOutputRoutingSection(instances: Vec<String>) -> Element {
                             class: "input",
                             value: "{selected_instance}",
                             onchange: move |evt| selected_instance.set(evt.value()),
-                            for name in instances.iter() {
-                                option { key: "{name}", value: "{name}", "{name}" }
+                            for instance in instances.iter() {
+                                option {
+                                    key: "{instance.name}",
+                                    value: "{instance.name}",
+                                    if let Some(host) = instance.host.as_ref() {
+                                        "{instance.name} — {host}"
+                                    } else {
+                                        "{instance.name}"
+                                    }
+                                }
                             }
                         }
                     }
