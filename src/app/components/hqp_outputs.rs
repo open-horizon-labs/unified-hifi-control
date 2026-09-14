@@ -1305,7 +1305,7 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
             div { class: "mb-4 border-b border-subtle pb-4",
                 h3 { class: "text-sm font-semibold mb-2", "Relay configuration" }
                 p { class: "text-xs text-muted mb-2",
-                    "One-time lifecycle setting for this instance's managed relay. Disabled means no listener exists at all — nothing here can route audio until it's enabled."
+                    "HQPlayer selects this relay once. UHC then forwards the authentication handshake, control messages, and audio to the route you choose below. PCM and DSD stay unchanged; NAA6 track metadata can be updated for the selected zone. Switching routes does not edit an HQPlayer profile or restart HQPlayer."
                 }
                 div { class: "grid grid-cols-1 sm:grid-cols-2 gap-3",
                     label { class: "flex items-center gap-2 text-sm",
@@ -1388,7 +1388,7 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
             div { class: "mb-4",
                 h3 { class: "text-sm font-semibold mb-2", "Configured routes" }
                 if projection.routes.is_empty() {
-                    p { class: "text-sm text-muted", "No routes configured yet. Add one below or import from a legacy configuration." }
+                    p { class: "text-sm text-muted", "No routes configured yet. Add a discovered NAA endpoint or enter one below." }
                 } else {
                     ul { class: "space-y-2",
                         for route in projection.routes.iter() {
