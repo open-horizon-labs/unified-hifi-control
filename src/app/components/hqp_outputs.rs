@@ -558,13 +558,13 @@ pub fn HqpOutputRoutingSection(instances: Vec<String>) -> Element {
     // Default to the first known instance once the list arrives; do not clobber an operator's
     // later selection on unrelated re-renders.
     let instances_for_default = instances.clone();
-    use_effect(move || {
-        if selected_instance().is_empty() {
+    use_effect(use_reactive!(|instances_for_default| {
+        if selected_instance.peek().is_empty() {
             if let Some(first) = instances_for_default.first() {
                 selected_instance.set(first.clone());
             }
         }
-    });
+    }));
 
     if instances.is_empty() {
         return rsx! {};
@@ -871,21 +871,20 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
 
     // Initial load and reload whenever the selected instance changes (`instance` is read inside
     // this effect, so switching instances re-subscribes it).
-    use_effect(move || {
-        let _ = instance();
+    use_effect(use_reactive!(|instance| {
         refresh_outputs(instance, outputs, loaded_once, read_fence);
-    });
+    }));
 
     // The backend's existing HqpStateChanged SSE hint fires on every output commit; use it only
     // to trigger a re-read (the contract does not add a new SSE event type — the polled GET
     // remains authoritative and works even after a client reconnects).
     let event_count = sse.event_count;
-    use_effect(move || {
+    use_effect(use_reactive!(|instance| {
         let _ = event_count();
         if sse.should_refresh_hqp() {
             refresh_outputs(instance, outputs, loaded_once, read_fence);
         }
-    });
+    }));
 
     // Stop is priority cancellation (`priority: true` below bumps both fences via `.stop()`
     // before building or sending anything else), so a held select/route response — or a stale
