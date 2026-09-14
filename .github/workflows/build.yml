@@ -648,7 +648,7 @@ jobs:
       - name: Cache Zig
         uses: actions/cache@v5
         with:
-          path: ${{ runner.tool_cache }}/uhc/zig/0.13.0/x64
+          path: ${{ runner.tool_cache }}/zig/0.13.0/x64
           key: zig-${{ runner.os }}-${{ runner.arch }}-0.13.0
 
       - name: Install zig
@@ -961,7 +961,7 @@ jobs:
       - name: Cache Zig
         uses: actions/cache@v5
         with:
-          path: ${{ runner.tool_cache }}/uhc/zig/0.13.0/${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
+          path: ${{ runner.tool_cache }}/zig/0.13.0/${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
           key: zig-${{ runner.os }}-${{ runner.arch }}-0.13.0
 
       - name: Install zig

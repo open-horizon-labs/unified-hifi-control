@@ -133,7 +133,7 @@ fn zigbuild_tool_cache_is_versioned_and_validated() {
             "{name} must install the same version named by its cache key"
         );
         assert!(
-            body.contains("path: ${{ runner.tool_cache }}/uhc/zig/0.13.0/"),
+            body.contains("path: ${{ runner.tool_cache }}/zig/0.13.0/"),
             "{name} must restore Zig from the runner tool cache"
         );
         assert!(
