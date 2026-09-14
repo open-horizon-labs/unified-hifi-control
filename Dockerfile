@@ -46,9 +46,9 @@ COPY input.css tailwind.config.js ./
 RUN make css
 
 # ADR 002: Build WASM assets first, then build server which embeds them
-# Private integrations are opt-in on the server only; preserve the same feature
-# set when rebuilding the final binary with embedded assets.
-ARG UHC_SERVER_FEATURES=server
+# Keep the server feature set identical for the Dioxus build and the final binary
+# so embedded server artifacts expose the same runtime capabilities.
+ARG UHC_SERVER_FEATURES=server,naa-proxy
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \

@@ -144,6 +144,25 @@ fn zigbuild_tool_cache_is_versioned_and_validated() {
 }
 
 #[test]
+fn server_artifacts_include_the_naa_proxy() {
+    let source = workflow("build.yml");
+
+    for name in [
+        "build-linux-x64",
+        "build-linux-arm",
+        "build-macos-x64",
+        "build-macos-arm64",
+        "build-windows",
+    ] {
+        let body = job(&source, name);
+        assert!(
+            body.contains("--features naa-proxy"),
+            "{name} must compile the installed server artifact with the NAA relay"
+        );
+    }
+}
+
+#[test]
 fn parallel_fleet_workers_do_not_share_mutable_rust_toolchains() {
     let source = workflow("build.yml");
 

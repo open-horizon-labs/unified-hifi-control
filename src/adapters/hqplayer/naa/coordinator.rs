@@ -142,6 +142,8 @@ struct SetupRollbackFile {
     backup_sha256: String,
 }
 
+type RollbackFiles = (Vec<(String, String)>, Vec<u8>);
+
 struct Publisher {
     shutdown: CancellationToken,
     join: tokio::task::JoinHandle<()>,
@@ -1270,7 +1272,7 @@ impl HqpOutputCoordinator {
         ))
     }
 
-    fn read_rollback_files(instance: &str) -> Option<(Vec<(String, String)>, Vec<u8>)> {
+    fn read_rollback_files(instance: &str) -> Option<RollbackFiles> {
         let backup = std::fs::read(Self::setup_file_path(instance, "backup.xml")).ok()?;
         let material: SetupRollbackFile = serde_json::from_slice(
             &std::fs::read(Self::setup_file_path(instance, "form.json")).ok()?,
@@ -1937,7 +1939,7 @@ impl HqpOutputCoordinator {
         self.update_operation(op, |o| {
             o.evidence.native_state_before = Some(state.clone());
         });
-        if !matches!(transport.state, 0 | 1 | 2) {
+        if !matches!(transport.state, 0..=2) {
             self.finish_operation(
                 op,
                 HqpOutputOutcome::Failed,

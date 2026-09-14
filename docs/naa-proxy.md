@@ -1,15 +1,16 @@
 # HQPlayer network output routing
 
-The optional `naa-proxy` feature brings the HiPhi NAA relay into UHC's HQPlayer
+The `naa-proxy` feature brings the HiPhi NAA relay into UHC's HQPlayer
 adapter. UHC owns its listeners, routes, discovery and switching operations.
 HQPlayer keeps the stable virtual device `hiphi:router` selected; UHC chooses
 the downstream NAA and physical DAC. The existing HQPlayer command owner handles
 Stop, Play and position restoration. Authentication exchanges and audio remain
 pass-through; the relay adds no DSP or fallback output.
 
-This feature is private-build, default-off. The imported experiment's historical
-hardware results do not qualify a new integrated build. Current qualification is
-tracked in [the integration audit](../experiments/naa-router/GOAL-AUDIT.md).
+Server builds include this feature by default. A relay-free server remains
+available explicitly with `--no-default-features --features server`. The imported
+experiment's historical hardware results do not qualify a new integrated build.
+Current qualification is tracked in [the integration audit](../experiments/naa-router/GOAL-AUDIT.md).
 
 ## One control service, three clients
 
@@ -111,16 +112,17 @@ Disabling or removing the instance stops its owned relay. Disabled relay setting
 open no listener. A bind or worker failure is unavailable state, not an empty DAC
 inventory. There is no second proxy web service to run or automate.
 
-Build the matching Dioxus client and server; enable `naa-proxy` on the server
-target only. A server-only Cargo build does not produce a working hydrated UI.
+Build the matching Dioxus client and server; the server build includes
+`naa-proxy` by default. A server-only Cargo build does not produce a working
+hydrated UI.
 See the repository's normal Dioxus build instructions for its supported CLI
 version and deployment layout.
 
-For a private source-built Docker image, pass
-`--build-arg UHC_SERVER_FEATURES=server,naa-proxy` to `docker build`. The argument
-applies to both the Dioxus server build and the final binary embedding its assets;
-the client remains `web` only. The default image build leaves the relay disabled
-at compile time. Runtime relay enablement is still explicit per instance.
+For a source-built Docker image, the default
+`UHC_SERVER_FEATURES=server,naa-proxy` enables the relay in both the Dioxus server
+build and the final binary embedding its assets; the client remains `web` only.
+Override the argument with `server` when a relay-free image is specifically needed.
+Runtime relay enablement is still explicit per instance.
 
 NAA multicast needs access to the intended LAN interface. The repository's Linux
 host-network deployment pattern avoids Docker bridge multicast isolation; verify

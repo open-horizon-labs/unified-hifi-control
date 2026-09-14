@@ -726,6 +726,7 @@ jobs:
           # Force rebuild of main crate to pick up version env vars and embedded assets
           cargo clean -p unified-hifi-control 2>/dev/null || true
           cargo zigbuild --release --target x86_64-unknown-linux-musl \
+            --features naa-proxy \
             --bin unified-hifi-control --bin uhc-hiphi-pair
 
       - name: Rename binary
@@ -1036,6 +1037,7 @@ jobs:
           # Force rebuild of main crate to pick up version env vars and embedded assets
           cargo clean -p unified-hifi-control 2>/dev/null || true
           cargo zigbuild --release --target ${{ matrix.target }} \
+            --features naa-proxy \
             --bin unified-hifi-control --bin uhc-hiphi-pair
 
       - name: Smoke test armv7 binary
@@ -1109,7 +1111,7 @@ jobs:
         run: |
           # Force rebuild of main crate to pick up version env vars and embedded assets
           cargo clean -p unified-hifi-control 2>/dev/null || true
-          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin --features naa-proxy
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
@@ -1167,7 +1169,7 @@ jobs:
         run: |
           # Force rebuild of main crate to pick up version env vars and embedded assets
           cargo clean -p unified-hifi-control 2>/dev/null || true
-          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin --features naa-proxy
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
@@ -1389,7 +1391,7 @@ jobs:
         run: |
           # Force rebuild of main crate to pick up version env vars and embedded assets
           cargo clean -p unified-hifi-control 2>/dev/null || true
-          cargo build --release
+          cargo build --release --features naa-proxy
         shell: bash
 
       - name: Rename binary

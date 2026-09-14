@@ -285,7 +285,7 @@ pub fn derive(
         ));
     }
     let device_options = form.options("net_device").unwrap_or(&[]);
-    let relay_found = device_options.iter().any(|o| *o == wanted);
+    let relay_found = device_options.contains(&wanted);
     if !relay_found {
         blockers.push(format!(
             "HQPlayer has not discovered the relay as net_device {wanted:?}; enable discovery on the relay (same port as HQPlayer's scan) or refresh devices in HQPlayer ({} network devices offered)",
