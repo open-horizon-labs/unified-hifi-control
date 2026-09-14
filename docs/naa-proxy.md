@@ -1,11 +1,28 @@
 # HQPlayer network output routing
 
-The `naa-proxy` feature brings the HiPhi NAA relay into UHC's HQPlayer
-adapter. UHC owns its listeners, routes, discovery and switching operations.
-HQPlayer keeps the stable virtual device `hiphi:router` selected; UHC chooses
-the downstream NAA and physical DAC. The existing HQPlayer command owner handles
-Stop, Play and position restoration. Authentication exchanges and audio remain
-pass-through; the relay adds no DSP or fallback output.
+The `naa-proxy` feature gives HQPlayer one stable NAA device while UHC chooses
+the physical NAA and DAC behind it. HQPlayer does not need a new profile or a
+restart when you switch outputs.
+
+The normal path is:
+
+```text
+HQPlayer
+  └─ selects HiPhi Router (`hiphi:router`) once
+      └─ UHC relay forwards authentication, control, and audio
+          └─ selected NAA endpoint and DAC
+```
+
+This is a transparent relay in the RooNAA6 sense. UHC does not resample,
+mix, or otherwise process PCM or DSD. It changes only the length-delimited NAA6
+metadata sections when metadata is available, so the downstream device can show
+the current title, artist, and album. The frame writer also accepts artwork
+payloads; the current HQPlayer adapter does not yet fetch its cover bytes for
+injection. The audio payload passes through unchanged.
+
+UHC takes metadata from the already-bound HQPlayer zone projection. An optional
+source-zone fallback is only relevant when HQPlayer supplies no usable track
+metadata; it is not required for ordinary HQPlayer playback.
 
 Server builds include this feature by default. A relay-free server remains
 available explicitly with `--no-default-features --features server`. The imported
@@ -29,6 +46,18 @@ Use the configured UHC controller authentication for protected mutations.
 Credentials for HQPlayer remain in UHC's existing credential configuration;
 output commands do not accept passwords, upload URLs or arbitrary XML.
 
+## Straight pass-through setup
+
+Configure the relay once, select `HiPhi Router` in HQPlayer, and leave that
+device selected. After that, output changes happen through UHC's route command;
+HQPlayer stays connected to the same virtual device.
+
+The relay forwards the NAA authentication handshake and control messages to the
+currently selected endpoint. It enumerates that endpoint's DACs through the
+forwarded `getdevices` exchange, then forwards the audio stream. If the endpoint
+goes away, UHC reports the connection error; it does not silently choose another
+DAC.
+
 ## Setup and switching sequence
 
 1. Configure the HQPlayer instance through UHC's existing instance settings.
@@ -42,12 +71,12 @@ output commands do not accept passwords, upload URLs or arbitrary XML.
 3. Run `discover`. This is NAA's XML multicast discovery, not mDNS. It discovers
    NAA hosts without initiating authentication or playback. Add chosen hosts
    with `route_add`, including a physical `device_id` when known.
-4. Use `setup_preview` to inspect the derived one-time HQPlayer configuration
-   changes. If applicable, use `setup_apply` with that `preview_id`, then inspect
-   its transaction result and `setup_readback`. `setup_rollback` restores the
-   transaction's retained backup. Inspect disk and running-configuration evidence
-   separately: an upload acknowledgement or matching backup alone does not prove
-   that HQPlayer has applied the output to its running engine.
+4. If HQPlayer is not already configured to use the virtual device, use
+   `setup_preview` and, after inspecting it, `setup_apply` once. This is initial
+   setup only. Route switches do not edit a profile or restart HQPlayer.
+   Inspect `setup_readback` when you need proof that the initial configuration
+   reached HQPlayer's running engine; an upload acknowledgement alone is not that
+   proof.
 5. Submit `select` with the route ID. Poll its operation until `outcome` is
    non-null. Initial selection without an existing relay session can complete
    before audio starts. A switch from active playback requires fresh session
