@@ -74,7 +74,7 @@ pub struct HifiHqplayerOutputControlTool {
     pub enabled: Option<bool>,
     /// Explicit relay bind address; loopback is required unless an allowlist is supplied.
     pub bind: Option<String>,
-    /// Explicit HQPlayer source allowlist for non-loopback relay binds.
+    /// Optional HQPlayer source allowlist; empty accepts any reachable NAA peer.
     pub hqp_allow: Option<Vec<String>>,
     /// IPv4 interface used for NAA multicast discovery.
     pub discovery_interface: Option<String>,
