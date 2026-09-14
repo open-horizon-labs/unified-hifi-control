@@ -1104,7 +1104,11 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
             current_operation_id,
             polled_operation,
             false,
-            |_operation| {},
+            move |operation| {
+                if operation.outcome == Some(HqpOutputOutcome::Complete) {
+                    relay_form_dirty.set(false);
+                }
+            },
         );
     };
 
