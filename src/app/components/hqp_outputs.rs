@@ -1238,6 +1238,19 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
 
     rsx! {
         div { class: "card p-4 sm:p-5",
+            if !projection.relay.enabled || projection.routes.is_empty() {
+                div { class: "bg-primary/5 border border-primary/30 rounded-lg p-4 mb-4",
+                    h2 { class: "text-base font-semibold m-0", "Route HQPlayer through UHC" }
+                    p { class: "text-sm mt-1 mb-3",
+                        "Set this up once. HQPlayer keeps using the HiPhi Router device; UHC handles the downstream DAC and lets you switch it without restarting HQPlayer."
+                    }
+                    ol { class: "text-sm list-decimal ml-5 space-y-1",
+                        li { "Enable the relay and save the settings below." }
+                        li { "Discover or add the NAA endpoint that owns your DAC." }
+                        li { "Select a route, then start playback in HQPlayer." }
+                    }
+                }
+            }
             if let Some(ref err) = error() {
                 div { class: "bg-red-900/20 border border-red-500/50 rounded-lg p-3 mb-4",
                     p { class: "text-red-400 m-0 text-sm", "{err}" }
@@ -1303,7 +1316,7 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
             }
 
             div { class: "mb-4 border-b border-subtle pb-4",
-                h3 { class: "text-sm font-semibold mb-2", "Relay configuration" }
+                h3 { class: "text-sm font-semibold mb-2", "1. Connect HQPlayer to UHC" }
                 p { class: "text-xs text-muted mb-2",
                     "HQPlayer selects this relay once. UHC then forwards the authentication handshake, control messages, and audio to the route you choose below. PCM and DSD stay unchanged; NAA6 track metadata can be updated for the selected zone. Switching routes does not edit an HQPlayer profile or restart HQPlayer."
                 }
@@ -1386,7 +1399,7 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
             }
 
             div { class: "mb-4",
-                h3 { class: "text-sm font-semibold mb-2", "Configured routes" }
+                h3 { class: "text-sm font-semibold mb-2", "2. Choose a DAC route" }
                 if projection.routes.is_empty() {
                     p { class: "text-sm text-muted", "No routes configured yet. Add a discovered NAA endpoint or enter one below." }
                 } else {
@@ -1631,8 +1644,8 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                 }
             }
 
-            div { class: "mb-4",
-                h3 { class: "text-sm font-semibold mb-2", "Read-through DAC observations" }
+            details { class: "mb-4",
+                summary { class: "text-sm font-semibold cursor-pointer", "Inspect discovered hosts and DACs" }
                 p { class: "text-xs text-muted mb-2",
                     "Per endpoint (host:port), from the last relayed authenticated session. An endpoint with no entry here has never been enumerated — that is different from one that enumerated zero outputs."
                 }
@@ -1659,8 +1672,8 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                 }
             }
 
-            div { class: "mb-4",
-                h3 { class: "text-sm font-semibold mb-2", "One-time HQPlayer setup" }
+            details { class: "mb-4",
+                summary { class: "text-sm font-semibold cursor-pointer", "Advanced: one-time HQPlayer setup" }
                 p { class: "text-xs text-muted mb-2",
                     "Derives the proposed <output> change from this relay's own configuration and HQPlayer's current backup. Preview never uploads anything; a prior applied change can be rolled back to what was there before."
                 }
