@@ -3,7 +3,6 @@
 //! The PCM/DSD section is deliberately treated as opaque.  Only the length-delimited META and
 //! PIC sections are replaced, which lets the relay enrich a stream without changing its samples.
 
-pub const TYPE_POS: u32 = 0x04;
 pub const TYPE_META: u32 = 0x08;
 pub const TYPE_PIC: u32 = 0x10;
 
@@ -29,7 +28,7 @@ pub fn metadata_section(meta: &MetadataPayload) -> Vec<u8> {
 }
 
 fn escape_line(value: &str) -> String {
-    value.replace('\n', " ").replace('\r', " ")
+    value.replace(['\n', '\r'], " ")
 }
 
 /// Rewrite a complete NAA6 frame body. `pcm_len` is a sample count, while the other lengths are
@@ -43,12 +42,14 @@ pub fn rewrite_sections(
     if metadata.is_none() {
         return Ok(body.to_vec());
     }
-    let lengths = [
-        u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize,
-        u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize,
-        u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize,
-        u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize,
-    ];
+    let read_len = |range: std::ops::Range<usize>| -> Result<usize, String> {
+        Ok(u32::from_le_bytes(
+            header[range]
+                .try_into()
+                .map_err(|_| "invalid NAA frame header".to_string())?,
+        ) as usize)
+    };
+    let lengths = [read_len(4..8)?, read_len(8..12)?, read_len(12..16)?, read_len(16..20)?];
     let total: usize = lengths.iter().sum();
     if total != body.len() {
         return Err("NAA frame section lengths do not match body".into());
@@ -61,9 +62,10 @@ pub fn rewrite_sections(
     let old_meta = &body[at..at + lengths[2]];
     at += lengths[2];
     let old_pic = &body[at..];
-    let meta = metadata_section(metadata.unwrap());
-    let picture = metadata.unwrap().picture.as_deref().unwrap_or(old_pic);
-    let mask = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    let metadata = metadata.ok_or("metadata unexpectedly absent")?;
+    let meta = metadata_section(metadata);
+    let picture = metadata.picture.as_deref().unwrap_or(old_pic);
+    let mask = u32::from_le_bytes(header[0..4].try_into().map_err(|_| "invalid NAA frame header")?);
     let mut new_mask = mask | TYPE_META;
     if picture.is_empty() {
         new_mask &= !TYPE_PIC;

@@ -226,6 +226,10 @@ pub struct NaaRelay {
 }
 
 impl NaaRelay {
+    /// Update the effective metadata projection used by active sessions.
+    pub fn set_metadata(&self, metadata: Option<super::frame::MetadataPayload>) {
+        self.core.set_metadata(metadata);
+    }
     /// Load routes (if a persistence path is given) and construct an idle relay. No socket is
     /// opened here regardless of `settings.enabled`; the owner starts the listener explicitly.
     pub fn new(settings: NaaRelaySettings, persist_path: Option<PathBuf>) -> Result<Self, String> {

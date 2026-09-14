@@ -206,6 +206,13 @@ impl HqpOutputCoordinator {
         lock(&self.relay).clone()
     }
 
+    /// Publish the effective HQPlayer-zone metadata to the managed relay.
+    pub fn set_metadata(&self, metadata: Option<super::frame::MetadataPayload>) {
+        if let Some(relay) = self.relay() {
+            relay.set_metadata(metadata);
+        }
+    }
+
     fn instance_name(&self) -> String {
         lock(&self.instance)
             .clone()

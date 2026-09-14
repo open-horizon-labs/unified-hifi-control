@@ -3398,6 +3398,25 @@ impl HqpAdapter {
     ) -> Result<()> {
         let snapshot = self.read_coherent_pipeline().await?;
 
+        // The HQPlayer zone is the relay's already-declared source binding. Keep the relay's
+        // NAA6 metadata projection in step with the same coherent observation that feeds the
+        // aggregator; no second metadata store or provider-specific lookup is needed.
+        #[cfg(feature = "naa-proxy")]
+        {
+            let status = &snapshot.playback_status;
+            let usable = !status.track_id.is_empty()
+                || status.title.as_deref().is_some_and(|v| !v.is_empty())
+                || status.artist.as_deref().is_some_and(|v| !v.is_empty())
+                || status.album.as_deref().is_some_and(|v| !v.is_empty());
+            let metadata = usable.then(|| naa::frame::MetadataPayload {
+                title: status.title.clone().unwrap_or_default(),
+                artist: status.artist.clone().unwrap_or_default(),
+                album: status.album.clone().unwrap_or_default(),
+                picture: None,
+            });
+            self.outputs.set_metadata(metadata);
+        }
+
         {
             let mut state = self.state.write().await;
             if state.producer_epoch != snapshot.producer_epoch {

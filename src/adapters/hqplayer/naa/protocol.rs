@@ -443,9 +443,12 @@ fn upstream_loop(
                 body.extend_from_slice(&buffer[..n]);
                 remaining -= n;
             }
-            let mut wire_header = header;
+            let mut wire_header: [u8; HEADER_LEN] = header
+                .try_into()
+                .map_err(|_| invalid("short NAA audio header"))?;
+            let metadata = relay.metadata();
             let rewritten =
-                rewrite_sections(&mut wire_header, &body, relay.metadata()).map_err(invalid)?;
+                rewrite_sections(&mut wire_header, &body, metadata.as_ref()).map_err(invalid)?;
             writer.write_all(&wire_header)?;
             writer.write_all(&rewritten)?;
             relay.update(id, true, HEADER_LEN + rewritten.len(), Some("forwarding"));
