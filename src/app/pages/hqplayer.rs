@@ -48,6 +48,18 @@ struct InstancesResponse {
 struct HqpInstance {
     name: String,
     host: Option<String>,
+    #[serde(default)]
+    connected: bool,
+    #[serde(default)]
+    info: Option<HqpInstanceInfo>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
+struct HqpInstanceInfo {
+    #[serde(default)]
+    product: String,
+    #[serde(default)]
+    version: String,
 }
 
 /// Zone link request
@@ -729,6 +741,9 @@ pub fn HqPlayer() -> Element {
                         .map(|i| HqpOutputInstance {
                             name: i.name.clone(),
                             host: i.host.clone(),
+                            connected: i.connected,
+                            product: i.info.as_ref().map(|info| info.product.clone()),
+                            version: i.info.as_ref().map(|info| info.version.clone()),
                         })
                         .collect::<Vec<_>>(),
                 }

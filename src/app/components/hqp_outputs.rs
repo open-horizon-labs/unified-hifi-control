@@ -555,6 +555,9 @@ use crate::app::sse::use_sse;
 pub struct HqpOutputInstance {
     pub name: String,
     pub host: Option<String>,
+    pub connected: bool,
+    pub product: Option<String>,
+    pub version: Option<String>,
 }
 
 #[component]
@@ -593,13 +596,16 @@ pub fn HqpOutputRoutingSection(instances: Vec<HqpOutputInstance>) -> Element {
                             value: "{selected_instance}",
                             onchange: move |evt| selected_instance.set(evt.value()),
                             for instance in instances.iter() {
-                                option {
-                                    key: "{instance.name}",
-                                    value: "{instance.name}",
-                                    if let Some(host) = instance.host.as_ref() {
-                                        "{instance.name} — {host}"
-                                    } else {
-                                        "{instance.name}"
+                                {
+                                    let product = instance.product.as_deref().filter(|v| !v.is_empty()).unwrap_or("HQPlayer");
+                                    let version = instance.version.as_deref().filter(|v| !v.is_empty()).unwrap_or("version unknown");
+                                    let status = if instance.connected { "connected" } else { "offline" };
+                                    rsx! {
+                                        option {
+                                            key: "{instance.name}",
+                                            value: "{instance.name}",
+                                            "{instance.name} — {product} {version} — {status}"
+                                        }
                                     }
                                 }
                             }
