@@ -835,9 +835,6 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
     let mut form_port = use_signal(|| Some(43210u16));
     let mut form_device = use_signal(String::new);
 
-    let mut import_routes_json = use_signal(String::new);
-    let mut import_preview = use_signal(|| None::<crate::app::api::HqpImportPreview>);
-
     // Tracked independently of the projection so a stale/rejected background GET can never clear
     // or replace it (see `run_output_command`'s doc comment).
     let current_operation_id = use_signal(|| None::<String>);
@@ -983,68 +980,6 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
         form_host.set(String::new());
         form_port.set(Some(43210));
         form_device.set(String::new());
-        run_output_command(
-            request,
-            mutation_fence,
-            read_fence,
-            error,
-            busy,
-            outputs,
-            loaded_once,
-            current_operation_id,
-            polled_operation,
-            false,
-            |_operation| {},
-        );
-    };
-
-    let start_import_preview = move |_| {
-        let zone_id = resolve_command_target(move || instance());
-        let routes_json = import_routes_json();
-        let request = build_command(
-            zone_id,
-            Some(new_correlation_id("import-preview")),
-            HqpOutputAction::ImportPreview { routes_json },
-            None,
-        );
-        run_output_command(
-            request,
-            mutation_fence,
-            read_fence,
-            error,
-            busy,
-            outputs,
-            loaded_once,
-            current_operation_id,
-            polled_operation,
-            false,
-            move |operation| match operation.result {
-                Some(HqpOutputResult::ImportPreview(preview)) => {
-                    import_preview.set(Some(preview));
-                }
-                _ => error.set(Some("Preview did not return a preview result.".to_string())),
-            },
-        );
-    };
-
-    let apply_import = move |_| {
-        let zone_id = resolve_command_target(move || instance());
-        let routes_json = import_routes_json();
-        let Some(preview) = import_preview() else {
-            return;
-        };
-        let projection = outputs();
-        let request = build_command(
-            zone_id,
-            Some(new_correlation_id("import-apply")),
-            HqpOutputAction::ImportApply {
-                routes_json,
-                preview_id: preview.preview_id,
-            },
-            projection.as_ref(),
-        );
-        import_preview.set(None);
-        import_routes_json.set(String::new());
         run_output_command(
             request,
             mutation_fence,
@@ -1793,40 +1728,6 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                 }
             }
 
-            div {
-                h3 { class: "text-sm font-semibold mb-2", "Import legacy configuration" }
-                p { class: "text-xs text-muted mb-2",
-                    "Paste the standalone tool's routes.json. Preview never applies anything; a prior selection named in the file is reported but never applied."
-                }
-                textarea {
-                    class: "input",
-                    rows: "4",
-                    placeholder: "{{\"routes\": [...]}}",
-                    value: "{import_routes_json}",
-                    oninput: move |evt| import_routes_json.set(evt.value()),
-                }
-                if let Some(preview) = import_preview() {
-                    div { class: "text-sm text-muted my-2",
-                        "Preview: {preview.routes.len()} route(s), {preview.conflicts.len()} conflict(s)."
-                        if let Some(ignored) = preview.ignored_selected_route_id.as_ref() {
-                            " The file named route \"{ignored}\" as selected; that selection is never applied."
-                        }
-                    }
-                    button {
-                        class: "btn btn-primary btn-sm",
-                        disabled: is_busy,
-                        onclick: apply_import,
-                        "Apply import"
-                    }
-                } else {
-                    button {
-                        class: "btn btn-outline btn-sm mt-2",
-                        disabled: is_busy || import_routes_json().trim().is_empty(),
-                        onclick: start_import_preview,
-                        "Preview import"
-                    }
-                }
-            }
         }
     }
 }
