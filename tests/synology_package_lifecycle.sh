@@ -55,7 +55,7 @@ docker run --rm \
         SYNOPKG_PKG_STATUS=UPGRADE \
             SYNOPKG_PKGDEST_VOL=/volume2 \
             SYNOPKG_PKGVAR=/var/packages/unified-hifi-control/var \
-            /var/packages/unified-hifi-control/scripts/postuninst
+            run_as_package "/var/packages/unified-hifi-control/scripts/postuninst"
         test -f /volume2/@appdata/unified-hifi-control/firmware/version.json
         run_as_package "/var/packages/unified-hifi-control/scripts/preinst"
         run_as_package "/var/packages/unified-hifi-control/scripts/postinst"
@@ -88,24 +88,29 @@ docker run --rm \
         run_as_package "/var/packages/unified-hifi-control/scripts/preuninst"
 
         # A lookalike @appdata path outside the DSM-selected package volume must
-        # never be removed by the root-running uninstall hook.
+        # never be removed by the package-user uninstall hook.
         mkdir -p /tmp/@appdata/unified-hifi-control
         printf "preserve unexpected path\n" > /tmp/@appdata/unified-hifi-control/sentinel
         set +e
         SYNOPKG_PKG_STATUS=UNINSTALL \
             SYNOPKG_PKGDEST_VOL=/volume2 \
             SYNOPKG_PKGVAR=/tmp/@appdata/unified-hifi-control \
-            /var/packages/unified-hifi-control/scripts/postuninst
+            run_as_package "/var/packages/unified-hifi-control/scripts/postuninst"
         unexpected_path_rc=$?
         set -e
         test "$unexpected_path_rc" -ne 0
         test -f /tmp/@appdata/unified-hifi-control/sentinel
 
-        SYNOPKG_PKG_STATUS=UNINSTALL \
+        run_as_package "touch /volume2/@appdata/unified-hifi-control/.hidden-state"
+        run_as_package "ln -s /tmp/@appdata/unified-hifi-control /volume2/@appdata/unified-hifi-control/outside-link"
+        uninstall_output=$(SYNOPKG_PKG_STATUS=UNINSTALL \
             SYNOPKG_PKGDEST_VOL=/volume2 \
             SYNOPKG_PKGVAR=/var/packages/unified-hifi-control/var \
-            /var/packages/unified-hifi-control/scripts/postuninst
-        test ! -e /volume2/@appdata/unified-hifi-control
+            run_as_package "/var/packages/unified-hifi-control/scripts/postuninst" 2>&1)
+        test -z "$uninstall_output" || { echo "$uninstall_output" >&2; exit 1; }
+        test -d /volume2/@appdata/unified-hifi-control
+        test -z "$(ls -A /volume2/@appdata/unified-hifi-control)"
+        test -f /tmp/@appdata/unified-hifi-control/sentinel
 
         # Restore bind-mount ownership so the host-side cleanup trap works on
         # Linux runners where container UID ownership is preserved.

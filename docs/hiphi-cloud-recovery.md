@@ -54,3 +54,59 @@ The alternative of clearing quarantine on every restart was rejected because
 package restart loops would defeat containment. Automatic recovery of corrupt
 state was rejected because it could erase evidence or replay protection. The
 manual action is limited to a cost stop and leaves the Cloud safety lease intact.
+
+## Automatic outage recovery (#730)
+
+Connection failures no longer create permanent quarantine when the persisted
+32-attempt hourly budget runs out. The connector remains alive and waits until
+it can retry. Settings reports offline and explains automatic retries using the
+existing status contract.
+
+The first attempt is immediate. The next two are spaced by at least 5 and 30
+seconds; subsequent attempts are at least 15 minutes apart. Each interval adds
+0–30 seconds of jitter. A successful authenticated connection must last 15
+minutes before fast retries become available again. The hourly attempt ceiling
+is independent and is never reset by a successful connection.
+
+`hiphi-relay-epoch.retry` persists the retry sequence and next eligible time
+before network work. Restarts retain this schedule. Live scheduling uses elapsed
+monotonic time, so wall-clock corrections cannot accelerate retries. Across a
+restart, a backwards clock correction rebases the saved interval, retaining its
+sequence; an expired schedule admits one attempt and retains slow pacing. A
+future-dated hourly budget is likewise rebased without clearing its counter.
+An exhausted legacy budget can therefore take up to an hour to expire; ordinary
+slow recovery is within 15 minutes plus 30 seconds of jitter.
+
+Traffic quarantine remains deliberate containment. Existing `.quarantine` files
+lack a reliable cause and are not automatically removed, including old markers
+created by reconnect exhaustion. Use Resume once for those. Resume preserves the
+new retry schedule, pairing keys and replay ledger. Corrupted retry state is a
+safety error, not permission to start fresh.
+
+Production logs now include failed grant/connect reasons and
+`cloud_reconnect_cooldown` with attempt count, relative delay and the estimated
+next retry timestamp. Invalid grant JSON is reported without response content.
+The original cause of the September 8 network interruption is still unknown;
+local logs establish containment, not whether Cloudflare or the network closed
+the socket. Persistent Cloud-side denial after an eligible retry requires Cloud
+investigation and cannot be cleared by this local policy.
+
+### Execution and risk evidence
+
+The regression `outage_budget_exhaustion_is_temporary_and_never_creates_quarantine`
+was observed failing on the previous implementation (`cost_limit` instead of
+no pause). The retry-policy tests cover a 24-hour outage, hourly-budget recovery,
+restart loops, short authenticated sessions, sustained success, clock jumps,
+legacy containment and corrupt state. The runtime test
+`exhausted_budget_keeps_supervisor_alive_offline_and_shutdown_interrupts_cooldown`
+checks that the live supervisor waits instead of exiting or offering manual
+resume, and shuts down promptly. Existing flood, replay, authority, heartbeat
+and API-contract tests remain required.
+
+These checks reject increasing the budget, resetting it on restart or each
+hourly retry burst, resetting fast retries on every successful handshake, and
+expiring all quarantine markers. Live monotonic scheduling is also verified by
+inspection: the retry clock is anchored once at run startup, and all subsequent
+admission times use only elapsed monotonic time. Actual recovery on the NAS and
+the reason for Cloud/network resets require deployment observation; no production
+reset or deployment is part of this change.

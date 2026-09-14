@@ -5,8 +5,9 @@
 PACKAGE_NAME="unified-hifi-control"
 
 # DSM deliberately preserves SYNOPKG_PKGVAR across package removal. Resolve
-# its /var/packages symlink so the backing @appdata directory is removed on a
-# true uninstall, while retaining it when this hook runs during an upgrade.
+# its /var/packages symlink and clean package-owned contents on a true
+# uninstall. Leave the directory itself to DSM: its parent is system-owned.
+# Retain all data when this hook runs during an upgrade.
 if [ "${SYNOPKG_PKG_STATUS:-}" = "UNINSTALL" ] && [ -n "${SYNOPKG_PKGVAR:-}" ]; then
     PACKAGE_VAR=$(readlink -f "$SYNOPKG_PKGVAR")
     PACKAGE_VOLUME=${SYNOPKG_PKGDEST_VOL:-}
@@ -34,7 +35,12 @@ if [ "${SYNOPKG_PKG_STATUS:-}" = "UNINSTALL" ] && [ -n "${SYNOPKG_PKGVAR:-}" ]; 
         exit 1
     fi
 
-    rm -rf -- "$PACKAGE_VAR"
+    # Include hidden state, and unlink symlinks without following their targets.
+    # Unmatched glob patterns must not be treated as actual entries.
+    for entry in "$PACKAGE_VAR"/* "$PACKAGE_VAR"/.[!.]* "$PACKAGE_VAR"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        rm -rf -- "$entry" || exit 1
+    done
 fi
 
 exit 0

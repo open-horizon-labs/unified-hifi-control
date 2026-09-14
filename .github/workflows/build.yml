@@ -91,7 +91,7 @@ jobs:
 
   plan:
     name: Plan
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     outputs:
       is_release: ${{ steps.decide.outputs.is_release }}
       is_beta: ${{ steps.decide.outputs.is_beta }}
@@ -387,7 +387,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest' }}
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -412,7 +412,12 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # GitHub-hosted only. Self-hosted fleet runners are ephemeral containers
+      # with a persistent sccache mounted by the fleet's placement policy, so a
+      # target/ upload to GitHub's cache costs minutes of egress per job and
+      # buys nothing on the next one.
       - name: Cache cargo
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "native-build"
@@ -427,7 +432,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest' }}
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -450,17 +455,22 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # On self-hosted fleet runners sccache is already in the image and
+      # RUSTC_WRAPPER/SCCACHE_DIR point at a persistent local cache; the GHA
+      # backend would override that and ship objects to GitHub instead.
       - name: Setup sccache
+        if: runner.environment == 'github-hosted'
         uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Cache Rust
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "test-build"
 
       - name: Run tests
         env:
-          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_ENABLED: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
           RUSTC_WRAPPER: "sccache"
         run: cargo test --workspace
 
@@ -478,7 +488,7 @@ jobs:
 
   qnap-package-test:
     name: QNAP x86_64 Package Contract
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -490,7 +500,7 @@ jobs:
   # Uses content-based caching to skip build when source unchanged
   build-wasm:
     name: Build WASM Assets
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest' }}
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -541,7 +551,7 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Cache Rust dependencies
-        if: steps.check-cache.outputs.needs_build == 'true'
+        if: steps.check-cache.outputs.needs_build == 'true' && runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "wasm-build"
@@ -615,7 +625,7 @@ jobs:
   build-linux-x64:
     name: Build Linux x64
     needs: [plan, build-wasm]
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest' }}
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -630,6 +640,7 @@ jobs:
           targets: x86_64-unknown-linux-musl
 
       - name: Cache Rust
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: zigbuild-x86_64-unknown-linux-musl
@@ -912,7 +923,7 @@ jobs:
     name: Build Linux ARM (${{ matrix.arch }})
     needs: [plan, build-wasm]
     if: needs.plan.outputs.build_linux_arm == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     strategy:
       matrix:
         include:
@@ -1043,7 +1054,7 @@ jobs:
     name: Build macOS (x86_64)
     needs: [plan, build-wasm]
     if: needs.plan.outputs.build_macos == 'true'
-    runs-on: macos-latest
+    runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-latest' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -1101,7 +1112,7 @@ jobs:
     name: Build macOS (arm64)
     needs: [plan, build-wasm]
     if: needs.plan.outputs.build_macos == 'true'
-    runs-on: macos-latest
+    runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-latest' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -1163,7 +1174,7 @@ jobs:
       needs.plan.outputs.build_macos == 'true' &&
       needs.build-macos-x64.result == 'success' &&
       needs.build-macos-arm64.result == 'success'
-    runs-on: macos-latest
+    runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-latest' }}
     steps:
       - name: Download x86_64 binary
         uses: actions/download-artifact@v8
@@ -1202,7 +1213,7 @@ jobs:
     name: Build Apple Music Companion DMG (macOS arm64)
     needs: [plan]
     if: needs.plan.outputs.build_applemusic_macos == 'true'
-    runs-on: macos-latest
+    runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-latest' }}
     # `secrets` isn't allowed directly in step `if:` conditions, so surface
     # presence checks as job-level env vars instead.
     env:
@@ -1425,7 +1436,7 @@ jobs:
       always() &&
       needs.plan.outputs.build_lms == 'true' &&
       needs.build-linux-x64.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -1573,7 +1584,7 @@ jobs:
       needs.plan.outputs.build_synology == 'true' &&
       needs.build-linux-x64.result == 'success' &&
       needs.synology-package-test.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -1712,7 +1723,7 @@ jobs:
       always() &&
       needs.plan.outputs.build_qnap_arm == 'true' &&
       needs.build-linux-arm.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     # `secrets` isn't allowed directly in step `if:` conditions, so surface
     # the presence check as a job-level env var instead.
     env:
@@ -1790,7 +1801,7 @@ jobs:
     needs: [plan, build-linux-x64]
     # Only for PRs/branches - releases use build-docker-release
     if: needs.plan.outputs.build_docker == 'true' && needs.plan.outputs.is_release != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     permissions:
       packages: write
     steps:
@@ -1996,7 +2007,7 @@ jobs:
       always() &&
       needs.plan.outputs.build_linux_packages == 'true' &&
       needs.build-linux-x64.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -2277,7 +2288,7 @@ jobs:
     concurrency:
       group: lms-repo-feed-update
       cancel-in-progress: false
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     permissions:
       contents: write
       pull-requests: write
@@ -2388,7 +2399,7 @@ jobs:
     concurrency:
       group: lms-beta-feed-update
       cancel-in-progress: false
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     permissions:
       contents: write
       pull-requests: write
@@ -2445,7 +2456,7 @@ jobs:
       needs.plan.outputs.is_release == 'true' &&
       needs.plan.outputs.is_beta != 'true' &&
       needs.upload-release.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -2523,7 +2534,7 @@ jobs:
       - build-docker-release
       - build-linux-packages
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v8
@@ -2563,7 +2574,7 @@ jobs:
     name: Post Artifact Links
     needs: [summary]
     if: always() && github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     permissions:
       pull-requests: write
     steps:

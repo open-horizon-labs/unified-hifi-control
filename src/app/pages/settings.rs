@@ -270,6 +270,9 @@ fn HiphiCloudPairing() -> Element {
                     div { class: if status.connector_state == "online" { "status-ok" } else { "text-secondary" }, role: "status",
                         p { class: "font-medium", "This UHC installation is paired." }
                         p { class: "mt-1", "{status.display_state()}" }
+                        if status.connector_state == "offline" && status.pause_reason.is_none() {
+                            p { class: "mt-2 text-sm", "UHC retries automatically. During an outage, retries slow to about once every 15 minutes to limit Cloud usage." }
+                        }
                         if status.pause_reason.as_deref() == Some("cost_limit") {
                             p { class: "mt-2 text-sm", "Cloud traffic or repeated connection attempts reached a safety limit. Local playback is unaffected. Resume after the Cloud issue is resolved; cost protection stays enabled." }
                             button {

@@ -69,6 +69,9 @@ else
             continue
         fi
 
+        tar -xOf "$output_spk" conf/privilege | cmp - "${SYNOLOGY_DIR}/conf/privilege" \
+            || fail "assembled SPK must retain the validated unprivileged configuration"
+
         actual_version=$(tar -xOf "$output_spk" INFO | sed -n 's/^version="\([^"]*\)"$/\1/p')
         [[ "$actual_version" == "$expected_version" ]] || fail "${input_version} normalized to ${actual_version}, expected ${expected_version}"
 
@@ -130,13 +133,13 @@ fi
 
 privilege_file="${SYNOLOGY_DIR}/conf/privilege"
 python3 -S -m json.tool "$privilege_file" >/dev/null || fail "conf/privilege is invalid JSON"
-postuninst_run_as=$(python3 -S -c '
+python3 -S - "$privilege_file" <<'CHECK' || fail "all package lifecycle actions must run without root"
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as source:
     privilege = json.load(source)
-print(next((entry.get("run-as", "") for entry in privilege.get("ctrl-script", []) if entry.get("action") == "postuninst"), ""))
-' "$privilege_file")
-[[ "$postuninst_run_as" == root ]] || fail "postuninst must run as root so it can remove the package @appdata directory"
+assert privilege["defaults"]["run-as"] == "package"
+assert all(entry.get("run-as", "package") == "package" for entry in privilege.get("ctrl-script", []))
+CHECK
 python3 -S -m json.tool "${SYNOLOGY_DIR}/conf/resource" >/dev/null || fail "conf/resource is invalid JSON"
 assert_contains "${SYNOLOGY_DIR}/conf/resource" '"port-config"' "conf/resource must register the package firewall protocol file"
 

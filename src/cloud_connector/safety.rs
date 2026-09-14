@@ -8,6 +8,8 @@
 //! The cloud relay needs compatible 45-minute liveness before installing a
 //! connector with 15-minute steady heartbeats. State snapshots keep their own
 //! 20-second schedule; playback commands do not wait for a heartbeat.
+//! Outage reconnect exhaustion now waits automatically and never creates a
+//! quarantine marker. Existing ambiguous markers still require deliberate recovery.
 use std::{path::Path, time::Duration};
 
 pub fn heartbeat_delay(step: u32) -> Duration {
@@ -84,7 +86,7 @@ pub fn pause_reason(epoch_path: &Path) -> Option<&'static str> {
     }
 }
 
-fn read_regular(path: &Path) -> std::io::Result<Option<String>> {
+pub(super) fn read_regular(path: &Path) -> std::io::Result<Option<String>> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => std::fs::read_to_string(path).map(Some),
         Ok(_) => Err(std::io::Error::other("safety state is not a regular file")),
@@ -94,6 +96,7 @@ fn read_regular(path: &Path) -> std::io::Result<Option<String>> {
 }
 
 fn inspect(epoch_path: &Path) -> std::io::Result<bool> {
+    super::retry::validate(epoch_path)?;
     if let Some(previous) = read_regular(&epoch_path.with_extension("resume"))? {
         previous.parse::<u64>().map_err(std::io::Error::other)?;
     }
@@ -169,7 +172,6 @@ pub fn resume(epoch_path: &Path, now: u64) -> std::io::Result<()> {
 
 /// Reserve each attempt on disk before doing network work. Restart is not a refill.
 pub fn admit_reconnect(epoch_path: &Path, now: u64) -> std::io::Result<bool> {
-    use std::io::Write;
     if epoch_path.with_extension("quarantine").try_exists()? {
         return Ok(false);
     }
@@ -183,11 +185,21 @@ pub fn admit_reconnect(epoch_path: &Path, now: u64) -> std::io::Result<bool> {
         start = now;
         attempts = 0;
     }
+    if now < start {
+        start = now;
+    }
     if attempts >= 32 {
-        quarantine(epoch_path)?;
+        // Persist clock rebasing even when no network attempt is admitted.
+        write_attempts(&path, start, attempts)?;
         return Ok(false);
     }
     attempts += 1;
+    write_attempts(&path, start, attempts)?;
+    Ok(true)
+}
+
+fn write_attempts(path: &Path, start: u64, attempts: u32) -> std::io::Result<()> {
+    use std::io::Write;
     let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -200,12 +212,45 @@ pub fn admit_reconnect(epoch_path: &Path, now: u64) -> std::io::Result<bool> {
     file.write_all(serde_json::to_string(&(start, attempts))?.as_bytes())?;
     file.sync_all()?;
     std::fs::rename(temporary, path)?;
-    Ok(true)
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+pub(super) fn reconnect_attempt_count(epoch: &Path) -> Option<u32> {
+    let text = read_regular(&epoch.with_extension("attempts")).ok()??;
+    serde_json::from_str::<(u64, u32)>(&text)
+        .ok()
+        .map(|(_, count)| count)
+}
+
+pub(super) fn reconnect_budget_delay(epoch: &Path, now: u64) -> std::io::Result<Duration> {
+    let text = read_regular(&epoch.with_extension("attempts"))?
+        .ok_or_else(|| std::io::Error::other("missing reconnect budget"))?;
+    let (start, _): (u64, u32) = serde_json::from_str(&text).map_err(std::io::Error::other)?;
+    Ok(Duration::from_millis(
+        3_600_000u64
+            .saturating_sub(now.saturating_sub(start))
+            .max(1),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn outage_budget_exhaustion_is_temporary_and_never_creates_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let epoch = dir.path().join("epoch");
+        for _ in 0..32 {
+            assert!(admit_reconnect(&epoch, 10_000).unwrap());
+        }
+        assert!(!admit_reconnect(&epoch, 10_000).unwrap());
+        assert_eq!(pause_reason(&epoch), None);
+        assert!(admit_reconnect(&epoch, 3_610_000).unwrap());
+    }
+
     #[test]
     fn deliberate_resume_preserves_replay_and_retrips_with_persistent_cooldown() {
         let dir = tempfile::tempdir().unwrap();
@@ -216,6 +261,7 @@ mod tests {
             assert!(admit_reconnect(&epoch, now).unwrap());
         }
         assert!(!admit_reconnect(&epoch, now).unwrap());
+        quarantine(&epoch).unwrap();
         assert_eq!(pause_reason(&epoch), Some("cost_limit"));
         resume(&epoch, now).unwrap();
         assert_eq!(
@@ -227,6 +273,7 @@ mod tests {
             assert!(admit_reconnect(&epoch, now).unwrap());
         }
         assert!(!admit_reconnect(&epoch, now).unwrap());
+        quarantine(&epoch).unwrap();
         assert!(resume(&epoch, now + 1).is_err());
         assert_eq!(pause_reason(&epoch), Some("cost_limit"));
         resume(&epoch, now + 900_000).unwrap();
@@ -279,6 +326,8 @@ mod tests {
             assert!(admit_reconnect(&epoch, 10_000).unwrap());
         }
         assert!(!admit_reconnect(&epoch, 10_000).unwrap());
-        assert!(!admit_reconnect(&epoch, 10_000_000).unwrap());
+        assert!(admit_reconnect(&epoch, 10_000_000).unwrap());
+        quarantine(&epoch).unwrap();
+        assert!(!admit_reconnect(&epoch, 100_000_000).unwrap());
     }
 }

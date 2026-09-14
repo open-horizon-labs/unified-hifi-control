@@ -129,6 +129,7 @@ pub struct ConnectorSupervisor {
 struct ConnectionLifecycle<'a> {
     supervisor: &'a ConnectorSupervisor,
     generation: u64,
+    online_since: &'a Mutex<Option<tokio::time::Instant>>,
 }
 
 impl ConnectorSupervisor {
@@ -269,7 +270,18 @@ async fn run(
     supervisor: ConnectorSupervisor,
     generation: u64,
 ) -> ConnectorPhase {
-    let mut backoff = super::transport::Backoff::default();
+    let clock_origin = tokio::time::Instant::now();
+    let wall_origin = now_ms() as u64;
+    // Never consult wall time again during this run: NTP changes cannot
+    // shorten a live cooldown or freeze the hourly window.
+    let retry_now = || wall_origin.saturating_add(clock_origin.elapsed().as_millis() as u64);
+    let mut retry = match super::retry::RetryPolicy::load(&config.epoch_path, wall_origin) {
+        Ok(retry) => retry,
+        Err(error) => {
+            tracing::error!("HiPhi reconnect schedule unavailable: {error}");
+            return ConnectorPhase::SafetyError;
+        }
+    };
     let shutdown = state.shutdown.clone();
     let mut store = StateStore::default();
     let mut epoch_guard = match SessionEpochGuard::load(&config.epoch_path) {
@@ -282,23 +294,35 @@ async fn run(
     let mut ledger = CommandLedger::default();
     let mut final_phase = ConnectorPhase::Offline;
     loop {
-        supervisor
-            .set_phase(generation, ConnectorPhase::Connecting)
-            .await;
-        let delay = backoff.next_delay();
-        tokio::select! { _ = shutdown.cancelled() => break, _ = tokio::time::sleep(delay) => {} }
-        match super::safety::admit_reconnect(&config.epoch_path, now_ms() as u64) {
-            Ok(true) => {}
-            result => {
-                tracing::error!(event = "cloud_cost_quarantined", "HiPhi remote access stopped: reconnect budget or persisted safety state unavailable; inspect connector safety files before recovery ({result:?})");
-                final_phase = if result.is_err() {
-                    ConnectorPhase::SafetyError
-                } else {
-                    ConnectorPhase::Paused
-                };
+        match retry.reserve(retry_now()) {
+            Ok(super::retry::Admission::Attempt) => {}
+            Ok(super::retry::Admission::Wait(delay)) => {
+                supervisor
+                    .set_phase(generation, ConnectorPhase::Offline)
+                    .await;
+                tracing::info!(
+                    event = "cloud_reconnect_cooldown",
+                    retry_after_seconds = delay.as_secs(),
+                    attempts_in_window = ?super::safety::reconnect_attempt_count(&config.epoch_path),
+                    next_retry_at_ms = now_ms().saturating_add(delay.as_millis() as i64),
+                    "HiPhi Cloud unavailable; automatic retry scheduled"
+                );
+                tokio::select! { _ = shutdown.cancelled() => break, _ = tokio::time::sleep(delay) => {} }
+                continue;
+            }
+            Ok(super::retry::Admission::Quarantined) => {
+                final_phase = ConnectorPhase::Paused;
+                break;
+            }
+            Err(error) => {
+                tracing::error!("HiPhi reconnect safety state unavailable: {error}");
+                final_phase = ConnectorPhase::SafetyError;
                 break;
             }
         }
+        supervisor
+            .set_phase(generation, ConnectorPhase::Connecting)
+            .await;
         let grant = match tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
@@ -306,7 +330,7 @@ async fn run(
         } {
             Ok(grant) => grant,
             Err(error) => {
-                tracing::debug!("HiPhi Cloud session grant unavailable: {error}");
+                tracing::warn!("HiPhi Cloud session grant unavailable: {error}");
                 continue;
             }
         };
@@ -345,7 +369,8 @@ async fn run(
         };
         match connection {
             Ok(Ok((socket, _))) => {
-                match run_connection(
+                let online_since = Mutex::new(None);
+                let result = run_connection(
                     &state,
                     &config,
                     &identity,
@@ -357,19 +382,24 @@ async fn run(
                     ConnectionLifecycle {
                         supervisor: &supervisor,
                         generation,
+                        online_since: &online_since,
                     },
                     socket,
                 )
-                .await
-                {
-                    // Reset only after the authenticated session completed its
-                    // challenge/proof ceremony.  A socket that accepts TCP
-                    // and then rejects the protocol must still back off.
+                .await;
+                if let Some(online_since) = *online_since.lock().await {
+                    if let Err(error) = retry.connected_for(online_since.elapsed(), retry_now()) {
+                        tracing::error!("HiPhi reconnect schedule could not be saved: {error}");
+                        final_phase = ConnectorPhase::SafetyError;
+                        break;
+                    }
+                }
+                match result {
+                    // Brief authenticated connections retain the persisted cooldown.
                     Ok(ConnectionExit::Disconnected) => {
                         supervisor
                             .set_phase(generation, ConnectorPhase::Offline)
                             .await;
-                        backoff.reset();
                     }
                     Ok(ConnectionExit::Revoked) => {
                         final_phase = ConnectorPhase::Revoked;
@@ -388,8 +418,8 @@ async fn run(
                     }
                 }
             }
-            Ok(Err(error)) => tracing::debug!("HiPhi Cloud relay unavailable: {error}"),
-            Err(_) => tracing::debug!("HiPhi Cloud relay connect timed out"),
+            Ok(Err(error)) => tracing::warn!("HiPhi Cloud relay unavailable: {error}"),
+            Err(_) => tracing::warn!("HiPhi Cloud relay connect timed out"),
         }
     }
     final_phase
@@ -462,7 +492,8 @@ async fn request_session_grant_at(
         }
         bytes.extend_from_slice(&chunk);
     }
-    let response: GrantResponse = serde_json::from_slice(&bytes)?;
+    let response: GrantResponse = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("session grant response did not match its JSON schema"))?;
     if response.endpoint != expected_relay_endpoint || response.expires_at <= 0 {
         anyhow::bail!("session grant response did not match the requested relay");
     }
@@ -565,6 +596,8 @@ where
         .supervisor
         .set_phase(lifecycle.generation, ConnectorPhase::Online)
         .await;
+
+    *lifecycle.online_since.lock().await = Some(tokio::time::Instant::now());
 
     let mut verifier = CommandGrantVerifier::new(
         "hiphi-command-authorization",
@@ -1391,6 +1424,51 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_budget_keeps_supervisor_alive_offline_and_shutdown_interrupts_cooldown() {
+        let (directory, installation_id) = paired_directory();
+        InstallationIdentity::generate(installation_id)
+            .unwrap()
+            .save(&directory.path().join("hiphi-installation.key"))
+            .unwrap();
+        let epoch = directory.path().join("hiphi-relay-epoch");
+        std::fs::write(
+            epoch.with_extension("attempts"),
+            format!("[{},32]", super::now_ms()),
+        )
+        .unwrap();
+        let supervisor = ConnectorSupervisor::default();
+        let state = empty_app_state().await;
+        supervisor
+            .start_from_runtime(state.clone(), directory.path())
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        let status = supervisor
+            .status_from_runtime(directory.path())
+            .await
+            .unwrap();
+        assert_eq!(status.phase, super::ConnectorPhase::Offline);
+        assert_eq!(status.pause_reason, None);
+        assert!(!status.can_resume);
+        assert!(
+            supervisor.inner.lock().await.active,
+            "cooldown must keep recovery alive"
+        );
+        assert!(!epoch.with_extension("quarantine").exists());
+        state.shutdown.cancel();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !supervisor.inner.lock().await.active,
+            "shutdown must not wait an hour"
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn recovery_serializes_clicks_preserves_identity_and_exposes_terminal_pause() {
         let (directory, installation_id) = paired_directory();
@@ -1772,7 +1850,7 @@ mod tests {
                     "grant": "g".repeat(64),
                     "endpoint": "wss://cloud.invalid/v1/relay/connect",
                     "expires_at": 1_800_000_060_000_i64,
-                    "extra": true,
+                    "sensitive_untrusted_field": true,
                 }))
             }),
         ))
@@ -1785,7 +1863,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(unexpected_error.to_string().contains("unknown field"));
+        assert!(unexpected_error.to_string().contains("JSON schema"));
+        assert!(!unexpected_error
+            .to_string()
+            .contains("sensitive_untrusted_field"));
     }
 
     #[test]
@@ -1938,6 +2019,7 @@ mod tests {
             &mut epoch_guard,
             &mut ledger,
             ConnectionLifecycle {
+                online_since: &tokio::sync::Mutex::new(None),
                 supervisor: &supervisor,
                 generation: 1,
             },
@@ -2091,6 +2173,7 @@ mod tests {
             &mut epoch_guard,
             &mut ledger,
             ConnectionLifecycle {
+                online_since: &tokio::sync::Mutex::new(None),
                 supervisor: &supervisor,
                 generation: 1,
             },
@@ -2228,6 +2311,7 @@ mod tests {
             &mut epoch_guard,
             &mut ledger,
             ConnectionLifecycle {
+                online_since: &tokio::sync::Mutex::new(None),
                 supervisor: &supervisor,
                 generation: 1,
             },
@@ -2347,6 +2431,7 @@ mod tests {
                 &mut epoch_guard,
                 &mut ledger,
                 ConnectionLifecycle {
+                    online_since: &tokio::sync::Mutex::new(None),
                     supervisor: &supervisor,
                     generation: 1,
                 },

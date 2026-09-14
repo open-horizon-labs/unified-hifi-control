@@ -64,15 +64,24 @@ fn development_does_not_enable_edge_image_publication() {
     );
 }
 
+// The contract is the capability, not the machine. Pinning `nuc14` here is what
+// let the workflow name a host that no longer exists: the test agreed with the
+// workflow and both were wrong together. A capability label is placeable by the
+// broker on whatever machine currently serves it.
 #[test]
-fn trusted_expensive_linux_jobs_use_the_nuc_with_a_hosted_fork_fallback() {
+fn trusted_expensive_linux_jobs_ask_for_a_capability_with_a_hosted_fork_fallback() {
     let source = workflow("build.yml");
-    let selector = r#"vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","nuc14"]') || 'ubuntu-latest'"#;
+    let selector = r#"vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest'"#;
 
     for name in ["lint", "test", "build-wasm", "build-linux-x64"] {
+        let body = job(&source, name);
         assert!(
-            job(&source, name).contains(selector),
-            "{name} must use nuc14 for trusted work and ubuntu-latest for fork PRs"
+            body.contains(selector),
+            "{name} must ask for the linux-general capability for trusted work and ubuntu-latest for fork PRs"
+        );
+        assert!(
+            !body.contains("nuc14"),
+            "{name} still names a host rather than a capability"
         );
     }
 }
@@ -81,10 +90,14 @@ fn trusted_expensive_linux_jobs_use_the_nuc_with_a_hosted_fork_fallback() {
 fn jobs_that_need_playwright_or_docker_stay_on_hosted_ubuntu() {
     let source = workflow("build.yml");
 
-    for name in ["smoke-test", "build-qnap-x64"] {
+    // synology-package-test joined this list after a fleet migration moved it and
+    // its lifecycle script died on `docker: command not found`. The job runs
+    // inside a container with no docker CLI and no host socket; granting one
+    // would hand every job the container engine, so the job stays hosted.
+    for name in ["smoke-test", "build-qnap-x64", "synology-package-test"] {
         assert!(
             job(&source, name).contains("runs-on: ubuntu-latest"),
-            "{name} requires tooling absent from the nuc14 runner image"
+            "{name} requires tooling absent from the ephemeral fleet runner image"
         );
     }
 }
@@ -123,7 +136,7 @@ fn zigbuild_tool_cache_is_versioned_and_validated() {
 }
 
 #[test]
-fn parallel_nuc_workers_do_not_share_mutable_rust_toolchains() {
+fn parallel_fleet_workers_do_not_share_mutable_rust_toolchains() {
     let source = workflow("build.yml");
 
     for name in [
