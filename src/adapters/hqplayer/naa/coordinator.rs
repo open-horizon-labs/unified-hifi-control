@@ -269,8 +269,15 @@ impl HqpOutputCoordinator {
     }
 
     async fn start_publisher(self: &Arc<Self>) {
-        let mut publisher = self.publisher.lock().await;
-        if publisher.is_some() {
+        // Reserve the decision in a short scope. The publisher task below contains awaits; keep
+        // its construction outside the mutex guard so the lock lint also reflects the runtime
+        // ownership boundary. A concurrent starter may race this check, so the final install
+        // below re-checks the slot and aborts the losing task.
+        let already_started = {
+            let publisher = self.publisher.lock().await;
+            publisher.is_some()
+        };
+        if already_started {
             return;
         }
         let shutdown = CancellationToken::new();
@@ -301,14 +308,28 @@ impl HqpOutputCoordinator {
                 drop(coordinator);
             }
         });
-        *publisher = Some(Publisher { shutdown, join });
+        let mut publisher = self.publisher.lock().await;
+        if publisher.is_none() {
+            *publisher = Some(Publisher { shutdown, join });
+        } else {
+            // Another starter installed its task first. Do not leave a duplicate publisher
+            // running; dropping a JoinHandle would otherwise detach it permanently.
+            join.abort();
+            shutdown.cancel();
+        }
     }
 
     /// Stop the relay with the instance lifecycle. Cancels pending work first, closes the pair
     /// and the listener, then publishes the retained observation as unavailable.
     pub async fn stop(&self, reason: &str) {
         self.supersede(&format!("superseded: {reason}"));
-        if let Some(publisher) = self.publisher.lock().await.take() {
+        // Take ownership of the join handle before awaiting it. Keeping the mutex guard alive
+        // through `join.await` would block a concurrent lifecycle/drop path indefinitely.
+        let publisher = {
+            let mut slot = self.publisher.lock().await;
+            slot.take()
+        };
+        if let Some(publisher) = publisher {
             publisher.shutdown.cancel();
             let _ = publisher.join.await;
         }
