@@ -9489,7 +9489,7 @@ impl HqpAdapter {
         fence: &NativeHookFence,
         deadline: tokio::time::Instant,
     ) -> Result<NativeHookOutcome<NativeTransportSnapshot>> {
-        let _operation_guard = match self.output_hook_lease(fence, deadline).await {
+        let _lease_guard = match self.output_hook_lease(fence, deadline).await {
             Ok(guard) => guard,
             Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
         };
@@ -9525,7 +9525,7 @@ impl HqpAdapter {
         fence: &NativeHookFence,
         deadline: tokio::time::Instant,
     ) -> Result<NativeHookOutcome<()>> {
-        let _operation_guard = match self.output_hook_lease(fence, deadline).await {
+        let _lease_guard = match self.output_hook_lease(fence, deadline).await {
             Ok(guard) => guard,
             Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
         };
@@ -9573,7 +9573,7 @@ impl HqpAdapter {
         fence: &NativeHookFence,
         deadline: tokio::time::Instant,
     ) -> Result<NativeHookOutcome<()>> {
-        let _operation_guard = match self.output_hook_lease(fence, deadline).await {
+        let _lease_guard = match self.output_hook_lease(fence, deadline).await {
             Ok(guard) => guard,
             Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
         };
@@ -9599,7 +9599,7 @@ impl HqpAdapter {
         fence: &NativeHookFence,
         deadline: tokio::time::Instant,
     ) -> Result<NativeHookOutcome<u8>> {
-        let _operation_guard = match self.output_hook_lease(fence, deadline).await {
+        let _lease_guard = match self.output_hook_lease(fence, deadline).await {
             Ok(guard) => guard,
             Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
         };
@@ -9622,7 +9622,7 @@ impl HqpAdapter {
         track: &str,
         seconds: u64,
     ) -> Result<NativeHookOutcome<bool>> {
-        let _operation_guard = match self.output_hook_lease(fence, deadline).await {
+        let _lease_guard = match self.output_hook_lease(fence, deadline).await {
             Ok(guard) => guard,
             Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
         };
@@ -9774,7 +9774,7 @@ impl HqpAdapter {
         fence: &NativeHookFence,
         deadline: tokio::time::Instant,
     ) -> Result<NativeHookOutcome<String>> {
-        let _operation_guard = match self.output_hook_lease(fence, deadline).await {
+        let _lease_guard = match self.output_hook_lease(fence, deadline).await {
             Ok(guard) => guard,
             Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
         };
@@ -9853,7 +9853,7 @@ impl HqpAdapter {
         fence: &NativeHookFence,
         deadline: tokio::time::Instant,
     ) -> Result<NativeHookOutcome<String>> {
-        let _operation_guard = match self.output_hook_lease(fence, deadline).await {
+        let _lease_guard = match self.output_hook_lease(fence, deadline).await {
             Ok(guard) => guard,
             Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
         };
