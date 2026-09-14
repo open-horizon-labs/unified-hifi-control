@@ -10069,7 +10069,7 @@ impl HqpAdapter {
     /// Test seam: shorten the one-click budgets.
     #[doc(hidden)]
     pub fn set_output_timeouts(&self, timeouts: naa::coordinator::HqpOutputTimeouts) {
-        self.outputs.set_timeouts(timeouts);
+        self.outputs.set_output_timeouts(timeouts);
     }
 
     /// Test seam: the pending setup transaction's generation.

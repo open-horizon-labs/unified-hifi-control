@@ -192,7 +192,7 @@ impl HqpOutputCoordinator {
         }
     }
 
-    pub fn set_timeouts(&self, timeouts: HqpOutputTimeouts) {
+    pub fn set_output_timeouts(&self, timeouts: HqpOutputTimeouts) {
         *lock(&self.timeouts) = timeouts;
     }
 
