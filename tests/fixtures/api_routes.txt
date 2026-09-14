@@ -13,6 +13,8 @@
 # multi-line closures that the route extractor doesn't detect, and they may change
 # with build configuration.
 
+
+DELETE /hqp/instances/{name}
 DELETE /knob/devices/{knob_id}
 DELETE /mcp
 GET /admin
@@ -31,20 +33,29 @@ GET /api/providers/{provider}/oauth/callback
 GET /api/providers/{provider}/oauth/start
 GET /api/settings
 GET /api/zones/visibility
+GET /apple-touch-icon.png
 GET /assets/{*path}
 GET /config/{knob_id}
 GET /control
+GET /dx-components-theme.css
 GET /events
+GET /favicon.ico
 GET /firmware/download
 GET /firmware/version
 GET /fonts/{*path}
 GET /hqp/discover
 GET /hqp/instances
+GET /hqp/instances/{name}/matrix/profiles
+GET /hqp/instances/{name}/profiles
 GET /hqp/pipeline
 GET /hqp/profiles
 GET /hqp/status
 GET /hqp/zones/links
+GET /hqp/zones/{zone_id}/pipeline
 GET /hqplayer/config
+GET /hqplayer/matrix/profiles
+GET /hqplayer/outputs
+GET /hqplayer/outputs/operation
 GET /hqplayer/pipeline
 GET /hqplayer/profiles
 GET /hqplayer/status
@@ -64,6 +75,7 @@ GET /mcp
 GET /now_playing
 GET /now_playing/image
 GET /openhome/status
+GET /openhome/zone/{zone_id}/now_playing
 GET /openhome/zones
 GET /roon/browse/status
 GET /roon/image
@@ -72,9 +84,13 @@ GET /roon/status
 GET /roon/zone/{zone_id}
 GET /roon/zones
 GET /status
+GET /tailwind.css
 GET /upnp/status
+GET /upnp/zone/{zone_id}/now_playing
 GET /upnp/zones
+GET /webmcp-bridge.js
 GET /zones
+POST /admin/fetch-firmware
 POST /api/bridges/applemusic/claim
 POST /api/bridges/applemusic/commands/{command_id}
 POST /api/bridges/applemusic/content/{request_id}
@@ -105,12 +121,16 @@ POST /api/zones/visibility
 POST /control
 POST /hqp/detect
 POST /hqp/instances
+POST /hqp/instances/{name}/matrix/profile
+POST /hqp/instances/{name}/profile
 POST /hqp/pipeline
 POST /hqp/profiles/load
 POST /hqp/zones/link
 POST /hqp/zones/unlink
 POST /hqplayer/configure
 POST /hqplayer/control
+POST /hqplayer/matrix/profile
+POST /hqplayer/outputs/command
 POST /hqplayer/profile
 POST /hqplayer/setting
 POST /hqplayer/volume
@@ -127,3 +147,4 @@ POST /roon/play
 POST /roon/play_item
 POST /roon/volume
 POST /upnp/control
+PUT /config/{knob_id}

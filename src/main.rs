@@ -471,7 +471,19 @@ mod server {
 
         // Fail before starting adapters or the adaptive actor if the public socket cannot be
         // acquired. After this point every fallible server exit goes through explicit teardown.
-        let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+        // UHC_BIND_ADDRESS (default 0.0.0.0, the historical behaviour) lets an isolated runtime
+        // fixture bind loopback only.
+        let bind_ip: std::net::IpAddr = std::env::var("UHC_BIND_ADDRESS")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                value.trim().parse().map_err(|error| {
+                    anyhow::anyhow!("UHC_BIND_ADDRESS {value:?} is not an IP address: {error}")
+                })
+            })
+            .transpose()?
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let addr = SocketAddr::from((bind_ip, config.port));
         let listener = tokio::net::TcpListener::bind(addr).await?;
 
         // SSE closes as soon as graceful HTTP shutdown begins.
@@ -943,6 +955,10 @@ mod server {
             // HQPlayer config routes
             .route("/hqplayer/config", get(api::hqp_config_handler))
             .route("/hqplayer/configure", post(api::hqp_configure_handler))
+            // HQPlayer output routing (NAA managed relay): GET/POST /hqplayer/outputs*. Merged
+            // from api::hqp_outputs_http::routes() — the same reusable attachment the
+            // public-transport tests bind, so both sides run the exact same handlers.
+            .merge(api::hqp_outputs_http::routes())
             .route("/hqp/detect", post(api::hqp_detect_handler))
             // HQPlayer pipeline POST route (iOS compatible)
             .route("/hqp/pipeline", get(api::hqp_pipeline_handler))

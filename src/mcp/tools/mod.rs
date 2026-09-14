@@ -22,6 +22,7 @@ pub mod apple_music;
 pub mod capabilities;
 pub mod collections;
 pub mod groups;
+pub mod hqp_outputs;
 pub mod hqplayer;
 pub mod library;
 pub mod queue;
@@ -37,6 +38,7 @@ pub use apple_music::HifiAppleMusicTool;
 pub use capabilities::HifiCapabilitiesTool;
 pub use collections::HifiCollectionsTool;
 pub use groups::HifiZoneGroupTool;
+pub use hqp_outputs::{HifiHqplayerOutputControlTool, HifiHqplayerOutputsTool};
 pub use hqplayer::{
     HifiHqplayerLoadProfileTool, HifiHqplayerProfilesTool, HifiHqplayerSetPipelineTool,
     HifiHqplayerStatusTool,
@@ -77,7 +79,12 @@ tool_box!(
         HifiSpotifyTool,
         HifiAppleMusicTool,
         HifiCollectionsTool,
-        HifiZoneGroupTool
+        HifiZoneGroupTool,
+        // Appended for the HQPlayer output-routing (NAA managed relay) contract: read the
+        // committed document / one operation, and mutate it. Both call the same shared command
+        // service the HTTP `/hqplayer/outputs*` surface calls.
+        HifiHqplayerOutputsTool,
+        HifiHqplayerOutputControlTool
     ]
 );
 
@@ -109,6 +116,8 @@ pub fn static_name(name: &str) -> Option<&'static str> {
         "hifi_apple_music" => "hifi_apple_music",
         "hifi_collections" => "hifi_collections",
         "hifi_zone_group" => "hifi_zone_group",
+        "hifi_hqplayer_outputs" => "hifi_hqplayer_outputs",
+        "hifi_hqplayer_output_control" => "hifi_hqplayer_output_control",
         _ => return None,
     })
 }
@@ -181,6 +190,27 @@ pub fn declared_params(tool: &str) -> &'static [&'static str] {
         ],
         "hifi_hqplayer_load_profile" => &["profile", "zone_id"],
         "hifi_hqplayer_set_pipeline" => &["setting", "value", "zone_id"],
+        "hifi_hqplayer_outputs" => &["zone_id", "operation_id"],
+        "hifi_hqplayer_output_control" => &[
+            "zone_id",
+            "action",
+            "correlation_id",
+            "expected_source_epoch",
+            "expected_output_revision",
+            "route_id",
+            "name",
+            "host",
+            "port",
+            "device_id",
+            "routes_json",
+            "preview_id",
+            "enabled",
+            "bind",
+            "hqp_allow",
+            "discovery_interface",
+            "discovery_port",
+            "adapter_name",
+        ],
         _ => &[],
     }
 }
@@ -222,11 +252,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn advertises_seventeen_tools_when_hqplayer_is_enabled() {
-        assert_eq!(list_tools(true).len(), 17);
+    fn advertises_nineteen_tools_when_hqplayer_is_enabled() {
+        assert_eq!(list_tools(true).len(), 19);
     }
 
-    /// The filter must remove exactly the four HQPlayer tools and nothing else.
+    /// The filter must remove exactly the six HQPlayer tools and nothing else.
     #[test]
     fn hides_only_the_hqplayer_tools_when_disabled() {
         let enabled: Vec<String> = list_tools(true).into_iter().map(|t| t.name).collect();
@@ -236,7 +266,7 @@ mod tests {
         assert!(disabled.iter().all(|n| !n.starts_with("hifi_hqplayer")));
 
         let removed: Vec<&String> = enabled.iter().filter(|n| !disabled.contains(n)).collect();
-        assert_eq!(removed.len(), 4, "only the HQPlayer tools may be filtered");
+        assert_eq!(removed.len(), 6, "only the HQPlayer tools may be filtered");
         assert!(removed.iter().all(|n| n.starts_with("hifi_hqplayer")));
 
         // Relative order of the surviving tools is preserved.

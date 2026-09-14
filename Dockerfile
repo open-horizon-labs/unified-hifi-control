@@ -46,11 +46,14 @@ COPY input.css tailwind.config.js ./
 RUN make css
 
 # ADR 002: Build WASM assets first, then build server which embeds them
+# Private integrations are opt-in on the server only; preserve the same feature
+# set when rebuilding the final binary with embedded assets.
+ARG UHC_SERVER_FEATURES=server
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    dx build --fullstack --release @client --no-default-features --features web @server --features server && \
-    cargo build --release && \
+    dx build --fullstack --release @client --no-default-features --features web @server --features "$UHC_SERVER_FEATURES" && \
+    cargo build --release --features "$UHC_SERVER_FEATURES" && \
     cp target/release/unified-hifi-control /app/unified-hifi-control-bin
 
 # Runtime stage - minimal image, no public/ directory needed

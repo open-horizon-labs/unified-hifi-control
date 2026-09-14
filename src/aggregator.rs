@@ -5,9 +5,11 @@ use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
 use tracing::{debug, info, warn};
 
+use crate::adapters::hqplayer::outputs::HqpOutputProjection;
 use crate::adapters::hqplayer::{
     HqpAdvancedOptionsSnapshot, HqpNativeObservation, HqpNativeObservationSink, HqpProfile,
 };
+use crate::bus::runtime::CommandId;
 #[cfg(test)]
 use crate::bus::runtime::ProjectionSource;
 use crate::bus::runtime::{
@@ -64,6 +66,8 @@ struct AggregateState {
     zones: HashMap<String, Zone>,
     volume_capabilities: HashMap<String, bool>,
     hqplayer_snapshots: HashMap<String, HqpSnapshot>,
+    /// Output-routing documents, one per HQPlayer instance, committed through the same lane.
+    hqplayer_outputs: HashMap<String, HqpOutputProjection>,
     projection_revision: u64,
     source_cursors: HashMap<String, ProjectionCursor>,
     projection_entries: BTreeMap<String, (u64, ProjectionPayload)>,
@@ -475,6 +479,16 @@ impl ZoneAggregator {
             .collect()
     }
 
+    /// The committed output-routing document for one exact HQPlayer instance, if any.
+    pub async fn get_hqplayer_outputs(&self, instance_name: &str) -> Option<HqpOutputProjection> {
+        self.state
+            .read()
+            .await
+            .hqplayer_outputs
+            .get(instance_name)
+            .cloned()
+    }
+
     /// Attach a coherent advanced-control read to the exact native snapshot it extends.
     pub async fn publish_hqplayer_advanced(
         &self,
@@ -668,11 +682,51 @@ impl ZoneAggregator {
                             removed_zones.push(PrefixedZoneId::hqplayer(instance_name));
                         }
                     }
+                    // A retired instance owns no output document either.
+                    aggregate.hqplayer_outputs.remove(instance_name);
+                }
+                ProjectionPayload::HqpOutputs {
+                    instance_name,
+                    projection,
+                } => {
+                    let mut committed = (**projection).clone();
+                    committed.source_epoch = update.source.epoch;
+                    committed.aggregate_revision = revision;
+                    // A newer source epoch replaces the old document even when its mutation
+                    // revision restarts at zero; within one epoch the revision must never move
+                    // backwards through a late publish (telemetry republishes carry the same value);
+                    // an older epoch is rejected outright.
+                    let admit =
+                        aggregate
+                            .hqplayer_outputs
+                            .get(instance_name)
+                            .is_none_or(|current| {
+                                committed.source_epoch > current.source_epoch
+                                    || (committed.source_epoch == current.source_epoch
+                                        && current.output_revision <= committed.output_revision)
+                            });
+                    if admit {
+                        aggregate
+                            .hqplayer_outputs
+                            .insert(instance_name.clone(), committed);
+                    }
                 }
                 ProjectionPayload::HqpManagerStopped => {
                     for snapshot in aggregate.hqplayer_snapshots.values_mut() {
                         snapshot.presence = HqpSnapshotPresence::LastKnown;
                         snapshot.revision = snapshot.revision.saturating_add(1);
+                    }
+                    // No relay is owned once the manager stopped: retain routes and observations
+                    // but withdraw availability and any session claim.
+                    for outputs in aggregate.hqplayer_outputs.values_mut() {
+                        outputs.availability =
+                            crate::adapters::hqplayer::outputs::HqpOutputAvailability::Unavailable {
+                                reason: "HQPlayer lifecycle stopped".to_string(),
+                                since: observation_now(),
+                            };
+                        outputs.session = None;
+                        outputs.observed_forwarding_destination = None;
+                        outputs.aggregate_revision = revision;
                     }
                     aggregate
                         .zones
@@ -863,6 +917,26 @@ impl HqpNativeObservationSink for ZoneAggregator {
         Ok(())
     }
 
+    async fn outputs_observed(
+        &self,
+        instance_name: &str,
+        mut projection: HqpOutputProjection,
+        _caused_by: Option<CommandId>,
+    ) -> anyhow::Result<()> {
+        let mut aggregate = self.state.write().await;
+        projection.aggregate_revision = aggregate.projection_revision;
+        if aggregate
+            .hqplayer_outputs
+            .get(instance_name)
+            .is_none_or(|current| current.output_revision <= projection.output_revision)
+        {
+            aggregate
+                .hqplayer_outputs
+                .insert(instance_name.to_string(), projection);
+        }
+        Ok(())
+    }
+
     async fn instance_removed(
         &self,
         instance_name: &str,
@@ -876,6 +950,7 @@ impl HqpNativeObservationSink for ZoneAggregator {
         {
             snapshots.remove(instance_name);
         }
+        aggregate.hqplayer_outputs.remove(instance_name);
         Ok(())
     }
 
@@ -1002,6 +1077,188 @@ mod tests {
             caused_by: None,
             entries,
         }
+    }
+
+    fn outputs_document(revision: u64) -> crate::adapters::hqplayer::outputs::HqpOutputProjection {
+        use crate::adapters::hqplayer::outputs::*;
+        HqpOutputProjection {
+            zone_id: "hqplayer:main".into(),
+            instance: "main".into(),
+            source_epoch: 0,
+            aggregate_revision: 0,
+            output_revision: revision,
+            route_generation: 1,
+            availability: HqpOutputAvailability::Available,
+            relay: HqpRelayConfigView {
+                enabled: true,
+                adapter_name: DEFAULT_ADAPTER_NAME.into(),
+                virtual_device_id: VIRTUAL_DEVICE_ID.into(),
+                bind: Some("127.0.0.1:43210".into()),
+                hqp_allow: vec![],
+                discovery_interface: None,
+                discovery_port: DEFAULT_NAA_PORT,
+                discovery_responder: None,
+            },
+            routes: vec![HqpOutputRoute {
+                route_id: format!("r-{revision}"),
+                name: "A".into(),
+                host: "192.0.2.30".into(),
+                port: 43210,
+                device_id: None,
+                imported_from: None,
+            }],
+            selected_route_id: Some(format!("r-{revision}")),
+            desired_destination: None,
+            observed_forwarding_destination: None,
+            session: Some(HqpRelaySessionView {
+                session_id: 1,
+                route_id: format!("r-{revision}"),
+                route_generation: 1,
+                state: "forwarding".into(),
+                peer: String::new(),
+                connected_at: 0,
+                bytes_to_naa: 1,
+                bytes_from_naa: 1,
+                initialized: true,
+                started: true,
+                current_stream_audio_bytes: 100,
+            }),
+            discovery: None,
+            dac_observations: vec![],
+            native: HqpNativeControlView::default(),
+            current_operation_id: None,
+            operations: vec![],
+            last_error: None,
+            observed_at: 0,
+        }
+    }
+
+    fn outputs_update(epoch: u64, sequence: u64, revision: u64) -> ProjectionUpdate {
+        projection(
+            source(epoch),
+            sequence,
+            ProjectionKind::Snapshot,
+            vec![ProjectionEntry {
+                key: "hqplayer:main".to_string(),
+                payload: ProjectionPayload::HqpOutputs {
+                    instance_name: "main".to_string(),
+                    projection: Box::new(outputs_document(revision)),
+                },
+            }],
+        )
+    }
+
+    /// A restarted producer (new source epoch) legitimately restarts its mutation revision at
+    /// zero and must replace the previous epoch's document; within one epoch the revision never
+    /// moves backwards; an older epoch is stale and ignored by the cursor.
+    #[tokio::test]
+    async fn output_documents_replace_by_epoch_first_then_by_revision() {
+        let aggregator = ZoneAggregator::new(crate::bus::create_bus());
+        ProjectionCommitter::commit_projection(&aggregator, outputs_update(1, 1, 5)).await;
+        let committed = aggregator
+            .get_hqplayer_outputs("main")
+            .await
+            .expect("committed");
+        assert_eq!((committed.source_epoch, committed.output_revision), (1, 5));
+
+        // Same epoch, lower revision (a late republish): kept out.
+        ProjectionCommitter::commit_projection(&aggregator, outputs_update(1, 2, 4)).await;
+        assert_eq!(
+            aggregator
+                .get_hqplayer_outputs("main")
+                .await
+                .map(|p| p.output_revision),
+            Some(5)
+        );
+        // Same epoch, equal revision (telemetry republish): admitted.
+        ProjectionCommitter::commit_projection(&aggregator, outputs_update(1, 3, 5)).await;
+        let same = aggregator
+            .get_hqplayer_outputs("main")
+            .await
+            .expect("still committed");
+        assert_eq!(same.output_revision, 5);
+        assert!(same.aggregate_revision >= 3);
+
+        // New epoch, revision restarts at 0: replaces the old epoch's revision 5.
+        ProjectionCommitter::commit_projection(&aggregator, outputs_update(2, 1, 0)).await;
+        let replaced = aggregator
+            .get_hqplayer_outputs("main")
+            .await
+            .expect("replaced");
+        assert_eq!((replaced.source_epoch, replaced.output_revision), (2, 0));
+        assert_eq!(replaced.selected_route_id.as_deref(), Some("r-0"));
+
+        // Old epoch arriving late is stale at the cursor and never reaches the document.
+        assert!(matches!(
+            ProjectionCommitter::commit_projection(&aggregator, outputs_update(1, 9, 99)).await,
+            ProjectionCommit::StaleIgnored { .. }
+        ));
+        assert_eq!(
+            aggregator
+                .get_hqplayer_outputs("main")
+                .await
+                .map(|p| (p.source_epoch, p.output_revision)),
+            Some((2, 0))
+        );
+    }
+
+    /// Manager shutdown withdraws relay availability and any session claim from every output
+    /// document while retaining routes, exactly as it marks native snapshots last-known.
+    #[tokio::test]
+    async fn manager_stopped_withdraws_output_availability_and_session_but_keeps_routes() {
+        let aggregator = ZoneAggregator::new(crate::bus::create_bus());
+        ProjectionCommitter::commit_projection(&aggregator, outputs_update(1, 1, 3)).await;
+        let stopped = projection(
+            ProjectionSource {
+                adapter: "hqplayer-lifecycle".to_string(),
+                instance: None,
+                epoch: 0,
+            },
+            1,
+            ProjectionKind::Snapshot,
+            vec![ProjectionEntry {
+                key: "hqplayer:lifecycle".to_string(),
+                payload: ProjectionPayload::HqpManagerStopped,
+            }],
+        );
+        ProjectionCommitter::commit_projection(&aggregator, stopped).await;
+        let after = aggregator
+            .get_hqplayer_outputs("main")
+            .await
+            .expect("retained");
+        assert!(matches!(
+            after.availability,
+            crate::adapters::hqplayer::outputs::HqpOutputAvailability::Unavailable { .. }
+        ));
+        assert!(after.session.is_none());
+        assert!(!after.session_confirms_audio());
+        assert_eq!(
+            after.routes.len(),
+            1,
+            "routes are configuration and survive"
+        );
+        assert_eq!(after.output_revision, 3);
+    }
+
+    /// Removing the instance retires its output document too.
+    #[tokio::test]
+    async fn removing_the_instance_retires_its_output_document() {
+        let aggregator = ZoneAggregator::new(crate::bus::create_bus());
+        ProjectionCommitter::commit_projection(&aggregator, outputs_update(1, 1, 3)).await;
+        let removed = projection(
+            source(1),
+            2,
+            ProjectionKind::Delta,
+            vec![ProjectionEntry {
+                key: "hqplayer:main".to_string(),
+                payload: ProjectionPayload::HqpRemoved {
+                    instance_name: "main".to_string(),
+                    producer_epoch: 1,
+                },
+            }],
+        );
+        ProjectionCommitter::commit_projection(&aggregator, removed).await;
+        assert!(aggregator.get_hqplayer_outputs("main").await.is_none());
     }
 
     #[tokio::test]

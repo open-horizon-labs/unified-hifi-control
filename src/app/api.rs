@@ -1173,6 +1173,454 @@ pub struct HqpNativeState {
 }
 
 // =============================================================================
+// HQPlayer Output Routing (NAA / managed relay destination selection)
+//
+// Wire shape for GET /hqplayer/outputs, POST /hqplayer/outputs/command, GET
+// /hqplayer/outputs/operation. Mirrors the backend's public
+// `unified_hifi_control::adapters::hqplayer::outputs` types field-for-field; the
+// server-side types are the authority, this is a frontend copy per that contract.
+// `output_revision` is a mutation/configuration revision (bumped by route/select/stop
+// changes); `aggregate_revision` is the broader telemetry revision and advances on
+// streaming updates too — they are different counters and must not be conflated.
+// =============================================================================
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum HqpOutputAvailability {
+    Disabled,
+    Available,
+    Unavailable { reason: String, since: u64 },
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct HqpRelayConfigView {
+    pub enabled: bool,
+    pub adapter_name: String,
+    pub virtual_device_id: String,
+    pub bind: Option<String>,
+    #[serde(default)]
+    pub hqp_allow: Vec<String>,
+    pub discovery_interface: Option<String>,
+    /// UDP discovery port the relay answers on (and the scanner asks). Defaults to the backend's
+    /// own default when absent on the wire (older/partial responses).
+    #[serde(default = "default_discovery_port")]
+    pub discovery_port: u16,
+    /// Bound UDP address while the relay is actively advertising itself. `None` while
+    /// `discovery_interface` is also `None` is normal (discovery not configured); `None` while
+    /// `discovery_interface` IS configured means the responder failed to bind — a real listener
+    /// failure the operator needs to see, not something to render as if discovery were simply
+    /// off.
+    #[serde(default)]
+    pub discovery_responder: Option<String>,
+}
+
+fn default_discovery_port() -> u16 {
+    43210
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct HqpEndpointRef {
+    pub host: String,
+    pub port: u16,
+    pub device_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct HqpOutputRoute {
+    pub route_id: String,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub device_id: Option<String>,
+    pub imported_from: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct HqpRelaySessionView {
+    pub session_id: u64,
+    pub route_id: String,
+    pub route_generation: u64,
+    pub state: String,
+    pub peer: String,
+    pub connected_at: u64,
+    pub bytes_to_naa: u64,
+    pub bytes_from_naa: u64,
+    pub initialized: bool,
+    pub started: bool,
+    /// Current-stream audio-section payload bytes only, reset on each start. The only byte
+    /// field that may back an "audio is flowing" claim, and only together with `started`,
+    /// `state == "forwarding"`, and a `route_generation` matching the projection's current one.
+    pub current_stream_audio_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct HqpDiscoveredEndpoint {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub protocol: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct HqpDiscoveryObservation {
+    pub scanned_at: u64,
+    pub interface: String,
+    pub duration_ms: u64,
+    pub provenance: String,
+    /// `[]` = scan completed and saw nothing. Self/other routers excluded.
+    #[serde(default)]
+    pub endpoints: Vec<HqpDiscoveredEndpoint>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct HqpDacDevice {
+    pub id: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct HqpDacObservation {
+    /// Endpoint identity is `host`+`port`, NOT the device id: identical device ids across
+    /// different hosts must remain distinct entries.
+    pub host: String,
+    pub port: u16,
+    pub observed_at: u64,
+    pub session_id: u64,
+    pub provenance: String,
+    /// Whole-list replacement per endpoint. `[]` = that endpoint replied with zero outputs.
+    /// An endpoint with no entry at all in the surrounding `Vec<HqpDacObservation>` is unknown
+    /// (never enumerated through a relayed auth session) — a state this type cannot represent on
+    /// its own; callers must check for absence in the outer vec, not just an empty `devices`.
+    #[serde(default)]
+    pub devices: Vec<HqpDacDevice>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct HqpNativeControlView {
+    pub transport_state: Option<String>,
+    pub track: Option<String>,
+    pub position: Option<String>,
+    pub position_restored: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct HqpOutputError {
+    pub code: String,
+    pub message: String,
+    pub at: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HqpOutputPhase {
+    #[default]
+    Admitted,
+    Checking,
+    Stopping,
+    Committed,
+    Connecting,
+    Initialized,
+    Resuming,
+    Forwarding,
+    Complete,
+    Cancelled,
+    Rejected,
+    Failed,
+    Partial,
+    Indeterminate,
+    /// Not one of the backend contract's known phases. Never deserialization-fails the whole
+    /// projection over one unrecognized value; the UI renders this as an explicit "unknown"
+    /// status rather than silently reading it as `Admitted`/"not switching".
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HqpOutputOutcome {
+    Complete,
+    Cancelled,
+    Rejected,
+    Failed,
+    Partial,
+    Indeterminate,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct HqpOutputEvidence {
+    pub native_state_before: Option<String>,
+    pub native_stop_verified: Option<bool>,
+    pub session_id: Option<u64>,
+    #[serde(default)]
+    pub initialized: bool,
+    #[serde(default)]
+    pub started: bool,
+    #[serde(default)]
+    pub current_stream_audio_bytes: u64,
+    pub native_state_after: Option<String>,
+    pub position_restored: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HqpImportConflict {
+    pub route_id: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HqpImportPreview {
+    pub preview_id: String,
+    #[serde(default)]
+    pub routes: Vec<HqpOutputRoute>,
+    #[serde(default)]
+    pub conflicts: Vec<HqpImportConflict>,
+    pub ignored_selected_route_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HqpSetupAttribute {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HqpSetupChange {
+    pub attribute: String,
+    pub from: Option<String>,
+    pub to: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HqpSetupPreview {
+    #[serde(default)]
+    pub preserved_controls: usize,
+    #[serde(default)]
+    pub relay_option: Option<String>,
+    pub preview_id: String,
+    pub applicable: bool,
+    pub blocker: Option<String>,
+    #[serde(default)]
+    pub current: Vec<HqpSetupAttribute>,
+    #[serde(default)]
+    pub changes: Vec<HqpSetupChange>,
+    pub backup_sha256: String,
+    pub proposed_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HqpSetupTransaction {
+    #[serde(default)]
+    pub runtime_matches: Option<bool>,
+    #[serde(default)]
+    pub disk_matches: Option<bool>,
+    pub step: String,
+    pub uploaded: bool,
+    pub daemon_response: Option<String>,
+    pub readback_matches: Option<bool>,
+    pub readback_sha256: Option<String>,
+    pub settled_after_ms: Option<u64>,
+    pub rollback_available: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HqpOutputApplied {
+    #[serde(default)]
+    pub added: Vec<HqpOutputRoute>,
+    #[serde(default)]
+    pub skipped: Vec<HqpImportConflict>,
+    pub ignored_selected_route_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HqpOutputResult {
+    Discovery(HqpDiscoveryObservation),
+    ImportPreview(HqpImportPreview),
+    ImportApplied(HqpOutputApplied),
+    SetupPreview(HqpSetupPreview),
+    Setup(HqpSetupTransaction),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HqpOutputOperation {
+    pub operation_id: String,
+    pub correlation_id: Option<String>,
+    pub request_fingerprint: String,
+    pub zone_id: String,
+    pub action: String,
+    pub route_id: Option<String>,
+    pub phase: HqpOutputPhase,
+    pub outcome: Option<HqpOutputOutcome>,
+    pub source_epoch: u64,
+    pub output_revision_at_admission: u64,
+    pub route_generation: Option<u64>,
+    pub admitted_at: u64,
+    pub updated_at: u64,
+    pub detail: Option<String>,
+    pub result: Option<HqpOutputResult>,
+    pub evidence: HqpOutputEvidence,
+}
+
+impl HqpOutputOperation {
+    /// The audio-claim rule from the backend contract: forwarding is only claimed when the
+    /// operation's own evidence recorded a started, positive-byte-count native session. This
+    /// evidence is already scoped to that operation's own `session_id`/`route_generation`, so no
+    /// additional generation comparison is needed here — the scoping already happened server-side
+    /// when the evidence was captured.
+    pub fn confirms_audio(&self) -> bool {
+        self.evidence.started && self.evidence.current_stream_audio_bytes > 0
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct HqpOutputProjection {
+    pub zone_id: String,
+    pub instance: String,
+    pub source_epoch: u64,
+    pub aggregate_revision: u64,
+    pub output_revision: u64,
+    pub route_generation: u64,
+    pub availability: HqpOutputAvailabilityOrUnknown,
+    pub relay: HqpRelayConfigView,
+    #[serde(default)]
+    pub routes: Vec<HqpOutputRoute>,
+    pub selected_route_id: Option<String>,
+    pub desired_destination: Option<HqpEndpointRef>,
+    pub observed_forwarding_destination: Option<HqpEndpointRef>,
+    pub session: Option<HqpRelaySessionView>,
+    /// `None` = never scanned / scan unavailable.
+    pub discovery: Option<HqpDiscoveryObservation>,
+    /// One entry per endpoint (host+port) ever observed through a relayed auth session. An
+    /// endpoint with no entry here is unknown; do not default this to conjure a "no observation"
+    /// entry — absence itself is the unknown signal.
+    #[serde(default)]
+    pub dac_observations: Vec<HqpDacObservation>,
+    pub native: HqpNativeControlView,
+    pub current_operation_id: Option<String>,
+    #[serde(default)]
+    pub operations: Vec<HqpOutputOperation>,
+    pub last_error: Option<HqpOutputError>,
+    pub observed_at: u64,
+}
+
+/// Wraps `HqpOutputAvailability` so a malformed/missing field decodes to an explicit "unknown"
+/// state rather than silently defaulting to available or disabled. `HqpOutputProjection` does not
+/// derive `Default` usefully otherwise, but nothing in the UI may construct one from `{}` and
+/// treat it as a real projection — see `HqpOutputProjection::is_well_formed`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum HqpOutputAvailabilityOrUnknown {
+    Known(HqpOutputAvailability),
+    Unknown(serde_json::Value),
+}
+
+impl Default for HqpOutputAvailabilityOrUnknown {
+    fn default() -> Self {
+        Self::Unknown(serde_json::Value::Null)
+    }
+}
+
+impl HqpOutputProjection {
+    /// A malformed successful response (missing required identity/revision fields, or an
+    /// unrecognized `availability` shape) must never be silently accepted as "available" or
+    /// "empty" — see the DTO-review finding this guards against. Callers should check this before
+    /// rendering routes/session state from a freshly-fetched projection.
+    pub fn is_well_formed(&self) -> bool {
+        !self.zone_id.is_empty()
+            && !self.instance.is_empty()
+            && matches!(self.availability, HqpOutputAvailabilityOrUnknown::Known(_))
+    }
+
+    pub fn availability(&self) -> Option<&HqpOutputAvailability> {
+        match &self.availability {
+            HqpOutputAvailabilityOrUnknown::Known(a) => Some(a),
+            HqpOutputAvailabilityOrUnknown::Unknown(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HqpOutputCommandReceipt {
+    pub accepted: bool,
+    pub operation: HqpOutputOperation,
+    pub projection: HqpOutputProjection,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum HqpOutputAction {
+    Discover,
+    RouteAdd {
+        name: String,
+        host: String,
+        port: Option<u16>,
+        device_id: Option<String>,
+    },
+    RouteUpdate {
+        route_id: String,
+        name: String,
+        host: String,
+        port: Option<u16>,
+        device_id: Option<String>,
+    },
+    RouteRemove {
+        route_id: String,
+    },
+    Select {
+        route_id: String,
+    },
+    Stop,
+    ImportPreview {
+        routes_json: String,
+    },
+    ImportApply {
+        routes_json: String,
+        preview_id: String,
+    },
+    RelayConfigure {
+        enabled: bool,
+        bind: Option<String>,
+        hqp_allow: Vec<String>,
+        discovery_interface: Option<String>,
+        /// Defaults to the standard NAA port 43210 when omitted.
+        discovery_port: Option<u16>,
+        adapter_name: Option<String>,
+    },
+    SetupPreview,
+    SetupApply {
+        preview_id: String,
+    },
+    SetupReadback,
+    SetupRollback,
+}
+
+impl HqpOutputAction {
+    /// Mutations other than these require `expected_source_epoch` and
+    /// `expected_output_revision` echoed from the last GET; a mismatch is refused server-side
+    /// (409 STALE_EXPECTATION) before any relay I/O.
+    pub fn requires_expectations(&self) -> bool {
+        !matches!(
+            self,
+            Self::Discover
+                | Self::Stop
+                | Self::ImportPreview { .. }
+                | Self::SetupPreview
+                | Self::SetupReadback
+        )
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct HqpOutputCommandRequest {
+    pub zone_id: String,
+    pub correlation_id: Option<String>,
+    pub expected_source_epoch: Option<u64>,
+    pub expected_output_revision: Option<u64>,
+    #[serde(flatten)]
+    pub action: HqpOutputAction,
+}
+
+// =============================================================================
 // Knob Types
 // =============================================================================
 
@@ -1546,6 +1994,216 @@ mod mqtt_status_tests {
         assert_eq!(
             status.broker_address().as_deref(),
             Some("mqtts://core-mosquitto:8883")
+        );
+    }
+}
+
+/// Fixture-driven checks for the `/hqplayer/outputs*` wire shape, against the backend's
+/// published contract (`unified_hifi_control::adapters::hqplayer::outputs`). The GET fixture below
+/// is the contract's own worked wire example verbatim, so this is a genuine contract regression
+/// test, not a self-consistency check: if the backend's serialization drifts from that example,
+/// this fails.
+#[cfg(test)]
+mod hqp_output_contract_tests {
+    use super::{
+        HqpOutputAction, HqpOutputAvailability, HqpOutputAvailabilityOrUnknown,
+        HqpOutputCommandRequest, HqpOutputProjection,
+    };
+
+    /// Verbatim from the backend contract's GET wire example (available, forwarding session).
+    const AVAILABLE_FORWARDING_PROJECTION: &str = r#"{"zone_id":"hqplayer:living","instance":"living","source_epoch":3,"aggregate_revision":418,
+ "output_revision":12,"route_generation":7,"availability":"available",
+ "relay":{"enabled":true,"adapter_name":"HiPhi Router","virtual_device_id":"hiphi:router",
+          "bind":"127.0.0.1:43210","hqp_allow":[],"discovery_interface":null},
+ "routes":[{"route_id":"9a1c","name":"Chosen NAA","host":"192.0.2.30","port":43210,"device_id":"hw:CARD=A,DEV=0","imported_from":null}],
+ "selected_route_id":"9a1c",
+ "desired_destination":{"host":"192.0.2.30","port":43210,"device_id":"hw:CARD=A,DEV=0"},
+ "observed_forwarding_destination":{"host":"192.0.2.30","port":43210,"device_id":"hw:CARD=A,DEV=0"},
+ "session":{"session_id":4,"route_id":"9a1c","route_generation":7,"state":"forwarding","peer":"127.0.0.1:50122",
+            "connected_at":1789390000,"bytes_to_naa":880212,"bytes_from_naa":4096,"initialized":true,"started":true,"current_stream_audio_bytes":819200},
+ "discovery":null,
+ "dac_observations":[{"host":"192.0.2.30","port":43210,"observed_at":1789389990,"session_id":4,"provenance":"relayed-getdevices",
+                      "devices":[{"id":"hw:CARD=A,DEV=0","description":"DAC A"}]}],
+ "native":{"transport_state":"2","track":"3","position":"41","position_restored":true},
+ "current_operation_id":null,
+ "operations":[{"operation_id":"op-17","correlation_id":"ui-8f2","request_fingerprint":"fp","zone_id":"hqplayer:living","action":"select",
+   "route_id":"9a1c","phase":"complete","outcome":"complete","source_epoch":3,"output_revision_at_admission":11,"route_generation":7,
+   "admitted_at":1789389980,"updated_at":1789389986,"detail":null,
+   "evidence":{"native_state_before":"2","native_stop_verified":true,"session_id":4,"initialized":true,"started":true,
+               "current_stream_audio_bytes":819200,"native_state_after":"2","position_restored":true}}],
+ "last_error":null,"observed_at":1789390001}"#;
+
+    /// Verbatim shape for the unavailable child case: last observation retained, session absent.
+    const UNAVAILABLE_PROJECTION: &str = r#"{"zone_id":"hqplayer:living","instance":"living","source_epoch":3,"aggregate_revision":420,
+ "output_revision":12,"route_generation":7,
+ "availability":{"unavailable":{"reason":"relay listener exited: bind refused","since":1789390100}},
+ "relay":{"enabled":true,"adapter_name":"HiPhi Router","virtual_device_id":"hiphi:router",
+          "bind":"127.0.0.1:43210","hqp_allow":[],"discovery_interface":null},
+ "routes":[{"route_id":"9a1c","name":"Chosen NAA","host":"192.0.2.30","port":43210,"device_id":"hw:CARD=A,DEV=0","imported_from":null}],
+ "selected_route_id":"9a1c",
+ "desired_destination":{"host":"192.0.2.30","port":43210,"device_id":"hw:CARD=A,DEV=0"},
+ "observed_forwarding_destination":null,
+ "session":null,
+ "discovery":null,
+ "dac_observations":[{"host":"192.0.2.30","port":43210,"observed_at":1789389990,"session_id":4,"provenance":"relayed-getdevices",
+                      "devices":[{"id":"hw:CARD=A,DEV=0","description":"DAC A"}]}],
+ "native":{"transport_state":null,"track":null,"position":null,"position_restored":null},
+ "current_operation_id":null,"operations":[],
+ "last_error":null,"observed_at":1789390101}"#;
+
+    #[test]
+    fn the_contracts_own_wire_example_deserializes_and_confirms_audio() {
+        let projection: HqpOutputProjection =
+            serde_json::from_str(AVAILABLE_FORWARDING_PROJECTION).unwrap();
+        assert!(projection.is_well_formed());
+        assert_eq!(
+            projection.availability(),
+            Some(&HqpOutputAvailability::Available)
+        );
+        assert_eq!(projection.output_revision, 12);
+        assert_eq!(projection.aggregate_revision, 418);
+        assert_ne!(
+            projection.output_revision, projection.aggregate_revision,
+            "these are different counters in the same fixture; a test that conflated them \
+             would not catch a real regression"
+        );
+
+        let session = projection.session.as_ref().expect("session present");
+        assert_eq!(session.state, "forwarding");
+        assert_eq!(session.route_generation, projection.route_generation);
+        assert!(session.started);
+        assert!(session.current_stream_audio_bytes > 0);
+
+        let op = &projection.operations[0];
+        assert!(
+            op.confirms_audio(),
+            "the fixture's completed select operation recorded started + positive bytes"
+        );
+    }
+
+    #[test]
+    fn unavailable_projection_retains_last_observation_and_reports_no_session() {
+        let projection: HqpOutputProjection = serde_json::from_str(UNAVAILABLE_PROJECTION).unwrap();
+        assert!(projection.is_well_formed());
+        match projection.availability() {
+            Some(HqpOutputAvailability::Unavailable { reason, since }) => {
+                assert_eq!(reason, "relay listener exited: bind refused");
+                assert_eq!(*since, 1789390100);
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+        assert!(
+            !projection.routes.is_empty(),
+            "unavailable must retain the last observed routes, not report an empty inventory"
+        );
+        assert!(
+            projection.session.is_none(),
+            "no session should be claimed while the relay is unavailable"
+        );
+    }
+
+    #[test]
+    fn an_empty_response_body_fails_to_deserialize_rather_than_being_silently_accepted() {
+        // `zone_id`, `instance`, the revision counters, `availability`, `relay`, `native` and
+        // `observed_at` are all required (no `Option`, no `#[serde(default)]`) precisely so a
+        // malformed or empty `{}` body cannot be parsed at all, let alone accepted as an
+        // "available, empty inventory" projection.
+        let result: Result<HqpOutputProjection, _> = serde_json::from_str("{}");
+        assert!(
+            result.is_err(),
+            "an empty body must fail to deserialize, not silently produce a permissive default"
+        );
+    }
+
+    #[test]
+    fn is_well_formed_rejects_an_unrecognized_availability_shape() {
+        // Every other required field is present and valid; only `availability` is garbled (not
+        // one of "disabled"/"available"/{"unavailable":{...}}). This must still parse (so the UI
+        // can render *something*) but must not be read as a real, actionable projection.
+        let body = r#"{"zone_id":"hqplayer:living","instance":"living","source_epoch":1,
+ "aggregate_revision":1,"output_revision":1,"route_generation":1,"availability":"garbage",
+ "relay":{"enabled":false,"adapter_name":"x","virtual_device_id":"x","bind":null,"hqp_allow":[],"discovery_interface":null},
+ "native":{"transport_state":null,"track":null,"position":null,"position_restored":null},
+ "observed_at":1}"#;
+        let projection: HqpOutputProjection = serde_json::from_str(body).unwrap();
+        assert!(
+            !projection.is_well_formed(),
+            "an unrecognized availability shape must not be treated as a real projection"
+        );
+        assert_eq!(projection.availability(), None);
+    }
+
+    #[test]
+    fn unknown_endpoint_absence_is_distinct_from_an_observed_empty_device_list() {
+        let projection: HqpOutputProjection =
+            serde_json::from_str(AVAILABLE_FORWARDING_PROJECTION).unwrap();
+        // The fixture's only dac_observations entry is for 192.0.2.30:43210. A different
+        // endpoint (e.g. a route the operator just added) has no entry at all here, which is the
+        // "unknown" state — never enumerated — distinct from an entry with `devices: []`.
+        let known_endpoint = projection
+            .dac_observations
+            .iter()
+            .find(|obs| obs.host == "192.0.2.30" && obs.port == 43210);
+        assert!(known_endpoint.is_some());
+        assert!(!known_endpoint.unwrap().devices.is_empty());
+
+        let unknown_endpoint = projection
+            .dac_observations
+            .iter()
+            .find(|obs| obs.host == "10.0.0.9" && obs.port == 43210);
+        assert!(
+            unknown_endpoint.is_none(),
+            "an endpoint that was never relay-authenticated must have no entry at all"
+        );
+    }
+
+    #[test]
+    fn select_command_requires_both_epoch_and_revision_expectations() {
+        let command = HqpOutputCommandRequest {
+            zone_id: "hqplayer:living".to_string(),
+            correlation_id: Some("ui-8f3".to_string()),
+            expected_source_epoch: Some(3),
+            expected_output_revision: Some(12),
+            action: HqpOutputAction::Select {
+                route_id: "b77e".to_string(),
+            },
+        };
+        assert!(command.action.requires_expectations());
+        let json = serde_json::to_value(&command).unwrap();
+        assert_eq!(json["action"], "select");
+        assert_eq!(json["zone_id"], "hqplayer:living");
+        assert_eq!(json["route_id"], "b77e");
+        assert_eq!(json["expected_source_epoch"], 3);
+        assert_eq!(json["expected_output_revision"], 12);
+    }
+
+    #[test]
+    fn stop_and_discover_do_not_require_expectations_and_carry_no_route_target() {
+        assert!(!HqpOutputAction::Stop.requires_expectations());
+        assert!(!HqpOutputAction::Discover.requires_expectations());
+
+        let command = HqpOutputCommandRequest {
+            zone_id: "hqplayer:living".to_string(),
+            correlation_id: Some("ui-8f4".to_string()),
+            expected_source_epoch: None,
+            expected_output_revision: None,
+            action: HqpOutputAction::Stop,
+        };
+        let json = serde_json::to_value(&command).unwrap();
+        assert_eq!(json["action"], "stop");
+        assert_eq!(json["zone_id"], "hqplayer:living");
+        assert!(
+            json.get("route_id").is_none(),
+            "a stop payload that could carry a stale route_id is exactly the kind of shape bug \
+             that could reintroduce a native-controller race"
+        );
+    }
+
+    #[test]
+    fn availability_or_unknown_defaults_to_unknown_not_available() {
+        assert_eq!(
+            super::HqpOutputAvailabilityOrUnknown::default(),
+            HqpOutputAvailabilityOrUnknown::Unknown(serde_json::Value::Null)
         );
     }
 }

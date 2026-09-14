@@ -528,8 +528,8 @@ async fn tools_list_matches_fixture() {
 
     assert_eq!(
         tools.len(),
-        17,
-        "expected 17 tools with HQPlayer enabled, got {}: {:?}",
+        19,
+        "expected 19 tools with HQPlayer enabled, got {}: {:?}",
         tools.len(),
         tool_names(tools)
     );
@@ -597,6 +597,8 @@ async fn tools_list_order_is_pinned() {
             "hifi_apple_music",
             "hifi_collections",
             "hifi_zone_group",
+            "hifi_hqplayer_outputs",
+            "hifi_hqplayer_output_control",
         ],
         "tools/list order follows the tool_box! list in src/mcp/tools/mod.rs. \
          APPEND new tools rather than inserting, so this assertion grows by one \
@@ -885,6 +887,33 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
             ("confirm", false),
         ],
     ),
+    (
+        "hifi_hqplayer_outputs",
+        &[("zone_id", true), ("operation_id", false)],
+    ),
+    (
+        "hifi_hqplayer_output_control",
+        &[
+            ("zone_id", true),
+            ("action", true),
+            ("correlation_id", false),
+            ("expected_source_epoch", false),
+            ("expected_output_revision", false),
+            ("route_id", false),
+            ("name", false),
+            ("host", false),
+            ("port", false),
+            ("device_id", false),
+            ("routes_json", false),
+            ("preview_id", false),
+            ("enabled", false),
+            ("bind", false),
+            ("hqp_allow", false),
+            ("discovery_interface", false),
+            ("discovery_port", false),
+            ("adapter_name", false),
+        ],
+    ),
 ];
 
 #[tokio::test]
@@ -1047,7 +1076,7 @@ async fn a_stale_session_id_is_transparently_recovered() {
         .unwrap_or_else(|| panic!("recovered request must return the tool list, got: {response}"));
     assert_eq!(
         tools.len(),
-        17,
+        19,
         "the recovered session must serve the same tool list as a fresh one"
     );
 }

@@ -787,6 +787,12 @@ pub(crate) async fn dispatch_hqplayer_reconfiguration(
         }
         HqpRuntimeCommand::RefreshAdvanced => std::time::Duration::from_secs(15),
         HqpRuntimeCommand::RefreshProfiles => std::time::Duration::from_secs(30),
+        HqpRuntimeCommand::Output(_) => {
+            return Err(HqpDispatchError::BadRequest {
+                message: "HQPlayer output commands use the output command service".to_string(),
+                code: "INVALID_COMMAND",
+            });
+        }
     };
     dispatch_hqplayer_runtime_command(
         state,

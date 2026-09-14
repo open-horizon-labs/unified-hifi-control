@@ -1,0 +1,20 @@
+[package]
+name = "naa-native"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "naa_native"
+path = "src/lib.rs"
+
+[[bin]]
+name = "naa-replay"
+path = "src/main.rs"
+
+[[bin]]
+name = "naa-android"
+path = "src/android.rs"
+
+[dependencies]
+libc = "0.2"
+roxmltree = "0.20"

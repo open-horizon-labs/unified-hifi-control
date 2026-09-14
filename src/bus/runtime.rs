@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{timeout_at, Instant};
 
+use crate::adapters::hqplayer::outputs::{HqpOutputCommandRequest, HqpOutputProjection};
 use crate::adapters::hqplayer::{HqpAdvancedOptionsSnapshot, HqpNativeObservation, HqpProfile};
 
 use super::{Command, PrefixedZoneId, Zone};
@@ -85,6 +86,10 @@ pub enum HqpRuntimeCommand {
     RefreshProfiles,
     /// Load one named Embedded profile and wait for native recovery/readback.
     LoadProfile { profile: String },
+    /// One typed output-routing command (NAA relay routes, selection, Stop, configuration).
+    /// Executed by the exact-instance endpoint; confirmed by the output projection commit that
+    /// names this command id.
+    Output(Box<HqpOutputCommandRequest>),
 }
 
 /// A semantic command admitted to the reliable runtime.
@@ -552,6 +557,12 @@ pub enum ProjectionPayload {
     HqpRemoved {
         instance_name: String,
         producer_epoch: u64,
+    },
+    /// One instance's output-routing document. The aggregator stamps `source_epoch` and
+    /// `aggregate_revision` at commit; `output_revision` is the producer's own mutation revision.
+    HqpOutputs {
+        instance_name: String,
+        projection: Box<HqpOutputProjection>,
     },
     HqpManagerStopped,
     /// Test/control-plane payload used until a provider-specific typed snapshot is wired.

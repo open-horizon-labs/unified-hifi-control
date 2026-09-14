@@ -8,7 +8,9 @@ use crate::app::api::{
     self, HqpConfig, HqpMatrixProfilesResponse, HqpPipeline, HqpProfile, HqpStatus, NowPlaying,
     Zone, ZonesResponse,
 };
-use crate::app::components::{HqpMatrixSelect, HqpProfileSelect, Layout, VolumeControlsCompact};
+use crate::app::components::{
+    HqpMatrixSelect, HqpOutputRoutingSection, HqpProfileSelect, Layout, VolumeControlsCompact,
+};
 use crate::app::sse::use_sse;
 
 /// HQP configure request
@@ -343,6 +345,13 @@ pub fn HqPlayer() -> Element {
         let u = username();
         let pw = password();
 
+        if h.trim().is_empty() {
+            config_status.set(Some(
+                "Enter the HQPlayer host before testing the connection.".to_string(),
+            ));
+            return;
+        }
+
         config_status.set(Some("Testing connection…".to_string()));
 
         spawn(async move {
@@ -570,8 +579,8 @@ pub fn HqPlayer() -> Element {
                                 "Add HQPlayer Embedded once. Unified Hi-Fi Control will verify the native engine and its web artwork endpoint."
                             }
                         }
-                        ol { class: "hqp-onboarding-path mb-6",
-                            li {
+                        ol { class: "hqp-onboarding-path mb-6", aria_label: "HQPlayer setup progress",
+                            li { aria_current: "step",
                                 span { "1" }
                                 div {
                                     strong { "Connect" }
@@ -707,6 +716,14 @@ pub fn HqPlayer() -> Element {
                         on_load_profile: load_profile,
                         on_set_matrix: set_matrix,
                     }
+                }
+            }
+
+            // Output routing (NAA / managed relay destination) is a per-instance concept, so it
+            // only makes sense once at least one instance is configured and reachable.
+            if is_connected && instances_loaded_once() {
+                HqpOutputRoutingSection {
+                    instances: instances_list.iter().map(|i| i.name.clone()).collect::<Vec<_>>(),
                 }
             }
 
@@ -1193,13 +1210,14 @@ fn ConfigForm(
     on_save: EventHandler<()>,
 ) -> Element {
     rsx! {
-        div { class: "space-y-4",
+        div { class: "space-y-4 max-w-3xl",
             div {
                 label { class: "block text-sm font-medium mb-1", r#for: "hqp-host", "HQPlayer host" }
                 input {
                     id: "hqp-host",
                     class: "input",
                     r#type: "text",
+                    required: true,
                     placeholder: "192.168.1.100",
                     value: "{host}",
                     oninput: move |evt| host.set(evt.value())
@@ -1213,6 +1231,7 @@ fn ConfigForm(
                         id: "hqp-native-port",
                         class: "input",
                         r#type: "number",
+                        required: true,
                         value: "{port}",
                         oninput: move |evt| {
                             if let Ok(p) = evt.value().parse() {
@@ -1228,6 +1247,7 @@ fn ConfigForm(
                         id: "hqp-web-port",
                         class: "input",
                         r#type: "number",
+                        required: true,
                         value: "{web_port}",
                         oninput: move |evt| {
                             if let Ok(p) = evt.value().parse() {

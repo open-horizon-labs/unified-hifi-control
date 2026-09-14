@@ -1,0 +1,45 @@
+{
+  "id": "ce001-prefix-before-error",
+  "status": "approved",
+  "classification": "implementation defect",
+  "authority": "Existing sketch governing rule 3: process TCP independently of read chunk boundaries. User authorized execution and CE creation on 2026-09-13.",
+  "provenance": "Entirely synthetic ASCII input, constructed by root; failure reproduced against initial projection before repair on 2026-09-13. No vendor trace bytes.",
+  "input_ascii": "<networkaudio><operation type=\"keepalive\"/></networkaudio>\n<nope>\n",
+  "sample_bytes": 4,
+  "chunk_sizes": [
+    1,
+    2,
+    5,
+    59,
+    8192
+  ],
+  "observed_before": {
+    "split_at_59": "Control offset=0 bytes=59, then InvalidControl offset=59",
+    "coalesced": "InvalidControl offset=59; valid Control discarded"
+  },
+  "expected_exit": 1,
+  "expected_records": [
+    {
+      "type": "control",
+      "offset": 0,
+      "bytes": 59
+    },
+    {
+      "type": "error",
+      "offset": 59,
+      "kind": "InvalidControl"
+    }
+  ],
+  "corrected_behavior": "Emit the same complete prefix exactly once, followed by the same terminal error, for every input segmentation. No bytes after the error may be emitted or resynchronized.",
+  "tempting_wrong_repair": "Process and return a batch only when every record in that read succeeds, dropping earlier complete records on a later error.",
+  "sketch_change": "none; existing rule already governs the correction",
+  "adjacent_holes": "Authentication, complete XML grammar, endpoint replies, actual wire framing and output lifecycle remain unresolved.",
+  "approval": {
+    "reviewer": "Luna medium naa_alignment",
+    "decision": "approved as existing-rule implementation-defect regression",
+    "date": "2026-09-13"
+  },
+  "after_gate": "pass: chunk sizes 1, 2, 5, 59, 8192 on 2026-09-13",
+  "after_sketch_review": "pass: Luna medium naa_alignment reviewed corrected prefix and sticky failure; no sketch change",
+  "expected_control_ascii": "<networkaudio><operation type=\"keepalive\"/></networkaudio>\n"
+}

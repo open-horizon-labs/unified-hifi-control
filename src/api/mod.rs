@@ -45,6 +45,8 @@ pub mod controller_auth;
 pub mod credentials;
 pub mod ha_integration;
 pub mod hiphi_pairing;
+pub mod hqp_outputs;
+pub mod hqp_outputs_http;
 pub mod ingress;
 pub mod mqtt_bootstrap;
 pub mod mqtt_settings;
