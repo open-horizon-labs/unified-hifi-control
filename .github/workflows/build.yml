@@ -664,9 +664,9 @@ jobs:
             TEMP_DIR=$(mktemp -d "$ZIG_PARENT/.zig-install.XXXXXX")
             trap 'rm -rf "$TEMP_DIR"' EXIT
             curl --fail --show-error --location \
-              https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | \
+              "https://ziglang.org/download/$ZIG_VERSION/zig-linux-x86_64-$ZIG_VERSION.tar.xz" | \
               tar -xJ -C "$TEMP_DIR"
-            STAGED_ROOT="$TEMP_DIR/zig-linux-x86_64-0.13.0"
+            STAGED_ROOT="$TEMP_DIR/zig-linux-x86_64-$ZIG_VERSION"
             test -x "$STAGED_ROOT/zig"
             rm -rf "$ZIG_ROOT"
             mv "$STAGED_ROOT" "$ZIG_ROOT"
