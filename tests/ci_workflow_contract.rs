@@ -95,16 +95,44 @@ fn linux_x64_tool_install_is_safe_on_a_persistent_runner() {
     let linux_x64 = job(&source, "build-linux-x64");
 
     assert!(linux_x64.contains("RUNNER_TOOL_CACHE"));
+    assert!(linux_x64.contains("Using runner-provided Zig"));
     assert!(!linux_x64.contains("sudo mv zig-linux"));
     assert!(linux_x64.contains(r#"test -x "$STAGED_ROOT/zig""#));
     assert!(linux_x64.contains(r#"rm -rf "$ZIG_ROOT""#));
 }
 
 #[test]
+fn zigbuild_tool_cache_is_versioned_and_validated() {
+    let source = workflow("build.yml");
+
+    for name in ["build-linux-x64", "build-linux-arm"] {
+        let body = job(&source, name);
+        assert!(
+            body.contains("cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-0.23.4"),
+            "{name} must key the cargo-zigbuild cache by platform and pinned version"
+        );
+        assert!(
+            body.contains("cargo-zigbuild --version | grep -q 'cargo-zigbuild 0.23.4'"),
+            "{name} must validate a restored cargo-zigbuild binary before using it"
+        );
+        assert!(
+            body.contains("cargo install cargo-zigbuild --version 0.23.4 --locked"),
+            "{name} must install the same version named by its cache key"
+        );
+    }
+}
+
+#[test]
 fn parallel_nuc_workers_do_not_share_mutable_rust_toolchains() {
     let source = workflow("build.yml");
 
-    for name in ["lint", "test", "build-wasm", "build-linux-x64"] {
+    for name in [
+        "lint",
+        "test",
+        "build-wasm",
+        "build-linux-x64",
+        "build-linux-arm",
+    ] {
         let body = job(&source, name);
         assert!(body.contains(
             r#"echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV""#

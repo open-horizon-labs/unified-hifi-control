@@ -636,7 +636,17 @@ jobs:
 
       - name: Install zig
         run: |
-          ZIG_ROOT="${RUNNER_TOOL_CACHE:-$HOME/.cache/uhc-tools}/zig/0.13.0/x64"
+          set -euo pipefail
+          ZIG_VERSION="0.13.0"
+
+          # The fleet image may already carry the exact compiler. Reuse it;
+          # the host being x86_64 does not remove the musl linker requirement.
+          if command -v zig >/dev/null 2>&1 && [ "$(zig version)" = "$ZIG_VERSION" ]; then
+            echo "Using runner-provided Zig $(zig version)"
+            exit 0
+          fi
+
+          ZIG_ROOT="${RUNNER_TOOL_CACHE:-$HOME/.cache/uhc-tools}/zig/$ZIG_VERSION/x64"
           if [ ! -x "$ZIG_ROOT/zig" ]; then
             ZIG_PARENT=$(dirname "$ZIG_ROOT")
             mkdir -p "$ZIG_PARENT"
@@ -660,11 +670,19 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ env.CARGO_HOME }}/bin/cargo-zigbuild
-          key: cargo-zigbuild-0.20
+          key: cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-0.23.4
+          restore-keys: |
+            cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Install cargo-zigbuild
-        if: steps.cache-zigbuild.outputs.cache-hit != 'true'
-        run: cargo install cargo-zigbuild --locked
+      - name: Ensure cargo-zigbuild
+        run: |
+          set -euo pipefail
+          if command -v cargo-zigbuild >/dev/null 2>&1 && \
+             cargo-zigbuild --version | grep -q 'cargo-zigbuild 0.23.4'; then
+            echo "Using cached cargo-zigbuild $(cargo-zigbuild --version)"
+          else
+            cargo install cargo-zigbuild --version 0.23.4 --locked
+          fi
 
       - name: Download WASM assets
         uses: actions/download-artifact@v8
@@ -907,32 +925,68 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Isolate mutable tool state
+        run: |
+          echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache Rust
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: zigbuild-${{ matrix.target }}
 
       - name: Install zig
         run: |
-          curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ
-          sudo mv zig-linux-x86_64-0.13.0 /opt/zig
-          echo "/opt/zig" >> $GITHUB_PATH
+          set -euo pipefail
+          ZIG_VERSION="0.13.0"
+          ZIG_ARCH="$(uname -m)"
+          if command -v zig >/dev/null 2>&1 && [ "$(zig version)" = "$ZIG_VERSION" ]; then
+            echo "Using runner-provided Zig $(zig version)"
+          else
+            ZIG_ROOT="${RUNNER_TOOL_CACHE:-$HOME/.cache/uhc-tools}/zig/$ZIG_VERSION/$ZIG_ARCH"
+            if [ ! -x "$ZIG_ROOT/zig" ]; then
+              ZIG_PARENT=$(dirname "$ZIG_ROOT")
+              mkdir -p "$ZIG_PARENT"
+              TEMP_DIR=$(mktemp -d "$ZIG_PARENT/.zig-install.XXXXXX")
+              trap 'rm -rf "$TEMP_DIR"' EXIT
+              curl --fail --show-error --location \
+                "https://ziglang.org/download/$ZIG_VERSION/zig-linux-${ZIG_ARCH}-$ZIG_VERSION.tar.xz" | \
+                tar -xJ -C "$TEMP_DIR"
+              STAGED_ROOT="$TEMP_DIR/zig-linux-${ZIG_ARCH}-$ZIG_VERSION"
+              test -x "$STAGED_ROOT/zig"
+              rm -rf "$ZIG_ROOT"
+              mv "$STAGED_ROOT" "$ZIG_ROOT"
+              rm -rf "$TEMP_DIR"
+              trap - EXIT
+            fi
+            test -x "$ZIG_ROOT/zig"
+            echo "$ZIG_ROOT" >> "$GITHUB_PATH"
+          fi
 
       - name: Cache cargo-zigbuild
         id: cache-zigbuild
         uses: actions/cache@v5
         with:
-          path: ~/.cargo/bin/cargo-zigbuild
-          key: cargo-zigbuild-0.20
+          path: ${{ env.CARGO_HOME }}/bin/cargo-zigbuild
+          key: cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-0.23.4
+          restore-keys: |
+            cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Install cargo-zigbuild
-        if: steps.cache-zigbuild.outputs.cache-hit != 'true'
-        run: cargo install cargo-zigbuild --locked
+      - name: Ensure cargo-zigbuild
+        run: |
+          set -euo pipefail
+          if command -v cargo-zigbuild >/dev/null 2>&1 && \
+             cargo-zigbuild --version | grep -q 'cargo-zigbuild 0.23.4'; then
+            echo "Using cached cargo-zigbuild $(cargo-zigbuild --version)"
+          else
+            cargo install cargo-zigbuild --version 0.23.4 --locked
+          fi
 
       - name: Download WASM assets
         uses: actions/download-artifact@v8
