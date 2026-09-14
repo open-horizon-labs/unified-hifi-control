@@ -257,7 +257,7 @@ fn bind_failure_is_unavailable_and_retains_the_last_observation() {
 }
 
 #[test]
-fn lan_bind_without_an_allow_list_is_refused_before_any_socket_opens() {
+fn lan_bind_without_an_allow_list_accepts_connections() {
     let port = reserved_port();
     let relay = Arc::new(
         NaaRelay::new(
@@ -273,17 +273,12 @@ fn lan_bind_without_an_allow_list_is_refused_before_any_socket_opens() {
         )
         .expect("constructs"),
     );
-    let error = relay
-        .start_listener()
-        .expect_err("LAN exposure needs hqp_allow");
-    assert!(error.contains("hqp_allow"), "{error}");
-    assert!(!port_is_listening(
+    relay.start_listener().expect("empty hqp_allow is allowed");
+    assert!(port_is_listening(
         format!("127.0.0.1:{port}").parse().unwrap()
     ));
-    assert!(matches!(
-        relay.availability(),
-        HqpOutputAvailability::Unavailable { .. }
-    ));
+    assert_eq!(relay.availability(), HqpOutputAvailability::Available);
+    relay.stop_listener();
 }
 
 #[test]

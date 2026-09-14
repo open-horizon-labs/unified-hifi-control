@@ -335,8 +335,8 @@ impl NaaRelay {
     // Listener lifecycle
     // ------------------------------------------------------------------------------------------
 
-    /// Bind the NAA listener from the current settings and start the accept loop. Refuses a LAN
-    /// bind without an explicit HQPlayer allow-list, exactly like the PoC. Idempotent while bound.
+    /// Bind the NAA listener from the current settings and start the accept loop. An empty
+    /// allow-list accepts any NAA peer; a populated list restricts connections to those IPs.
     pub fn start_listener(&self) -> Result<SocketAddr, String> {
         if let Some(addr) = self.listener_addr() {
             return Ok(addr);
@@ -363,12 +363,6 @@ impl NaaRelay {
                     .map_err(|e| format!("invalid hqp_allow entry {ip:?}: {e}"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if !bind.ip().is_loopback() && allow.is_empty() {
-            let reason =
-                "LAN exposure requires hqp_allow with the explicit HQPlayer IP".to_string();
-            self.core.mark_failed(reason.clone());
-            return Err(reason);
-        }
         let listener = match TcpListener::bind(bind) {
             Ok(listener) => listener,
             Err(e) => {
@@ -452,7 +446,7 @@ impl NaaRelay {
         };
         // A loopback-configured relay must not be reachable from the LAN through its discovery
         // socket either: bind the responder to loopback. A LAN interface needs the wildcard bind
-        // to receive multicast, and its allow-list (mandatory for a LAN TCP bind) gates replies.
+        // to receive multicast, and its optional allow-list gates replies.
         let bind_ip = if interface.is_loopback() {
             interface
         } else {

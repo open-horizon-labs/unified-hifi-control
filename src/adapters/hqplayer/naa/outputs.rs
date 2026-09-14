@@ -33,10 +33,10 @@ pub const OPERATION_HISTORY_LIMIT: usize = 32;
 pub struct NaaRelaySettings {
     #[serde(default)]
     pub enabled: bool,
-    /// NAA TCP listener address. Loopback by default; a LAN address requires `hqp_allow`.
+    /// NAA TCP listener address. Loopback by default; a LAN address may be paired with `hqp_allow`.
     #[serde(default = "default_bind")]
     pub bind: String,
-    /// Accept NAA/discovery only from these HQPlayer IPs. Mandatory for a non-loopback bind.
+    /// Optional source ACL: when empty, accept NAA/discovery from any peer that can reach the bind.
     #[serde(default)]
     pub hqp_allow: Vec<String>,
     /// Opt-in NAA multicast discovery on this explicit local IPv4 interface.

@@ -34,8 +34,8 @@ output commands do not accept passwords, upload URLs or arbitrary XML.
 1. Configure the HQPlayer instance through UHC's existing instance settings.
    Read its output projection to obtain `source_epoch` and `output_revision`.
 2. Submit `relay_configure` with `enabled: true`, an explicit TCP `bind`,
-   `hqp_allow` containing the HQPlayer server address, and the local IPv4
-   `discovery_interface`. The default discovery port is 43210. For standard
+   optionally supply `hqp_allow` to restrict source IPs, and set the local IPv4
+   `discovery_interface`. An empty allow-list accepts any reachable NAA peer. The default discovery port is 43210. For standard
    HQPlayer discovery, use TCP and UDP port 43210 on the selected address.
    A custom discovery port requires a peer configured to query that port;
    it does not make an unmodified Embedded scanner discover arbitrary ports.

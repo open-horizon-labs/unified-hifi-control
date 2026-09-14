@@ -1397,7 +1397,7 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                     input {
                         class: "input",
                         r#type: "text",
-                        placeholder: "Allowed HQPlayer IPs, comma-separated (required for a non-loopback bind)",
+                        placeholder: "Allowed HQPlayer IPs, comma-separated (optional)",
                         value: "{relay_hqp_allow}",
                         oninput: move |evt| {
                             relay_form_dirty.set(true);

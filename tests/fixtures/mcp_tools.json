@@ -265,7 +265,7 @@
           "type": "string"
         },
         "hqp_allow": {
-          "description": "Explicit HQPlayer source allowlist for non-loopback relay binds.",
+          "description": "Optional HQPlayer source allowlist; empty accepts any reachable NAA peer.",
           "items": {
             "type": "string"
           },
