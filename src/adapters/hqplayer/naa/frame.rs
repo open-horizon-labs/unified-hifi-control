@@ -1,0 +1,123 @@
+//! NAA6 audio-frame section rewriting.
+//!
+//! The PCM/DSD section is deliberately treated as opaque.  Only the length-delimited META and
+//! PIC sections are replaced, which lets the relay enrich a stream without changing its samples.
+
+pub const TYPE_POS: u32 = 0x04;
+pub const TYPE_META: u32 = 0x08;
+pub const TYPE_PIC: u32 = 0x10;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetadataPayload {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub picture: Option<Vec<u8>>,
+}
+
+/// Build the NAA6 metadata section used by HQPlayer's NAA endpoints.
+pub fn metadata_section(meta: &MetadataPayload) -> Vec<u8> {
+    let mut out = format!(
+        "[metadata]\nsong={}\nartist={}\nalbum={}\n",
+        escape_line(&meta.title),
+        escape_line(&meta.artist),
+        escape_line(&meta.album)
+    )
+    .into_bytes();
+    out.push(0);
+    out
+}
+
+fn escape_line(value: &str) -> String {
+    value.replace('\n', " ").replace('\r', " ")
+}
+
+/// Rewrite a complete NAA6 frame body. `pcm_len` is a sample count, while the other lengths are
+/// byte counts. The input section order is PCM, POS, META, PIC, matching the 32-byte header.
+/// When `metadata` is `None`, all sections are preserved byte-for-byte.
+pub fn rewrite_sections(
+    header: &mut [u8; 32],
+    body: &[u8],
+    metadata: Option<&MetadataPayload>,
+) -> Result<Vec<u8>, String> {
+    if metadata.is_none() {
+        return Ok(body.to_vec());
+    }
+    let lengths = [
+        u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize,
+        u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize,
+        u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize,
+        u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize,
+    ];
+    let total: usize = lengths.iter().sum();
+    if total != body.len() {
+        return Err("NAA frame section lengths do not match body".into());
+    }
+    let mut at = 0;
+    let pcm = &body[at..at + lengths[0]];
+    at += lengths[0];
+    let pos = &body[at..at + lengths[1]];
+    at += lengths[1];
+    let old_meta = &body[at..at + lengths[2]];
+    at += lengths[2];
+    let old_pic = &body[at..];
+    let meta = metadata_section(metadata.unwrap());
+    let picture = metadata.unwrap().picture.as_deref().unwrap_or(old_pic);
+    let mask = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    let mut new_mask = mask | TYPE_META;
+    if picture.is_empty() {
+        new_mask &= !TYPE_PIC;
+    } else {
+        new_mask |= TYPE_PIC;
+    }
+    header[0..4].copy_from_slice(&new_mask.to_le_bytes());
+    header[12..16].copy_from_slice(&(meta.len() as u32).to_le_bytes());
+    header[16..20].copy_from_slice(&(picture.len() as u32).to_le_bytes());
+    let mut out = Vec::with_capacity(pcm.len() + pos.len() + meta.len() + picture.len());
+    out.extend_from_slice(pcm);
+    out.extend_from_slice(pos);
+    out.extend_from_slice(&meta);
+    out.extend_from_slice(picture);
+    let _ = old_meta;
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(mask: u32, pcm: u32, pos: u32, meta: u32, pic: u32) -> [u8; 32] {
+        let mut h = [0; 32];
+        h[0..4].copy_from_slice(&mask.to_le_bytes());
+        h[4..8].copy_from_slice(&pcm.to_le_bytes());
+        h[8..12].copy_from_slice(&pos.to_le_bytes());
+        h[12..16].copy_from_slice(&meta.to_le_bytes());
+        h[16..20].copy_from_slice(&pic.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn replacement_preserves_pcm_and_replaces_picture() {
+        let mut h = header(TYPE_META | TYPE_PIC, 4, 2, 3, 3);
+        let body = b"PCM!POoldPIC";
+        let replacement = MetadataPayload {
+            title: "New\nTitle".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            picture: Some(b"JPEG".to_vec()),
+        };
+        let out = rewrite_sections(&mut h, body, Some(&replacement)).unwrap();
+        assert_eq!(&out[..6], b"PCM!PO");
+        assert!(out.ends_with(b"JPEG"));
+        assert_eq!(u32::from_le_bytes(h[16..20].try_into().unwrap()), 4);
+        assert!(String::from_utf8_lossy(&out).contains("song=New Title"));
+    }
+
+    #[test]
+    fn absent_metadata_is_transparent() {
+        let mut h = header(TYPE_META, 2, 0, 2, 0);
+        let body = b"PCM!xx";
+        assert_eq!(rewrite_sections(&mut h, body, None).unwrap(), body);
+        assert_eq!(h, header(TYPE_META, 2, 0, 2, 0));
+    }
+}

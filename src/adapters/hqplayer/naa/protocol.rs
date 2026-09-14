@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::frame::rewrite_sections;
 use super::outputs::{HqpDacDevice, HqpOutputRoute};
 use super::relay::RelayCore;
 
@@ -428,10 +429,9 @@ fn upstream_loop(
             if remaining > FRAME_LIMIT - HEADER_LEN {
                 return Err(invalid("audio record exceeds 8 MiB"));
             }
-            // Only lengths delimit payload. No XML search or rewriting inside audio, metadata,
-            // position, picture, reserved fields, or opaque flags.
-            writer.write_all(&header)?;
-            relay.update(id, true, header.len(), Some("forwarding"));
+            // Read one complete frame so the source-independent metadata projection can replace
+            // META/PIC sections. PCM/DSD remains opaque and is copied byte-for-byte.
+            let mut body = Vec::with_capacity(remaining);
             let mut buffer = [0u8; 65536];
             while remaining > 0 {
                 arm(reader, deadline)?;
@@ -440,10 +440,15 @@ fn upstream_loop(
                 if n == 0 {
                     return Err(io::ErrorKind::UnexpectedEof.into());
                 }
-                writer.write_all(&buffer[..n])?;
+                body.extend_from_slice(&buffer[..n]);
                 remaining -= n;
-                relay.update(id, true, n, None);
             }
+            let mut wire_header = header;
+            let rewritten =
+                rewrite_sections(&mut wire_header, &body, relay.metadata()).map_err(invalid)?;
+            writer.write_all(&wire_header)?;
+            writer.write_all(&rewritten)?;
+            relay.update(id, true, HEADER_LEN + rewritten.len(), Some("forwarding"));
             if pcm_bytes > 0 {
                 relay.audio(id, pcm_bytes);
             }

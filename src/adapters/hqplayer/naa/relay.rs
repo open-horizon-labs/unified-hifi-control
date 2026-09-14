@@ -36,6 +36,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use super::discovery;
+use super::frame::MetadataPayload;
 use super::outputs::{
     HqpDacDevice, HqpDacObservation, HqpDiscoveryObservation, HqpEndpointRef,
     HqpOutputAvailability, HqpOutputRoute, HqpRelayConfigView, HqpRelaySessionView,
@@ -148,6 +149,9 @@ struct RelayInner {
     responder: Option<SocketAddr>,
     /// Test seam: makes the accept loop fail on its next iteration.
     injected_accept_failure: Option<String>,
+    /// Latest metadata projection for this HQPlayer instance. The owner may update this while a
+    /// session is active; the protocol worker reads a clone per audio frame.
+    metadata: Option<MetadataPayload>,
 }
 
 /// Shared worker state. Never joins threads; see the module docs for why.
@@ -276,6 +280,7 @@ impl NaaRelay {
                     listener: ListenerState::Disabled,
                     responder: None,
                     injected_accept_failure: None,
+                    metadata: None,
                 }),
                 persist_path,
                 changed: tokio::sync::Notify::new(),
@@ -852,6 +857,17 @@ impl Drop for NaaRelay {
 }
 
 impl RelayCore {
+    /// Install the effective metadata projection used by active NAA sessions. Empty/absent
+    /// metadata leaves HQPlayer's original sections untouched.
+    pub fn set_metadata(&self, metadata: Option<MetadataPayload>) {
+        lock(&self.inner).metadata = metadata;
+        self.changed.notify_one();
+    }
+
+    pub(super) fn metadata(&self) -> Option<MetadataPayload> {
+        lock(&self.inner).metadata.clone()
+    }
+
     pub(super) fn name(&self) -> String {
         lock(&self.inner).settings.adapter_name.clone()
     }

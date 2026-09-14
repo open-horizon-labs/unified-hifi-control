@@ -16,6 +16,8 @@
 pub mod coordinator;
 #[cfg(feature = "naa-proxy")]
 pub mod discovery;
+#[cfg(feature = "naa-proxy")]
+pub mod frame;
 pub mod outputs;
 #[cfg(feature = "naa-proxy")]
 pub mod protocol;
