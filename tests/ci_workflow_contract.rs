@@ -163,6 +163,25 @@ fn server_artifacts_include_the_naa_proxy() {
 }
 
 #[test]
+fn dioxus_cli_cache_matches_the_isolated_cargo_home() {
+    let source = workflow("build.yml");
+    let wasm = job(&source, "build-wasm");
+
+    assert!(
+        wasm.contains("path: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/cargo/bin/dx"),
+        "Dioxus CLI cache must use the isolated runner Cargo bin path"
+    );
+    assert!(
+        wasm.contains("key: dx-cli-${{ runner.os }}-${{ runner.arch }}-0.7.10"),
+        "Dioxus CLI cache must be scoped by runner platform and pinned version"
+    );
+    assert!(
+        wasm.find("name: Cache Dioxus CLI") < wasm.find("name: Install Dioxus CLI"),
+        "Dioxus CLI cache must restore before installation"
+    );
+}
+
+#[test]
 fn parallel_fleet_workers_do_not_share_mutable_rust_toolchains() {
     let source = workflow("build.yml");
 

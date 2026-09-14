@@ -563,8 +563,12 @@ jobs:
         id: cache-dx
         uses: actions/cache@v5
         with:
-          path: ${{ env.CARGO_HOME }}/bin/dx
-          key: dx-cli-0.7.10
+          # Isolate this from other runner jobs just like the installer isolates
+          # CARGO_HOME, otherwise a shared fleet cache can restore the wrong tool.
+          path: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/cargo/bin/dx
+          key: dx-cli-${{ runner.os }}-${{ runner.arch }}-0.7.10
+          restore-keys: |
+            dx-cli-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install Dioxus CLI
         if: steps.check-cache.outputs.needs_build == 'true' && steps.cache-dx.outputs.cache-hit != 'true'
