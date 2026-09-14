@@ -17,8 +17,8 @@
 #![allow(clippy::redundant_closure)]
 
 use crate::app::api::{
-    HqpOutputAction, HqpOutputAvailability, HqpOutputCommandRequest, HqpOutputPhase,
-    HqpOutputProjection, HqpRelaySessionView,
+    HqpOutputAction, HqpOutputAvailability, HqpOutputCommandRequest, HqpOutputOutcome,
+    HqpOutputPhase, HqpOutputProjection, HqpRelaySessionView,
 };
 
 /// Fences stale responses out of the UI so a slow in-flight request cannot overwrite state a
@@ -844,6 +844,7 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
     let polled_operation = use_signal(|| None::<HqpOutputOperation>);
 
     let mut relay_enabled = use_signal(|| false);
+    let mut relay_form_dirty = use_signal(|| false);
     let mut relay_bind = use_signal(String::new);
     let mut relay_hqp_allow = use_signal(String::new);
     let mut relay_discovery_interface = use_signal(String::new);
@@ -857,12 +858,15 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
     // operator is actively editing is a fresh render's problem, matching this page's existing
     // `ConfigForm` sync pattern elsewhere.
     use_effect(move || {
-        if let Some(p) = outputs() {
-            relay_enabled.set(p.relay.enabled);
-            relay_bind.set(p.relay.bind.clone().unwrap_or_default());
-            relay_hqp_allow.set(p.relay.hqp_allow.join(", "));
-            relay_discovery_interface.set(p.relay.discovery_interface.clone().unwrap_or_default());
-            relay_discovery_port.set(p.relay.discovery_port);
+        if !relay_form_dirty() {
+            if let Some(p) = outputs() {
+                relay_enabled.set(p.relay.enabled);
+                relay_bind.set(p.relay.bind.clone().unwrap_or_default());
+                relay_hqp_allow.set(p.relay.hqp_allow.join(", "));
+                relay_discovery_interface
+                    .set(p.relay.discovery_interface.clone().unwrap_or_default());
+                relay_discovery_port.set(p.relay.discovery_port);
+            }
         }
     });
 
@@ -912,7 +916,11 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
             current_operation_id,
             polled_operation,
             true,
-            |_operation| {},
+            move |operation| {
+                if operation.outcome == Some(HqpOutputOutcome::Complete) {
+                    relay_form_dirty.set(false);
+                }
+            },
         );
     };
 
@@ -1365,7 +1373,10 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                         input {
                             r#type: "checkbox",
                             checked: relay_enabled(),
-                            onchange: move |evt| relay_enabled.set(evt.checked()),
+                            onchange: move |evt| {
+                                relay_form_dirty.set(true);
+                                relay_enabled.set(evt.checked());
+                            },
                         }
                         "Enabled"
                     }
@@ -1374,21 +1385,30 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                         r#type: "text",
                         placeholder: "Bind address, e.g. 127.0.0.1:43210",
                         value: "{relay_bind}",
-                        oninput: move |evt| relay_bind.set(evt.value()),
+                        oninput: move |evt| {
+                            relay_form_dirty.set(true);
+                            relay_bind.set(evt.value());
+                        },
                     }
                     input {
                         class: "input",
                         r#type: "text",
                         placeholder: "Allowed HQPlayer IPs, comma-separated (required for a non-loopback bind)",
                         value: "{relay_hqp_allow}",
-                        oninput: move |evt| relay_hqp_allow.set(evt.value()),
+                        oninput: move |evt| {
+                            relay_form_dirty.set(true);
+                            relay_hqp_allow.set(evt.value());
+                        },
                     }
                     input {
                         class: "input",
                         r#type: "text",
                         placeholder: "Discovery interface IPv4 (optional; blank disables discovery)",
                         value: "{relay_discovery_interface}",
-                        oninput: move |evt| relay_discovery_interface.set(evt.value()),
+                        oninput: move |evt| {
+                            relay_form_dirty.set(true);
+                            relay_discovery_interface.set(evt.value());
+                        },
                     }
                     label { class: "block",
                         span { class: "block text-xs text-muted mb-1", "Discovery UDP port" }
@@ -1398,6 +1418,7 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                             placeholder: "43210",
                             value: "{relay_discovery_port}",
                             oninput: move |evt| {
+                                relay_form_dirty.set(true);
                                 if let Ok(port) = evt.value().parse() {
                                     relay_discovery_port.set(port);
                                 }
