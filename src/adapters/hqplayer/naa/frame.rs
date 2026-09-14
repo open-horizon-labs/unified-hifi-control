@@ -49,7 +49,12 @@ pub fn rewrite_sections(
                 .map_err(|_| "invalid NAA frame header".to_string())?,
         ) as usize)
     };
-    let lengths = [read_len(4..8)?, read_len(8..12)?, read_len(12..16)?, read_len(16..20)?];
+    let lengths = [
+        read_len(4..8)?,
+        read_len(8..12)?,
+        read_len(12..16)?,
+        read_len(16..20)?,
+    ];
     let total: usize = lengths.iter().sum();
     if total != body.len() {
         return Err("NAA frame section lengths do not match body".into());
@@ -65,7 +70,11 @@ pub fn rewrite_sections(
     let metadata = metadata.ok_or("metadata unexpectedly absent")?;
     let meta = metadata_section(metadata);
     let picture = metadata.picture.as_deref().unwrap_or(old_pic);
-    let mask = u32::from_le_bytes(header[0..4].try_into().map_err(|_| "invalid NAA frame header")?);
+    let mask = u32::from_le_bytes(
+        header[0..4]
+            .try_into()
+            .map_err(|_| "invalid NAA frame header")?,
+    );
     let mut new_mask = mask | TYPE_META;
     if picture.is_empty() {
         new_mask &= !TYPE_PIC;
