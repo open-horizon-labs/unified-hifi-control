@@ -132,6 +132,14 @@ fn zigbuild_tool_cache_is_versioned_and_validated() {
             body.contains("cargo install cargo-zigbuild --version 0.23.4 --locked"),
             "{name} must install the same version named by its cache key"
         );
+        assert!(
+            body.contains("path: ${{ runner.tool_cache }}/uhc/zig/0.13.0/"),
+            "{name} must restore Zig from the runner tool cache"
+        );
+        assert!(
+            body.find("name: Cache Zig") < body.find("name: Install zig"),
+            "{name} must restore Zig before checking whether an install is needed"
+        );
     }
 }
 

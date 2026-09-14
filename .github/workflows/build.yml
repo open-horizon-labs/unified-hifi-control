@@ -645,6 +645,12 @@ jobs:
         with:
           shared-key: zigbuild-x86_64-unknown-linux-musl
 
+      - name: Cache Zig
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.tool_cache }}/uhc/zig/0.13.0/x64
+          key: zig-${{ runner.os }}-${{ runner.arch }}-0.13.0
+
       - name: Install zig
         run: |
           set -euo pipefail
@@ -951,6 +957,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: zigbuild-${{ matrix.target }}
+
+      - name: Cache Zig
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.tool_cache }}/uhc/zig/0.13.0/${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
+          key: zig-${{ runner.os }}-${{ runner.arch }}-0.13.0
 
       - name: Install zig
         run: |
