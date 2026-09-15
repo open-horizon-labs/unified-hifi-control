@@ -38,6 +38,7 @@ pub fn rewrite_sections(
     header: &mut [u8; 32],
     body: &[u8],
     metadata: Option<&MetadataPayload>,
+    sample_bytes: usize,
 ) -> Result<Vec<u8>, String> {
     if metadata.is_none() {
         return Ok(body.to_vec());
@@ -50,7 +51,9 @@ pub fn rewrite_sections(
         ) as usize)
     };
     let lengths = [
-        read_len(4..8)?,
+        read_len(4..8)?
+            .checked_mul(sample_bytes)
+            .ok_or("PCM length overflow")?,
         read_len(8..12)?,
         read_len(12..16)?,
         read_len(16..20)?,
@@ -67,6 +70,11 @@ pub fn rewrite_sections(
     let old_meta = &body[at..at + lengths[2]];
     at += lengths[2];
     let old_pic = &body[at..];
+    // Source metadata is a fallback. Preserve the producer's metadata exactly when present;
+    // this keeps pass-through streams byte-for-byte stable and avoids overwriting richer data.
+    if !old_meta.is_empty() {
+        return Ok(body.to_vec());
+    }
     let metadata = metadata.ok_or("metadata unexpectedly absent")?;
     let meta = metadata_section(metadata);
     let picture = metadata.picture.as_deref().unwrap_or(old_pic);
@@ -109,15 +117,15 @@ mod tests {
 
     #[test]
     fn replacement_preserves_pcm_and_replaces_picture() {
-        let mut h = header(TYPE_META | TYPE_PIC, 4, 2, 3, 3);
-        let body = b"PCM!POoldPIC";
+        let mut h = header(TYPE_META | TYPE_PIC, 4, 2, 0, 3);
+        let body = b"PCM!POPIC";
         let replacement = MetadataPayload {
             title: "New\nTitle".into(),
             artist: "Artist".into(),
             album: "Album".into(),
             picture: Some(b"JPEG".to_vec()),
         };
-        let out = rewrite_sections(&mut h, body, Some(&replacement)).unwrap();
+        let out = rewrite_sections(&mut h, body, Some(&replacement), 1).unwrap();
         assert_eq!(&out[..6], b"PCM!PO");
         assert!(out.ends_with(b"JPEG"));
         assert_eq!(u32::from_le_bytes(h[16..20].try_into().unwrap()), 4);
@@ -128,7 +136,7 @@ mod tests {
     fn absent_metadata_is_transparent() {
         let mut h = header(TYPE_META, 2, 0, 2, 0);
         let body = b"PCM!xx";
-        assert_eq!(rewrite_sections(&mut h, body, None).unwrap(), body);
+        assert_eq!(rewrite_sections(&mut h, body, None, 1).unwrap(), body);
         assert_eq!(h, header(TYPE_META, 2, 0, 2, 0));
     }
 }

@@ -551,6 +551,20 @@ pub fn HqPlayer() -> Element {
         .flatten()
         .map(|r| r.instances)
         .unwrap_or_default();
+    let connected_instance = instances_list
+        .iter()
+        .find(|instance| instance.connected)
+        .or_else(|| instances_list.first());
+    let connected_product = connected_instance
+        .and_then(|instance| instance.info.as_ref())
+        .map(|info| info.product.as_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("HQPlayer");
+    let connected_version = connected_instance
+        .and_then(|instance| instance.info.as_ref())
+        .map(|info| info.version.as_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("version unknown");
     let zone_match_resources_loaded =
         zones_loaded_once() && zone_links_loaded_once() && instances_loaded_once();
     let controlled_zones_loaded = zones_loaded_once() && zone_links_loaded_once();
@@ -639,7 +653,7 @@ pub fn HqPlayer() -> Element {
                                 "Connected to {current_status.as_ref().and_then(|s| s.host.as_deref()).unwrap_or(\"HQPlayer\")}"
                             }
                             p { class: "mt-0.5 text-xs text-muted sm:text-sm",
-                                "Live engine reads and DSP changes are verified with HQPlayer."
+                                "{connected_product} {connected_version} · Live engine reads and DSP changes are verified with HQPlayer."
                             }
                         }
                     }

@@ -587,6 +587,15 @@ pub fn HqpOutputRoutingSection(instances: Vec<HqpOutputInstance>) -> Element {
                     p { class: "mt-1 text-sm text-muted",
                         "Choose which network audio destination this HQPlayer instance forwards to. Selection is verified against the live engine before this page calls it switched."
                     }
+                    if let Some(instance) = instances.iter().find(|i| i.name == selected_instance()) {
+                        {
+                            let product = instance.product.as_deref().filter(|v| !v.is_empty()).unwrap_or("HQPlayer");
+                            let version = instance.version.as_deref().filter(|v| !v.is_empty()).unwrap_or("version unknown");
+                            let host = instance.host.as_deref().unwrap_or("host unknown");
+                            let status = if instance.connected { "connected" } else { "offline" };
+                            rsx! { p { class: "mt-2 text-xs font-medium text-muted", "{product} {version} · {host} · {status}" } }
+                        }
+                    }
                 }
                 if instances.len() > 1 {
                     label { class: "text-sm",

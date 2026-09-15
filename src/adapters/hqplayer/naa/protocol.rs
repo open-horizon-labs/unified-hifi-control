@@ -447,8 +447,8 @@ fn upstream_loop(
                 .try_into()
                 .map_err(|_| invalid("short NAA audio header"))?;
             let metadata = relay.metadata();
-            let rewritten =
-                rewrite_sections(&mut wire_header, &body, metadata.as_ref()).map_err(invalid)?;
+            let rewritten = rewrite_sections(&mut wire_header, &body, metadata.as_ref(), width)
+                .map_err(invalid)?;
             writer.write_all(&wire_header)?;
             writer.write_all(&rewritten)?;
             relay.update(id, true, HEADER_LEN + rewritten.len(), Some("forwarding"));
