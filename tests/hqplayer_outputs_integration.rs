@@ -3135,6 +3135,8 @@ struct PairedSourceFixture {
     was_playing: AtomicBool,
     fail_pause: AtomicBool,
     hold_pause: AtomicBool,
+    paused_at: std::sync::Mutex<Option<Instant>>,
+    resume_gap: std::sync::Mutex<Option<Duration>>,
 }
 #[async_trait::async_trait]
 impl unified_hifi_control::adapters::hqplayer::naa_relay::RelaySourceControl
@@ -3149,6 +3151,7 @@ impl unified_hifi_control::adapters::hqplayer::naa_relay::RelaySourceControl
             return Err("pause rejected".into());
         }
         self.client.set_playing(false);
+        *self.paused_at.lock().unwrap() = Some(Instant::now());
         Ok(Some((
             "roon:paired".into(),
             self.was_playing.load(Ordering::Acquire),
@@ -3162,6 +3165,7 @@ impl unified_hifi_control::adapters::hqplayer::naa_relay::RelaySourceControl
     async fn resume_after_switch(&self, source: &str) -> Result<(), String> {
         assert_eq!(source, "roon:paired");
         assert!(self.paused.load(Ordering::Acquire));
+        *self.resume_gap.lock().unwrap() = self.paused_at.lock().unwrap().map(|at| at.elapsed());
         self.client.set_playing(true);
         self.resumed.store(true, Ordering::Release);
         Ok(())
@@ -3196,6 +3200,8 @@ async fn paired_source_switch_uses_source_transport_without_native_stop_or_play(
         was_playing: AtomicBool::new(true),
         fail_pause: AtomicBool::new(false),
         hold_pause: AtomicBool::new(false),
+        paused_at: std::sync::Mutex::new(None),
+        resume_gap: std::sync::Mutex::new(None),
     });
     adapter.set_relay_source_control(source.clone());
     let receipt = rig
@@ -3222,6 +3228,10 @@ async fn paired_source_switch_uses_source_transport_without_native_stop_or_play(
     assert_eq!(model.request_count("Stop"), 0);
     assert_eq!(model.request_count("Play"), 0);
     assert!(b.audio_bytes() > 0);
+    assert!(
+        source.resume_gap.lock().unwrap().unwrap() >= Duration::from_secs(2),
+        "Roon pause and relay selection each need a one-second settling gap before resume"
+    );
     // An idempotent retry must not pause/play a second time.
     source.paused.store(false, Ordering::Release);
     let retry = rig

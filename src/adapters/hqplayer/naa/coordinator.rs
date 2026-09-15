@@ -1994,6 +1994,11 @@ impl HqpOutputCoordinator {
         if token.is_cancelled() {
             return Err(SelectAbort::Cancelled);
         }
+        // Roon's paused projection can precede HQPlayer releasing its old stream.
+        // The live pause -> wait -> select -> wait -> play sequence needs both gaps.
+        if was_playing {
+            cancellable(token, tokio::time::sleep(Duration::from_secs(1))).await?;
+        }
         let generation = match relay.commit_selection(route_id) {
             Ok(generation) => generation,
             Err(error) => {
@@ -2020,6 +2025,7 @@ impl HqpOutputCoordinator {
         if token.is_cancelled() || relay.generation() != generation {
             return Err(SelectAbort::Cancelled);
         }
+        cancellable(token, tokio::time::sleep(Duration::from_secs(1))).await?;
         self.set_phase(op, HqpOutputPhase::Resuming);
         self.publish(None).await;
         let resumed = cancellable(
