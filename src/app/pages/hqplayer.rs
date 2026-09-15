@@ -17,6 +17,7 @@ use crate::app::sse::use_sse;
 /// HQP configure request
 #[derive(Clone, serde::Serialize)]
 struct HqpConfigureRequest {
+    name: String,
     host: String,
     port: u16,
     web_port: u16,
@@ -167,6 +168,7 @@ pub fn HqPlayer() -> Element {
     let sse = use_sse();
 
     // Form fields for config
+    let instance_name = use_signal(|| "default".to_string());
     let mut host = use_signal(String::new);
     let mut port = use_signal(|| 4321u16);
     let mut web_port = use_signal(|| 8088u16);
@@ -369,6 +371,7 @@ pub fn HqPlayer() -> Element {
 
         spawn(async move {
             let req = HqpConfigureRequest {
+                name: instance_name(),
                 host: h,
                 port: p,
                 web_port: wp,
@@ -630,6 +633,7 @@ pub fn HqPlayer() -> Element {
                             }
                         }
                         ConfigForm {
+                            instance_name: instance_name,
                             host: host,
                             port: port,
                             web_port: web_port,
@@ -669,6 +673,7 @@ pub fn HqPlayer() -> Element {
                     section { id: "hqp-config", class: "mb-8",
                         div { class: "card p-6",
                             ConfigForm {
+                                instance_name: instance_name,
                                 host: host,
                                 port: port,
                                 web_port: web_port,
@@ -1236,6 +1241,7 @@ fn format_hqp_time(seconds: u32) -> String {
 /// Configuration form component
 #[component]
 fn ConfigForm(
+    instance_name: Signal<String>,
     host: Signal<String>,
     port: Signal<u16>,
     web_port: Signal<u16>,
@@ -1247,6 +1253,11 @@ fn ConfigForm(
 ) -> Element {
     rsx! {
         div { class: "space-y-4 max-w-3xl",
+            div {
+                label { class: "block text-sm font-medium mb-1", r#for: "hqp-instance-name", "Instance name" }
+                input { id: "hqp-instance-name", class: "input", r#type: "text", required: true, placeholder: "Living Room", value: "{instance_name}", oninput: move |evt| instance_name.set(evt.value()) }
+                p { class: "mt-1 text-xs text-muted", "A label you choose for this HQPlayer endpoint. It appears in selectors and zone bindings." }
+            }
             div {
                 label { class: "block text-sm font-medium mb-1", r#for: "hqp-host", "HQPlayer host" }
                 input {

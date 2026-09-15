@@ -2746,9 +2746,15 @@ pub async fn lms_configure_handler(
     }
 }
 
+fn default_hqp_instance_name() -> String {
+    "default".to_string()
+}
+
 /// HQPlayer configuration request
 #[derive(Deserialize)]
 pub struct HqpConfigRequest {
+    #[serde(default = "default_hqp_instance_name")]
+    pub name: String,
     pub host: String,
     #[serde(default)]
     pub port: Option<u16>,
@@ -2763,17 +2769,31 @@ pub async fn hqp_configure_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpConfigRequest>,
 ) -> impl IntoResponse {
-    // Configure the adapter
-    state
-        .hqplayer
-        .configure(
-            req.host.clone(),
-            req.port,
-            req.web_port,
-            req.username,
-            req.password,
-        )
-        .await;
+    // Configure the named instance. The default name keeps the legacy adapter path intact.
+    if req.name == "default" {
+        state
+            .hqplayer
+            .configure(
+                req.host.clone(),
+                req.port,
+                req.web_port,
+                req.username.clone(),
+                req.password.clone(),
+            )
+            .await;
+    } else {
+        state
+            .hqp_instances
+            .add_instance(
+                req.name.clone(),
+                req.host.clone(),
+                req.port,
+                req.web_port,
+                req.username.clone(),
+                req.password.clone(),
+            )
+            .await;
+    }
 
     // Save to instance manager for persistence
     state.hqp_instances.save_to_config().await;
@@ -2817,6 +2837,7 @@ pub async fn hqp_configure_handler(
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
+            "name": req.name,
             "host": req.host,
             "port": req.port.unwrap_or(4321),
             "web_port": req.web_port.unwrap_or(8088),
