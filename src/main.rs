@@ -975,6 +975,8 @@ mod server {
                 "/hqp/instances/{name}",
                 delete(api::hqp_remove_instance_handler),
             )
+            .route("/hqp/instances/{name}/pipeline", get(api::hqp_instance_pipeline_handler))
+            .route("/hqp/instances/{name}/pipeline", post(api::hqp_instance_pipeline_update_handler))
             // HQPlayer instance-specific profile routes (web UI profiles via HTTP)
             .route(
                 "/hqp/instances/{name}/profiles",

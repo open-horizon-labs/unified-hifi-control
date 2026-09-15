@@ -824,7 +824,7 @@ fn run_output_command<F>(
 }
 
 #[component]
-fn HqpOutputRouting(instance: Signal<String>) -> Element {
+pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
     let sse = use_sse();
 
     let outputs = use_signal(|| None::<HqpOutputProjection>);

@@ -2670,3 +2670,77 @@ async fn native_hooks_return_within_their_deadline_while_a_lock_is_still_held() 
 
 #[allow(dead_code)]
 fn unused(_: Value) {}
+
+#[tokio::test]
+#[serial_test::serial(hqp_output_config)]
+async fn instance_pipeline_controls_never_fall_back_to_default() {
+    use axum::{
+        extract::{Path, State},
+        Json,
+    };
+    use unified_hifi_control::api::{
+        hqp_instance_pipeline_handler, hqp_instance_pipeline_update_handler, HqpPipelineRequest,
+    };
+    let model = playing_daemon();
+    let daemon = WireServer::start(Arc::new(model.clone()), WirePolicy::default()).await;
+    let rig = Rig::new("office-dsp").await;
+    rig.attach(&daemon).await;
+    let other_model = playing_daemon();
+    let other = WireServer::start(Arc::new(other_model.clone()), WirePolicy::default()).await;
+    rig.manager
+        .add_instance(
+            "default".into(),
+            "127.0.0.1".into(),
+            Some(other.port()),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+    let read =
+        hqp_instance_pipeline_handler(State(rig.state.clone()), Path("office-dsp".into())).await;
+    assert_eq!(
+        read.status(),
+        axum::http::StatusCode::OK,
+        "read must target the named instance"
+    );
+    let result = hqp_instance_pipeline_update_handler(
+        State(rig.state.clone()),
+        Path("office-dsp".into()),
+        Json(HqpPipelineRequest {
+            setting: "repeat".into(),
+            value: serde_json::json!("all"),
+        }),
+    )
+    .await;
+    assert_eq!(
+        result.status(),
+        axum::http::StatusCode::OK,
+        "mutation must target the named instance"
+    );
+    assert_eq!(model.state().repeat, 2);
+    assert_eq!(
+        other_model.state().repeat,
+        0,
+        "default instance must remain unchanged"
+    );
+    let missing = hqp_instance_pipeline_update_handler(
+        State(rig.state.clone()),
+        Path("missing".into()),
+        Json(HqpPipelineRequest {
+            setting: "repeat".into(),
+            value: serde_json::json!("off"),
+        }),
+    )
+    .await;
+    assert!(!missing.status().is_success());
+    assert_eq!(
+        model.state().repeat,
+        2,
+        "unknown instance cannot change another engine"
+    );
+    other.shutdown().await;
+    daemon.shutdown().await;
+    rig.shutdown().await;
+}

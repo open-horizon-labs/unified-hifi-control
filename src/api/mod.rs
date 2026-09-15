@@ -1871,6 +1871,15 @@ async fn hqp_apply_named_setting(
     setting: &str,
     value: &str,
 ) -> anyhow::Result<()> {
+    hqp_apply_named_setting_for(state, "default", setting, value).await
+}
+
+async fn hqp_apply_named_setting_for(
+    state: &AppState,
+    instance: &str,
+    setting: &str,
+    value: &str,
+) -> anyhow::Result<()> {
     let normalized = match setting {
         "mode" | "filter" | "filter1x" | "filterNx" | "filternx" | "shaper" | "dither"
         | "junk_filter" => value.to_string(),
@@ -1888,7 +1897,7 @@ async fn hqp_apply_named_setting(
     };
     crate::knobs::routes::dispatch_hqplayer_reconfiguration(
         state,
-        "default",
+        instance,
         HqpRuntimeCommand::Pipeline {
             setting: setting.to_string(),
             value: normalized,
@@ -3096,6 +3105,72 @@ pub async fn hqp_remove_instance_handler(
     }
 }
 
+/// Read the live pipeline for one configured HQPlayer. Unknown names never fall back.
+pub async fn hqp_instance_pipeline_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    if state.hqp_instances.get(&name).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Instance not found: {name}"),
+            }),
+        )
+            .into_response();
+    }
+    match state.aggregator.get_hqplayer_snapshot(&name).await {
+        Some(snapshot) if snapshot.presence == HqpSnapshotPresence::Live => {
+            (StatusCode::OK, Json(snapshot.observation.pipeline)).into_response()
+        }
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: format!("HQPlayer {name} is offline"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Apply a semantic choice to the exact instance, using the same native command owner as MCP.
+pub async fn hqp_instance_pipeline_update_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<HqpPipelineRequest>,
+) -> axum::response::Response {
+    if state.hqp_instances.get(&name).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Instance not found: {name}"),
+            }),
+        )
+            .into_response();
+    }
+    let Some(value) = req.value.as_str() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error:
+                    "Instance pipeline settings require a named string value (sample rate as Hz)."
+                        .into(),
+            }),
+        )
+            .into_response();
+    };
+    match hqp_apply_named_setting_for(&state, &name, &req.setting, value).await {
+        Ok(()) => hqp_instance_pipeline_handler(State(state), Path(name)).await,
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /hqp/instances/:name/profiles - Get profiles for a specific HQPlayer instance
 pub async fn hqp_instance_profiles_handler(
     State(state): State<AppState>,
@@ -3175,7 +3250,14 @@ pub async fn hqp_instance_matrix_profiles_handler(
             Json(serde_json::json!({
                 "instance": name,
                 "profiles": snapshot.matrix_profiles,
-                "current": snapshot.current_matrix_profile
+                "current": snapshot.current_matrix_profile,
+                "junk_filters": snapshot.junk_filters,
+                "junk_filter": snapshot.state.filter_junk,
+                "convolution": snapshot.state.convolution,
+                "adaptive_volume": snapshot.state.adaptive,
+                "repeat": snapshot.state.repeat,
+                "random": snapshot.state.random,
+                "native_state": snapshot.state
             })),
         )
             .into_response(),

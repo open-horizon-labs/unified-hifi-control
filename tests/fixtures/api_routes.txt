@@ -13,7 +13,6 @@
 # multi-line closures that the route extractor doesn't detect, and they may change
 # with build configuration.
 
-
 DELETE /hqp/instances/{name}
 DELETE /knob/devices/{knob_id}
 DELETE /mcp
@@ -46,6 +45,7 @@ GET /fonts/{*path}
 GET /hqp/discover
 GET /hqp/instances
 GET /hqp/instances/{name}/matrix/profiles
+GET /hqp/instances/{name}/pipeline
 GET /hqp/instances/{name}/profiles
 GET /hqp/pipeline
 GET /hqp/profiles
@@ -122,6 +122,7 @@ POST /control
 POST /hqp/detect
 POST /hqp/instances
 POST /hqp/instances/{name}/matrix/profile
+POST /hqp/instances/{name}/pipeline
 POST /hqp/instances/{name}/profile
 POST /hqp/pipeline
 POST /hqp/profiles/load
