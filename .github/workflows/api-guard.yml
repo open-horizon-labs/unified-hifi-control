@@ -3,10 +3,16 @@ name: API Guard
 on:
   pull_request:
     branches: [master, v3, v4]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     paths:
+      - '.github/workflows/api-guard.yml'
       - 'src/main.rs'
       - 'src/api/**'
       - 'tests/fixtures/api_routes.txt'
+
+permissions:
+  contents: read
+  pull-requests: read
 
 jobs:
   check-api-changes:
@@ -29,27 +35,18 @@ jobs:
 
       - name: Require approval label for API changes
         if: steps.check.outputs.api_changed == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          echo "API contract file changed - checking for approval label..."
-
-          LABELS=$(gh pr view ${{ github.event.pull_request.number }} --json labels -q '.labels[].name' 2>/dev/null || echo "")
-
-          if echo "$LABELS" | grep -q 'api-change-approved'; then
-            echo "✅ API change approved via label"
-          else
-            echo "❌ API CONTRACT CHANGED!"
-            echo ""
-            echo "Changes to tests/fixtures/api_routes.txt detected."
-            echo "API changes require explicit approval."
-            echo ""
-            echo "To approve this change:"
-            echo "1. Review the API changes carefully"
-            echo "2. Add the 'api-change-approved' label to this PR"
-            echo "3. Re-run this workflow"
-            exit 1
-          fi
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: context.issue.number,
+            });
+            if (pr.labels.some(label => label.name === 'api-change-approved')) {
+              core.info('API change approved via label');
+            } else {
+              core.setFailed('API contract changed. Review the changes and add api-change-approved to this PR.');
+            }
 
       - name: API unchanged
         if: steps.check.outputs.api_changed == 'false'

@@ -3110,7 +3110,11 @@ pub async fn hqp_instance_pipeline_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> axum::response::Response {
-    if state.hqp_instances.get(&name).await.is_none() {
+    if !state
+        .reliable_commands
+        .as_ref()
+        .is_some_and(|gateway| gateway.has_endpoint(&PrefixedZoneId::hqplayer(&name)))
+    {
         return (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -3139,7 +3143,11 @@ pub async fn hqp_instance_pipeline_update_handler(
     Path(name): Path<String>,
     Json(req): Json<HqpPipelineRequest>,
 ) -> axum::response::Response {
-    if state.hqp_instances.get(&name).await.is_none() {
+    if !state
+        .reliable_commands
+        .as_ref()
+        .is_some_and(|gateway| gateway.has_endpoint(&PrefixedZoneId::hqplayer(&name)))
+    {
         return (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
