@@ -60,6 +60,10 @@ use unified_hifi_control::knobs::KnobStore;
 // Harness
 // =============================================================================
 
+// Every async scenario below writes the same process-wide configuration file.
+// Serialize these scenarios so another manager cannot replace a persistence assertion
+// with its own instance array while the first scenario is still running.
+
 /// Isolated from the developer's real config; every unrelated adapter is explicitly off (Roon
 /// defaults to on), so nothing but the HQPlayer lifecycle under test can run.
 fn isolate_config_dir() {
@@ -386,6 +390,7 @@ fn profile_router(state: AppState) -> Router {
 /// The relay follows the exact managed instance: enabled and bound while managed, unavailable with
 /// its reason when the lifecycle stops (retaining routes), gone when the instance is removed.
 #[tokio::test]
+#[serial_test::serial(hqp_output_config)]
 async fn relay_lifecycle_follows_the_managed_instance() {
     let model = playing_daemon();
     let daemon = WireServer::start(Arc::new(model.clone()), WirePolicy::default()).await;
@@ -450,6 +455,7 @@ async fn relay_lifecycle_follows_the_managed_instance() {
 // =============================================================================
 
 #[tokio::test]
+#[serial_test::serial(hqp_output_config)]
 async fn commands_target_the_exact_instance_and_never_fall_back() {
     let model = playing_daemon();
     let daemon = WireServer::start(Arc::new(model.clone()), WirePolicy::default()).await;
@@ -485,6 +491,7 @@ async fn commands_target_the_exact_instance_and_never_fall_back() {
 }
 
 #[tokio::test]
+#[serial_test::serial(hqp_output_config)]
 async fn stale_expectations_are_refused_before_any_side_effect() {
     let model = playing_daemon();
     let daemon = WireServer::start(Arc::new(model.clone()), WirePolicy::default()).await;
@@ -554,6 +561,7 @@ async fn stale_expectations_are_refused_before_any_side_effect() {
 }
 
 #[tokio::test]
+#[serial_test::serial(hqp_output_config)]
 async fn correlation_dedups_identical_requests_and_rejects_conflicts() {
     let model = playing_daemon();
     let daemon = WireServer::start(Arc::new(model.clone()), WirePolicy::default()).await;
@@ -625,6 +633,7 @@ async fn correlation_dedups_identical_requests_and_rejects_conflicts() {
 /// on B, one Play, accepted start with real payload, native state 2, position restored. The
 /// receipt is accepted first; the operation GET carries the outcome and evidence.
 #[tokio::test]
+#[serial_test::serial(hqp_output_config)]
 async fn select_switches_a_playing_source_with_stop_fresh_session_play_and_seek() {
     let model = playing_daemon();
     let daemon = WireServer::start(Arc::new(model.clone()), WirePolicy::default()).await;
@@ -812,6 +821,7 @@ async fn select_switches_a_playing_source_with_stop_fresh_session_play_and_seek(
 /// Stop must overtake a select that is blocked behind a held native reply: the pair closes and the
 /// receipt returns immediately, the select ends cancelled, and no late Play is ever issued.
 #[tokio::test]
+#[serial_test::serial(hqp_output_config)]
 async fn stop_overtakes_a_select_held_on_native_stop_and_prevents_late_play() {
     let model = playing_daemon();
     let gate = ReplyGate::new("Stop");
@@ -931,6 +941,7 @@ async fn stop_overtakes_a_select_held_on_native_stop_and_prevents_late_play() {
 /// A profile load (reconfiguration lane) shares the lease and invalidates pending output work: the
 /// held select is cancelled and never issues Play.
 #[tokio::test]
+#[serial_test::serial(hqp_output_config)]
 async fn a_reconfiguration_command_supersedes_a_pending_select() {
     let model = playing_daemon();
     let gate = ReplyGate::new("Stop");
@@ -1012,6 +1023,7 @@ async fn a_reconfiguration_command_supersedes_a_pending_select() {
 
 /// Import preserves PoC route ids, host, port and device, and never applies the file's selection.
 #[tokio::test]
+#[serial_test::serial(hqp_output_config)]
 async fn import_preview_and_apply_preserve_ids_and_ignore_the_files_selection() {
     let model = playing_daemon();
     let daemon = WireServer::start(Arc::new(model.clone()), WirePolicy::default()).await;
@@ -1098,6 +1110,7 @@ async fn import_preview_and_apply_preserve_ids_and_ignore_the_files_selection() 
 /// Settings arrive through the same typed command; disabling closes the listener and Stop-like
 /// reads stay possible; re-enabling binds again and the change persists in the instance file.
 #[tokio::test]
+#[serial_test::serial(hqp_output_config)]
 async fn relay_configure_toggles_the_listener_and_persists() {
     let model = playing_daemon();
     let daemon = WireServer::start(Arc::new(model.clone()), WirePolicy::default()).await;
@@ -1169,6 +1182,7 @@ async fn relay_configure_toggles_the_listener_and_persists() {
 /// listener closes, and an adapter that outlives it reports a retired persister instead of
 /// claiming durable success.
 #[tokio::test]
+#[serial_test::serial(hqp_output_config)]
 async fn dropping_the_manager_retires_persistence_and_closes_the_relay() {
     isolate_config_dir();
     let model = playing_daemon();
@@ -1265,6 +1279,7 @@ async fn dropping_the_manager_retires_persistence_and_closes_the_relay() {
 /// superseded by Stop must never write Stop/Play/Seek once the reply is released: the write
 /// admission fence sits inside the conversation lease, after every await.
 #[tokio::test]
+#[serial_test::serial(hqp_output_config)]
 async fn a_select_held_inside_the_native_conversation_never_writes_after_stop() {
     let model = playing_daemon();
     let gate = ReplyGate::new("State");
@@ -1343,6 +1358,7 @@ async fn a_select_held_inside_the_native_conversation_never_writes_after_stop() 
 /// Finding 22: an already-expired hook deadline or a cancelled token produces zero native writes,
 /// even though the future is immediately ready.
 #[tokio::test]
+#[serial_test::serial(hqp_output_config)]
 async fn expired_or_cancelled_hooks_never_write() {
     use unified_hifi_control::adapters::hqplayer::naa_relay::{NativeHookFence, NativeHookOutcome};
     let model = playing_daemon();
@@ -1416,6 +1432,7 @@ async fn expired_or_cancelled_hooks_never_write() {
 /// (Before the fix the fence was checked before those awaits, so this release would have written
 /// Play.) Also exercised with the connection slot and the state lock held across the cancel.
 #[tokio::test]
+#[serial_test::serial(hqp_output_config)]
 async fn a_hook_cancelled_between_the_pre_write_awaits_and_admission_never_writes() {
     use unified_hifi_control::adapters::hqplayer::naa_relay::{NativeHookFence, NativeHookOutcome};
     let model = playing_daemon();
@@ -2151,6 +2168,7 @@ fn posted_value<'a>(fields: &'a [(String, String)], name: &str) -> Option<&'a st
 /// restores the raw persistent bytes second. No XML, attribute map or credential ever appears in a
 /// request parameter or an operation record.
 #[tokio::test]
+#[serial_test::serial(hqp_output_config)]
 async fn setup_preview_apply_readback_and_rollback_through_the_credential_owner() {
     let model = playing_daemon();
     let daemon = WireServer::start(Arc::new(model.clone()), WirePolicy::default()).await;
@@ -2390,6 +2408,7 @@ async fn setup_preview_apply_readback_and_rollback_through_the_credential_owner(
 /// HQPlayer has not discovered the relay: the preview reports a blocker and apply is refused
 /// instead of inventing an option.
 #[tokio::test]
+#[serial_test::serial(hqp_output_config)]
 async fn setup_preview_reports_a_blocker_when_hqplayer_has_not_discovered_the_relay() {
     let model = playing_daemon();
     let daemon = WireServer::start(Arc::new(model.clone()), WirePolicy::default()).await;
@@ -2425,6 +2444,7 @@ async fn setup_preview_reports_a_blocker_when_hqplayer_has_not_discovered_the_re
 /// Apply is bound to the successful controls the preview read: a running form that changed since
 /// (an operator edit or a profile load) is refused under the lease before any post.
 #[tokio::test]
+#[serial_test::serial(hqp_output_config)]
 async fn setup_apply_is_refused_when_the_running_form_changed_since_the_preview() {
     let model = playing_daemon();
     let daemon = WireServer::start(Arc::new(model.clone()), WirePolicy::default()).await;
@@ -2464,6 +2484,7 @@ async fn setup_apply_is_refused_when_the_running_form_changed_since_the_preview(
 /// posts. Two transactions armed in turn keep their identities: the older one's cleanup never
 /// clears the newer one's, whether or not the newer one was itself cancelled.
 #[tokio::test]
+#[serial_test::serial(hqp_output_config)]
 async fn superseded_setup_transactions_never_post_and_never_clear_a_newer_one() {
     let model = playing_daemon();
     let daemon = WireServer::start(Arc::new(model.clone()), WirePolicy::default()).await;
@@ -2549,6 +2570,7 @@ async fn superseded_setup_transactions_never_post_and_never_clear_a_newer_one() 
 /// Finding 29: with the native connection or the adapter state lock held, a hook with a short
 /// deadline returns "not attempted" within its bound while the lock is STILL held.
 #[tokio::test]
+#[serial_test::serial(hqp_output_config)]
 async fn native_hooks_return_within_their_deadline_while_a_lock_is_still_held() {
     use unified_hifi_control::adapters::hqplayer::naa_relay::{NativeHookFence, NativeHookOutcome};
     let model = playing_daemon();
