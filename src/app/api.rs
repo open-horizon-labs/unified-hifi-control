@@ -1739,8 +1739,9 @@ pub async fn fetch_json<T: for<'de> Deserialize<'de>>(_url: &str) -> Result<T, S
 
 /// POST JSON to a URL (client-side only)
 #[cfg(target_arch = "wasm32")]
-pub async fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
+async fn request_json<T: Serialize, R: for<'de> Deserialize<'de>>(
     url: &str,
+    method: &str,
     body: &T,
 ) -> Result<R, String> {
     use wasm_bindgen::JsCast;
@@ -1768,7 +1769,7 @@ pub async fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
     let body_str = serde_json::to_string(body).map_err(|e| e.to_string())?;
 
     let opts = RequestInit::new();
-    opts.set_method("POST");
+    opts.set_method(method);
     opts.set_headers(&headers);
     opts.set_body(&wasm_bindgen::JsValue::from_str(&body_str));
 
@@ -1795,11 +1796,23 @@ pub async fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
 
 /// SSR stub - returns error (should not be called during SSR)
 #[cfg(not(target_arch = "wasm32"))]
-pub async fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
+async fn request_json<T: Serialize, R: for<'de> Deserialize<'de>>(
     _url: &str,
+    _method: &str,
     _body: &T,
 ) -> Result<R, String> {
     Err("post_json is only available in browser".to_string())
+}
+
+pub async fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
+    url: &str,
+    body: &T,
+) -> Result<R, String> {
+    request_json(url, "POST", body).await
+}
+
+pub async fn delete_json<R: for<'de> Deserialize<'de>>(url: &str) -> Result<R, String> {
+    request_json(url, "DELETE", &serde_json::json!({})).await
 }
 
 /// POST JSON without expecting response body

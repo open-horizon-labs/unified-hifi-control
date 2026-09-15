@@ -27,7 +27,6 @@ src/api/mod.rs|get_image_with_source_limit|direct-field-access|roon
 src/api/mod.rs|hqp_add_instance_handler|direct-field-access|hqp_instances
 src/api/mod.rs|hqp_config_handler|direct-field-access|hqplayer
 src/api/mod.rs|hqp_configure_handler|direct-field-access|hqp_instances
-src/api/mod.rs|hqp_configure_handler|direct-field-access|hqplayer
 src/api/mod.rs|hqp_instance_matrix_profiles_handler|direct-field-access|hqp_instances
 src/api/mod.rs|hqp_instance_profiles_handler|direct-field-access|hqp_instances
 src/api/mod.rs|hqp_instances_handler|direct-field-access|hqp_instances

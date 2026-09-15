@@ -10121,6 +10121,7 @@ pub struct HqpInstanceInfo {
     pub name: String,
     pub host: Option<String>,
     pub port: u16,
+    pub web_port: u16,
     pub connected: bool,
     pub info: Option<HqpInfo>,
 }
@@ -10481,8 +10482,10 @@ impl HqpInstanceManager {
         let mut result = Vec::new();
         for (name, adapter) in adapters {
             let status = adapter.get_status().await;
+            let web_port = adapter.state.read().await.web_port;
             result.push(HqpInstanceInfo {
                 name,
+                web_port,
                 host: status.host,
                 port: status.port,
                 connected: status.connected,
@@ -10514,6 +10517,51 @@ impl HqpInstanceManager {
             self.start_worker(name, adapter.clone()).await;
         }
         adapter
+    }
+
+    /// Configure a user-supplied endpoint without creating a second owner for it.
+    /// The duplicate check and mutation share the lifecycle lock, including concurrent requests.
+    pub async fn configure_unique_instance(
+        &self,
+        name: String,
+        host: String,
+        port: Option<u16>,
+        web_port: Option<u16>,
+        username: Option<String>,
+        password: Option<String>,
+    ) -> Result<Arc<HqpAdapter>> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        let normalize = |host: &str| {
+            host.trim()
+                .trim_end_matches('.')
+                .trim_matches(['[', ']'])
+                .to_ascii_lowercase()
+        };
+        let requested = normalize(&host);
+        let port = port.unwrap_or(DEFAULT_PORT);
+        for existing in self.list_instances().await {
+            if existing.name != name
+                && existing.port == port
+                && existing
+                    .host
+                    .as_deref()
+                    .is_some_and(|h| normalize(h) == requested)
+            {
+                anyhow::bail!(
+                    "This address and port are already saved as '{}'. Edit that instance instead.",
+                    existing.name
+                );
+            }
+        }
+        let adapter = self.get_or_create_locked(&name).await;
+        adapter
+            .configure(host, Some(port), web_port, username, password)
+            .await;
+        self.save_to_config().await;
+        if self.running.load(Ordering::SeqCst) {
+            self.start_worker(name, adapter.clone()).await;
+        }
+        Ok(adapter)
     }
 
     /// Remove an instance by name

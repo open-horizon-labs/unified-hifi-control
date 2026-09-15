@@ -2769,34 +2769,40 @@ pub async fn hqp_configure_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpConfigRequest>,
 ) -> impl IntoResponse {
-    // Configure the named instance. The default name keeps the legacy adapter path intact.
-    if req.name == "default" {
-        state
-            .hqplayer
-            .configure(
-                req.host.clone(),
-                req.port,
-                req.web_port,
-                req.username.clone(),
-                req.password.clone(),
-            )
-            .await;
-    } else {
-        state
-            .hqp_instances
-            .add_instance(
-                req.name.clone(),
-                req.host.clone(),
-                req.port,
-                req.web_port,
-                req.username.clone(),
-                req.password.clone(),
-            )
-            .await;
+    let name = req.name.trim().to_string();
+    let host = req.host.trim().to_string();
+    if name.is_empty() || host.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Name and host are required".into(),
+            }),
+        )
+            .into_response();
     }
-
-    // Save to instance manager for persistence
-    state.hqp_instances.save_to_config().await;
+    let adapter = match state
+        .hqp_instances
+        .configure_unique_instance(
+            name,
+            host,
+            req.port,
+            req.web_port,
+            req.username,
+            req.password,
+        )
+        .await
+    {
+        Ok(adapter) => adapter,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: error.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    };
 
     // Same enable gesture as LMS. This used to start the lifecycle only when the
     // toggle was already on, which left "configured, connected, invisible" reachable
@@ -2825,7 +2831,7 @@ pub async fn hqp_configure_handler(
     }
 
     // Test connection by attempting to get pipeline status (this establishes connection)
-    let connected = match state.hqplayer.get_pipeline_status().await {
+    let connected = match adapter.get_pipeline_status().await {
         Ok(_) => true,
         Err(e) => {
             tracing::warn!("HQPlayer connection test failed: {}", e);
@@ -3004,37 +3010,37 @@ pub async fn hqp_add_instance_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpAddInstanceRequest>,
 ) -> impl IntoResponse {
-    if req.name.is_empty() {
+    let name = req.name.trim().to_string();
+    let host = req.host.trim().to_string();
+    if name.is_empty() || host.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "Instance name is required".to_string(),
+                error: "Name and host are required".into(),
             }),
         )
             .into_response();
     }
-
-    if req.host.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "Host is required".to_string(),
-            }),
-        )
-            .into_response();
-    }
-
-    let _adapter = state
+    if let Err(error) = state
         .hqp_instances
-        .add_instance(
-            req.name.clone(),
-            req.host.clone(),
+        .configure_unique_instance(
+            name,
+            host,
             req.port,
             req.web_port,
             req.username,
             req.password,
         )
-        .await;
+        .await
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response();
+    }
 
     // Adding an instance is the same gesture as configuring the first one.
     if let Err(error) = mark_adapter_configured(&state, "hqplayer").await {

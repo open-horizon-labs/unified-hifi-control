@@ -568,7 +568,10 @@ pub fn HqpOutputRoutingSection(instances: Vec<HqpOutputInstance>) -> Element {
     // later selection on unrelated re-renders.
     let instances_for_default = instances.clone();
     use_effect(use_reactive!(|instances_for_default| {
-        if selected_instance.peek().is_empty() {
+        if !instances_for_default
+            .iter()
+            .any(|i| i.name == *selected_instance.peek())
+        {
             if let Some(first) = instances_for_default.first() {
                 selected_instance.set(first.name.clone());
             }
@@ -585,36 +588,42 @@ pub fn HqpOutputRoutingSection(instances: Vec<HqpOutputInstance>) -> Element {
                 div {
                     h2 { class: "text-lg font-semibold", "Digital audio output" }
                     p { class: "mt-1 text-sm text-muted",
-                        "Choose which network audio destination this HQPlayer instance forwards to. Selection is verified against the live engine before this page calls it switched."
+                        "Choose an HQPlayer instance, then its NAA destination."
                     }
                     if let Some(instance) = instances.iter().find(|i| i.name == selected_instance()) {
                         {
-                            let product = instance.product.as_deref().filter(|v| !v.is_empty()).unwrap_or("HQPlayer");
-                            let version = instance.version.as_deref().filter(|v| !v.is_empty()).unwrap_or("version unknown");
+                            let product = instance
+                                .product
+                                .as_deref()
+                                .filter(|v| !v.is_empty())
+                                .unwrap_or("HQPlayer");
+                            let version = instance
+                                .version
+                                .as_deref()
+                                .filter(|v| !v.is_empty())
+                                .unwrap_or("version unknown");
                             let host = instance.host.as_deref().unwrap_or("host unknown");
                             let status = if instance.connected { "connected" } else { "offline" };
-                            rsx! { p { class: "mt-2 text-xs font-medium text-muted", "{product} {version} · {host} · {status}" } }
+                            rsx! {
+                                p { class: "mt-2 text-xs font-medium text-muted",
+                                    "{instance.name} · {product} {version} · {host} · {status}"
+                                }
+                            }
                         }
                     }
                 }
                 if instances.len() > 1 {
                     label { class: "text-sm",
-                        span { class: "sr-only", "Instance" }
+                        span { class: "block mb-1", "HQPlayer for NAA output" }
                         select {
                             class: "input",
                             value: "{selected_instance}",
                             onchange: move |evt| selected_instance.set(evt.value()),
                             for instance in instances.iter() {
                                 {
-                                    let product = instance.product.as_deref().filter(|v| !v.is_empty()).unwrap_or("HQPlayer");
-                                    let version = instance.version.as_deref().filter(|v| !v.is_empty()).unwrap_or("version unknown");
                                     let status = if instance.connected { "connected" } else { "offline" };
                                     rsx! {
-                                        option {
-                                            key: "{instance.name}",
-                                            value: "{instance.name}",
-                                            "{instance.name} — {product} {version} — {status}"
-                                        }
+                                        option { key: "{instance.name}", value: "{instance.name}", "{instance.name} — {status}" }
                                     }
                                 }
                             }
@@ -859,6 +868,8 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
     let mut error = use_signal(|| None::<String>);
 
     let mut editing_route_id = use_signal(|| None::<String>);
+    let mut pending_remove = use_signal(|| None::<String>);
+    let mut route_form_open = use_signal(|| false);
     let mut form_name = use_signal(String::new);
     let mut form_host = use_signal(String::new);
     let mut form_port = use_signal(|| Some(43210u16));
@@ -973,7 +984,7 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
         );
     };
 
-    let submit_route_form = move |_| {
+    let mut submit_route_form = move || {
         let zone_id = resolve_command_target(move || instance());
         let name = form_name();
         let host = form_host();
@@ -1027,7 +1038,7 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
     // One-time relay lifecycle configuration. Requires the usual epoch/output_revision echo
     // (RelayConfigure is a mutation), so it goes through the same shared driver — and the same
     // fenced operation tracking — as every other mutation, not a bespoke fetch.
-    let submit_relay_configure = move |_| {
+    let submit_relay_configure = move || {
         let zone_id = resolve_command_target(move || instance());
         let hqp_allow: Vec<String> = relay_hqp_allow()
             .split(',')
@@ -1222,7 +1233,9 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
     let Some(projection) = data else {
         return rsx! {
             div { class: "card p-4",
-                p { class: "text-sm text-muted", "Output routing is not available for this instance yet." }
+                p { class: "text-sm text-muted",
+                    "Output routing is not available for this instance yet."
+                }
             }
         };
     };
@@ -1230,7 +1243,9 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
     if !projection.is_well_formed() {
         return rsx! {
             div { class: "card p-4",
-                p { class: "text-sm text-muted", "The server returned an unrecognized output-routing response. Try refreshing." }
+                p { class: "text-sm text-muted",
+                    "The server returned an unrecognized output-routing response. Try refreshing."
+                }
             }
         };
     }
@@ -1267,46 +1282,45 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
 
     rsx! {
         div { class: "card p-4 sm:p-5",
-            if !projection.relay.enabled || projection.routes.is_empty() {
-                div { class: "bg-primary/5 border border-primary/30 rounded-lg p-4 mb-4",
-                    h2 { class: "text-base font-semibold m-0", "Route HQPlayer through UHC" }
-                    p { class: "text-sm mt-1 mb-3",
-                        "Set this up once. HQPlayer keeps using the HiPhi Router device; UHC handles the downstream DAC and lets you switch it without restarting HQPlayer."
-                    }
-                    ol { class: "text-sm list-decimal ml-5 space-y-1",
-                        li { "Enable the relay and save the settings below." }
-                        li { "Discover or add the NAA endpoint that owns your DAC." }
-                        li { "Select a route, then start playback in HQPlayer." }
-                    }
+            if projection.routes.is_empty() {
+                p { class: "text-sm mb-4",
+                    "Enable the relay, add an NAA destination, then select this relay in HQPlayer's output settings."
                 }
             }
             if let Some(ref err) = error() {
-                div { class: "bg-red-900/20 border border-red-500/50 rounded-lg p-3 mb-4",
+                div {
+                    role: "alert",
+                    class: "bg-red-900/20 border border-red-500/50 rounded-lg p-3 mb-4",
                     p { class: "text-red-400 m-0 text-sm", "{err}" }
                 }
             }
 
             match availability {
-                Some(crate::app::api::HqpOutputAvailability::Unavailable { reason, .. }) => rsx! {
-                    div { class: "bg-amber-900/20 border border-amber-500/50 rounded-lg p-3 mb-4",
-                        p { class: "text-amber-400 m-0 text-sm", "{unavailable_banner_text(reason)}" }
+                Some(crate::app::api::HqpOutputAvailability::Unavailable { reason, .. }) => {
+                    rsx! {
+                        div { class: "bg-amber-900/20 border border-amber-500/50 rounded-lg p-3 mb-4",
+                            p { class: "text-amber-400 m-0 text-sm", "{unavailable_banner_text(reason)}" }
+                        }
                     }
-                },
+                }
                 Some(crate::app::api::HqpOutputAvailability::Disabled) => rsx! {
                     div { class: "bg-slate-900/20 border border-slate-500/50 rounded-lg p-3 mb-4",
-                        p { class: "text-muted m-0 text-sm", "The managed relay is disabled for this instance. Enable it in setup to route audio." }
+                        p { class: "text-muted m-0 text-sm", "Relay off. Open Relay settings to enable it." }
                     }
                 },
                 Some(crate::app::api::HqpOutputAvailability::Available) => rsx! {},
                 None => rsx! {
                     div { class: "bg-amber-900/20 border border-amber-500/50 rounded-lg p-3 mb-4",
-                        p { class: "text-amber-400 m-0 text-sm", "Relay availability is unknown from this response. Try refreshing." }
+                        p { class: "text-amber-400 m-0 text-sm",
+                            "Relay availability is unknown from this response. Try refreshing."
+                        }
                     }
                 },
             }
 
             div { class: "flex flex-wrap items-center gap-3 mb-4",
                 span {
+                    role: "status",
                     class: if audio_confirmed { "status-ok" } else { "text-muted" },
                     "{status_text}"
                 }
@@ -1326,111 +1340,152 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                     class: "btn btn-ghost btn-sm",
                     disabled: stop_disabled,
                     onclick: stop,
-                    "Stop"
+                    "Stop relay"
                 }
             }
 
             if let Some(selected_id) = projection.selected_route_id.as_ref() {
-                if let Some(selected) = projection.routes.iter().find(|route| &route.route_id == selected_id) {
+                if let Some(selected) = projection
+                    .routes
+                    .iter()
+                    .find(|route| &route.route_id == selected_id)
+                {
                     div { class: "rounded-lg border border-primary/40 bg-primary/5 p-3 mb-4",
-                        p { class: "text-xs text-muted m-0", "Current output" }
+                        p { class: "text-xs text-muted m-0", "Selected destination" }
                         p { class: "font-medium m-0 mt-1", "{selected.name}" }
                         p { class: "text-sm text-muted m-0", "{selected.host}:{selected.port}" }
                         if let Some(device) = selected.device_id.as_ref() {
                             p { class: "text-xs text-muted m-0 mt-1", "DAC: {device}" }
                         }
-                        p { class: "text-xs m-0 mt-2", if audio_confirmed { "Audio confirmed at the relay." } else { "Selection saved; audio has not been confirmed yet." } }
+                        p { role: "status", class: "text-sm m-0 mt-2",
+                            if !projection.relay.enabled {
+                                "Relay off. This destination is saved but is not receiving audio through this relay."
+                            } else if audio_confirmed {
+                                "Audio confirmed at the relay."
+                            } else {
+                                "Selection saved; audio has not been confirmed yet."
+                            }
+                        }
                     }
                 }
             }
 
-            div { class: "mb-4 border-b border-subtle pb-4",
-                h3 { class: "text-sm font-semibold mb-2", "1. Connect HQPlayer to UHC" }
+            details {
+                class: "mb-4 border-b border-subtle pb-4",
+                open: !projection.relay.enabled,
+                summary { class: "text-sm font-semibold mb-2 cursor-pointer", "Relay settings" }
                 p { class: "text-xs text-muted mb-2",
-                    "HQPlayer selects this relay once. UHC then forwards the authentication handshake, control messages, and audio to the route you choose below. PCM and DSD stay unchanged; NAA6 track metadata can be updated for the selected zone. Switching routes does not edit an HQPlayer profile or restart HQPlayer."
+                    "Select this relay as HQPlayer's NAA output. It forwards audio to the destination below without changing PCM or DSD samples."
                 }
-                div { class: "grid grid-cols-1 sm:grid-cols-2 gap-3",
-                    label { class: "flex items-center gap-2 text-sm",
-                        input {
-                            r#type: "checkbox",
-                            checked: relay_enabled(),
-                            onchange: move |evt| {
-                                relay_form_dirty.set(true);
-                                relay_enabled.set(evt.checked());
-                            },
+                form {
+                    onsubmit: move |evt| {
+                        evt.prevent_default();
+                        submit_relay_configure();
+                    },
+                    div { class: "grid grid-cols-1 sm:grid-cols-2 gap-3",
+                        label { class: "flex items-center gap-2 text-sm",
+                            input {
+                                r#type: "checkbox",
+                                disabled: is_busy,
+                                checked: relay_enabled(),
+                                onchange: move |evt| {
+                                    relay_form_dirty.set(true);
+                                    relay_enabled.set(evt.checked());
+                                },
+                            }
+                            "Enabled"
                         }
-                        "Enabled"
+                        label { class: "block text-sm",
+                            span { class: "block mb-1", "Listen address and port" }
+                            input {
+                                class: "input",
+                                disabled: is_busy,
+                                r#type: "text",
+                                placeholder: "Bind address, e.g. 127.0.0.1:43210",
+                                value: "{relay_bind}",
+                                oninput: move |evt| {
+                                    relay_form_dirty.set(true);
+                                    relay_bind.set(evt.value());
+                                },
+                            }
+                        }
+                        label { class: "block text-sm",
+                            span { class: "block mb-1", "Allowed HQPlayer IPs (optional)" }
+                            input {
+                                class: "input",
+                                disabled: is_busy,
+                                r#type: "text",
+                                placeholder: "Allowed HQPlayer IPs, comma-separated (optional)",
+                                value: "{relay_hqp_allow}",
+                                oninput: move |evt| {
+                                    relay_form_dirty.set(true);
+                                    relay_hqp_allow.set(evt.value());
+                                },
+                            }
+                        }
+                        label { class: "block text-sm",
+                            span { class: "block mb-1", "LAN IPv4 address for discovery (optional)" }
+                            input {
+                                class: "input",
+                                disabled: is_busy,
+                                r#type: "text",
+                                placeholder: "Discovery interface IPv4 (optional; blank disables discovery)",
+                                value: "{relay_discovery_interface}",
+                                oninput: move |evt| {
+                                    relay_form_dirty.set(true);
+                                    relay_discovery_interface.set(evt.value());
+                                },
+                            }
+                        }
+                        label { class: "block",
+                            span { class: "block text-xs text-muted mb-1", "Discovery UDP port" }
+                            input {
+                                class: "input",
+                                r#type: "number",
+                                placeholder: "43210",
+                                disabled: is_busy,
+                                min: "1",
+                                max: "65535",
+                                required: true,
+                                value: "{relay_discovery_port}",
+                                oninput: move |evt| {
+                                    relay_form_dirty.set(true);
+                                    if let Ok(port) = evt.value().parse() {
+                                        relay_discovery_port.set(port);
+                                    }
+                                },
+                            }
+                        }
                     }
-                    input {
-                        class: "input",
-                        r#type: "text",
-                        placeholder: "Bind address, e.g. 127.0.0.1:43210",
-                        value: "{relay_bind}",
-                        oninput: move |evt| {
-                            relay_form_dirty.set(true);
-                            relay_bind.set(evt.value());
-                        },
+                    if discovery_responder_unsupported(
+                        projection.relay.discovery_interface.as_deref(),
+                        projection.relay.discovery_responder.as_deref(),
+                    )
+                    {
+                        div { class: "bg-amber-900/20 border border-amber-500/50 rounded-lg p-3 mt-2",
+                            p { class: "text-amber-400 m-0 text-sm",
+                                "Discovery is configured on this interface, but the responder failed to bind — HQPlayer cannot discover this relay. Check the interface address and try saving again."
+                            }
+                        }
                     }
-                    input {
-                        class: "input",
-                        r#type: "text",
-                        placeholder: "Allowed HQPlayer IPs, comma-separated (optional)",
-                        value: "{relay_hqp_allow}",
-                        oninput: move |evt| {
-                            relay_form_dirty.set(true);
-                            relay_hqp_allow.set(evt.value());
-                        },
-                    }
-                    input {
-                        class: "input",
-                        r#type: "text",
-                        placeholder: "Discovery interface IPv4 (optional; blank disables discovery)",
-                        value: "{relay_discovery_interface}",
-                        oninput: move |evt| {
-                            relay_form_dirty.set(true);
-                            relay_discovery_interface.set(evt.value());
-                        },
-                    }
-                    label { class: "block",
-                        span { class: "block text-xs text-muted mb-1", "Discovery UDP port" }
-                        input {
-                            class: "input",
-                            r#type: "number",
-                            placeholder: "43210",
-                            value: "{relay_discovery_port}",
-                            oninput: move |evt| {
-                                relay_form_dirty.set(true);
-                                if let Ok(port) = evt.value().parse() {
-                                    relay_discovery_port.set(port);
-                                }
-                            },
+                    div { class: "mt-3",
+                        button {
+                            class: "btn btn-primary btn-sm",
+                            disabled: is_busy,
+                            r#type: "submit",
+                            "Save relay configuration"
                         }
                     }
                 }
-                if discovery_responder_unsupported(
-                    projection.relay.discovery_interface.as_deref(),
-                    projection.relay.discovery_responder.as_deref(),
-                ) {
-                    div { class: "bg-amber-900/20 border border-amber-500/50 rounded-lg p-3 mt-2",
-                        p { class: "text-amber-400 m-0 text-sm",
-                            "Discovery is configured on this interface, but the responder failed to bind — \"Discover devices\" above will not find this instance from HQPlayer. Check the interface address and try saving again."
-                        }
-                    }
-                }
-                div { class: "mt-3",
-                    button {
-                        class: "btn btn-primary btn-sm",
-                        disabled: is_busy,
-                        onclick: submit_relay_configure,
-                        "Save relay configuration"
-                    }
-                }
+
             }
 
             div { class: "mb-4",
-                h3 { class: "text-sm font-semibold mb-2", "2. Choose a DAC route" }
+                h3 { class: "text-sm font-semibold mb-2", "NAA destinations" }
                 if projection.routes.is_empty() {
-                    p { class: "text-sm text-muted", "No routes configured yet. Add a discovered NAA endpoint or enter one below." }
+                    p { class: "text-sm text-muted",
+                        "No destinations saved. Discover NAA hosts or add one by address."
+                    }
                 } else {
                     ul { class: "space-y-2",
                         for route in projection.routes.iter() {
@@ -1439,7 +1494,9 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                                 let route_id_select = route_id.clone();
                                 let route_id_edit = route_id.clone();
                                 let route_id_remove = route_id.clone();
-                                let is_selected = projection.selected_route_id.as_deref() == Some(route.route_id.as_str());
+                                let is_selected = projection.selected_route_id.as_deref()
+
+                                    == Some(route.route_id.as_str());
                                 let route_name = route.name.clone();
                                 let route_host = route.host.clone();
                                 let route_port = route.port;
@@ -1447,17 +1504,20 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                                 rsx! {
                                     li {
                                         key: "{route.route_id}",
-                                        class: if is_selected { "flex items-center justify-between gap-3 rounded-lg border border-primary/50 bg-primary/5 p-3" } else { "flex items-center justify-between gap-3 rounded-lg border border-subtle p-3" },
+                                        class: if is_selected { "flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-lg border border-primary/50 bg-primary/5 p-3" } else { "flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-lg border border-subtle p-3" },
                                         div { class: "min-w-0",
                                             p { class: "text-sm font-medium truncate",
                                                 "{route.name}"
-                                                if is_selected { span { class: "badge badge-secondary ml-2", "Selected" } }
+                                                if is_selected {
+                                                    span { class: "badge badge-secondary ml-2", "Selected" }
+                                                }
                                             }
                                             p { class: "text-xs text-muted truncate", "{route.host}:{route.port}" }
                                         }
-                                        div { class: "flex items-center gap-2 shrink-0",
+                                        div { class: "flex flex-wrap items-center gap-2 shrink-0",
                                             button {
-                                                class: "btn btn-primary btn-sm",
+                                                class: "btn btn-secondary btn-sm",
+                                                aria_label: "Select {route.name}",
                                                 disabled: is_busy || is_selected,
                                                 onclick: move |_| {
                                                     let zone_id = resolve_command_target(move || instance());
@@ -1465,17 +1525,33 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                                                     let request = build_command(
                                                         zone_id,
                                                         Some(new_correlation_id("select")),
-                                                        HqpOutputAction::Select { route_id: route_id_select.clone() },
+                                                        HqpOutputAction::Select {
+                                                            route_id: route_id_select.clone(),
+                                                        },
                                                         projection.as_ref(),
                                                     );
-                                                    run_output_command(request, mutation_fence, read_fence, error, busy, outputs, loaded_once, current_operation_id, polled_operation, false, |_operation| {});
+                                                    run_output_command(
+                                                        request,
+                                                        mutation_fence,
+                                                        read_fence,
+                                                        error,
+                                                        busy,
+                                                        outputs,
+                                                        loaded_once,
+                                                        current_operation_id,
+                                                        polled_operation,
+                                                        false,
+                                                        |_operation| {},
+                                                    );
                                                 },
                                                 "Select"
                                             }
                                             button {
                                                 class: "btn btn-ghost btn-sm",
                                                 disabled: is_busy,
+                                                aria_label: "Edit {route.name}",
                                                 onclick: move |_| {
+                                                    route_form_open.set(true);
                                                     editing_route_id.set(Some(route_id_edit.clone()));
                                                     form_name.set(route_name.clone());
                                                     form_host.set(route_host.clone());
@@ -1488,18 +1564,50 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                                                 class: "btn btn-ghost btn-sm",
                                                 disabled: is_busy,
                                                 onclick: move |_| {
+                                                    if pending_remove().as_deref() != Some(route_id_remove.as_str()) {
+                                                        pending_remove.set(Some(route_id_remove.clone()));
+                                                        return;
+                                                    }
+                                                    pending_remove.set(None);
                                                     let zone_id = resolve_command_target(move || instance());
                                                     let projection = outputs();
                                                     let request = build_command(
                                                         zone_id,
                                                         Some(new_correlation_id("route-remove")),
-                                                        HqpOutputAction::RouteRemove { route_id: route_id_remove.clone() },
+                                                        HqpOutputAction::RouteRemove {
+                                                            route_id: route_id_remove.clone(),
+                                                        },
                                                         projection.as_ref(),
                                                     );
-                                                    run_output_command(request, mutation_fence, read_fence, error, busy, outputs, loaded_once, current_operation_id, polled_operation, false, |_operation| {});
+                                                    run_output_command(
+                                                        request,
+                                                        mutation_fence,
+                                                        read_fence,
+                                                        error,
+                                                        busy,
+                                                        outputs,
+                                                        loaded_once,
+                                                        current_operation_id,
+                                                        polled_operation,
+                                                        false,
+                                                        |_operation| {},
+                                                    );
                                                 },
-                                                "Remove"
+                                                if pending_remove().as_deref() == Some(route.route_id.as_str()) {
+                                                    "Remove {route.name}?"
+                                                } else {
+                                                    "Remove"
+                                                }
                                             }
+                                            if pending_remove().as_deref() == Some(route.route_id.as_str()) {
+                                                button {
+                                                    class: "btn btn-ghost btn-sm",
+                                                    onclick: move |_| pending_remove.set(None),
+                                                    "Cancel"
+                                                }
+                                            }
+
+
                                         }
                                     }
                                 }
@@ -1509,109 +1617,154 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                 }
             }
 
-            div { class: "mb-4",
-                h3 { class: "text-sm font-semibold mb-2",
-                    if editing_route_id().is_some() { "Edit route" } else { "Add a route" }
+            details {
+                class: "mb-4",
+                open: route_form_open() || projection.routes.is_empty(),
+                summary { class: "text-sm font-semibold mb-2 cursor-pointer",
+                    if editing_route_id().is_some() {
+                        "Edit destination"
+                    } else {
+                        "Add destination"
+                    }
                 }
-                div { class: "grid grid-cols-1 sm:grid-cols-2 gap-3",
-                    input {
-                        class: "input",
-                        r#type: "text",
-                        placeholder: "Name",
-                        value: "{form_name}",
-                        oninput: move |evt| form_name.set(evt.value()),
-                    }
-                    input {
-                        class: "input",
-                        r#type: "text",
-                        placeholder: "Host",
-                        value: "{form_host}",
-                        // Changing the host invalidates whatever device id was picked for the
-                        // *previous* host — device ids are only meaningful scoped to their own
-                        // host+port, so leaving the old value in place risks silently submitting
-                        // a stale, invisible DAC id from a different endpoint.
-                        oninput: move |evt| {
-                            form_host.set(evt.value());
-                            form_device.set(String::new());
-                        },
-                    }
-                    input {
-                        class: "input",
-                        r#type: "number",
-                        placeholder: "Port (defaults to 43210)",
-                        value: "{form_port().map(|p| p.to_string()).unwrap_or_default()}",
-                        // Same reasoning as the host handler above: the effective endpoint changed,
-                        // so any previously-picked device id no longer applies.
-                        oninput: move |evt| {
-                            form_port.set(evt.value().parse().ok());
-                            form_device.set(String::new());
-                        },
-                    }
-                    {
-                        // Per-host+port DAC picker: once this exact endpoint has been enumerated
-                        // through a relayed session, offer its actual observed devices instead of
-                        // a free-text field — device ids are only meaningful scoped to their own
-                        // host+port (the same id can exist on two different endpoints). Uses
-                        // `effective_port` (not the raw, possibly-blank `form_port()`) so a blank
-                        // port field — which the backend defaults to 43210 on submit — looks up
-                        // the observation for that same real, effective port rather than always
-                        // reporting "no observation" whenever the field happens to be empty.
-                        let host = form_host();
-                        let port = effective_port(form_port());
-                        let observed_devices = projection
-                            .dac_observations
-                            .iter()
-                            .find(|obs| obs.host == host && obs.port == port);
-                        match observed_devices {
-                            Some(observation) if !observation.devices.is_empty() => rsx! {
-                                select {
-                                    class: "input",
-                                    value: "{form_device}",
-                                    onchange: move |evt| form_device.set(evt.value()),
-                                    option { value: "", "(resolve automatically)" }
-                                    for device in observation.devices.iter() {
-                                        option {
-                                            key: "{device.id}",
-                                            value: "{device.id}",
-                                            selected: form_device() == device.id,
-                                            "{device.id} — {device.description}"
+                form {
+                    onsubmit: move |evt| {
+                        evt.prevent_default();
+                        submit_route_form();
+                    },
+                    div { class: "grid grid-cols-1 sm:grid-cols-2 gap-3",
+                        label { class: "block text-sm",
+                            span { class: "block mb-1", "Destination name" }
+                            input {
+                                class: "input",
+                                disabled: is_busy,
+                                r#type: "text",
+                                required: true,
+                                placeholder: "Name",
+                                value: "{form_name}",
+                                oninput: move |evt| form_name.set(evt.value()),
+                            }
+                        }
+                        label { class: "block text-sm",
+                            span { class: "block mb-1", "NAA host" }
+                            input {
+                                class: "input",
+                                disabled: is_busy,
+                                r#type: "text",
+                                required: true,
+                                placeholder: "Host",
+                                value: "{form_host}",
+                                // Changing the host invalidates whatever device id was picked for the
+                                // *previous* host — device ids are only meaningful scoped to their own
+                                // host+port, so leaving the old value in place risks silently submitting
+                                // a stale, invisible DAC id from a different endpoint.
+                                oninput: move |evt| {
+                                    form_host.set(evt.value());
+                                    form_device.set(String::new());
+                                },
+                            }
+                        }
+                        label { class: "block text-sm",
+                            span { class: "block mb-1", "NAA port" }
+                            input {
+                                class: "input",
+                                disabled: is_busy,
+                                r#type: "number",
+                                min: "1",
+                                max: "65535",
+                                placeholder: "Port (defaults to 43210)",
+                                value: "{form_port().map(|p| p.to_string()).unwrap_or_default()}",
+                                // Same reasoning as the host handler above: the effective endpoint changed,
+                                // so any previously-picked device id no longer applies.
+                                oninput: move |evt| {
+                                    form_port.set(evt.value().parse().ok());
+                                    form_device.set(String::new());
+                                },
+                            }
+                        }
+                        {
+                            // Per-host+port DAC picker: once this exact endpoint has been enumerated
+                            // through a relayed session, offer its actual observed devices instead of
+                            // a free-text field — device ids are only meaningful scoped to their own
+                            // host+port (the same id can exist on two different endpoints). Uses
+                            // `effective_port` (not the raw, possibly-blank `form_port()`) so a blank
+                            // port field — which the backend defaults to 43210 on submit — looks up
+                            // the observation for that same real, effective port rather than always
+                            // reporting "no observation" whenever the field happens to be empty.
+                            let host = form_host();
+                            let port = effective_port(form_port());
+                            let observed_devices = projection
+                                .dac_observations
+                                .iter()
+                                .find(|obs| obs.host == host && obs.port == port);
+                            match observed_devices {
+                                Some(observation) if !observation.devices.is_empty() => rsx! {
+                                    label { class: "block text-sm",
+                                        span { class: "block mb-1", "DAC" }
+                                        select {
+                                            class: "input",
+                                            disabled: is_busy,
+                                            aria_label: "DAC",
+                                            value: "{form_device}",
+                                            onchange: move |evt| form_device.set(evt.value()),
+                                            option { value: "", "(resolve automatically)" }
+                                            for device in observation.devices.iter() {
+                                                option {
+                                                    key: "{device.id}",
+                                                    value: "{device.id}",
+                                                    selected: form_device() == device.id,
+                                                    "{device.id} — {device.description}"
+                                                }
+                                            }
                                         }
                                     }
-                                }
-                            },
-                            _ => rsx! {
-                                input {
-                                    class: "input",
-                                    r#type: "text",
-                                    placeholder: "Device id (optional; resolves the endpoint's sole output when blank)",
-                                    value: "{form_device}",
-                                    oninput: move |evt| form_device.set(evt.value()),
-                                }
-                            },
+                                },
+                                _ => rsx! {
+                                    label { class: "block text-sm",
+                                        span { class: "block mb-1", "DAC ID (optional)" }
+                                        input {
+                                            disabled: is_busy,
+                                            class: "input",
+                                            r#type: "text",
+                                            placeholder: "Blank selects the only attached DAC",
+                                            value: "{form_device}",
+                                            oninput: move |evt| form_device.set(evt.value()),
+                                        }
+                                    }
+                                },
+                            }
                         }
                     }
-                }
-                div { class: "flex items-center gap-2 mt-3",
-                    button {
-                        class: "btn btn-primary btn-sm",
-                        disabled: is_busy || form_name().trim().is_empty() || form_host().trim().is_empty(),
-                        onclick: submit_route_form,
-                        if editing_route_id().is_some() { "Save changes" } else { "Add route" }
-                    }
-                    if editing_route_id().is_some() {
+                    div { class: "flex items-center gap-2 mt-3",
                         button {
-                            class: "btn btn-ghost btn-sm",
-                            onclick: move |_| {
-                                editing_route_id.set(None);
-                                form_name.set(String::new());
-                                form_host.set(String::new());
-                                form_port.set(Some(43210));
-                                form_device.set(String::new());
-                            },
-                            "Cancel"
+                            class: "btn btn-primary btn-sm",
+                            disabled: is_busy || form_name().trim().is_empty() || form_host().trim().is_empty(),
+                            r#type: "submit",
+                            if editing_route_id().is_some() {
+                                "Save changes"
+                            } else {
+                                "Add destination"
+                            }
+                        }
+                        if editing_route_id().is_some() {
+                            button {
+                                class: "btn btn-ghost btn-sm",
+                                r#type: "button",
+                                disabled: is_busy,
+                                onclick: move |_| {
+                                    route_form_open.set(false);
+                                    editing_route_id.set(None);
+                                    form_name.set(String::new());
+                                    form_host.set(String::new());
+                                    form_port.set(Some(43210));
+                                    form_device.set(String::new());
+                                },
+                                "Cancel"
+                            }
                         }
                     }
                 }
+
             }
 
             div { class: "mb-4",
@@ -1654,15 +1807,16 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                                             button {
                                                 class: "btn btn-ghost btn-sm shrink-0",
                                                 disabled: is_busy,
-                                                title: "Fill in the route form below with this host — pick a different device id for a second DAC on the same endpoint",
+                                                title: "Fill in the destination form with this host — pick a different device id for a second DAC on the same endpoint",
                                                 onclick: move |_| {
                                                     editing_route_id.set(None);
+                                                    route_form_open.set(true);
                                                     form_name.set(endpoint_name.clone());
                                                     form_host.set(endpoint_host.clone());
                                                     form_port.set(Some(endpoint_port));
                                                     form_device.set(String::new());
                                                 },
-                                                "Add as route"
+                                                "Use this host"
                                             }
                                         }
                                     }
@@ -1674,24 +1828,38 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
             }
 
             details { class: "mb-4",
-                summary { class: "text-sm font-semibold cursor-pointer", "Inspect discovered hosts and DACs" }
+                summary { class: "text-sm font-semibold cursor-pointer",
+                    "Inspect discovered hosts and DACs"
+                }
                 p { class: "text-xs text-muted mb-2",
                     "Per endpoint (host:port), from the last relayed authenticated session. An endpoint with no entry here has never been enumerated — that is different from one that enumerated zero outputs."
                 }
                 if projection.dac_observations.is_empty() {
-                    p { class: "text-sm text-muted", "No endpoint has been enumerated yet. Select a route to establish a relayed session." }
+                    p { class: "text-sm text-muted",
+                        "No endpoint has been enumerated yet. Select a route to establish a relayed session."
+                    }
                 } else {
                     ul { class: "space-y-2",
                         for observation in projection.dac_observations.iter() {
-                            li { key: "{observation.host}:{observation.port}", class: "text-sm",
+                            li {
+                                key: "{observation.host}:{observation.port}",
+                                class: "text-sm",
                                 p { class: "font-medium", "{observation.host}:{observation.port}" }
-                                p { class: "text-xs text-muted", "last seen {observation.observed_at}" }
+                                p { class: "text-xs text-muted",
+                                    "Observed during relay session {observation.session_id}"
+                                }
                                 if observation.devices.is_empty() {
-                                    p { class: "text-xs text-muted", "This endpoint reported zero outputs." }
+                                    p { class: "text-xs text-muted",
+                                        "This endpoint reported zero outputs."
+                                    }
                                 } else {
                                     ul { class: "ml-4 list-disc",
                                         for device in observation.devices.iter() {
-                                            li { key: "{device.id}", class: "text-xs", "{device.id} — {device.description}" }
+                                            li {
+                                                key: "{device.id}",
+                                                class: "text-xs",
+                                                "{device.id} — {device.description}"
+                                            }
                                         }
                                     }
                                 }
@@ -1702,7 +1870,9 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
             }
 
             details { class: "mb-4",
-                summary { class: "text-sm font-semibold cursor-pointer", "Advanced: one-time HQPlayer setup" }
+                summary { class: "text-sm font-semibold cursor-pointer",
+                    "Advanced: one-time HQPlayer setup"
+                }
                 p { class: "text-xs text-muted mb-2",
                     "Derives the proposed <output> change from this relay's own configuration and HQPlayer's current backup. Preview never uploads anything; a prior applied change can be rolled back to what was there before."
                 }
@@ -1727,12 +1897,16 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                                 "Not applicable: {preview.blocker.clone().unwrap_or_else(|| \"unknown reason\".to_string())}"
                             }
                         } else if preview.changes.is_empty() {
-                            p { class: "text-muted m-0", "No changes needed — the current configuration already matches." }
+                            p { class: "text-muted m-0",
+                                "No changes needed — the current configuration already matches."
+                            }
                         } else {
                             p { class: "font-medium mb-1", "Proposed changes" }
                             ul { class: "list-disc ml-4",
                                 for change in preview.changes.iter() {
-                                    li { key: "{change.attribute}", class: "text-xs",
+                                    li {
+                                        key: "{change.attribute}",
+                                        class: "text-xs",
                                         "{change.attribute}: {change.from.clone().unwrap_or_else(|| \"(unset)\".to_string())} → {change.to}"
                                     }
                                 }
@@ -1748,14 +1922,21 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                 }
                 if let Some(transaction) = setup_transaction() {
                     div { class: "text-sm border border-subtle rounded-lg p-3",
-                        p { class: "m-0", "Step: {transaction.step} — uploaded: {transaction.uploaded}" }
+                        p { class: "m-0",
+                            "Step: {transaction.step} — uploaded: {transaction.uploaded}"
+                        }
                         if let Some(daemon_response) = transaction.daemon_response.as_ref() {
-                            p { class: "text-xs text-muted mt-1", "HQPlayer responded: {daemon_response}" }
+                            p { class: "text-xs text-muted mt-1",
+                                "HQPlayer responded: {daemon_response}"
+                            }
                         }
                         if let Some(matches) = transaction.readback_matches {
-                            p {
-                                class: if matches { "status-ok mt-1" } else { "text-red-400 mt-1" },
-                                if matches { "Readback confirms an exact byte match." } else { "Readback does NOT match — the configuration may not have applied as expected." }
+                            p { class: if matches { "status-ok mt-1" } else { "text-red-400 mt-1" },
+                                if matches {
+                                    "Readback confirms an exact byte match."
+                                } else {
+                                    "Readback does NOT match — the configuration may not have applied as expected."
+                                }
                             }
                         }
                         if transaction.rollback_available {
@@ -2854,7 +3035,11 @@ mod command_projection_guard_tests {
 
     #[tokio::test]
     async fn a_command_response_resolving_after_an_unrelated_background_refresh_still_applies() {
-        let dom = VirtualDom::new(|| rsx! { div {} });
+        let dom = VirtualDom::new(|| {
+            rsx! {
+                div {}
+            }
+        });
         let _runtime_guard = dioxus::dioxus_core::RuntimeGuard::new(dom.runtime());
         let mut mutation_fence =
             dom.in_scope(ScopeId::ROOT, || Signal::new(OutputCommandFence::default()));
@@ -2900,7 +3085,11 @@ mod command_projection_guard_tests {
 
     #[tokio::test]
     async fn a_command_response_resolving_after_a_genuinely_newer_mutation_is_rejected() {
-        let dom = VirtualDom::new(|| rsx! { div {} });
+        let dom = VirtualDom::new(|| {
+            rsx! {
+                div {}
+            }
+        });
         let _runtime_guard = dioxus::dioxus_core::RuntimeGuard::new(dom.runtime());
         // Reverse arrival order: a genuinely newer mutation B is issued (bumping mutation_fence
         // itself) before A's POST resolves. This is a real supersession, not an unrelated

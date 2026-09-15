@@ -5,8 +5,8 @@
 use dioxus::prelude::*;
 
 use crate::app::api::{
-    self, HqpConfig, HqpMatrixProfilesResponse, HqpPipeline, HqpProfile, HqpStatus, NowPlaying,
-    Zone, ZonesResponse,
+    self, HqpMatrixProfilesResponse, HqpPipeline, HqpProfile, HqpStatus, NowPlaying, Zone,
+    ZonesResponse,
 };
 use crate::app::components::{
     HqpMatrixSelect, HqpOutputInstance, HqpOutputRoutingSection, HqpProfileSelect, Layout,
@@ -50,6 +50,10 @@ struct HqpInstance {
     name: String,
     host: Option<String>,
     #[serde(default)]
+    port: u16,
+    #[serde(default)]
+    web_port: u16,
+    #[serde(default)]
     connected: bool,
     #[serde(default)]
     info: Option<HqpInstanceInfo>,
@@ -61,6 +65,126 @@ struct HqpInstanceInfo {
     product: String,
     #[serde(default)]
     version: String,
+    #[serde(default)]
+    engine: String,
+}
+
+fn hqp_version_label(info: &HqpInstanceInfo) -> String {
+    match (info.version.trim(), info.engine.trim()) {
+        ("", "") => "Version not reported".into(),
+        (version, "") => version.into(),
+        ("", engine) => format!("Engine {engine}"),
+        (version, engine) => format!("{version} · Engine {engine}"),
+    }
+}
+
+#[component]
+fn HqpInstanceRow(
+    instance: HqpInstance,
+    duplicate: bool,
+    on_removed: EventHandler<()>,
+    on_edit: EventHandler<HqpInstance>,
+) -> Element {
+    let mut confirming = use_signal(|| false);
+    let mut busy = use_signal(|| false);
+    let mut error = use_signal(|| None::<String>);
+    let product = instance
+        .info
+        .as_ref()
+        .map(|i| i.product.trim())
+        .filter(|p| !p.is_empty())
+        .unwrap_or("Type not reported");
+    let version = instance
+        .info
+        .as_ref()
+        .map(hqp_version_label)
+        .unwrap_or_else(|| "Version unavailable until connected".into());
+    let host = instance.host.as_deref().unwrap_or("No host");
+    let name = instance.name.clone();
+    let edit = instance.clone();
+    rsx! {
+        article { class: "py-4 border-b border-subtle",
+            div { class: "flex flex-wrap items-center justify-between gap-3",
+                div { class: "min-w-0",
+                    h3 { class: "font-semibold break-words", "{instance.name}" }
+                    p { class: "text-sm",
+                        "{product} {version}"
+                        if !instance.connected && instance.info.is_some() {
+                            " · Last reported"
+                        }
+                    }
+                    p { class: "text-sm text-muted break-words",
+                        "{host}:{instance.port} · "
+                        if instance.connected {
+                            "Connected"
+                        } else {
+                            "Offline"
+                        }
+                    }
+                }
+                div { class: "flex gap-2",
+                    button {
+                        aria_label: "Edit {instance.name}",
+                        class: "btn btn-ghost btn-sm",
+                        disabled: busy(),
+                        onclick: move |_| on_edit.call(edit.clone()),
+                        "Edit"
+                    }
+                    button {
+                        aria_label: "Remove {instance.name}",
+                        class: "btn btn-ghost btn-sm",
+                        disabled: busy(),
+                        onclick: move |_| confirming.set(true),
+                        "Remove"
+                    }
+                }
+            }
+            if duplicate {
+                p { class: "mt-2 text-sm", "Another saved instance uses this address and port." }
+            }
+            if confirming() {
+                div { class: "mt-3 space-y-2",
+                    p { class: "text-sm",
+                        "Remove {instance.name}? This stops its UHC relay and removes its saved connection and zone pairings."
+                    }
+                    div { class: "flex gap-2",
+                        button {
+                            class: "btn btn-primary btn-sm",
+                            disabled: busy(),
+                            onclick: move |_| {
+                                let name = name.clone();
+                                busy.set(true);
+                                error.set(None);
+                                spawn(async move {
+                                    let url = format!("/hqp/instances/{}", urlencoding::encode(&name));
+                                    match api::delete_json::<serde_json::Value>(&url).await {
+                                        Ok(_) => on_removed.call(()),
+                                        Err(e) => error.set(Some(e)),
+                                    }
+                                    busy.set(false);
+                                });
+                            },
+                            if busy() {
+                                "Removing…"
+                            } else {
+                                "Remove instance"
+                            }
+                        }
+                        button {
+                            aria_label: "Cancel removal of {instance.name}",
+                            class: "btn btn-ghost btn-sm",
+                            disabled: busy(),
+                            onclick: move |_| confirming.set(false),
+                            "Cancel"
+                        }
+                    }
+                }
+            }
+            if let Some(message) = error() {
+                p { role: "alert", class: "mt-2 text-sm", "{message}" }
+            }
+        }
+    }
 }
 
 /// Zone link request
@@ -168,15 +292,16 @@ pub fn HqPlayer() -> Element {
     let sse = use_sse();
 
     // Form fields for config
-    let instance_name = use_signal(|| "default".to_string());
+    let mut instance_name = use_signal(|| "default".to_string());
     let mut host = use_signal(String::new);
     let mut port = use_signal(|| 4321u16);
     let mut web_port = use_signal(|| 8088u16);
-    let username = use_signal(String::new);
-    let password = use_signal(String::new);
-    let mut has_credentials = use_signal(|| false);
+    let mut username = use_signal(String::new);
+    let mut password = use_signal(String::new);
     let mut config_status = use_signal(|| None::<String>);
     let mut show_config = use_signal(|| false);
+    let mut editing_instance = use_signal(|| false);
+    let mut config_busy = use_signal(|| false);
 
     // HQP state
     let mut hqp_loading = use_signal(|| false);
@@ -187,23 +312,55 @@ pub fn HqPlayer() -> Element {
     // Now playing for linked zones
     let mut now_playing_map = use_signal(std::collections::HashMap::<String, NowPlaying>::new);
 
-    // Load config resource
-    let config =
-        use_resource(|| async { api::fetch_json::<HqpConfig>("/hqplayer/config").await.ok() });
-
     // Load status resource
-    let mut status =
-        use_resource(|| async { api::fetch_json::<HqpStatus>("/hqp/status").await.ok() });
+    let mut status_error = use_signal(|| None::<String>);
+    let mut status_cache = use_signal(|| None::<HqpStatus>);
+    let mut status = use_resource(move || async move {
+        match api::fetch_json::<HqpStatus>("/hqp/status").await {
+            Ok(value) => {
+                status_error.set(None);
+                status_cache.set(Some(value.clone()));
+                Some(value)
+            }
+            Err(error) => {
+                status_error.set(Some(error.to_string()));
+                status_cache.peek().clone()
+            }
+        }
+    });
 
     // Load pipeline resource
-    let mut pipeline =
-        use_resource(|| async { api::fetch_json::<HqpPipeline>("/hqp/pipeline").await.ok() });
+    let mut pipeline_error = use_signal(|| None::<String>);
+    let mut pipeline_cache = use_signal(|| None::<HqpPipeline>);
+    let mut pipeline = use_resource(move || async move {
+        match api::fetch_json::<HqpPipeline>("/hqp/pipeline").await {
+            Ok(value) => {
+                pipeline_error.set(None);
+                pipeline_cache.set(Some(value.clone()));
+                Some(value)
+            }
+            Err(error) => {
+                pipeline_error.set(Some(error.to_string()));
+                pipeline_cache.peek().clone()
+            }
+        }
+    });
 
     // Load profiles resource
-    let mut profiles = use_resource(|| async {
-        api::fetch_json::<Vec<HqpProfile>>("/hqp/profiles")
-            .await
-            .ok()
+    let mut profiles_error = use_signal(|| None::<String>);
+    let mut profiles_cache = use_signal(|| None::<Vec<HqpProfile>>);
+    let mut profiles = use_resource(move || async move {
+        match api::fetch_json::<Vec<HqpProfile>>("/hqp/profiles").await {
+            Ok(value) => {
+                profiles_error.set(None);
+                profiles_cache.set(Some(value.clone()));
+                Some(value)
+            }
+            Err(error) => {
+                profiles_error.set(Some(error.to_string()));
+                profiles_cache.peek().clone()
+            }
+        }
     });
 
     // Advanced state is intentionally not a restartable Resource: its slow read is coalesced so
@@ -213,21 +370,54 @@ pub fn HqPlayer() -> Element {
     use_effect(move || refresh_advanced_projection(matrix, matrix_refresh, true));
 
     // Load zones resource
-    let mut zones =
-        use_resource(|| async { api::fetch_json::<ZonesResponse>("/knob/zones").await.ok() });
+    let mut zones_error = use_signal(|| None::<String>);
+    let mut zones_cache = use_signal(|| None::<ZonesResponse>);
+    let mut zones = use_resource(move || async move {
+        match api::fetch_json::<ZonesResponse>("/knob/zones").await {
+            Ok(value) => {
+                zones_error.set(None);
+                zones_cache.set(Some(value.clone()));
+                Some(value)
+            }
+            Err(error) => {
+                zones_error.set(Some(error.to_string()));
+                zones_cache.peek().clone()
+            }
+        }
+    });
 
     // Load zone links resource
-    let mut zone_links = use_resource(|| async {
-        api::fetch_json::<ZoneLinksResponse>("/hqp/zones/links")
-            .await
-            .ok()
+    let mut zone_links_error = use_signal(|| None::<String>);
+    let mut zone_links_cache = use_signal(|| None::<ZoneLinksResponse>);
+    let mut zone_links = use_resource(move || async move {
+        match api::fetch_json::<ZoneLinksResponse>("/hqp/zones/links").await {
+            Ok(value) => {
+                zone_links_error.set(None);
+                zone_links_cache.set(Some(value.clone()));
+                Some(value)
+            }
+            Err(error) => {
+                zone_links_error.set(Some(error.to_string()));
+                zone_links_cache.peek().clone()
+            }
+        }
     });
 
     // Load instances resource
-    let instances = use_resource(|| async {
-        api::fetch_json::<InstancesResponse>("/hqp/instances")
-            .await
-            .ok()
+    let mut instances_error = use_signal(|| None::<String>);
+    let mut instances_cache = use_signal(|| None::<InstancesResponse>);
+    let mut instances = use_resource(move || async move {
+        match api::fetch_json::<InstancesResponse>("/hqp/instances").await {
+            Ok(value) => {
+                instances_error.set(None);
+                instances_cache.set(Some(value.clone()));
+                Some(value)
+            }
+            Err(error) => {
+                instances_error.set(Some(error.to_string()));
+                instances_cache.peek().clone()
+            }
+        }
     });
     let mut zones_loaded_once = use_signal(|| false);
     let mut zone_links_loaded_once = use_signal(|| false);
@@ -239,7 +429,10 @@ pub fn HqPlayer() -> Element {
         // flips to Ready, not when `zones_loaded_once` (which it also writes) changes.
         // A tracked read here would subscribe the effect to its own write, causing an
         // extra self-triggered run every time the latch flips (reactive-loop-lint).
-        if !*zones_loaded_once.peek() && matches!(*zones_state.read(), UseResourceState::Ready) {
+        if !*zones_loaded_once.peek()
+            && matches!(*zones_state.read(), UseResourceState::Ready)
+            && zones.read().as_ref().is_some_and(Option::is_some)
+        {
             zones_loaded_once.set(true);
         }
     });
@@ -249,6 +442,7 @@ pub fn HqPlayer() -> Element {
         // its own latch write.
         if !*zone_links_loaded_once.peek()
             && matches!(*zone_links_state.read(), UseResourceState::Ready)
+            && zone_links.read().as_ref().is_some_and(Option::is_some)
         {
             zone_links_loaded_once.set(true);
         }
@@ -259,18 +453,9 @@ pub fn HqPlayer() -> Element {
         // its own latch write.
         if !*instances_loaded_once.peek()
             && matches!(*instances_state.read(), UseResourceState::Ready)
+            && instances.read().as_ref().is_some_and(Option::is_some)
         {
             instances_loaded_once.set(true);
-        }
-    });
-
-    // Sync config to form when loaded
-    use_effect(move || {
-        if let Some(Some(cfg)) = config.read().as_ref() {
-            host.set(cfg.host.clone().unwrap_or_default());
-            port.set(cfg.port.unwrap_or(4321));
-            web_port.set(cfg.web_port.unwrap_or(8088));
-            has_credentials.set(cfg.has_web_credentials);
         }
     });
 
@@ -303,6 +488,12 @@ pub fn HqPlayer() -> Element {
             .filter(|zone| {
                 zone.source.as_deref() == Some("hqplayer")
                     || links.iter().any(|link| link.zone_id == zone.zone_id)
+            })
+            .map(|mut zone| {
+                if let Some(instance) = zone.zone_id.strip_prefix("hqplayer:") {
+                    zone.zone_name = format!("{} · {}", instance, zone.zone_name);
+                }
+                zone
             })
             .collect::<Vec<_>>()
     });
@@ -354,24 +545,27 @@ pub fn HqPlayer() -> Element {
 
     // Save config handler
     let save_config = move |_| {
-        let h = host();
+        if config_busy() {
+            return;
+        }
+        let name = instance_name().trim().to_string();
+        let h = host().trim().to_string();
         let p = port();
         let wp = web_port();
         let u = username();
         let pw = password();
 
-        if h.trim().is_empty() {
-            config_status.set(Some(
-                "Enter the HQPlayer host before testing the connection.".to_string(),
-            ));
+        if h.is_empty() || name.is_empty() {
+            config_status.set(Some("Enter a name and host for HQPlayer.".to_string()));
             return;
         }
 
+        config_busy.set(true);
         config_status.set(Some("Testing connection…".to_string()));
 
         spawn(async move {
             let req = HqpConfigureRequest {
-                name: instance_name(),
+                name,
                 host: h,
                 port: p,
                 web_port: wp,
@@ -386,24 +580,27 @@ pub fn HqPlayer() -> Element {
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     if connected {
-                        config_status.set(Some("Connected and verified.".to_string()));
+                        config_status.set(Some(
+                            "Saved. HQPlayer control connection succeeded.".to_string(),
+                        ));
                     } else {
                         config_status.set(Some(
                             "Saved, but HQPlayer did not answer. Check the host and control port."
                                 .to_string(),
                         ));
                     }
+                    editing_instance.set(true);
+                    instances.restart();
                     status.restart();
                     pipeline.restart();
                     profiles.restart();
                     refresh_advanced_projection(matrix, matrix_refresh, false);
                 }
                 Err(e) => {
-                    config_status.set(Some(format!(
-                        "Connection failed: {e}. Check the address, ports, and web credentials."
-                    )));
+                    config_status.set(Some(format!("Could not save connection: {e}")));
                 }
             }
+            config_busy.set(false);
         });
     };
 
@@ -533,7 +730,6 @@ pub fn HqPlayer() -> Element {
         });
     };
 
-    let _is_loading = config.read().is_none();
     let current_status = status.read().clone().flatten();
     let current_pipeline = pipeline.read().clone().flatten();
     let profiles_list = profiles.read().clone().flatten().unwrap_or_default();
@@ -554,23 +750,9 @@ pub fn HqPlayer() -> Element {
         .flatten()
         .map(|r| r.instances)
         .unwrap_or_default();
-    let connected_instance = instances_list
-        .iter()
-        .find(|instance| instance.connected)
-        .or_else(|| instances_list.first());
-    let connected_product = connected_instance
-        .and_then(|instance| instance.info.as_ref())
-        .map(|info| info.product.as_str())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("HQPlayer");
-    let connected_version = connected_instance
-        .and_then(|instance| instance.info.as_ref())
-        .map(|info| info.version.as_str())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("version unknown");
     let zone_match_resources_loaded =
         zones_loaded_once() && zone_links_loaded_once() && instances_loaded_once();
-    let controlled_zones_loaded = zones_loaded_once() && zone_links_loaded_once();
+    let _controlled_zones_loaded = zones_loaded_once() && zone_links_loaded_once();
     let np_map = now_playing_map();
 
     let controlled_zones = controlled_zones_signal();
@@ -579,122 +761,194 @@ pub fn HqPlayer() -> Element {
         .as_ref()
         .map(|s| s.connected)
         .unwrap_or(false);
+    let any_connected = instances_list.iter().any(|instance| instance.connected);
 
     rsx! {
-        Layout {
-            title: "HQPlayer".to_string(),
-            nav_active: "hqplayer".to_string(),
+        Layout { title: "HQPlayer".to_string(), nav_active: "hqplayer".to_string(),
 
             div { class: "hqp-page-heading",
                 h1 { class: "text-2xl font-bold", "HQPlayer" }
                 p { class: "mt-2 max-w-2xl text-sm text-muted sm:text-base",
-                    "Start playback in the app you already use, then see and shape HQPlayer's live output here."
+                    "Manage HQPlayer connections, choose an output, and adjust DSP."
                 }
             }
 
             // Error display
             if let Some(ref error) = hqp_error() {
-                div { class: "bg-red-900/20 border border-red-500/50 rounded-lg p-4 mb-6",
+                div {
+                    role: "alert",
+                    class: "bg-red-900/20 border border-red-500/50 rounded-lg p-4 mb-6",
                     p { class: "text-red-400 m-0", "{error}" }
                 }
             }
 
-            // If not connected, show configuration first and prominently
-            if !is_connected {
-                section { id: "hqp-config", class: "mb-8",
-                    div { class: "card p-6",
-                        div { class: "mb-5 max-w-2xl",
-                            h2 { class: "text-lg font-semibold", "Connect HQPlayer" }
-                            p { class: "mt-1 text-sm text-muted",
-                                "Add HQPlayer Embedded once. Unified Hi-Fi Control will verify the native engine and its web artwork endpoint."
-                            }
+            for (label , problem) in [
+                ("HQPlayer instances", instances_error()),
+                ("playback zones", zones_error()),
+                ("pairings", zone_links_error()),
+                ("default DSP settings", if is_connected { pipeline_error() } else { None }),
+                ("default profiles", if is_connected { profiles_error() } else { None }),
+                (
+                    "default connection status",
+                    if instances_list.iter().any(|i| i.name == "default" && i.host.is_some()) {
+                        status_error()
+                    } else {
+                        None
+                    },
+                ),
+            ]
+            {
+                if let Some(problem) = problem {
+                    div { role: "alert", class: "mb-4 text-sm",
+                        p {
+                            "Could not refresh {label}. Previously loaded information may be out of date. {problem}"
                         }
-                        ol { class: "hqp-onboarding-path mb-6", aria_label: "HQPlayer setup progress",
-                            li { aria_current: "step",
-                                span { "1" }
-                                div {
-                                    strong { "Connect" }
-                                    small { "Verify the engine" }
+                        button {
+                            class: "btn btn-ghost btn-sm",
+                            onclick: move |_| {
+                                instances.restart();
+                                zones.restart();
+                                zone_links.restart();
+                                status.restart();
+                                pipeline.restart();
+                                profiles.restart();
+                            },
+                            "Retry"
+                        }
+                    }
+                }
+            }
+
+            details {
+                id: "hqp-instances",
+                class: "mb-6",
+                open: show_config() || instances_list.iter().all(|i| i.host.is_none()),
+                summary { class: "cursor-pointer text-lg font-semibold mb-3",
+                    "HQPlayer connections ({instances_list.iter().filter(|i| i.host.is_some()).count()})"
+                }
+                div { class: "flex flex-wrap items-center justify-between gap-3 mb-3",
+                    h2 { class: "text-lg font-semibold", "HQPlayer instances" }
+                    button {
+                        class: "btn btn-ghost btn-sm",
+                        onclick: move |_| instances.restart(),
+                        "Refresh instances"
+                    }
+                    button {
+                        class: "btn btn-primary btn-sm",
+                        disabled: config_busy(),
+                        onclick: move |_| {
+                            instance_name.set(String::new());
+                            host.set(String::new());
+                            port.set(4321);
+                            web_port.set(8088);
+                            username.set(String::new());
+                            password.set(String::new());
+                            editing_instance.set(false);
+                            config_status.set(None);
+                            show_config.set(true);
+                        },
+                        "Add HQPlayer"
+                    }
+                }
+                if !instances_loaded_once() && instances_error().is_none() {
+                    p { role: "status", "Loading HQPlayer instances…" }
+                }
+                for instance in instances_list.iter().filter(|i| i.host.is_some()) {
+                    HqpInstanceRow {
+                        key: "{instance.name}",
+                        instance: instance.clone(),
+                        duplicate: instances_list
+                            .iter()
+                            .any(|other| {
+                                other.name != instance.name && other.host == instance.host
+                                    && other.port == instance.port
+                            }),
+                        on_removed: move |_| {
+                            instances.restart();
+                            status.restart();
+                            zones.restart();
+                            zone_links.restart();
+                        },
+                        on_edit: move |instance: HqpInstance| {
+                            if config_busy() {
+                                return;
+                            }
+                            instance_name.set(instance.name);
+                            host.set(instance.host.unwrap_or_default());
+                            port.set(instance.port);
+                            web_port.set(if instance.web_port == 0 { 8088 } else { instance.web_port });
+                            username.set(String::new());
+                            password.set(String::new());
+                            editing_instance.set(true);
+                            config_status.set(None);
+                            show_config.set(true);
+                        },
+                    }
+                }
+                if instances_loaded_once() && instances_list.iter().all(|i| i.host.is_none()) {
+                    p { class: "text-sm text-muted",
+                        "Add the computer running HQPlayer Desktop or Embedded."
+                    }
+                }
+                if show_config() {
+                    div { class: "mt-4 pt-4 border-t border-subtle",
+                        div { class: "flex items-center justify-between mb-4",
+                            h3 { class: "font-semibold",
+                                if editing_instance() {
+                                    "Edit {instance_name}"
+                                } else {
+                                    "Add HQPlayer"
                                 }
                             }
-                            li {
-                                span { "2" }
-                                div {
-                                    strong { "Pair" }
-                                    small { "Name the playback path" }
-                                }
-                            }
-                            li {
-                                span { "3" }
-                                div {
-                                    strong { "Listen & tune" }
-                                    small { "Control live DSP" }
-                                }
+                            button {
+                                class: "btn btn-ghost btn-sm",
+                                disabled: config_busy(),
+                                onclick: move |_| show_config.set(false),
+                                "Close"
                             }
                         }
                         ConfigForm {
-                            instance_name: instance_name,
-                            host: host,
-                            port: port,
-                            web_port: web_port,
-                            username: username,
-                            password: password,
-                            has_credentials: has_credentials(),
+                            instance_name,
+                            host,
+                            port,
+                            web_port,
+                            username,
+                            password,
+                            editing: editing_instance(),
+                            busy: config_busy(),
                             config_status: config_status(),
+                            on_changed: move |_| config_status.set(None),
                             on_save: save_config,
                         }
                     }
                 }
             }
 
-            // Connected: show status bar with collapsible settings
-            if is_connected {
-                div { class: "hqp-connection-bar mb-8",
-                    div { class: "flex min-w-0 items-center gap-3",
-                        span { class: "hqp-signal", aria_hidden: "true" }
-                        div { class: "min-w-0",
-                            p { class: "font-semibold truncate",
-                                "Connected to {current_status.as_ref().and_then(|s| s.host.as_deref()).unwrap_or(\"HQPlayer\")}"
-                            }
-                            p { class: "mt-0.5 text-xs text-muted sm:text-sm",
-                                "{connected_product} {connected_version} · Live engine reads and DSP changes are verified with HQPlayer."
-                            }
-                        }
-                    }
-                    button {
-                        class: "btn btn-ghost btn-sm",
-                        onclick: move |_| show_config.toggle(),
-                        if show_config() { "Close connection settings" } else { "Connection settings" }
-                    }
-                }
-
-                // Collapsible config when connected
-                if show_config() {
-                    section { id: "hqp-config", class: "mb-8",
-                        div { class: "card p-6",
-                            ConfigForm {
-                                instance_name: instance_name,
-                                host: host,
-                                port: port,
-                                web_port: web_port,
-                                username: username,
-                                password: password,
-                                has_credentials: has_credentials(),
-                                config_status: config_status(),
-                                on_save: save_config,
-                            }
-                        }
-                    }
+            // Output routing (NAA / managed relay destination) is a per-instance concept, so it
+            // only makes sense once at least one instance is configured and reachable.
+            if instances_loaded_once() {
+                HqpOutputRoutingSection {
+                    instances: instances_list
+                        .iter()
+                        .filter(|i| i.host.is_some())
+                        .map(|i| HqpOutputInstance {
+                            name: i.name.clone(),
+                            host: i.host.clone(),
+                            connected: i.connected,
+                            product: i.info.as_ref().map(|info| info.product.clone()),
+                            version: i.info.as_ref().map(hqp_version_label),
+                        })
+                        .collect::<Vec<_>>(),
                 }
             }
 
             // Every direct or linked HQPlayer zone uses the same aggregator-backed control path.
-            if is_connected && !controlled_zones.is_empty() {
+            if any_connected && !controlled_zones.is_empty() {
                 section { id: "hqp-zones", class: "mb-8",
                     div { class: "mb-4 max-w-3xl",
                         h2 { class: "text-lg font-semibold", "Now playing through HQPlayer" }
                         p { class: "mt-1 text-sm text-muted",
-                            "Transport comes from the playback zone; sound shaping comes from HQPlayer. Paired zones keep both together."
+                            "Playback controls for your paired sources and HQPlayer outputs."
                         }
                     }
                     div { class: "grid gap-4 grid-cols-1",
@@ -710,33 +964,13 @@ pub fn HqPlayer() -> Element {
                 }
             }
 
-            if is_connected && controlled_zones_loaded && controlled_zones.is_empty() {
-                section { id: "hqp-zones-empty", class: "hqp-empty-path mb-8",
-                    span { aria_hidden: "true",
-                        svg { view_box: "0 0 48 24",
-                            circle { cx: "8", cy: "12", r: "5" }
-                            path { d: "M14 12h18" }
-                            path { d: "m27 7 5 5-5 5" }
-                            circle { cx: "40", cy: "12", r: "5" }
-                        }
-                    }
-                    div { class: "min-w-0 flex-1",
-                        h2 { class: "font-semibold", "Bring your playback zone into view" }
-                        p { class: "mt-1 max-w-2xl text-sm text-muted",
-                            "If Roon, JPLAY, or another controller already sends this zone through HQPlayer, pair their names below. Audio routing stays exactly as configured."
-                        }
-                    }
-                    a { class: "btn btn-primary shrink-0", href: "#hqp-zone-links", "Pair a playback zone" }
-                }
-            }
-
             // DSP Settings (only if connected)
             if is_connected {
-                section { id: "hqp-dsp", class: "mb-8",
+                details { id: "hqp-dsp", class: "mb-8",
+                    summary { class: "cursor-pointer text-lg font-semibold", "DSP settings · default" }
                     div { class: "mb-4 max-w-3xl",
-                        h2 { class: "text-lg font-semibold", "Shape the sound" }
                         p { class: "mt-1 text-sm text-muted",
-                            "Playing now is measured from HQPlayer's engine. The controls below set the pipeline and confirm what HQPlayer accepted."
+                            "Settings for the default HQPlayer connection."
                         }
                     }
                     DspSettings {
@@ -751,38 +985,23 @@ pub fn HqPlayer() -> Element {
                 }
             }
 
-            // Output routing (NAA / managed relay destination) is a per-instance concept, so it
-            // only makes sense once at least one instance is configured and reachable.
-            if is_connected && instances_loaded_once() {
-                HqpOutputRoutingSection {
-                    instances: instances_list
-                        .iter()
-                        .map(|i| HqpOutputInstance {
-                            name: i.name.clone(),
-                            host: i.host.clone(),
-                            connected: i.connected,
-                            product: i.info.as_ref().map(|info| info.product.clone()),
-                            version: i.info.as_ref().map(|info| info.version.clone()),
-                        })
-                        .collect::<Vec<_>>(),
-                }
-            }
-
             // Pairing is useful only after HQPlayer itself is connected. Keeping it hidden during
             // first-run setup preserves the connect → pair → listen progression above.
-            if is_connected {
+            if instances_list.iter().any(|i| i.host.is_some()) {
                 section { id: "hqp-zone-links", class: "mb-8",
                     div { class: "mb-4 max-w-3xl",
                         h2 { class: "text-lg font-semibold", "Pair a playback zone" }
                         p { class: "mt-1 text-sm text-muted",
-                            "Tell Unified Hi-Fi Control which playback-zone name and HQPlayer instance describe the same existing signal path."
+                            "Pair the source where you start playback with the HQPlayer it already feeds. UHC uses this pairing for controls and missing track metadata, including artwork."
                         }
                     }
-                    div { key: "{_zone_match_key}", class: "card overflow-hidden",
+                    div {
+                        key: "{_zone_match_key}",
+                        class: "card overflow-hidden",
                         ZoneLinkTable {
                             zones: zones_list,
                             links: links_list,
-                            instances: instances_list,
+                            instances: instances_list.clone(),
                             resources_loaded: zone_match_resources_loaded,
                             busy: zone_match_busy(),
                             feedback: zone_match_feedback(),
@@ -1117,7 +1336,7 @@ fn LinkedZoneCard(
                     img {
                         src: "{image_url}",
                         alt: "Album art",
-                        class: "hqp-album-art w-20 h-20 sm:w-24 sm:h-24 object-cover rounded-lg bg-elevated flex-shrink-0"
+                        class: "hqp-album-art w-20 h-20 sm:w-24 sm:h-24 object-cover rounded-lg bg-elevated flex-shrink-0",
                     }
                 } else {
                     div { class: "w-20 h-20 sm:w-24 sm:h-24 rounded-lg bg-elevated flex items-center justify-center text-muted text-2xl flex-shrink-0",
@@ -1146,7 +1365,10 @@ fn LinkedZoneCard(
                             "aria-label": "Previous track",
                             disabled: !can_previous,
                             onclick: move |_| on_control.call((zone_id_prev.clone(), "previous".to_string(), None)),
-                            svg { class: "w-4 h-4", fill: "currentColor", view_box: "0 0 24 24",
+                            svg {
+                                class: "w-4 h-4",
+                                fill: "currentColor",
+                                view_box: "0 0 24 24",
                                 path { d: "M6 6h2v12H6zm3.5 6l8.5 6V6z" }
                             }
                         }
@@ -1155,11 +1377,17 @@ fn LinkedZoneCard(
                             "aria-label": if is_playing { "Pause" } else { "Play" },
                             onclick: move |_| on_control.call((zone_id_play.clone(), "play_pause".to_string(), None)),
                             if is_playing {
-                                svg { class: "w-4 h-4", fill: "currentColor", view_box: "0 0 24 24",
+                                svg {
+                                    class: "w-4 h-4",
+                                    fill: "currentColor",
+                                    view_box: "0 0 24 24",
                                     path { d: "M6 19h4V5H6v14zm8-14v14h4V5h-4z" }
                                 }
                             } else {
-                                svg { class: "w-4 h-4", fill: "currentColor", view_box: "0 0 24 24",
+                                svg {
+                                    class: "w-4 h-4",
+                                    fill: "currentColor",
+                                    view_box: "0 0 24 24",
                                     path { d: "M8 5v14l11-7z" }
                                 }
                             }
@@ -1169,7 +1397,10 @@ fn LinkedZoneCard(
                             "aria-label": "Next track",
                             disabled: !can_next,
                             onclick: move |_| on_control.call((zone_id_next.clone(), "next".to_string(), None)),
-                            svg { class: "w-4 h-4", fill: "currentColor", view_box: "0 0 24 24",
+                            svg {
+                                class: "w-4 h-4",
+                                fill: "currentColor",
+                                view_box: "0 0 24 24",
                                 path { d: "M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" }
                             }
                         }
@@ -1178,8 +1409,17 @@ fn LinkedZoneCard(
                             "aria-label": "Stop playback",
                             title: "Stop playback",
                             onclick: move |_| on_control.call((zone_id_stop.clone(), "stop".to_string(), None)),
-                            svg { class: "w-4 h-4", fill: "currentColor", view_box: "0 0 24 24",
-                                rect { x: "6", y: "6", width: "12", height: "12", rx: "1" }
+                            svg {
+                                class: "w-4 h-4",
+                                fill: "currentColor",
+                                view_box: "0 0 24 24",
+                                rect {
+                                    x: "6",
+                                    y: "6",
+                                    width: "12",
+                                    height: "12",
+                                    rx: "1",
+                                }
                             }
                         }
                         button {
@@ -1188,16 +1428,21 @@ fn LinkedZoneCard(
                             title: mute_control.title,
                             disabled: mute_control.disabled,
                             onclick: move |_| on_control.call((zone_id_mute.clone(), "mute".to_string(), None)),
-                            svg { class: "w-4 h-4", fill: "none", stroke: "currentColor", stroke_width: "2", view_box: "0 0 24 24",
+                            svg {
+                                class: "w-4 h-4",
+                                fill: "none",
+                                stroke: "currentColor",
+                                stroke_width: "2",
+                                view_box: "0 0 24 24",
                                 path { d: "M11 5 6 9H3v6h3l5 4V5Z" }
                                 path { d: "m19 9-6 6m0-6 6 6" }
                             }
                         }
 
                         VolumeControlsCompact {
-                            volume: volume,
-                            volume_type: volume_type,
-                            volume_step: volume_step,
+                            volume,
+                            volume_type,
+                            volume_step,
                             on_vol_down: move |_| on_control.call((zone_id_vol_down.clone(), "vol_down".to_string(), None)),
                             on_vol_up: move |_| on_control.call((zone_id_vol_up.clone(), "vol_up".to_string(), None)),
                         }
@@ -1224,10 +1469,12 @@ fn LinkedZoneCard(
                         if let Ok(position) = event.value().parse::<f64>() {
                             on_control.call((zone_id_seek.clone(), "seek".to_string(), Some(position)));
                         }
-                    }
+                    },
                 }
                 if !can_seek {
-                    p { class: "text-xs text-muted mt-2", "Seek becomes available when HQPlayer reports a track duration." }
+                    p { class: "text-xs text-muted mt-2",
+                        "Seek becomes available when HQPlayer reports a track duration."
+                    }
                 }
             }
         }
@@ -1242,102 +1489,170 @@ fn format_hqp_time(seconds: u32) -> String {
 #[component]
 fn ConfigForm(
     instance_name: Signal<String>,
+    editing: bool,
+    busy: bool,
     host: Signal<String>,
     port: Signal<u16>,
     web_port: Signal<u16>,
     username: Signal<String>,
     password: Signal<String>,
-    has_credentials: bool,
     config_status: Option<String>,
+    on_changed: EventHandler<()>,
     on_save: EventHandler<()>,
 ) -> Element {
     rsx! {
-        div { class: "space-y-4 max-w-3xl",
-            div {
-                label { class: "block text-sm font-medium mb-1", r#for: "hqp-instance-name", "Instance name" }
-                input { id: "hqp-instance-name", class: "input", r#type: "text", required: true, placeholder: "Living Room", value: "{instance_name}", oninput: move |evt| instance_name.set(evt.value()) }
-                p { class: "mt-1 text-xs text-muted", "A label you choose for this HQPlayer endpoint. It appears in selectors and zone bindings." }
-            }
-            div {
-                label { class: "block text-sm font-medium mb-1", r#for: "hqp-host", "HQPlayer host" }
-                input {
-                    id: "hqp-host",
-                    class: "input",
-                    r#type: "text",
-                    required: true,
-                    placeholder: "192.168.1.100",
-                    value: "{host}",
-                    oninput: move |evt| host.set(evt.value())
-                }
-                p { class: "mt-1 text-xs text-muted", "The hostname or LAN address running HQPlayer Embedded." }
-            }
-            div { class: "grid grid-cols-1 sm:grid-cols-2 gap-4",
+        form {
+            oninput: move |_| on_changed.call(()),
+            onsubmit: move |evt| {
+                evt.prevent_default();
+                on_save.call(());
+            },
+            fieldset { disabled: busy, class: "space-y-4 max-w-3xl",
                 div {
-                    label { class: "block text-sm font-medium mb-1", r#for: "hqp-native-port", "Engine control port" }
-                    input {
-                        id: "hqp-native-port",
-                        class: "input",
-                        r#type: "number",
-                        required: true,
-                        value: "{port}",
-                        oninput: move |evt| {
-                            if let Ok(p) = evt.value().parse() {
-                                port.set(p);
-                            }
-                        }
+                    label {
+                        class: "block text-sm font-medium mb-1",
+                        r#for: "hqp-instance-name",
+                        "Instance name"
                     }
-                    p { class: "mt-1 text-xs text-muted", "Usually 4321. Used for playback and DSP control." }
-                }
-                div {
-                    label { class: "block text-sm font-medium mb-1", r#for: "hqp-web-port", "Web and artwork port" }
                     input {
-                        id: "hqp-web-port",
-                        class: "input",
-                        r#type: "number",
-                        required: true,
-                        value: "{web_port}",
-                        oninput: move |evt| {
-                            if let Ok(p) = evt.value().parse() {
-                                web_port.set(p);
-                            }
-                        }
-                    }
-                    p { class: "mt-1 text-xs text-muted", "Usually 8088. Used for profiles and current cover art." }
-                }
-            }
-            div { class: "pt-1",
-                p { class: "text-sm font-medium", "Web sign-in" }
-                p { class: "mt-1 text-xs text-muted", "Optional. Leave blank unless HQPlayer's web interface requires credentials." }
-            }
-            div { class: "grid grid-cols-1 sm:grid-cols-2 gap-4",
-                div {
-                    label { class: "block text-sm font-medium mb-1", r#for: "hqp-username", "Username" }
-                    input {
-                        id: "hqp-username",
+                        id: "hqp-instance-name",
+                        disabled: editing || busy,
                         class: "input",
                         r#type: "text",
-                        placeholder: if has_credentials { "(saved)" } else { "admin" },
-                        value: "{username}",
-                        oninput: move |evt| username.set(evt.value())
+                        required: true,
+                        placeholder: "Living Room",
+                        value: "{instance_name}",
+                        oninput: move |evt| instance_name.set(evt.value()),
+                    }
+                    p { class: "mt-1 text-xs text-muted",
+                        "Choose a name when adding HQPlayer. Editing an existing connection keeps its name and pairings."
                     }
                 }
                 div {
-                    label { class: "block text-sm font-medium mb-1", r#for: "hqp-password", "Password" }
+                    label {
+                        class: "block text-sm font-medium mb-1",
+                        r#for: "hqp-host",
+                        "HQPlayer host"
+                    }
                     input {
-                        id: "hqp-password",
+                        id: "hqp-host",
                         class: "input",
-                        r#type: "password",
-                        placeholder: if has_credentials { "(saved)" } else { "password" },
-                        value: "{password}",
-                        oninput: move |evt| password.set(evt.value())
+                        r#type: "text",
+                        required: true,
+                        placeholder: "192.168.1.100",
+                        value: "{host}",
+                        oninput: move |evt| host.set(evt.value()),
+                    }
+                    p { class: "mt-1 text-xs text-muted",
+                        "The hostname or LAN address running HQPlayer Desktop or Embedded."
                     }
                 }
-            }
-            div { class: "flex flex-wrap items-center gap-4 pt-1",
-                button { class: "btn btn-primary", onclick: move |_| on_save.call(()), "Save and test connection" }
-                if let Some(ref msg) = config_status {
-                    span { class: if msg.contains("Connected") { "status-ok" } else if msg.contains("failed") || msg.starts_with("Saved, but") { "status-err" } else { "text-muted" },
-                        "{msg}"
+                div { class: "grid grid-cols-1 sm:grid-cols-2 gap-4",
+                    div {
+                        label {
+                            class: "block text-sm font-medium mb-1",
+                            r#for: "hqp-native-port",
+                            "Engine control port"
+                        }
+                        input {
+                            id: "hqp-native-port",
+                            class: "input",
+                            r#type: "number",
+                            min: "1",
+                            max: "65535",
+                            required: true,
+                            value: "{port}",
+                            oninput: move |evt| {
+                                if let Ok(p) = evt.value().parse() {
+                                    port.set(p);
+                                }
+                            },
+                        }
+                        p { class: "mt-1 text-xs text-muted",
+                            "Usually 4321. Used for playback and DSP control."
+                        }
+                    }
+                    div {
+                        label {
+                            class: "block text-sm font-medium mb-1",
+                            r#for: "hqp-web-port",
+                            "Web and artwork port"
+                        }
+                        input {
+                            id: "hqp-web-port",
+                            class: "input",
+                            r#type: "number",
+                            min: "1",
+                            max: "65535",
+                            required: true,
+                            value: "{web_port}",
+                            oninput: move |evt| {
+                                if let Ok(p) = evt.value().parse() {
+                                    web_port.set(p);
+                                }
+                            },
+                        }
+                        p { class: "mt-1 text-xs text-muted",
+                            "Usually 8088. Used for profiles and current cover art."
+                        }
+                    }
+                }
+                div { class: "pt-1",
+                    p { class: "text-sm font-medium", "Web sign-in" }
+                    p { class: "mt-1 text-xs text-muted",
+                        "Optional. Leave blank unless HQPlayer's web interface requires credentials."
+                    }
+                }
+                div { class: "grid grid-cols-1 sm:grid-cols-2 gap-4",
+                    div {
+                        label {
+                            class: "block text-sm font-medium mb-1",
+                            r#for: "hqp-username",
+                            "Username"
+                        }
+                        input {
+                            id: "hqp-username",
+                            class: "input",
+                            r#type: "text",
+                            placeholder: if editing { "Leave blank to keep existing" } else { "Optional username" },
+                            value: "{username}",
+                            oninput: move |evt| username.set(evt.value()),
+                        }
+                    }
+                    div {
+                        label {
+                            class: "block text-sm font-medium mb-1",
+                            r#for: "hqp-password",
+                            "Password"
+                        }
+                        input {
+                            id: "hqp-password",
+                            class: "input",
+                            r#type: "password",
+                            placeholder: if editing { "Leave blank to keep existing" } else { "Optional password" },
+                            value: "{password}",
+                            oninput: move |evt| password.set(evt.value()),
+                        }
+                    }
+                }
+                div { class: "flex flex-wrap items-center gap-4 pt-1",
+                    button {
+                        r#type: "submit",
+                        class: "btn btn-primary",
+                        disabled: busy,
+                        if busy {
+                            "Testing…"
+                        } else {
+                            "Save and test connection"
+                        }
+                    }
+                    if let Some(ref msg) = config_status {
+                        span {
+                            role: "status",
+                            class: if msg.contains("succeeded") { "status-ok" } else if msg.contains("failed") || msg.starts_with("Could not")
+    || msg.starts_with("Saved, but") { "status-err" } else { "text-muted" },
+                            "{msg}"
+                        }
                     }
                 }
             }
@@ -1469,11 +1784,26 @@ fn DspSettings(
                         p { class: "text-xs text-muted", "Live engine readback" }
                     }
                     dl { class: "grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-3 lg:grid-cols-5",
-                        HqpReadout { label: "Engine", value: status.state.clone().unwrap_or_else(|| "Unknown".to_string()) }
-                        HqpReadout { label: "Mode", value: hqp_live_mode_readout(status) }
-                        HqpReadout { label: "Filter", value: status.active_filter.clone().unwrap_or_else(|| "—".to_string()) }
-                        HqpReadout { label: "Dither / modulator", value: status.active_shaper.clone().unwrap_or_else(|| "—".to_string()) }
-                        HqpReadout { label: "Output", value: hqp_live_output_readout(status) }
+                        HqpReadout {
+                            label: "Engine",
+                            value: status.state.clone().unwrap_or_else(|| "Unknown".to_string()),
+                        }
+                        HqpReadout {
+                            label: "Mode",
+                            value: hqp_live_mode_readout(status),
+                        }
+                        HqpReadout {
+                            label: "Filter",
+                            value: status.active_filter.clone().unwrap_or_else(|| "—".to_string()),
+                        }
+                        HqpReadout {
+                            label: "Dither / modulator",
+                            value: status.active_shaper.clone().unwrap_or_else(|| "—".to_string()),
+                        }
+                        HqpReadout {
+                            label: "Output",
+                            value: hqp_live_output_readout(status),
+                        }
                     }
                 }
             }
@@ -1483,30 +1813,32 @@ fn DspSettings(
                 div { class: "mb-6",
                     div { class: "mb-3",
                         h3 { class: "text-sm font-semibold", "Recall a saved setup" }
-                        p { class: "mt-1 text-xs text-muted", "Loading a profile can change several pipeline controls at once." }
+                        p { class: "mt-1 text-xs text-muted",
+                            "Loading a profile can change several pipeline controls at once."
+                        }
                     }
                     div { class: "grid grid-cols-1 sm:grid-cols-2 gap-4",
-                    if !profiles.is_empty() {
-                        label { class: "block",
-                            span { class: "block text-sm font-medium mb-1", "Profile" }
-                            HqpProfileSelect {
-                                profiles: profiles.clone(),
-                                on_select: on_load_profile,
-                                disabled: loading,
+                        if !profiles.is_empty() {
+                            label { class: "block",
+                                span { class: "block text-sm font-medium mb-1", "Profile" }
+                                HqpProfileSelect {
+                                    profiles: profiles.clone(),
+                                    on_select: on_load_profile,
+                                    disabled: loading,
+                                }
                             }
                         }
-                    }
-                    if has_matrix {
-                        label { class: "block",
-                            span { class: "block text-sm font-medium mb-1", "Matrix" }
-                            HqpMatrixSelect {
-                                profiles: matrix_profiles,
-                                active: matrix_current,
-                                on_select: on_set_matrix,
-                                disabled: loading,
+                        if has_matrix {
+                            label { class: "block",
+                                span { class: "block text-sm font-medium mb-1", "Matrix" }
+                                HqpMatrixSelect {
+                                    profiles: matrix_profiles,
+                                    active: matrix_current,
+                                    on_select: on_set_matrix,
+                                    disabled: loading,
+                                }
                             }
                         }
-                    }
                     }
                 }
             }
@@ -1566,7 +1898,9 @@ fn DspSettings(
                 }
             }
 
-            if junk_filter_opts.is_some() || convolution.is_some() || adaptive_volume.is_some() || repeat_opts.is_some() || random.is_some() {
+            if junk_filter_opts.is_some() || convolution.is_some() || adaptive_volume.is_some()
+                || repeat_opts.is_some() || random.is_some()
+            {
                 div { class: "mt-6 pt-6 border-t border-subtle",
                     div { class: "mb-4",
                         h3 { class: "text-sm font-semibold", "Advanced processing" }
@@ -1705,7 +2039,11 @@ fn HqpToggle(
                 "aria-pressed": enabled,
                 "aria-label": "{label}: {state_label}",
                 onclick: move |_| on_change.call((setting.to_string(), (!enabled).to_string())),
-                if enabled { "On" } else { "Off" }
+                if enabled {
+                    "On"
+                } else {
+                    "Off"
+                }
             }
         }
     }
@@ -1742,15 +2080,15 @@ fn HqpSelect(
     let setting_name = setting.to_string();
 
     rsx! {
-        label {
-            span { class: "block text-sm font-medium mb-1", "{label}" }
+        div {
+            label { r#for: "{id}", class: "block text-sm font-medium mb-1", "{label}" }
             if searchable {
                 input {
                     r#type: "search",
                     class: "input mb-2",
                     value: "{query}",
                     placeholder: "Search {total_options} choices…",
-                    disabled: disabled,
+                    disabled,
                     aria_label: "Search {label}",
                     oninput: move |evt| query.set(evt.value()),
                 }
@@ -1758,7 +2096,7 @@ fn HqpSelect(
             select {
                 id: "{id}",
                 class: "input",
-                disabled: disabled,
+                disabled,
                 onchange: move |evt: Event<FormData>| {
                     let value = evt.value();
                     on_change.call((setting_name.clone(), value));
@@ -1887,7 +2225,7 @@ fn playback_source_label(source: Option<&str>) -> String {
         Some("openhome") => "OpenHome".to_string(),
         Some("upnp") => "UPnP".to_string(),
         Some(other) => other.to_string(),
-        None => "Playback zone".to_string(),
+        None => "Unavailable zone".to_string(),
     }
 }
 
@@ -1983,8 +2321,7 @@ fn ZoneLinkTable(
                 }
             }
             p { class: "mb-6 max-w-3xl text-sm text-muted",
-                strong { class: "text-primary", "Pairing only changes this screen. " }
-                "It does not route audio, group rooms, or change either app's configuration."
+                "Pairing does not change audio routing or either app’s configuration."
             }
 
             if current_links.is_empty()
@@ -2010,11 +2347,11 @@ fn ZoneLinkTable(
                     div { class: "mt-4 divide-y divide-[var(--border-default)]",
                         for link in current_links.iter() {
                             {
-                let zone_name = zones
-                    .iter()
-                    .find(|z| z.zone_id == link.zone_id)
-                    .map(|z| z.zone_name.clone())
-                    .unwrap_or_else(|| link.zone_id.clone());
+                                let zone_name = zones
+                                    .iter()
+                                    .find(|z| z.zone_id == link.zone_id)
+                                    .map(|z| z.zone_name.clone())
+                                    .unwrap_or_else(|| link.zone_id.clone());
                                 let source = zones
                                     .iter()
                                     .find(|z| z.zone_id == link.zone_id)
@@ -2026,8 +2363,8 @@ fn ZoneLinkTable(
                                     .and_then(|instance| instance.host.as_deref())
                                     .map(|host| format!("{} at {}", link.instance, host))
                                     .unwrap_or_else(|| link.instance.clone());
-                let zone_id = link.zone_id.clone();
-                rsx! {
+                                let zone_id = link.zone_id.clone();
+                                rsx! {
                                     div { class: "flex flex-col gap-3 py-4 first:pt-0 last:pb-0 lg:flex-row lg:items-center lg:justify-between",
                                         div { class: "hqp-saved-path min-w-0 flex-1",
                                             div { class: "min-w-0",
@@ -2051,7 +2388,11 @@ fn ZoneLinkTable(
                                             disabled: busy,
                                             aria_label: "Remove pairing for {zone_name}",
                                             onclick: move |_| on_unlink.call(zone_id.clone()),
-                                            if busy { "Updating…" } else { "Remove pairing" }
+                                            if busy {
+                                                "Updating…"
+                                            } else {
+                                                "Remove pairing"
+                                            }
                                         }
                                     }
                                 }
@@ -2077,16 +2418,35 @@ fn ZoneLinkTable(
                     ZoneMatchAvailability::NoPlaybackZones => rsx! {
                         h3 { class: "font-semibold", "No playback zones available to pair" }
                         p { class: "mt-1 text-sm text-muted",
-                            "Every available zone is already paired, or no playback provider is connected yet."
+                            if zones
+                                .iter()
+                                .any(|zone| is_zone_match_candidate(
+                                    &zone.zone_id,
+                                    zone.source.as_deref(),
+                                    false,
+                                ))
+                            {
+                                "Every available playback zone is already paired."
+                            } else {
+                                "No playback zones are available. Connect a playback provider in Settings, then refresh this page."
+                            }
                         }
                     },
                     ZoneMatchAvailability::Ready => rsx! {
                         h3 { class: "font-semibold",
-                            if current_links.is_empty() { "Pair this signal path" } else { "Pair another signal path" }
+                            if current_links.is_empty() {
+                                "Pair this signal path"
+                            } else {
+                                "Pair another signal path"
+                            }
                         }
                         div { class: "mt-4 grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] lg:items-end",
                             div {
-                                label { class: "mb-2 block text-sm font-medium", r#for: "zone-match-playback", "Zone where playback starts" }
+                                label {
+                                    class: "mb-2 block text-sm font-medium",
+                                    r#for: "zone-match-playback",
+                                    "Zone where playback starts"
+                                }
                                 select {
                                     id: "zone-match-playback",
                                     class: "input",
@@ -2103,7 +2463,11 @@ fn ZoneLinkTable(
                                 }
                             }
                             div {
-                                label { class: "mb-2 block text-sm font-medium", r#for: "zone-match-instance", "HQPlayer it already feeds" }
+                                label {
+                                    class: "mb-2 block text-sm font-medium",
+                                    r#for: "zone-match-instance",
+                                    "HQPlayer it already feeds"
+                                }
                                 select {
                                     id: "zone-match-instance",
                                     class: "input",
@@ -2144,7 +2508,11 @@ fn ZoneLinkTable(
                                         on_link.call((zone_id, instance));
                                     }
                                 },
-                                if busy { "Pairing…" } else { "Pair zone" }
+                                if busy {
+                                    "Pairing…"
+                                } else {
+                                    "Pair zone"
+                                }
                             }
                         }
                         p { class: "mt-3 max-w-3xl text-xs text-muted",
