@@ -193,13 +193,17 @@ async fn configuring_hqplayer_at_runtime_enables_it() {
     // the host happened to answer, so it must hold either way.
     let response = unified_hifi_control::api::hqp_configure_handler(
         State(state.clone()),
-        Json(unified_hifi_control::api::HqpConfigRequest {
-            host: "127.0.0.1".to_string(),
-            port: Some(4321),
-            web_port: Some(8088),
-            username: None,
-            password: None,
-        }),
+        // Exercise the legacy HTTP payload: omitting a name must still configure default.
+        Json(
+            serde_json::from_value::<unified_hifi_control::api::HqpConfigRequest>(
+                serde_json::json!({
+                    "host": "127.0.0.1",
+                    "port": 4321,
+                    "web_port": 8088
+                }),
+            )
+            .expect("legacy HQPlayer configuration remains valid"),
+        ),
     )
     .await;
     let status = axum::response::IntoResponse::into_response(response).status();
