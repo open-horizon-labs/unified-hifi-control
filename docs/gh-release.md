@@ -148,10 +148,16 @@ This prevents spurious builds from non-build labels (arch, coderabbit, etc.).
 |------------|----------|-------|
 | WASM assets | actions/cache + restore-keys | Content-based key, incremental on partial match |
 | Fullstack check | rust-cache only | Validates `dx build --fullstack` works |
-| Linux (zigbuild) | rust-cache only | sccache doesn't work with zig wrapper |
+| Linux (zigbuild) | Fleet sccache over MinIO; hosted rust-cache fallback | Fleet runners already inject `RUSTC_WRAPPER=sccache`; `Swatinem/rust-cache` is hosted-only |
 | macOS/Windows | sccache + rust-cache | sccache for `.o` files, rust-cache for proc-macros |
-| Tools (dx, zigbuild) | actions/cache | Pin version in cache key |
+| Tools (dx, zigbuild) | actions/cache | Keys include OS, architecture, and the pinned tool version; restored binaries are version-checked before use |
 | Docker images | Use GHCR | 10x faster than Docker Hub from Actions |
+
+Self-hosted Linux jobs use the fleet's shared `sccache` S3 backend (MinIO at
+`192.168.1.2:9000`, bucket `sccache`). The workflow does not enable
+`SCCACHE_GHA_ENABLED` on those runners and does not upload `target/` with
+`Swatinem/rust-cache`; both would bypass the shared compiler cache. Hosted
+fallbacks retain the GitHub Actions cache path.
 
 ### WASM Caching
 
@@ -196,7 +202,10 @@ WASM is built once and shared across all platform builds. The cache uses content
     RUSTC_WRAPPER: "sccache"
 ```
 
-**cargo-zigbuild** cross-compiles Linux binaries without Docker containers (unlike `cross`), so rust-cache works normally.
+**cargo-zigbuild** cross-compiles the required static musl Linux binaries without
+Docker containers (unlike `cross`). The x86_64 host still needs a musl linker;
+the workflow reuses a matching runner-provided Zig when available and otherwise
+installs Zig 0.13.0 into the runner tool cache.
 
 **Tool caching** pins versions in cache keys to ensure invalidation on upgrade:
 

@@ -563,8 +563,12 @@ jobs:
         id: cache-dx
         uses: actions/cache@v5
         with:
-          path: ${{ env.CARGO_HOME }}/bin/dx
-          key: dx-cli-0.7.10
+          # Isolate this from other runner jobs just like the installer isolates
+          # CARGO_HOME, otherwise a shared fleet cache can restore the wrong tool.
+          path: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/cargo/bin/dx
+          key: dx-cli-${{ runner.os }}-${{ runner.arch }}-0.7.10
+          restore-keys: |
+            dx-cli-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install Dioxus CLI
         if: steps.check-cache.outputs.needs_build == 'true' && steps.cache-dx.outputs.cache-hit != 'true'
@@ -645,18 +649,34 @@ jobs:
         with:
           shared-key: zigbuild-x86_64-unknown-linux-musl
 
+      - name: Cache Zig
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.tool_cache }}/zig/0.13.0/x64
+          key: zig-${{ runner.os }}-${{ runner.arch }}-0.13.0
+
       - name: Install zig
         run: |
-          ZIG_ROOT="${RUNNER_TOOL_CACHE:-$HOME/.cache/uhc-tools}/zig/0.13.0/x64"
+          set -euo pipefail
+          ZIG_VERSION="0.13.0"
+
+          # The fleet image may already carry the exact compiler. Reuse it;
+          # the host being x86_64 does not remove the musl linker requirement.
+          if command -v zig >/dev/null 2>&1 && [ "$(zig version)" = "$ZIG_VERSION" ]; then
+            echo "Using runner-provided Zig $(zig version)"
+            exit 0
+          fi
+
+          ZIG_ROOT="${RUNNER_TOOL_CACHE:-$HOME/.cache/uhc-tools}/zig/$ZIG_VERSION/x64"
           if [ ! -x "$ZIG_ROOT/zig" ]; then
             ZIG_PARENT=$(dirname "$ZIG_ROOT")
             mkdir -p "$ZIG_PARENT"
             TEMP_DIR=$(mktemp -d "$ZIG_PARENT/.zig-install.XXXXXX")
             trap 'rm -rf "$TEMP_DIR"' EXIT
             curl --fail --show-error --location \
-              https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | \
+              "https://ziglang.org/download/$ZIG_VERSION/zig-linux-x86_64-$ZIG_VERSION.tar.xz" | \
               tar -xJ -C "$TEMP_DIR"
-            STAGED_ROOT="$TEMP_DIR/zig-linux-x86_64-0.13.0"
+            STAGED_ROOT="$TEMP_DIR/zig-linux-x86_64-$ZIG_VERSION"
             test -x "$STAGED_ROOT/zig"
             rm -rf "$ZIG_ROOT"
             mv "$STAGED_ROOT" "$ZIG_ROOT"
@@ -671,11 +691,19 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ env.CARGO_HOME }}/bin/cargo-zigbuild
-          key: cargo-zigbuild-0.20
+          key: cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-0.23.4
+          restore-keys: |
+            cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Install cargo-zigbuild
-        if: steps.cache-zigbuild.outputs.cache-hit != 'true'
-        run: cargo install cargo-zigbuild --locked
+      - name: Ensure cargo-zigbuild
+        run: |
+          set -euo pipefail
+          if command -v cargo-zigbuild >/dev/null 2>&1 && \
+             cargo-zigbuild --version | grep -q 'cargo-zigbuild 0.23.4'; then
+            echo "Using cached cargo-zigbuild $(cargo-zigbuild --version)"
+          else
+            cargo install cargo-zigbuild --version 0.23.4 --locked
+          fi
 
       - name: Download WASM assets
         uses: actions/download-artifact@v8
@@ -702,6 +730,7 @@ jobs:
           # Force rebuild of main crate to pick up version env vars and embedded assets
           cargo clean -p unified-hifi-control 2>/dev/null || true
           cargo zigbuild --release --target x86_64-unknown-linux-musl \
+            --features naa-proxy \
             --bin unified-hifi-control --bin uhc-hiphi-pair
 
       - name: Rename binary
@@ -918,35 +947,74 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Isolate mutable tool state
+        run: |
+          echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache Rust
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: zigbuild-${{ matrix.target }}
 
+      - name: Cache Zig
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.tool_cache }}/zig/0.13.0/${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
+          key: zig-${{ runner.os }}-${{ runner.arch }}-0.13.0
+
       - name: Install zig
         run: |
-          # Arch-derived, not hardcoded: this job now runs natively on aarch64
-          # fleet hardware, and falls back to x86_64 hosted runners.
+          set -euo pipefail
+          ZIG_VERSION="0.13.0"
           ZIG_ARCH="$(uname -m)"
-          curl -L "https://ziglang.org/download/0.13.0/zig-linux-${ZIG_ARCH}-0.13.0.tar.xz" | tar -xJ
-          mv "zig-linux-${ZIG_ARCH}-0.13.0" "$HOME/zig"
-          echo "$HOME/zig" >> $GITHUB_PATH
+          if command -v zig >/dev/null 2>&1 && [ "$(zig version)" = "$ZIG_VERSION" ]; then
+            echo "Using runner-provided Zig $(zig version)"
+          else
+            ZIG_ROOT="${RUNNER_TOOL_CACHE:-$HOME/.cache/uhc-tools}/zig/$ZIG_VERSION/$ZIG_ARCH"
+            if [ ! -x "$ZIG_ROOT/zig" ]; then
+              ZIG_PARENT=$(dirname "$ZIG_ROOT")
+              mkdir -p "$ZIG_PARENT"
+              TEMP_DIR=$(mktemp -d "$ZIG_PARENT/.zig-install.XXXXXX")
+              trap 'rm -rf "$TEMP_DIR"' EXIT
+              curl --fail --show-error --location \
+                "https://ziglang.org/download/$ZIG_VERSION/zig-linux-${ZIG_ARCH}-$ZIG_VERSION.tar.xz" | \
+                tar -xJ -C "$TEMP_DIR"
+              STAGED_ROOT="$TEMP_DIR/zig-linux-${ZIG_ARCH}-$ZIG_VERSION"
+              test -x "$STAGED_ROOT/zig"
+              rm -rf "$ZIG_ROOT"
+              mv "$STAGED_ROOT" "$ZIG_ROOT"
+              rm -rf "$TEMP_DIR"
+              trap - EXIT
+            fi
+            test -x "$ZIG_ROOT/zig"
+            echo "$ZIG_ROOT" >> "$GITHUB_PATH"
+          fi
 
       - name: Cache cargo-zigbuild
         id: cache-zigbuild
         uses: actions/cache@v5
         with:
-          path: ~/.cargo/bin/cargo-zigbuild
-          key: cargo-zigbuild-0.20
+          path: ${{ env.CARGO_HOME }}/bin/cargo-zigbuild
+          key: cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-0.23.4
+          restore-keys: |
+            cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Install cargo-zigbuild
-        if: steps.cache-zigbuild.outputs.cache-hit != 'true'
-        run: cargo install cargo-zigbuild --locked
+      - name: Ensure cargo-zigbuild
+        run: |
+          set -euo pipefail
+          if command -v cargo-zigbuild >/dev/null 2>&1 && \
+             cargo-zigbuild --version | grep -q 'cargo-zigbuild 0.23.4'; then
+            echo "Using cached cargo-zigbuild $(cargo-zigbuild --version)"
+          else
+            cargo install cargo-zigbuild --version 0.23.4 --locked
+          fi
 
       - name: Download WASM assets
         uses: actions/download-artifact@v8
@@ -973,6 +1041,7 @@ jobs:
           # Force rebuild of main crate to pick up version env vars and embedded assets
           cargo clean -p unified-hifi-control 2>/dev/null || true
           cargo zigbuild --release --target ${{ matrix.target }} \
+            --features naa-proxy \
             --bin unified-hifi-control --bin uhc-hiphi-pair
 
       - name: Smoke test armv7 binary
@@ -1046,7 +1115,7 @@ jobs:
         run: |
           # Force rebuild of main crate to pick up version env vars and embedded assets
           cargo clean -p unified-hifi-control 2>/dev/null || true
-          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin --features naa-proxy
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
@@ -1104,7 +1173,7 @@ jobs:
         run: |
           # Force rebuild of main crate to pick up version env vars and embedded assets
           cargo clean -p unified-hifi-control 2>/dev/null || true
-          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin --features naa-proxy
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
@@ -1326,7 +1395,7 @@ jobs:
         run: |
           # Force rebuild of main crate to pick up version env vars and embedded assets
           cargo clean -p unified-hifi-control 2>/dev/null || true
-          cargo build --release
+          cargo build --release --features naa-proxy
         shell: bash
 
       - name: Rename binary

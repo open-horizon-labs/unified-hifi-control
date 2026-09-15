@@ -45,6 +45,8 @@ pub mod controller_auth;
 pub mod credentials;
 pub mod ha_integration;
 pub mod hiphi_pairing;
+pub mod hqp_outputs;
+pub mod hqp_outputs_http;
 pub mod ingress;
 pub mod mqtt_bootstrap;
 pub mod mqtt_settings;
@@ -1869,6 +1871,15 @@ async fn hqp_apply_named_setting(
     setting: &str,
     value: &str,
 ) -> anyhow::Result<()> {
+    hqp_apply_named_setting_for(state, "default", setting, value).await
+}
+
+async fn hqp_apply_named_setting_for(
+    state: &AppState,
+    instance: &str,
+    setting: &str,
+    value: &str,
+) -> anyhow::Result<()> {
     let normalized = match setting {
         "mode" | "filter" | "filter1x" | "filterNx" | "filternx" | "shaper" | "dither"
         | "junk_filter" => value.to_string(),
@@ -1886,7 +1897,7 @@ async fn hqp_apply_named_setting(
     };
     crate::knobs::routes::dispatch_hqplayer_reconfiguration(
         state,
-        "default",
+        instance,
         HqpRuntimeCommand::Pipeline {
             setting: setting.to_string(),
             value: normalized,
@@ -2116,6 +2127,7 @@ pub async fn hqp_matrix_profiles_handler(State(state): State<AppState>) -> impl 
                 "profiles": snapshot.matrix_profiles,
                 "current": snapshot.current_matrix_profile,
                 "junk_filters": snapshot.junk_filters,
+                "junk_filters_supported": snapshot.junk_filters_supported,
                 "junk_filter": snapshot.state.filter_junk,
                 "convolution": snapshot.state.convolution,
                 "adaptive_volume": snapshot.state.adaptive,
@@ -2744,9 +2756,18 @@ pub async fn lms_configure_handler(
     }
 }
 
+fn default_hqp_instance_name() -> String {
+    "default".to_string()
+}
+
 /// HQPlayer configuration request
 #[derive(Deserialize)]
 pub struct HqpConfigRequest {
+    /// Add refuses an existing identity; omitted preserves the legacy upsert behavior.
+    #[serde(default)]
+    pub create_only: bool,
+    #[serde(default = "default_hqp_instance_name")]
+    pub name: String,
     pub host: String,
     #[serde(default)]
     pub port: Option<u16>,
@@ -2761,20 +2782,41 @@ pub async fn hqp_configure_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpConfigRequest>,
 ) -> impl IntoResponse {
-    // Configure the adapter
-    state
-        .hqplayer
-        .configure(
-            req.host.clone(),
+    let name = req.name.trim().to_string();
+    let host = req.host.trim().to_string();
+    if name.is_empty() || host.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Name and host are required".into(),
+            }),
+        )
+            .into_response();
+    }
+    let adapter = match state
+        .hqp_instances
+        .configure_instance(
+            name,
+            host,
             req.port,
             req.web_port,
             req.username,
             req.password,
+            req.create_only,
         )
-        .await;
-
-    // Save to instance manager for persistence
-    state.hqp_instances.save_to_config().await;
+        .await
+    {
+        Ok(adapter) => adapter,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: error.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    };
 
     // Same enable gesture as LMS. This used to start the lifecycle only when the
     // toggle was already on, which left "configured, connected, invisible" reachable
@@ -2803,7 +2845,7 @@ pub async fn hqp_configure_handler(
     }
 
     // Test connection by attempting to get pipeline status (this establishes connection)
-    let connected = match state.hqplayer.get_pipeline_status().await {
+    let connected = match adapter.get_pipeline_status().await {
         Ok(_) => true,
         Err(e) => {
             tracing::warn!("HQPlayer connection test failed: {}", e);
@@ -2815,6 +2857,7 @@ pub async fn hqp_configure_handler(
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
+            "name": req.name,
             "host": req.host,
             "port": req.port.unwrap_or(4321),
             "web_port": req.web_port.unwrap_or(8088),
@@ -2960,7 +3003,28 @@ fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
 /// GET /hqp/instances - List all HQPlayer instances
 pub async fn hqp_instances_handler(State(state): State<AppState>) -> impl IntoResponse {
     let instances = state.hqp_instances.list_instances().await;
+    let settings = load_app_settings();
+    let instances = instances
+        .into_iter()
+        .map(|instance| {
+            let display_name = settings
+                .custom_zone_name(&format!("hqplayer:{}", instance.name))
+                .unwrap_or(&instance.name)
+                .to_string();
+            NamedHqpInstance {
+                instance,
+                display_name,
+            }
+        })
+        .collect::<Vec<_>>();
     Json(InstancesWrapper { instances })
+}
+
+#[derive(Serialize)]
+struct NamedHqpInstance {
+    #[serde(flatten)]
+    instance: crate::adapters::hqplayer::HqpInstanceInfo,
+    display_name: String,
 }
 
 /// HQPlayer add instance request
@@ -2981,37 +3045,37 @@ pub async fn hqp_add_instance_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpAddInstanceRequest>,
 ) -> impl IntoResponse {
-    if req.name.is_empty() {
+    let name = req.name.trim().to_string();
+    let host = req.host.trim().to_string();
+    if name.is_empty() || host.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "Instance name is required".to_string(),
+                error: "Name and host are required".into(),
             }),
         )
             .into_response();
     }
-
-    if req.host.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "Host is required".to_string(),
-            }),
-        )
-            .into_response();
-    }
-
-    let _adapter = state
+    if let Err(error) = state
         .hqp_instances
-        .add_instance(
-            req.name.clone(),
-            req.host.clone(),
+        .configure_unique_instance(
+            name,
+            host,
             req.port,
             req.web_port,
             req.username,
             req.password,
         )
-        .await;
+        .await
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response();
+    }
 
     // Adding an instance is the same gesture as configuring the first one.
     if let Err(error) = mark_adapter_configured(&state, "hqplayer").await {
@@ -3064,6 +3128,80 @@ pub async fn hqp_remove_instance_handler(
             }),
         )
             .into_response()
+    }
+}
+
+/// Read the live pipeline for one configured HQPlayer. Unknown names never fall back.
+pub async fn hqp_instance_pipeline_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    if !state
+        .reliable_commands
+        .as_ref()
+        .is_some_and(|gateway| gateway.has_endpoint(&PrefixedZoneId::hqplayer(&name)))
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Instance not found: {name}"),
+            }),
+        )
+            .into_response();
+    }
+    match state.aggregator.get_hqplayer_snapshot(&name).await {
+        Some(snapshot) if snapshot.presence == HqpSnapshotPresence::Live => {
+            (StatusCode::OK, Json(snapshot.observation.pipeline)).into_response()
+        }
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: format!("HQPlayer {name} is offline"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Apply a semantic choice to the exact instance, using the same native command owner as MCP.
+pub async fn hqp_instance_pipeline_update_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<HqpPipelineRequest>,
+) -> axum::response::Response {
+    if !state
+        .reliable_commands
+        .as_ref()
+        .is_some_and(|gateway| gateway.has_endpoint(&PrefixedZoneId::hqplayer(&name)))
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Instance not found: {name}"),
+            }),
+        )
+            .into_response();
+    }
+    let Some(value) = req.value.as_str() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error:
+                    "Instance pipeline settings require a named string value (sample rate as Hz)."
+                        .into(),
+            }),
+        )
+            .into_response();
+    };
+    match hqp_apply_named_setting_for(&state, &name, &req.setting, value).await {
+        Ok(()) => hqp_instance_pipeline_handler(State(state), Path(name)).await,
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -3146,7 +3284,15 @@ pub async fn hqp_instance_matrix_profiles_handler(
             Json(serde_json::json!({
                 "instance": name,
                 "profiles": snapshot.matrix_profiles,
-                "current": snapshot.current_matrix_profile
+                "current": snapshot.current_matrix_profile,
+                "junk_filters": snapshot.junk_filters,
+                "junk_filters_supported": snapshot.junk_filters_supported,
+                "junk_filter": snapshot.state.filter_junk,
+                "convolution": snapshot.state.convolution,
+                "adaptive_volume": snapshot.state.adaptive,
+                "repeat": snapshot.state.repeat,
+                "random": snapshot.state.random,
+                "native_state": snapshot.state
             })),
         )
             .into_response(),

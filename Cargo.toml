@@ -8,8 +8,8 @@ license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/open-horizon-labs/unified-hifi-control"
 
 [features]
-# Default to server for standalone cargo build/test (dx build uses explicit features)
-default = ["server"]
+# Default to a complete server for standalone cargo build/test (dx build uses explicit features)
+default = ["server", "naa-proxy"]
 server = [
     "dioxus/fullstack",
     "dioxus/server",
@@ -39,6 +39,9 @@ server = [
     "dep:ed25519-dalek",
     "dep:uuid",
 ]
+# UHC-owned NAA relay for HQPlayer output routing. Server builds include it by default; use
+# `--no-default-features --features server` when a relay-free server is specifically required.
+naa-proxy = ["server", "dep:roxmltree", "dep:socket2"]
 # Hydrate SSR markup in the browser without enabling the Dioxus CLI's inferred
 # fullstack server build. Native server binaries enable the separate `server`
 # feature explicitly.
@@ -156,6 +159,12 @@ rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"
 # optional outbound HiPhi Cloud connector. The cloud signing key never enters UHC.
 ed25519-dalek = { version = "2.2", features = ["rand_core"], optional = true }
 
+# NAA relay core for HQPlayer output routing (server only). roxmltree gives byte ranges for
+# exact in-place control-line splicing; socket2 replaces the PoC's libc setsockopt calls because
+# this crate denies unsafe code.
+roxmltree = { version = "0.20", optional = true }
+socket2 = { version = "0.6", features = ["all"], optional = true }
+
 # ============ WEB-ONLY DEPENDENCIES ============
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
@@ -165,6 +174,9 @@ web-sys = { version = "0.3", features = ["Window", "Location", "Navigator", "Cli
 serde-wasm-bindgen = "0.6"
 # getrandom needs js feature for WASM (used by rand)
 getrandom = { version = "0.2", features = ["js"] }
+# Cross-platform async delay for the output-routing operation poll backoff
+# (src/app/components/hqp_outputs.rs); the server target uses tokio::time::sleep instead.
+gloo-timers = { version = "0.3", features = ["futures"] }
 
 [[bin]]
 name = "unified-hifi-control"
@@ -201,6 +213,10 @@ tempfile = "3"
 # embeddable, and wire-compatible with the `rumqttc` client used by the publisher -
 # this is the "mock/in-process broker" the issue's acceptance criteria calls for.
 rumqttd = { version = "0.19", default-features = false }
+
+[profile.dev]
+# Keep file/line backtraces without full variable and type debug information.
+debug = "line-tables-only"
 
 [profile.release]
 lto = true

@@ -1,0 +1,5 @@
+**/target/
+**/__pycache__/
+routes.json
+*.pcap
+*.capture

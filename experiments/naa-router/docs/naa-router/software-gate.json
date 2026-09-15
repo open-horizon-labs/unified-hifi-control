@@ -1,0 +1,54 @@
+{
+  "verified_at_utc": "2026-09-14T12:17:49.768166+00:00",
+  "platform": "Darwin arm64",
+  "binary": "native/naa-router/target/qualified/naa-router-af3f14ca20ac",
+  "binary_sha256": "af3f14ca20ac870ec735e00b4822087e58b0f0dce7ce85fb650921d8bfa54c0c",
+  "source_sha256": {
+    "native/naa-native/Cargo.lock": "ccf655310ee719ff9214de99a6b59243f8785d9e9df6e87569ac3b56ec8d6692",
+    "native/naa-native/Cargo.toml": "869f20e33b6795c424cc76a355337f1c21c7c062e2dc54dc46eb2198bc409572",
+    "native/naa-native/src/android.rs": "c52ee0b830b41b9125e4babf12f1faf2a317e20089a468402a2aa140242d76cb",
+    "native/naa-native/src/discovery.rs": "f34e9973e4de1d52012355e1b0f86dbcb9b22db4e2fd77cc1eddf370913b87df",
+    "native/naa-native/src/lib.rs": "351dabf8a1dcc66a5dcbc8ed6a70c536be7106830e827fad44182a192cead1cb",
+    "native/naa-native/src/main.rs": "006e589b4c91d432ad91ca08541a575870d9bfd19766c97c9622c02012a05760",
+    "native/naa-native/src/pcm.rs": "7eee78ae795bb55cd24423f204fbf79fd716f9f90b4e36633541d0d25584391c",
+    "native/naa-native/src/server.rs": "d2ccc40b16525a5199e426acfd4232512922ac62063b9ecd676791a77cc88fa5",
+    "native/naa-router/Cargo.lock": "c4744fdb2f190ec77d15255b2035e36e6c04037850b84b07a13d902ab9076929",
+    "native/naa-router/Cargo.toml": "bc7181ecd5258d571d5a2a0b949050fca82a7b57c978586ed4222caa48170f1f",
+    "native/naa-router/src/control.rs": "a34dccaf6d28ce7b6054acd2a0fcc161d57c34e15f296bb16ccb2af004e81df2",
+    "native/naa-router/src/http.rs": "67d18070edfaeb698706dcefe9db1ec25d8316df763020a74289d83d2be46ede",
+    "native/naa-router/src/main.rs": "d6d290b1a6642ce9ab1e965ad13d80d3d268cb751b1224236d3dd6f4d65c8610",
+    "native/naa-router/src/protocol.rs": "cdc69df85c9f0ec45f2e1934032937c2bca153516754d894ea25e3688731e498",
+    "native/naa-router/src/state.rs": "3473ab467ca9ebf61fd2743f55cddec6426b26df79d63a2a1cb26598c8307e7f",
+    "native/naa-router/tests/black_box.rs": "4074813c62fb7d50e14ad7d8a7a2da99e6a42eba0c014304a68c8fc3640fe693",
+    "native/naa-router/tests/deadlines.rs": "5ad5935539b6e9219f11bb8ca16937ef8ce06f0b05e2a93a09e86bccb3ec6f75",
+    "native/naa-router/tests/stop_save_failure.rs": "84291471c3a0034c18378a12367c0c3ee06fef5e1824dd46d4f9b0e71a2f40da",
+    "native/naa-router/web/index.html": "5e9bcaffcf348b73c344f21270f28a19c10e4b6d0d613b9df3431f68cff242f5",
+    "tools/naa_router_lab.py": "e106154a4e0183ac594c4e6a10588904a73ae42c0554d554aad10177c8d09f21",
+    "tools/naa_router_live.py": "19efb47c2540bd97997eb33c0a6b9f17d60debc1b18a1c9003d115050bafee13"
+  },
+  "combined_source_sha256": "d21576bed426422d833761241f42acee6d40d9fc9e90a61f6613410ffde6a9cc",
+  "checks": {
+    "release_python_suite": {
+      "passed": 63,
+      "failed": 0,
+      "product_cases": 54,
+      "reference_fixture_cases": 9,
+      "command": "python3 tools/naa_router_lab.py --binary native/naa-router/target/release/naa-router",
+      "log": "/tmp/hiphi-router-paused-release-gate.log"
+    },
+    "rust_cases": {
+      "passed": 9,
+      "failed": 0,
+      "command": "cargo test --manifest-path native/naa-router/Cargo.toml --no-fail-fast",
+      "log": "/tmp/hiphi-router-paused-gate.log"
+    },
+    "clippy": {
+      "passed": true,
+      "command": "cargo clippy --manifest-path native/naa-router/Cargo.toml --all-targets -- -D warnings",
+      "log": "/tmp/hiphi-router-paused-clippy.log"
+    }
+  },
+  "live_integrated_controller_verified": true,
+  "combined_source_encoding": "JSON source_sha256 object, sort_keys=True, default Python separators, UTF-8",
+  "live_evidence": "docs/naa-router/live-test.md, final live qualification"
+}

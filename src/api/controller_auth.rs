@@ -367,6 +367,7 @@ fn is_protected(path: &str, method: &axum::http::Method) -> bool {
             | "/hqplayer/setting"
             | "/hqplayer/profile"
             | "/hqplayer/configure"
+            | "/hqplayer/outputs/command"
             | "/lms/configure"
             | "/lms/control"
             | "/lms/volume"

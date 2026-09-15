@@ -108,16 +108,90 @@ fn linux_x64_tool_install_is_safe_on_a_persistent_runner() {
     let linux_x64 = job(&source, "build-linux-x64");
 
     assert!(linux_x64.contains("RUNNER_TOOL_CACHE"));
+    assert!(linux_x64.contains("Using runner-provided Zig"));
     assert!(!linux_x64.contains("sudo mv zig-linux"));
     assert!(linux_x64.contains(r#"test -x "$STAGED_ROOT/zig""#));
     assert!(linux_x64.contains(r#"rm -rf "$ZIG_ROOT""#));
 }
 
 #[test]
+fn zigbuild_tool_cache_is_versioned_and_validated() {
+    let source = workflow("build.yml");
+
+    for name in ["build-linux-x64", "build-linux-arm"] {
+        let body = job(&source, name);
+        assert!(
+            body.contains("cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-0.23.4"),
+            "{name} must key the cargo-zigbuild cache by platform and pinned version"
+        );
+        assert!(
+            body.contains("cargo-zigbuild --version | grep -q 'cargo-zigbuild 0.23.4'"),
+            "{name} must validate a restored cargo-zigbuild binary before using it"
+        );
+        assert!(
+            body.contains("cargo install cargo-zigbuild --version 0.23.4 --locked"),
+            "{name} must install the same version named by its cache key"
+        );
+        assert!(
+            body.contains("path: ${{ runner.tool_cache }}/zig/0.13.0/"),
+            "{name} must restore Zig from the runner tool cache"
+        );
+        assert!(
+            body.find("name: Cache Zig") < body.find("name: Install zig"),
+            "{name} must restore Zig before checking whether an install is needed"
+        );
+    }
+}
+
+#[test]
+fn server_artifacts_include_the_naa_proxy() {
+    let source = workflow("build.yml");
+
+    for name in [
+        "build-linux-x64",
+        "build-linux-arm",
+        "build-macos-x64",
+        "build-macos-arm64",
+        "build-windows",
+    ] {
+        let body = job(&source, name);
+        assert!(
+            body.contains("--features naa-proxy"),
+            "{name} must compile the installed server artifact with the NAA relay"
+        );
+    }
+}
+
+#[test]
+fn dioxus_cli_cache_matches_the_isolated_cargo_home() {
+    let source = workflow("build.yml");
+    let wasm = job(&source, "build-wasm");
+
+    assert!(
+        wasm.contains("path: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/cargo/bin/dx"),
+        "Dioxus CLI cache must use the isolated runner Cargo bin path"
+    );
+    assert!(
+        wasm.contains("key: dx-cli-${{ runner.os }}-${{ runner.arch }}-0.7.10"),
+        "Dioxus CLI cache must be scoped by runner platform and pinned version"
+    );
+    assert!(
+        wasm.find("name: Cache Dioxus CLI") < wasm.find("name: Install Dioxus CLI"),
+        "Dioxus CLI cache must restore before installation"
+    );
+}
+
+#[test]
 fn parallel_fleet_workers_do_not_share_mutable_rust_toolchains() {
     let source = workflow("build.yml");
 
-    for name in ["lint", "test", "build-wasm", "build-linux-x64"] {
+    for name in [
+        "lint",
+        "test",
+        "build-wasm",
+        "build-linux-x64",
+        "build-linux-arm",
+    ] {
         let body = job(&source, name);
         assert!(body.contains(
             r#"echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV""#

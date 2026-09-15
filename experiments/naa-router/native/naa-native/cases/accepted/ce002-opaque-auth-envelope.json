@@ -1,0 +1,47 @@
+{
+  "id": "ce002-opaque-auth-envelope",
+  "status": "approved",
+  "classification": "missing observational framing clause",
+  "authority": "User authorized capture-driven sketch refinement and CE creation, 2026-09-13. Luna medium naa_alignment approved this limited observational clause; no authentication policy change.",
+  "provenance": "Synthetic replacement values only. Structure observed in private complete getdevices connection and separate interrupted playback connection. No captured public keys, signatures or endpoint IDs retained.",
+  "input_ascii": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><authenticate public_key=\"synthetic\" signature=\"synthetic\"/>\n<?xml version=\"1.0\" encoding=\"UTF-8\"?><networkaudio><operation type=\"keepalive\"/></networkaudio>\n",
+  "sample_bytes": 4,
+  "chunk_sizes": [
+    1,
+    2,
+    7,
+    98,
+    99,
+    8192
+  ],
+  "observed_before": {
+    "exit": 1,
+    "stdout": "{\"type\":\"error\",\"offset\":0,\"kind\":\"InvalidControl\"}"
+  },
+  "projection_before_binary_sha256": "66b85415ef6dad2002a9badd898fa4418d57e415c3f95a73afcebf07d177a714",
+  "expected_exit": 0,
+  "expected_records": [
+    {
+      "type": "control",
+      "offset": 0,
+      "bytes": 99
+    },
+    {
+      "type": "control",
+      "offset": 99,
+      "bytes": 97
+    }
+  ],
+  "expected_control_ascii": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><authenticate public_key=\"synthetic\" signature=\"synthetic\"/>\n<?xml version=\"1.0\" encoding=\"UTF-8\"?><networkaudio><operation type=\"keepalive\"/></networkaudio>\n",
+  "corrected_behavior": "Preserve two opaque control envelopes and exact bytes independently of chunk boundaries; never interpret acceptance of the envelope as successful authentication.",
+  "tempting_wrong_repair": "Recognize only lines starting with <networkaudio, or strip XML declarations and authentication bytes rather than preserving them.",
+  "sketch_change": "Observed lexical framing subset: authenticate and networkaudio roots, optional same-line XML declaration, newline boundary.",
+  "adjacent_holes": "Complete XML grammar, auth verification/transcript binding/renewal, identity semantics and algorithm stay open.",
+  "approval": {
+    "reviewer": "Luna medium naa_alignment",
+    "decision": "approved observational framing refinement only",
+    "date": "2026-09-13"
+  },
+  "after_gate": "pass: 6 chunk sizes, exact opaque control bytes and ordered records; CE001 regressions 5 chunkings also pass",
+  "after_sketch_review": "pass: Luna medium naa_alignment reviewed active and R against updated sketch on 2026-09-13"
+}

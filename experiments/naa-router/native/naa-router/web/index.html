@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>HiPhi Router</title>
+<style>
+:root{color-scheme:dark;--surface:#071A2E;--ink:#F8FAFB;--secondary:#B9C9D4;--line:#637A8B;--pane:#123A58;--accent:#00C8F0;--error:#FFB4A6;--error-surface:#66190E;--focus:#00C8F0}
+*{box-sizing:border-box}body{margin:0;background:var(--surface);color:var(--ink);font:1rem/1.5 system-ui,-apple-system,sans-serif}button,input,summary{font:inherit}button,input{min-height:48px;border:1px solid var(--line);border-radius:6px}button{cursor:pointer;background:transparent;color:var(--ink);padding:.6rem 1.1rem;font-weight:600}button:hover:not(:disabled){background:var(--pane)}button:active:not(:disabled){transform:translateY(1px)}button:disabled{opacity:.55;cursor:default}button.primary{background:var(--accent);border-color:var(--accent);color:#071A2E}button.primary:hover:not(:disabled){background:#9CEFFF;border-color:#9CEFFF}:focus-visible{outline:3px solid var(--focus);outline-offset:4px}input{display:block;width:100%;background:var(--surface);color:var(--ink);padding:.6rem .75rem;margin-top:.35rem}input::placeholder{color:var(--secondary)}label{display:block;font-weight:600}small,.muted{color:var(--secondary)}h1,h2,h3,p{margin:0}h1{font-size:2rem;letter-spacing:-.02em;line-height:1.2;text-wrap:balance}h2{font-size:1.25rem;letter-spacing:-.02em}h3{font-size:1rem}p{max-width:68ch;text-wrap:pretty}header{border-bottom:1px solid var(--line)}.topbar{max-width:64rem;margin:auto;padding:1.1rem 1.5rem;display:flex;align-items:baseline;justify-content:space-between;gap:1rem}.brand{font-size:1.5rem;font-weight:700;letter-spacing:-.02em;color:var(--accent)}.topbar small{font-size:.8rem}main{max-width:64rem;margin:auto;padding:2.5rem 1.5rem 6rem}.eyebrow{font-size:.85rem;color:var(--secondary);margin-bottom:.6rem}.current{display:flex;justify-content:space-between;gap:2rem;align-items:start}.current p{margin-top:.75rem}.status{display:flex;align-items:center;gap:.65rem;color:var(--secondary)}.dot{height:8px;width:8px;border-radius:50%;background:var(--secondary);flex:none}.status.connected .dot{background:var(--accent)}.status.error .dot{background:var(--error)}#route-address{overflow-wrap:anywhere;font-size:.9rem}#stop{flex:none;min-width:8rem}.issue{background:var(--error-surface);color:var(--error);padding:.85rem 1rem;border-radius:6px;margin-top:1.5rem;overflow-wrap:anywhere}.notice{color:var(--secondary);margin-top:1.25rem;min-height:1.5em}.section-heading{display:flex;justify-content:space-between;align-items:baseline;gap:1rem;margin:2.5rem 0 .75rem}.section-heading small{font-size:.85rem}.routes{list-style:none;margin:0;padding:0;border-top:1px solid var(--line)}.route{display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:1.15rem 0;border-bottom:1px solid var(--line)}.route-info{min-width:0}.route-name{font-weight:650;overflow-wrap:anywhere}.route-host{font-size:.85rem;color:var(--secondary);overflow-wrap:anywhere;margin-top:.2rem}.route button{min-width:7rem;flex:none}.route.selected .route-name{color:var(--accent)}.empty{padding:1.5rem 0;color:var(--secondary)}details{margin-top:1.75rem}summary{min-height:48px;cursor:pointer;padding:.65rem 0;font-weight:600;width:fit-content}form{max-width:40rem;padding-top:.75rem}.fields{display:grid;grid-template-columns:1fr 1fr;gap:1rem}form p{margin:.75rem 0;color:var(--secondary);font-size:.9rem}.advanced{margin:.5rem 0 1rem}.advanced summary{font-size:.9rem;color:var(--secondary);font-weight:400}.advanced .fields{grid-template-columns:7rem 1fr}.form-actions{display:flex;gap:.75rem;align-items:center;margin-top:1rem}.setup{margin-top:3rem;padding-top:1.25rem;border-top:1px solid var(--line);color:var(--secondary);font-size:.9rem}.setup h2{font-size:1rem;color:var(--ink);margin-bottom:.5rem}.setup p+p{margin-top:.6rem}#adapter-name{color:var(--ink);font-weight:600}code{font: .85rem ui-monospace,monospace;overflow-wrap:anywhere}.details{font-size:.85rem}.details p{margin:.5rem 0}footer{margin-top:2rem;color:var(--secondary);font-size:.8rem}noscript{display:block;padding:1rem;background:var(--error-surface);color:var(--error)}[hidden]{display:none!important}
+@media(max-width:540px){main{padding:1.75rem 1rem 4rem}.topbar{padding:1rem}.current{flex-wrap:wrap;gap:1.25rem}.current>div{width:100%}h1{font-size:1.65rem}.fields,.advanced .fields{grid-template-columns:1fr}.route{align-items:start}.section-heading{flex-wrap:wrap;gap:.25rem}#stop{width:100%}.topbar small{max-width:10rem;text-align:right}}
+@media(prefers-color-scheme:light){:root{color-scheme:light;--surface:#F8FAFB;--ink:#172536;--secondary:#344B5F;--line:#637A8B;--pane:#E4ECF1;--accent:#00677D;--error:#9A2D1E;--error-surface:#FFF0EC;--focus:#00677D}button.primary{background:#00C8F0;border-color:#00C8F0}}
+</style>
+</head>
+<body>
+<header><div class="topbar"><span class="brand">HiPhi <span style="font-weight:400;color:var(--ink)">Router</span></span><small>NAA routing · Private preview</small></div></header>
+<noscript>Enable JavaScript to select a destination and control routing.</noscript>
+<main>
+  <section class="current" aria-labelledby="destination">
+    <div><p class="eyebrow">Selected destination</p><h1 id="destination">Connecting to router…</h1><p id="route-address" class="muted"></p><p id="connection" class="status" role="status"><span class="dot" aria-hidden="true"></span><span id="connection-text">Reading current state</span></p></div>
+    <button id="stop" type="button" disabled>Stop routing</button>
+  </section>
+  <p id="error" class="issue" role="alert" hidden></p>
+  <section id="device-choice" hidden aria-labelledby="device-heading" style="margin-top:1.25rem"><h2 id="device-heading">Choose the DAC on this NAA</h2><p class="muted" style="margin:.5rem 0 1rem">This endpoint has several outputs. Choose which one should receive audio.</p><div id="device-buttons" style="display:flex;flex-wrap:wrap;gap:.75rem"></div></section>
+  <p id="feedback" class="notice" role="status" aria-live="polite"></p>
+  <section aria-labelledby="destinations-heading">
+    <div class="section-heading"><h2 id="destinations-heading">Your destinations</h2><small>Switching ends the current audio session.</small></div>
+    <ul id="routes" class="routes" aria-label="NAA destinations"></ul>
+    <p id="empty" class="empty" hidden>Add an NAA below, then select it to start routing.</p>
+    <div class="section-heading"><h2>Available on your network</h2><button id="scan" type="button">Refresh</button></div>
+    <p id="scan-status" class="muted" role="status"></p><ul id="found" class="routes" aria-label="Discovered NAA endpoints"></ul>
+    <details id="add-details"><summary id="form-summary">Add a destination</summary>
+      <form id="add-form">
+        <input name="route_id" type="hidden">
+        <div class="fields"><label>Name<input name="name" autocomplete="off" maxlength="128" required placeholder="Listening room"></label><label>NAA address<input name="host" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="253" required placeholder="naa.local or IP address"></label></div>
+        <p>Use the address of the NAA connected to your DAC.</p>
+        <details class="advanced"><summary>Port and DAC device ID</summary><div class="fields"><label>Port<input name="port" type="number" min="1" max="65535" value="43210" required></label><label>DAC device ID <small>(optional)</small><input name="device_id" autocomplete="off" spellcheck="false" maxlength="1024"></label></div><p>Leave the device ID empty when this NAA has one output. If it has several, enter the exact output device ID.</p></details>
+        <div class="form-actions"><button class="primary" type="submit" id="add-button">Add destination</button><button type="button" id="cancel-add">Cancel</button><button type="button" id="remove-route" hidden>Remove</button></div>
+      </form>
+    </details>
+  </section>
+  <section class="setup" aria-labelledby="setup-heading"><h2 id="setup-heading">Connect HQPlayer once</h2><p>Select <span id="adapter-name">HiPhi Router</span> as the NAA and output device in HQPlayer. Then choose your destination here.</p><p id="resume-hint">After switching, resume playback in your controller. HQPlayer keeps control of the DSP and output format. The destination must support that format.</p>
+    <details class="details"><summary>Connection details</summary><p>Virtual device: <code id="virtual-id">hiphi:router</code></p><p>NAA listener: <code id="naa-address">—</code></p><p id="traffic">No active session.</p><p>Forwarded data confirms network activity. It does not confirm that the DAC is playing.</p></details>
+  </section>
+  <footer>HiPhi by Open Horizon Labs</footer>
+</main>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+// opEpoch is bumped by every mutating action; a handler only applies its own
+// result to shared state if opEpoch still matches what it captured when it
+// started. Stop always bumps opEpoch, so a slow/late select (or add/edit/
+// remove/device-choice) response arriving after Stop can never overwrite it.
+let state = null, routes = [], busy = false, stopBusy = false, refreshPending = false, routeSignature = '', deviceSignature = '', reachable = false, actionError = '', lastAttempt = null, selectingRouteId = null, pendingResume = null, opEpoch = 0;
+function message(text) { $('feedback').textContent = text; }
+function error(text) { $('error').textContent = text || ''; $('error').hidden = !text; }
+async function request(path, body, timeoutMs) {
+  const ms = timeoutMs || (body === undefined ? 7000 : 15000);
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), ms);
+  try {
+    const response = await fetch(path, {method: body === undefined ? 'GET' : 'POST', headers: body === undefined ? {} : {'Content-Type':'application/json'}, body: body === undefined ? undefined : JSON.stringify(body), signal:controller.signal, cache:'no-store'});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `Router request failed (${response.status}).`);
+    return data;
+  } catch (e) { if (e.name === 'AbortError') throw new Error('The router did not respond. Check that it is still running.'); throw e; }
+  finally { clearTimeout(timer); }
+}
+function setBusy(value) { busy = value; render(); }
+function setStopBusy(value) { stopBusy = value; render(); }
+function stateError(s) { return s && (s.last_error || (s.hqp_control && s.hqp_control.last_error)) || ''; }
+function selectionMessage(name, s) {
+  const hqp = s.hqp_control;
+  if(hqp && ['checking','stopping','waiting_for_naa','resuming'].includes(hqp.phase)) return `${name} selected. Reconnecting and resuming playback…`;
+  if(stateError(s)) return `${name} selected. Check the message above before resuming.`;
+  if(hqp && hqp.enabled) {
+    if(s.session && s.session.started && s.session.audio_bytes > 0)
+      return `${name} selected. Audio forwarding resumed.${hqp.position_restored === true ? ' Track position restored.' : ''}`;
+    return `${name} selected. Press Play in your controller when ready.`;
+  }
+  return `${name} selected. Resume playback in your controller.`;
+}
+function render() {
+  for(const button of $('found').querySelectorAll('button')) button.disabled = busy || stopBusy || !reachable;
+  const selected = state && state.route;
+  $('destination').textContent = !reachable ? 'Router unavailable' : selected ? selected.name : 'Choose a destination';
+  $('route-address').textContent = selected ? `${selected.host}:${selected.port}` : 'Select an NAA to receive HQPlayer’s audio.';
+  const session = state && state.session;
+  const phase = state && state.hqp_control && state.hqp_control.phase;
+  const resuming = ['checking','stopping','waiting_for_naa','resuming'].includes(phase);
+  let status = !reachable ? 'Connection lost — trying again'
+    : stopBusy ? 'Stopping routing…'
+    : selectingRouteId ? 'Selecting…'
+    : resuming ? (phase === 'resuming' ? 'Resuming playback…' : 'Reconnecting to selected NAA…')
+    : !selected ? 'Routing stopped'
+    : state.routing_enabled === false ? 'Routing paused — retry this destination'
+    : session ? (session.started && session.audio_bytes > 0 ? 'Forwarding audio to selected NAA' : session.initialized ? 'Ready — waiting for audio' : 'Connected to selected NAA') : 'Selected — waiting for HQPlayer';
+  if (!stopBusy && !selectingRouteId && !resuming && session && session.state && /connect|auth/.test(session.state) && !session.initialized) status = session.state === 'connecting' ? 'Connecting to selected NAA' : 'Connected to selected NAA';
+  $('connection-text').textContent = status;
+  $('connection').className = 'status' + (!reachable || stateError(state) || actionError ? ' error' : session ? ' connected' : '');
+  $('stop').disabled = stopBusy || !(selected || session || selectingRouteId || busy || resuming);
+  const formLocked = busy || stopBusy;
+  $('add-button').disabled = formLocked;
+  $('cancel-add').disabled = formLocked;
+  $('remove-route').disabled = formLocked;
+  if (state) {
+    $('adapter-name').textContent = state.name || 'HiPhi Router';
+    $('virtual-id').textContent = state.virtual_device_id || 'hiphi:router';
+    $('naa-address').textContent = state.naa_addr || '—';
+    $('traffic').textContent = session ? `Current stream: ${Number(session.audio_bytes || 0).toLocaleString()} audio bytes sent. Session: ${Number(session.bytes_to_naa || 0).toLocaleString()} total bytes sent; ${Number(session.bytes_from_naa || 0).toLocaleString()} bytes received.` : 'No active session.';
+    const hqp = state.hqp_control, auto = hqp && hqp.address && hqp.enabled !== false;
+    $('resume-hint').textContent = auto
+      ? 'Switching resumes audio automatically if HQPlayer was playing. Paused or stopped playback stays stopped. HQPlayer keeps control of the DSP and output format; the destination must support that format.'
+      : 'After switching, resume playback in your controller. HQPlayer keeps control of the DSP and output format. The destination must support that format.';
+  }
+  const devices = state && selected && !selected.device_id && Array.isArray(state.discovered_devices) ? state.discovered_devices : [];
+  const nextDeviceSignature = JSON.stringify([devices,selected && selected.id]);
+  if(nextDeviceSignature !== deviceSignature) {
+    deviceSignature = nextDeviceSignature; $('device-choice').hidden = devices.length < 2;
+    $('device-buttons').replaceChildren();
+    for(const device of devices) {
+      const choice = document.createElement('button'); choice.type = 'button'; choice.textContent = device.description || device.id; choice.disabled = busy || stopBusy; choice.title = device.id;
+      choice.addEventListener('click', async () => {
+        if(busy || stopBusy) return;
+        const epoch = ++opEpoch;
+        actionError = ''; lastAttempt = null; setBusy(true); error(stateError(state) || '');
+        try {
+          await request('/api/routes/update',{route_id:selected.id,name:selected.name,host:selected.host,port:selected.port,device_id:device.id});
+          if(epoch === opEpoch) message(`${device.description || device.id} chosen. Resume playback in your controller.`);
+        } catch(e) {
+          if(epoch === opEpoch) { actionError = e.message; lastAttempt = {kind:'device', routeId: selected.id, deviceId: device.id}; error(stateError(state) || actionError); }
+        } finally { if(epoch === opEpoch) setBusy(false); await refresh(); }
+      }); $('device-buttons').append(choice);
+    }
+  } else {
+    for(const button of $('device-buttons').children) button.disabled = busy || stopBusy;
+  }
+  const retry = !!selected && (state.routing_enabled === false || (!session && !!stateError(state)));
+  const signature = JSON.stringify([routes,state && state.selected_route_id,retry]);
+  if (signature !== routeSignature) {
+    routeSignature = signature;
+    const focused = document.activeElement, focusedId = focused && focused.dataset.routeId, focusedRole = focused && focused.dataset.role;
+    const fragment = document.createDocumentFragment();
+    for (const route of routes) {
+      const active = state && state.selected_route_id === route.id;
+      const row = document.createElement('li'); row.className = 'route' + (active ? ' selected' : '');
+      const info = document.createElement('div'); info.className = 'route-info';
+      const name = document.createElement('div'); name.className = 'route-name'; name.textContent = route.name;
+      const host = document.createElement('div'); host.className = 'route-host'; host.textContent = `${route.host}:${route.port}`;
+      info.append(name,host); attachDacList(info,route);
+      const button = document.createElement('button'); button.type = 'button'; button.textContent = active ? (retry ? 'Retry' : 'Selected') : 'Select'; button.className = active ? 'primary' : ''; button.disabled = busy || stopBusy || (active && !retry) || !reachable; button.dataset.routeId = route.id; button.dataset.role = 'select'; button.setAttribute('aria-label', `${active ? (retry ? 'Retry' : 'Selected:') : 'Select'} ${route.name}`);
+      if(active) button.setAttribute('aria-current','true');
+      const edit = document.createElement('button'); edit.type = 'button'; edit.textContent = 'Edit'; edit.style.cssText = 'border:0;min-width:0;padding:.25rem .5rem;margin-left:-.5rem;font-size:.85rem;color:var(--secondary)'; edit.disabled = busy || stopBusy || !reachable; edit.dataset.routeId = route.id; edit.dataset.role = 'edit'; edit.setAttribute('aria-label', `Edit ${route.name}`); edit.addEventListener('click', () => editRoute(route)); info.append(edit);
+      button.addEventListener('click', () => selectRoute(route)); row.append(info,button); fragment.append(row);
+    }
+    $('routes').replaceChildren(fragment);
+    if(focusedId) for(const button of $('routes').querySelectorAll('button')) if(button.dataset.routeId === focusedId && button.dataset.role === focusedRole && !button.disabled) { button.focus(); break; }
+  } else {
+    const disableRoute = busy || stopBusy || !reachable;
+    for(const button of $('routes').querySelectorAll('button[data-role="select"]')) button.disabled = disableRoute || (button.getAttribute('aria-current') === 'true' && !retry);
+    for(const button of $('routes').querySelectorAll('button[data-role="edit"]')) button.disabled = disableRoute;
+  }
+  $('empty').hidden = routes.length > 0 || !reachable;
+}
+async function refresh() {
+  if(refreshPending) return;
+  refreshPending = true;
+  try {
+    const [nextState,nextRoutes] = await Promise.all([request('/api/state'),request('/api/routes')]);
+    if(state && nextState.generation < state.generation) return;
+    state = nextState; routes = nextRoutes; reachable = true;
+    if(pendingResume && state.generation >= pendingResume.generation) {
+      if(state.selected_route_id !== pendingResume.routeId) pendingResume = null;
+      else if(!state.hqp_control || ['idle','error'].includes(state.hqp_control.phase)) {
+        message(selectionMessage(state.route.name,state)); pendingResume = null;
+      }
+    }
+    if(actionError && lastAttempt && attemptResolved(lastAttempt, state)) { actionError = ''; lastAttempt = null; }
+    error(stateError(state) || actionError); render(); renderDacLists();
+  } catch(e) { reachable = false; error(e.message); render(); }
+  finally { refreshPending = false; }
+}
+// select/stop/device-choice have a state shape that unambiguously proves success,
+// so a failed attempt's error clears once fresh state confirms it actually landed.
+// add/edit/remove keep their error until the user's next explicit action instead.
+function attemptResolved(attempt, s) {
+  if (stateError(s)) return false;
+  if (attempt.kind === 'select') return s.selected_route_id === attempt.routeId;
+  if (attempt.kind === 'stop') return !s.selected_route_id && !s.session;
+  if (attempt.kind === 'device') return !!s.route && s.route.id === attempt.routeId && s.route.device_id === attempt.deviceId;
+  return false;
+}
+async function selectRoute(route) {
+  if(busy || stopBusy) return;
+  const epoch = ++opEpoch;
+  selectingRouteId = route.id; pendingResume = null; actionError = ''; lastAttempt = null; setBusy(true); error(stateError(state) || ''); message(`Selecting ${route.name}…`);
+  try {
+    const result = await request('/api/select',{route_id:route.id});
+    if(epoch === opEpoch) { state = result; if(state.hqp_control && ['checking','stopping','waiting_for_naa','resuming'].includes(state.hqp_control.phase)) pendingResume = {routeId:route.id,generation:state.generation}; message(selectionMessage(route.name,state)); error(stateError(state) || ''); }
+  } catch(e) {
+    if(epoch === opEpoch) {
+      actionError = e.message; lastAttempt = {kind:'select', routeId: route.id};
+      error(stateError(state) || actionError);
+      message('Selection could not be confirmed. Check the current destination.');
+    }
+  } finally { if(epoch === opEpoch) { selectingRouteId = null; setBusy(false); } await refresh(); }
+}
+// Stop is deliberately independent of `busy`: it must stay clickable while a
+// select (or add/edit/remove/device-choice) request is still in flight, and it
+// always wins that race because it bumps opEpoch before awaiting anything.
+$('stop').addEventListener('click', async () => {
+  if(stopBusy) return;
+  ++opEpoch; busy = false; selectingRouteId = null; pendingResume = null;
+  actionError = ''; lastAttempt = null; setStopBusy(true); error(stateError(state) || '');
+  try {
+    state = await request('/api/stop',{});
+    message('Routing stopped. Select a destination to route again.');
+    error(stateError(state) || '');
+  } catch(e) {
+    actionError = e.message; lastAttempt = {kind:'stop'};
+    error(stateError(state) || actionError);
+  } finally { setStopBusy(false); await refresh(); }
+});
+function resetForm() { $('add-form').reset(); $('add-form').elements.route_id.value = ''; $('form-summary').textContent = 'Add a destination'; $('add-button').textContent = 'Add destination'; $('remove-route').hidden = true; }
+function editRoute(route) {
+  resetForm();
+  for(const key of ['name','host','port','device_id']) $('add-form').elements[key].value = route[key] || (key === 'port' ? 43210 : '');
+  $('add-form').elements.route_id.value = route.id;
+  $('form-summary').textContent = 'Edit destination'; $('add-button').textContent = 'Save changes'; $('remove-route').hidden = false;
+  $('add-details').open = true; $('add-form').elements.name.focus();
+}
+$('cancel-add').addEventListener('click', () => { resetForm(); $('add-details').open = false; $('form-summary').focus(); });
+$('remove-route').addEventListener('click', async () => {
+  if(busy || stopBusy) return;
+  const routeId = $('add-form').elements.route_id.value, name = $('add-form').elements.name.value;
+  if(!routeId) return;
+  const epoch = ++opEpoch;
+  actionError = ''; lastAttempt = null; setBusy(true); error(stateError(state) || '');
+  try {
+    await request('/api/routes/remove',{route_id:routeId});
+    if(epoch === opEpoch) { resetForm(); $('add-details').open = false; message(`${name} removed.`); $('form-summary').focus(); }
+  } catch(e) {
+    if(epoch === opEpoch) { actionError = e.message; error(stateError(state) || actionError); }
+  } finally { if(epoch === opEpoch) setBusy(false); await refresh(); }
+});
+$('add-form').addEventListener('submit', async event => {
+  event.preventDefault(); if(busy || stopBusy) return;
+  const form = new FormData(event.currentTarget);
+  const routeId = String(form.get('route_id') || '');
+  const epoch = ++opEpoch;
+  actionError = ''; lastAttempt = null; setBusy(true); error(stateError(state) || '');
+  try {
+    const route = await request(routeId ? '/api/routes/update' : '/api/routes',{...(routeId ? {route_id:routeId} : {}),name:String(form.get('name')).trim(),host:String(form.get('host')).trim(),port:Number(form.get('port')),device_id:String(form.get('device_id')).trim()});
+    if(epoch === opEpoch) {
+      message(routeId ? `${route.name} updated.` : `${route.name} added. Select it when you’re ready to route audio.`);
+      resetForm(); $('add-details').open = false; $('form-summary').focus();
+    }
+  } catch(e) {
+    if(epoch === opEpoch) { actionError = e.message; error(stateError(state) || actionError); }
+  } finally { if(epoch === opEpoch) setBusy(false); await refresh(); }
+});
+function attachDacList(info, endpoint) {
+  const list = document.createElement('div'); list.className = 'dac-list';
+  list.dataset.host = endpoint.host; list.dataset.port = endpoint.port; list.dataset.name = endpoint.name;
+  info.append(list);
+}
+function renderDacLists() {
+  for(const list of document.querySelectorAll('.dac-list')) {
+    const observation = ((state && state.dac_catalog) || []).find(e => e.host === list.dataset.host && e.port === Number(list.dataset.port));
+    const signature = JSON.stringify(observation || null);
+    if(list.dataset.signature !== signature) {
+      list.dataset.signature = signature; list.replaceChildren();
+      const note = document.createElement('p'); note.className = 'route-host';
+      note.textContent = observation ? `DACs last seen ${new Date(observation.observed_at * 1000).toLocaleString()}${observation.devices.length ? '' : ' — no outputs reported'}` : 'DAC list available after the first relayed connection.';
+      list.append(note);
+      if(observation) for(const device of observation.devices) {
+        if(!device.id) continue;
+        const button = document.createElement('button'); button.type = 'button'; button.textContent = device.description || device.id;
+        button.title = device.id; button.style.cssText = 'margin:.35rem .4rem 0 0;min-width:0';
+        button.onclick = () => selectKnownDac({host:list.dataset.host,port:Number(list.dataset.port),name:list.dataset.name},device);
+        list.append(button);
+      }
+    }
+    for(const button of list.querySelectorAll('button')) button.disabled = busy || stopBusy || !reachable;
+  }
+}
+async function selectKnownDac(endpoint, device) {
+  if(busy || stopBusy) return;
+  const epoch = ++opEpoch; setBusy(true);
+  try {
+    const route = routes.find(r => r.host === endpoint.host && r.port === endpoint.port && r.device_id === device.id)
+      || await request('/api/routes',{host:endpoint.host,port:endpoint.port,name:`${endpoint.name} · ${device.description || device.id}`.slice(0,128),device_id:device.id});
+    if(epoch !== opEpoch) return;
+    setBusy(false); await selectRoute(route);
+  } catch(e) { error(e.message); }
+  finally { if(epoch === opEpoch) setBusy(false); await refresh(); }
+}
+let scanning = false, scanGeneration = 0, expiryTimer;
+async function discover() {
+  if(scanning) return;
+  scanning = true;
+  const generation = ++scanGeneration;
+  clearTimeout(expiryTimer);
+  $('scan').disabled = true;
+  $('found').replaceChildren();
+  $('scan-status').textContent = 'Looking for NAA endpoints…';
+  try {
+    const endpoints = await request('/api/discover',{});
+    if(generation !== scanGeneration) return;
+    $('scan-status').textContent = endpoints.length ? 'Choose an endpoint to save and select it. DAC choices follow connection.' : 'No endpoints replied. You can refresh or add an address manually.';
+    for(const endpoint of endpoints) {
+      const row = document.createElement('li'); row.className = 'route';
+      const info = document.createElement('div'); info.className = 'route-info';
+      const name = document.createElement('div'); name.className = 'route-name'; name.textContent = endpoint.name;
+      const host = document.createElement('div'); host.className = 'route-host'; host.textContent = `${endpoint.host}:${endpoint.port} · NAA protocol ${endpoint.protocol}`;
+      info.append(name,host); attachDacList(info,endpoint);
+      const button = document.createElement('button'); button.type = 'button'; button.disabled = busy || stopBusy || !reachable; button.textContent = 'Select'; button.setAttribute('aria-label',`Select ${endpoint.name} at ${endpoint.host}:${endpoint.port}`);
+      button.onclick = async () => {
+        if(busy || stopBusy || generation !== scanGeneration) return;
+        const epoch = opEpoch;
+        button.disabled = true;
+        setBusy(true);
+        try {
+          const matching = routes.filter(r => r.host === endpoint.host && r.port === endpoint.port);
+          if(matching.length > 1) { message('This endpoint has multiple saved destinations. Choose one from Your destinations.'); return; }
+          const route = matching[0] || await request('/api/routes',{name:endpoint.name,host:endpoint.host,port:endpoint.port,device_id:''});
+          if(epoch !== opEpoch) return;
+          setBusy(false);
+          await selectRoute(route);
+        } catch(e) { error(e.message); }
+        finally { if(epoch === opEpoch) setBusy(false); button.disabled = false; await refresh(); }
+      };
+      row.append(info,button); $('found').append(row);
+      renderDacLists();
+    }
+    expiryTimer = setTimeout(() => { ++scanGeneration; $('found').replaceChildren(); $('scan-status').textContent = 'Discovery results expired. Refresh to check availability. Saved destinations remain available.'; },30000);
+  } catch(e) { $('scan-status').textContent = e.message; }
+  finally { scanning = false; $('scan').disabled = false; }
+}
+$('scan').onclick = discover;
+request('/api/discovery').then(config => {
+  if(config.enabled) discover();
+  else { $('scan').disabled = true; $('scan-status').textContent = 'Network discovery is off. Start the router with --discovery-interface to enable it, or add an address manually.'; }
+}).catch(e => { $('scan-status').textContent = e.message; });
+refresh(); setInterval(refresh,1500);
+document.addEventListener('visibilitychange', () => { if(!document.hidden) refresh(); });
+</script>
+</body>
+</html>

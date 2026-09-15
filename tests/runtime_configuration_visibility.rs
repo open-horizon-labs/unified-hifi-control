@@ -193,13 +193,17 @@ async fn configuring_hqplayer_at_runtime_enables_it() {
     // the host happened to answer, so it must hold either way.
     let response = unified_hifi_control::api::hqp_configure_handler(
         State(state.clone()),
-        Json(unified_hifi_control::api::HqpConfigRequest {
-            host: "127.0.0.1".to_string(),
-            port: Some(4321),
-            web_port: Some(8088),
-            username: None,
-            password: None,
-        }),
+        // Exercise the legacy HTTP payload: omitting a name must still configure default.
+        Json(
+            serde_json::from_value::<unified_hifi_control::api::HqpConfigRequest>(
+                serde_json::json!({
+                    "host": "127.0.0.1",
+                    "port": 4321,
+                    "web_port": 8088
+                }),
+            )
+            .expect("legacy HQPlayer configuration remains valid"),
+        ),
     )
     .await;
     let status = axum::response::IntoResponse::into_response(response).status();
@@ -269,4 +273,88 @@ async fn a_configure_that_cannot_persist_the_toggle_reports_failure() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A second label must not create a second connection to the same engine.
+#[tokio::test]
+#[serial_test::serial(lms_config)]
+async fn hqplayer_duplicate_endpoint_is_refused_on_both_configuration_surfaces() {
+    use axum::response::IntoResponse;
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("UHC_CONFIG_DIR", dir.path());
+    let (state, _) = app_state_with_live_lms_projection().await;
+    state
+        .hqp_instances
+        .add_instance(
+            "default".into(),
+            "localhost".into(),
+            Some(4321),
+            None,
+            None,
+            None,
+        )
+        .await;
+    let payload = serde_json::json!({"name":"mac", "host":"LOCALHOST.", "port":4321});
+    let add = unified_hifi_control::api::hqp_add_instance_handler(
+        State(state.clone()),
+        Json(serde_json::from_value(payload.clone()).unwrap()),
+    )
+    .await
+    .into_response();
+    assert_eq!(add.status(), axum::http::StatusCode::CONFLICT);
+    let configure = unified_hifi_control::api::hqp_configure_handler(
+        State(state.clone()),
+        Json(serde_json::from_value(payload).unwrap()),
+    )
+    .await
+    .into_response();
+    assert_eq!(configure.status(), axum::http::StatusCode::CONFLICT);
+    assert!(state.hqp_instances.get("mac").await.is_none());
+    assert_eq!(
+        state
+            .hqp_instances
+            .get("default")
+            .await
+            .unwrap()
+            .get_status()
+            .await
+            .host
+            .as_deref(),
+        Some("localhost")
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(lms_config)]
+async fn removing_one_hqplayer_duplicate_preserves_the_other_connection() {
+    use axum::{extract::Path, response::IntoResponse};
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("UHC_CONFIG_DIR", dir.path());
+    let (state, _) = app_state_with_live_lms_projection().await;
+    // Represent configuration saved before duplicate prevention existed.
+    for name in ["default", "mac"] {
+        state
+            .hqp_instances
+            .add_instance(
+                name.into(),
+                "localhost".into(),
+                Some(4321),
+                None,
+                None,
+                None,
+            )
+            .await;
+    }
+    let response = unified_hifi_control::api::hqp_remove_instance_handler(
+        State(state.clone()),
+        Path("mac".into()),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert!(state.hqp_instances.get("mac").await.is_none());
+    assert!(state.hqp_instances.get("default").await.is_some());
+    let saved = unified_hifi_control::adapters::hqplayer::load_hqp_configs();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].name, "default");
 }

@@ -1,0 +1,29 @@
+{
+  "verified_at_utc": "2026-09-14T12:45:05.854427+00:00",
+  "base_commit": "4f285251",
+  "import_manifest": "IMPORT.json",
+  "binary": "experiments/naa-router/native/naa-router/target/release/naa-router",
+  "binary_sha256": "238330932c15b9fbf26612f2fa99a804d351861e4af89d18384fb077bb059b3d",
+  "mcp_sources_sha256": {
+    "tools/test_router_mcp.py": "ec6c655438f27269c26db692d77a618b0d23e68d2e2f314b3d463e1458df5b67",
+    "tools/test_router_mcp_integration.py": "50dd3c7c75c0c7a5ce3cc62b7e93b743e9cf2c3b2f436ea7beffbfb8c8ed2d97",
+    "tools/router_mcp.py": "710422fcc4ac4cbd7ce55d8cd141cf5661985a117178725841d4da0f54ee319e"
+  },
+  "checks": {
+    "copied_cargo_test": {
+      "passed": true,
+      "python_cases": 65,
+      "rust_cases": 11,
+      "log": "/tmp/uhc-naa-import-test.log"
+    },
+    "clippy": {
+      "passed": true,
+      "log": "/tmp/uhc-naa-import-clippy.log"
+    },
+    "mcp_unit_cases": 7,
+    "mcp_wire_cases": 2,
+    "mcp_wire_backend": "actual copied release router + software NAA fixtures; concurrent Stop uses gated HTTP fixture"
+  },
+  "uhc_adapter_wired": false,
+  "new_live_hqplayer_tests": false
+}

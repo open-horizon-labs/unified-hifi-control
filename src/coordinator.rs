@@ -970,3 +970,241 @@ mod tests {
         assert!(!status["b"].enabled);
     }
 }
+
+/// Resolve an unambiguous playing source through the existing binding and aggregator.
+#[cfg(feature = "naa-proxy")]
+pub async fn relay_metadata_source(
+    state: &crate::api::AppState,
+    instance: &str,
+) -> Option<(String, crate::bus::NowPlaying)> {
+    let mut source = None;
+    for link in state.hqp_zone_links.get_links().await {
+        if link.instance != instance {
+            continue;
+        }
+        let Some(zone) = state.aggregator.get_zone(&link.zone_id).await else {
+            continue;
+        };
+        if zone.state != crate::bus::PlaybackState::Playing {
+            continue;
+        }
+        let Some(np) = zone.now_playing else {
+            continue;
+        };
+        if np.title.trim().is_empty() && np.artist.trim().is_empty() && np.album.trim().is_empty() {
+            continue;
+        }
+        // Multiple playing bindings provide no evidence of which one feeds this engine.
+        if source.is_some() {
+            return None;
+        }
+        source = Some((link.zone_id, np));
+    }
+    source
+}
+
+/// Keep relay fallback metadata synchronized without provider I/O in the audio worker.
+/// Artwork uses the same provider-neutral image service as the rest of UHC.
+#[cfg(feature = "naa-proxy")]
+pub async fn run_relay_metadata(state: crate::api::AppState) {
+    use crate::adapters::hqplayer::naa_relay::MetadataPayload;
+    struct CachedArtwork {
+        source: String,
+        key: Option<String>,
+        picture: Option<Vec<u8>>,
+        attempted: std::time::Instant,
+    }
+    let mut cache: HashMap<String, CachedArtwork> = HashMap::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    loop {
+        tokio::select! {
+            _ = state.shutdown.cancelled() => break,
+            _ = tick.tick() => {}
+        }
+        let instances = state.hqp_instances.list_instances().await;
+        cache.retain(|name, _| instances.iter().any(|instance| &instance.name == name));
+        for instance in instances {
+            let Some(adapter) = state.hqp_instances.get(&instance.name).await else {
+                continue;
+            };
+            adapter.set_relay_source_control(relay_source_control(&state, &instance.name));
+            let Some((source, np)) = relay_metadata_source(&state, &instance.name).await else {
+                adapter.set_relay_metadata(None);
+                cache.remove(&instance.name);
+                continue;
+            };
+            let cached = cache
+                .get(&instance.name)
+                .filter(|entry| entry.source == source && entry.key == np.image_key);
+            let mut metadata = MetadataPayload {
+                title: np.title.clone(),
+                artist: np.artist.clone(),
+                album: np.album.clone(),
+                picture: cached.and_then(|entry| entry.picture.clone()),
+            };
+            // Text arrives immediately, even while the image provider is slow or unavailable.
+            adapter.set_relay_metadata(Some(metadata.clone()));
+            let retry = cached.is_none_or(|entry| {
+                entry.picture.is_none() && entry.attempted.elapsed() >= Duration::from_secs(30)
+            });
+            if !retry {
+                continue;
+            }
+            let picture = if let Some(key) = &np.image_key {
+                tokio::select! {
+                    _ = state.shutdown.cancelled() => return,
+                    result = tokio::time::timeout(Duration::from_secs(2), state.get_image_bounded(&source, key, 1024 * 1024)) => {
+                        match result {
+                            Ok(Ok(image)) if matches!(image.content_type.split(';').next(), Some("image/jpeg" | "image/png")) => Some(image.data),
+                            _ => None,
+                        }
+                    }
+                }
+            } else {
+                None
+            };
+            // An image fetch must not publish a previous track or a removed binding.
+            let current = relay_metadata_source(&state, &instance.name).await;
+            if !current.as_ref().is_some_and(|(zone, now)| {
+                zone == &source
+                    && now.title == np.title
+                    && now.artist == np.artist
+                    && now.album == np.album
+                    && now.image_key == np.image_key
+            }) {
+                adapter.set_relay_metadata(None);
+                cache.remove(&instance.name);
+                continue;
+            }
+            metadata.picture = picture.clone();
+            adapter.set_relay_metadata(Some(metadata));
+            cache.insert(
+                instance.name,
+                CachedArtwork {
+                    source,
+                    key: np.image_key,
+                    picture,
+                    attempted: std::time::Instant::now(),
+                },
+            );
+        }
+    }
+}
+
+/// A source transport bridge scoped to one HQPlayer instance. Weak bindings avoid retaining
+/// the manager (and its adapters) after shutdown.
+#[cfg(feature = "naa-proxy")]
+struct RoonRelaySource {
+    instance: String,
+    links: std::sync::Weak<crate::adapters::hqplayer::HqpZoneLinkService>,
+    aggregator: Arc<crate::aggregator::ZoneAggregator>,
+    gateway: Option<crate::bus::runtime::CommandGateway>,
+}
+
+#[cfg(feature = "naa-proxy")]
+impl RoonRelaySource {
+    async fn source(&self) -> Result<Option<String>, String> {
+        let links = self
+            .links
+            .upgrade()
+            .ok_or("HQPlayer bindings unavailable")?;
+        let sources: Vec<_> = links
+            .get_links()
+            .await
+            .into_iter()
+            .filter(|link| link.instance == self.instance && link.zone_id.starts_with("roon:"))
+            .map(|link| link.zone_id)
+            .collect();
+        match sources.as_slice() {
+            [] => Ok(None),
+            [source] => Ok(Some(source.clone())),
+            _ => Err("Multiple Roon zones are paired; choose one pairing before switching.".into()),
+        }
+    }
+}
+
+#[cfg(feature = "naa-proxy")]
+#[async_trait::async_trait]
+impl crate::adapters::hqplayer::naa_relay::RelaySourceControl for RoonRelaySource {
+    async fn pause_for_switch(&self) -> Result<Option<(String, bool)>, String> {
+        use crate::bus::{Command, PlaybackState};
+        let Some(source) = self.source().await? else {
+            return Ok(None);
+        };
+        let zone = self
+            .aggregator
+            .get_zone(&source)
+            .await
+            .ok_or("Paired Roon zone is unavailable")?;
+        let playing = match zone.state {
+            PlaybackState::Playing => true,
+            PlaybackState::Paused | PlaybackState::Stopped => false,
+            _ => return Err("Paired Roon playback state is not settled; try again.".into()),
+        };
+        if playing {
+            crate::api::dispatch_roon_runtime_command_via(
+                self.gateway.as_ref(),
+                &source,
+                Command::Pause,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if self.source().await?.as_deref() != Some(&source) {
+                    return Err("Roon pairing changed during pause".into());
+                }
+                if self.aggregator.get_zone(&source).await.is_some_and(|zone| {
+                    matches!(zone.state, PlaybackState::Paused | PlaybackState::Stopped)
+                }) {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err("Roon pause was not confirmed; destination unchanged".into());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        Ok(Some((source, playing)))
+    }
+
+    async fn pause_after_failed_resume(&self, source: &str) -> Result<(), String> {
+        if self.source().await?.as_deref() != Some(source) {
+            return Err("Roon pairing changed; no cleanup command sent".into());
+        }
+        crate::api::dispatch_roon_runtime_command_via(
+            self.gateway.as_ref(),
+            source,
+            crate::bus::Command::Pause,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    async fn resume_after_switch(&self, source: &str) -> Result<(), String> {
+        if self.source().await?.as_deref() != Some(source) {
+            return Err("Roon pairing changed; playback was not resumed".into());
+        }
+        crate::api::dispatch_roon_runtime_command_via(
+            self.gateway.as_ref(),
+            source,
+            crate::bus::Command::Play,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+}
+
+/// Compose the exact-instance Roon transport bridge without exposing adapters to surfaces.
+#[cfg(feature = "naa-proxy")]
+pub fn relay_source_control(
+    state: &crate::api::AppState,
+    instance: &str,
+) -> Arc<dyn crate::adapters::hqplayer::naa_relay::RelaySourceControl> {
+    Arc::new(RoonRelaySource {
+        instance: instance.to_string(),
+        links: Arc::downgrade(&state.hqp_zone_links),
+        aggregator: state.aggregator.clone(),
+        gateway: state.reliable_commands.clone(),
+    })
+}

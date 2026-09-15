@@ -1,0 +1,33 @@
+{
+  "verified_at_utc": "2026-09-14T12:34:18.783803+00:00",
+  "binary": "native/naa-router/target/qualified/naa-router-8a9264f840fc",
+  "binary_sha256": "8a9264f840fcf075d92ba53a046f8a8b6b634763a11d29d15f92f5895c2f53fb",
+  "source_sha256": {
+    "native/naa-router/Cargo.lock": "c4744fdb2f190ec77d15255b2035e36e6c04037850b84b07a13d902ab9076929",
+    "native/naa-router/Cargo.toml": "bc7181ecd5258d571d5a2a0b949050fca82a7b57c978586ed4222caa48170f1f",
+    "native/naa-router/src/control.rs": "a34dccaf6d28ce7b6054acd2a0fcc161d57c34e15f296bb16ccb2af004e81df2",
+    "native/naa-router/src/discovery.rs": "31feaafa340a7f48ad05e9d9481a5259e7649c38e03cf3401b40dfd2d37ca426",
+    "native/naa-router/src/http.rs": "1a0d7c85aa1a24e1f25d3d02c839f0bbe9ea26f4ddc320a794914adcae7ab49c",
+    "native/naa-router/src/main.rs": "e62d7352f6a253984159e545fb62a613749b37468cdab67e986b7d45a1a95d22",
+    "native/naa-router/src/protocol.rs": "cdc69df85c9f0ec45f2e1934032937c2bca153516754d894ea25e3688731e498",
+    "native/naa-router/src/state.rs": "ed60155e7e689cd5e58d5fae67c1b43fca7e79d3ad82af6df7410b81387b389b",
+    "native/naa-router/tests/black_box.rs": "4074813c62fb7d50e14ad7d8a7a2da99e6a42eba0c014304a68c8fc3640fe693",
+    "native/naa-router/tests/deadlines.rs": "5ad5935539b6e9219f11bb8ca16937ef8ce06f0b05e2a93a09e86bccb3ec6f75",
+    "native/naa-router/tests/stop_save_failure.rs": "84291471c3a0034c18378a12367c0c3ee06fef5e1824dd46d4f9b0e71a2f40da",
+    "native/naa-router/web/index.html": "059c6d107ed7dad90c673309e98a0d25cdd769887c0c71d389d7b3ba4859f0ce",
+    "tools/naa_router_lab.py": "dc182464fbc448ac0dd8632c70aa11b0a576b63935fcceb547b841a89f93dc81"
+  },
+  "checks": {
+    "python_release": {
+      "passed": 65,
+      "router_cases": 56,
+      "reference_cases": 9,
+      "log": "/tmp/hiphi-dac-release.log"
+    },
+    "cargo_test": "/tmp/hiphi-dac-test.log",
+    "clippy": "/tmp/hiphi-dac-clippy.log",
+    "browser": "Exact cached DAC selection verified through API"
+  },
+  "full_live_audio_requalified": false,
+  "historical_live_build": "software-gate.json"
+}

@@ -206,6 +206,132 @@
       "type": "object"
     }
   },
+  "hifi_hqplayer_output_control": {
+    "description": "Mutate HQPlayer output routing on an exact instance: relay_configure, route_add, route_update, route_remove, select, stop, discover, import_preview, import_apply, setup_preview, setup_apply, setup_readback, or setup_rollback. Call hifi_hqplayer_outputs first for the current source_epoch/output_revision to echo back — every mutation except stop/discover/import_preview/setup_preview/setup_readback requires both.",
+    "inputSchema": {
+      "properties": {
+        "action": {
+          "description": "One of: relay_configure, route_add, route_update, route_remove, select, stop, discover,\nimport_preview, import_apply, setup_preview, setup_apply, setup_readback, setup_rollback.",
+          "type": "string"
+        },
+        "adapter_name": {
+          "description": "Name presented by this proxy as the NAA endpoint/DAC.",
+          "nullable": true,
+          "type": "string"
+        },
+        "bind": {
+          "description": "Optional relay listen address. New relays default to a LAN listener with an automatically allocated port.",
+          "nullable": true,
+          "type": "string"
+        },
+        "correlation_id": {
+          "description": "Caller-owned id. Reused with an identical request returns the same operation (no second\nside effect); reused with a different request is refused.",
+          "nullable": true,
+          "type": "string"
+        },
+        "device_id": {
+          "description": "Optional DAC device identifier returned by read-through discovery.",
+          "nullable": true,
+          "type": "string"
+        },
+        "discovery_interface": {
+          "description": "Optional IPv4 interface for NAA multicast discovery; enabled LAN relays choose the interface automatically when omitted.",
+          "nullable": true,
+          "type": "string"
+        },
+        "discovery_port": {
+          "description": "Shared NAA discovery query port; defaults to 43210. Replies advertise each relay’s own TCP port.",
+          "nullable": true,
+          "type": "integer"
+        },
+        "enabled": {
+          "description": "Enable or disable the managed relay.",
+          "nullable": true,
+          "type": "boolean"
+        },
+        "expected_output_revision": {
+          "description": "Expected output revision from the latest projection, used to reject stale commands.",
+          "nullable": true,
+          "type": "integer"
+        },
+        "expected_source_epoch": {
+          "description": "Expected source epoch from the latest projection, used to reject stale commands.",
+          "nullable": true,
+          "type": "integer"
+        },
+        "host": {
+          "description": "NAA destination host or address.",
+          "nullable": true,
+          "type": "string"
+        },
+        "hqp_allow": {
+          "description": "Optional HQPlayer source allowlist; empty accepts any reachable NAA peer.",
+          "items": {
+            "type": "string"
+          },
+          "nullable": true,
+          "type": "array"
+        },
+        "name": {
+          "description": "Friendly route or relay name.",
+          "nullable": true,
+          "type": "string"
+        },
+        "port": {
+          "description": "NAA destination TCP port.",
+          "nullable": true,
+          "type": "integer"
+        },
+        "preview_id": {
+          "description": "Preview identity returned by a preview operation.",
+          "nullable": true,
+          "type": "string"
+        },
+        "route_id": {
+          "description": "Existing route id for update, remove, or select.",
+          "nullable": true,
+          "type": "string"
+        },
+        "routes_json": {
+          "description": "JSON route document for import preview/apply.",
+          "nullable": true,
+          "type": "string"
+        },
+        "zone_id": {
+          "description": "Exact HQPlayer instance zone id; no implicit default is used.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "zone_id",
+        "action"
+      ],
+      "type": "object"
+    }
+  },
+  "hifi_hqplayer_outputs": {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Read the committed HQPlayer output-routing document for an exact instance: relay availability, saved routes, the selected route, the current relay session and recent operations. Pass operation_id to read one operation record instead of the whole document.",
+    "inputSchema": {
+      "properties": {
+        "operation_id": {
+          "description": "Read one operation record by id (from a prior write's receipt) instead of the projection.",
+          "nullable": true,
+          "type": "string"
+        },
+        "zone_id": {
+          "description": "Exact HQPlayer zone id, e.g. \"hqplayer:living\". Required — there is no default-instance\nfallback for output routing.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "zone_id"
+      ],
+      "type": "object"
+    }
+  },
   "hifi_hqplayer_profiles": {
     "annotations": {
       "readOnlyHint": true

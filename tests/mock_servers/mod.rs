@@ -8,6 +8,8 @@
 
 pub mod hqplayer;
 pub mod lms;
+#[cfg(feature = "naa-proxy")]
+pub mod naa;
 pub mod openhome;
 pub mod roon;
 pub mod roon_core;

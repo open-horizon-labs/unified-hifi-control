@@ -21,7 +21,35 @@
 //! - `result="OK"` is not proof a setting applied. See `verify_applied`.
 
 mod lifecycle;
+mod naa;
+
+/// Public output-routing wire types (`GET/POST /hqplayer/outputs*`, MCP output tools, UI).
+pub mod outputs {
+    pub use super::naa::outputs::*;
+}
+/// Owned NAA relay lifecycle (`naa-proxy` feature). Constructed only by the adapter composition;
+/// exposed publicly for hermetic lifecycle tests and deliberately without any control listener.
+#[cfg(feature = "naa-proxy")]
+pub mod naa_relay {
+    pub use super::naa::coordinator::{HqpOutputTimeouts, RelaySourceControl};
+    pub use super::naa::discovery::{
+        own_addresses as discovery_own_addresses, scan as discovery_scan,
+    };
+    pub use super::naa::frame::MetadataPayload;
+    pub use super::naa::relay::{
+        validate_route, NaaRelay, RelayObservation, RelayRoutesFile, RelaySharedState,
+        RelayStopOutcome, RelayStopReport,
+    };
+    pub use super::{NativeHookFence, NativeHookOutcome, NativeTransportSnapshot};
+}
+
+/// Whether the UHC-owned NAA relay is compiled into this binary.
+pub const NAA_PROXY_COMPILED: bool = cfg!(feature = "naa-proxy");
 pub use lifecycle::{HqpRecoveryConfig, HqpWorkerPhase, HqpWorkerStatus};
+pub use naa::outputs::{
+    HqpOutputAction, HqpOutputAvailability, HqpOutputCommandReceipt, HqpOutputCommandRequest,
+    HqpOutputOperation, HqpOutputPhase, HqpOutputProjection, NaaRelaySettings,
+};
 
 use anyhow::{anyhow, Context, Result};
 use quick_xml::events::{BytesStart, Event};
@@ -39,7 +67,7 @@ use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{Mutex, RwLock, Semaphore};
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use crate::adapters::Startable;
@@ -82,6 +110,10 @@ pub struct HqpInstanceConfig {
     pub username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// UHC-owned NAA relay settings for this instance (`naa-proxy`). Absent means disabled; the
+    /// legacy single-object and array files without this key load unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub naa_relay: Option<outputs::NaaRelaySettings>,
 }
 
 fn default_port() -> u16 {
@@ -163,6 +195,7 @@ pub fn load_hqp_configs() -> Vec<HqpInstanceConfig> {
             web_port: single.web_port,
             username: single.username,
             password: single.password,
+            naa_relay: None,
         }];
     }
 
@@ -1543,6 +1576,7 @@ pub struct HqpAdvancedOptionsSnapshot {
     pub pipeline: PipelineStatus,
     pub state: HqpState,
     pub junk_filters: Vec<ListItem>,
+    pub junk_filters_supported: bool,
     pub matrix_profiles: Vec<MatrixProfile>,
     pub current_matrix_profile: Option<MatrixProfile>,
 }
@@ -1846,6 +1880,17 @@ pub trait HqpNativeObservationSink: Send + Sync {
         Ok(())
     }
     async fn transient_failure(&self, instance_name: &str, observed_at: SystemTime) -> Result<()>;
+    /// Commit one instance's output-routing document. `caused_by` names the reliable command whose
+    /// admission or completion this projection proves; the runtime confirms that ticket only when
+    /// the commit carrying it lands.
+    async fn outputs_observed(
+        &self,
+        _instance_name: &str,
+        _projection: outputs::HqpOutputProjection,
+        _caused_by: Option<CommandId>,
+    ) -> Result<()> {
+        Ok(())
+    }
     async fn instance_removed(&self, instance_name: &str, producer_epoch: u64) -> Result<()>;
     async fn manager_stopped(&self) -> Result<()>;
 }
@@ -1931,6 +1976,27 @@ impl HqpNativeObservationSink for HqpRuntimeBridge {
         .await
     }
 
+    async fn outputs_observed(
+        &self,
+        instance_name: &str,
+        projection: outputs::HqpOutputProjection,
+        caused_by: Option<CommandId>,
+    ) -> Result<()> {
+        // Epoch 0 reuses the instance's current native epoch; the output document is not a native
+        // observation and must not open a new epoch of its own.
+        self.publish(
+            instance_name,
+            0,
+            caused_by,
+            ProjectionKind::Delta,
+            ProjectionPayload::HqpOutputs {
+                instance_name: instance_name.to_string(),
+                projection: Box::new(projection),
+            },
+        )
+        .await
+    }
+
     async fn instance_removed(&self, instance_name: &str, producer_epoch: u64) -> Result<()> {
         self.publish(
             instance_name,
@@ -1969,7 +2035,7 @@ impl HqpNativeObservationSink for HqpRuntimeBridge {
 }
 
 #[derive(Clone)]
-struct HqpNativeWorker {
+pub(crate) struct HqpNativeWorker {
     sink: Arc<dyn HqpNativeObservationSink>,
     instance_name: String,
 }
@@ -2073,6 +2139,25 @@ impl Drop for InFlightConnection {
         }
     }
 }
+
+/// Result of the inner native conversation when a write-admission guard is in play.
+enum InnerSend {
+    Reply(String),
+    /// The guard refused after the pre-write awaits; no byte entered the wire.
+    NotAdmitted(String),
+}
+
+/// Opaque hold on the adapter's native connection slot, for cancellation tests that need a hook
+/// to block exactly at the pre-write await.
+#[doc(hidden)]
+pub struct NativeConnectionHold(
+    #[allow(dead_code)] tokio::sync::OwnedMutexGuard<Option<HqpConnection>>,
+);
+
+/// Opaque write hold on the adapter state, for cancellation tests that need a hook to block on
+/// the `timeouts()` read that precedes the first write.
+#[doc(hidden)]
+pub struct NativeStateHold(#[allow(dead_code)] tokio::sync::OwnedRwLockWriteGuard<HqpAdapterState>);
 
 /// Profile info from web UI
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2434,6 +2519,8 @@ struct HqpAdapterState {
     profile_timeouts: HqpProfileTimeouts,
     /// Long-lived producer recovery policy. Separate from per-command retry semantics.
     recovery_config: HqpRecoveryConfig,
+    /// Persisted relay settings; the coordinator holds the live copy.
+    naa_relay: outputs::NaaRelaySettings,
 }
 
 /// Digest authentication state
@@ -2482,6 +2569,7 @@ impl Default for HqpAdapterState {
             timeouts: HqpTimeouts::default(),
             profile_timeouts: HqpProfileTimeouts::default(),
             recovery_config: HqpRecoveryConfig::default(),
+            naa_relay: outputs::NaaRelaySettings::default(),
         }
     }
 }
@@ -2525,6 +2613,22 @@ pub struct HqpAdapter {
     /// verification: against a well-behaved daemon this should stay at zero, so a non-zero count on
     /// real hardware is the signal that the reply-element invariant is narrower than documented.
     unsolicited_skipped: Arc<std::sync::atomic::AtomicU32>,
+    /// Exact-instance owner of output routing (NAA relay, operations, select/Stop state machine).
+    #[cfg(feature = "naa-proxy")]
+    outputs: Arc<naa::coordinator::HqpOutputCoordinator>,
+    /// Installed by the manager so relay reconfiguration can persist the instance array file.
+    config_persister: Arc<RwLock<Option<Arc<dyn ConfigPersister>>>>,
+    /// Test seam: an await point between the pre-write awaits and the write-admission guard of a
+    /// fenced native send. `None` in production; inert.
+    pre_write_gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+}
+
+/// Manager-owned persistence of the instance configuration array, invoked by the adapter after a
+/// relay reconfiguration lands so the saved file follows the live setting.
+#[async_trait::async_trait]
+pub trait ConfigPersister: Send + Sync {
+    /// Write the instance configuration. `Err` means the live setting is not durable.
+    async fn persist(&self) -> Result<()>;
 }
 
 impl HqpAdapter {
@@ -2644,6 +2748,12 @@ impl HqpAdapter {
             managed_lifecycle_sink,
             publish_legacy_zone_events: Arc::new(AtomicBool::new(true)),
             unsolicited_skipped: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            #[cfg(feature = "naa-proxy")]
+            outputs: Arc::new(naa::coordinator::HqpOutputCoordinator::new(
+                outputs::NaaRelaySettings::default(),
+            )),
+            config_persister: Arc::new(RwLock::new(None)),
+            pre_write_gate: std::sync::Mutex::new(None),
         };
         // Load saved config synchronously at startup
         adapter.load_config_sync();
@@ -2685,6 +2795,12 @@ impl HqpAdapter {
     /// Save config to disk
     async fn save_config(&self) {
         let state = self.state.read().await;
+        // Named instances are persisted together by HqpInstanceManager. In particular,
+        // configure() runs while loading that array, before its relay settings are applied.
+        // Writing a legacy object here destroys every instance's saved relay configuration.
+        if state.instance_name.is_some() {
+            return;
+        }
         if let Some(ref host) = state.host {
             let saved = SavedHqpConfig {
                 host: host.clone(),
@@ -2721,6 +2837,8 @@ impl HqpAdapter {
     ) {
         let _operation_guard = self.operation_lock.lock().await;
         let _conversation_guard = self.conversation_lock.lock().await;
+        // A new native endpoint invalidates any pending output switch against the old one.
+        self.supersede_output_work("superseded by HQPlayer instance reconfiguration");
         let (native_changed, old_reachable) = {
             let mut state = self.state.write().await;
             let port = port.unwrap_or(DEFAULT_PORT);
@@ -3618,6 +3736,11 @@ impl HqpAdapter {
         }
 
         self.disconnect_retaining_projection().await;
+        // A deliberate shutdown of this instance's worker takes its owned relay with it. An
+        // unexpected child exit is replaced by the supervisor and keeps the relay serving.
+        if shutdown.is_cancelled() {
+            self.stop_outputs("HQPlayer instance worker stopped").await;
+        }
     }
 
     /// Drop every cached chain-scoped enumeration.
@@ -4491,6 +4614,121 @@ impl HqpAdapter {
         }
     }
 
+    /// Send one irreversible output-hook write with admission fenced **at the write boundary**.
+    ///
+    /// The conversation lease is awaited with cancellation preferred (`biased`), the transport is
+    /// reconciled and the session identity checked, and only then, with the lease held and no
+    /// further await before the bytes, the fence and the deadline are checked. A cancelled or
+    /// expired hook therefore never enters the wire, no matter how long it waited. Delivery
+    /// evidence is typed: an explicit daemon rejection or a pre-write session change is never
+    /// reported as "entered the wire".
+    async fn send_fenced_on_transport(
+        &self,
+        xml: &str,
+        expected_generation: u64,
+        fence: &NativeHookFence,
+        deadline: tokio::time::Instant,
+    ) -> NativeSettingDelivery {
+        let _conversation_guard = tokio::select! {
+            biased;
+            _ = fence.token.cancelled() => {
+                return NativeSettingDelivery::NotAttempted {
+                    reason: "operation cancelled while waiting for the native conversation".into(),
+                };
+            }
+            guard = timeout_at(deadline, self.conversation_lock.lock()) => match guard {
+                Ok(guard) => guard,
+                Err(_) => {
+                    return NativeSettingDelivery::NotAttempted {
+                        reason: "hook deadline elapsed before the native conversation was acquired".into(),
+                    };
+                }
+            },
+        };
+        // Transport preparation is bounded by the same deadline and cancellation as the write:
+        // a held state or connection lock returns the hook on time instead of after release.
+        let prepared = tokio::select! {
+            biased;
+            _ = fence.token.cancelled() => Err("operation cancelled during native transport preparation".to_string()),
+            prep = timeout_at(deadline, async {
+                self.reconcile_cancelled_transport().await;
+                let actual_generation = self.transport_generation().await;
+                let has_connection = self.connection.lock().await.is_some();
+                (actual_generation, has_connection)
+            }) => prep.map_err(|_| "hook deadline elapsed during native transport preparation".to_string()),
+        };
+        let (actual_generation, has_connection) = match prepared {
+            Ok(prepared) => prepared,
+            Err(reason) => return NativeSettingDelivery::NotAttempted { reason },
+        };
+        if !has_connection || actual_generation != expected_generation {
+            return NativeSettingDelivery::NotAttempted {
+                reason: HqpSessionChanged {
+                    expected: expected_generation,
+                    actual: actual_generation,
+                }
+                .to_string(),
+            };
+        }
+        // Write admission runs inside the inner conversation, after its own `timeouts()` and
+        // connection awaits and immediately before the first byte, so nothing awaited in between
+        // can let a cancelled, superseded or expired hook write.
+        let admit = || -> Result<(), String> {
+            fence.check()?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err("hook deadline elapsed before the write was admitted".into());
+            }
+            Ok(())
+        };
+        let mut request_attempted = false;
+        let sent = timeout_at(
+            deadline,
+            self.send_command_inner_admitted(xml, &mut request_attempted, Some(&admit)),
+        )
+        .await;
+        match sent {
+            Ok(Ok(InnerSend::NotAdmitted(reason))) => {
+                NativeSettingDelivery::NotAttempted { reason }
+            }
+            Ok(Ok(InnerSend::Reply(response))) => match Self::parse_attr(&response, "result")
+                .as_deref()
+            {
+                Some("Error") => NativeSettingDelivery::DaemonRejected(HqpRejected {
+                    element: framing::root_element(&response).unwrap_or_else(|| "?".to_string()),
+                    reason: framing::root_text(&response),
+                }),
+                Some("OK") => NativeSettingDelivery::DaemonAcknowledged,
+                _ => NativeSettingDelivery::PossibleAttempt {
+                    reason: "the daemon replied without an explicit result=\"OK\" acknowledgement"
+                        .to_string(),
+                },
+            },
+            Ok(Err(error)) => {
+                self.mark_disconnected().await;
+                if request_attempted {
+                    NativeSettingDelivery::PossibleAttempt {
+                        reason: format!(
+                            "the request entered the native write path but drew no usable reply ({error})"
+                        ),
+                    }
+                } else {
+                    NativeSettingDelivery::NotAttempted {
+                        reason: format!(
+                            "the native transport failed before the request entered its write path ({error})"
+                        ),
+                    }
+                }
+            }
+            // The dropped in-flight conversation has poisoned the transport already.
+            Err(_) if request_attempted => NativeSettingDelivery::PossibleAttempt {
+                reason: "the hook deadline elapsed after the request entered the wire".to_string(),
+            },
+            Err(_) => NativeSettingDelivery::NotAttempted {
+                reason: "the hook deadline elapsed before the request entered the wire".to_string(),
+            },
+        }
+    }
+
     /// Retry one command while the caller owns the instance conversation lease.
     async fn send_command_serialized(&self, xml: &str) -> Result<String> {
         let timeouts = self.timeouts().await;
@@ -4610,7 +4848,41 @@ impl HqpAdapter {
         xml: &str,
         request_attempted: &mut bool,
     ) -> Result<String> {
+        match self
+            .send_command_inner_admitted(xml, request_attempted, None)
+            .await?
+        {
+            InnerSend::Reply(response) => Ok(response),
+            InnerSend::NotAdmitted(reason) => Err(anyhow!(reason)),
+        }
+    }
+
+    /// The inner conversation with an optional **write-admission guard**.
+    ///
+    /// The guard runs after every await that precedes the first byte (`timeouts()`, taking the
+    /// connection out of shared state) and immediately before `request_attempted` is set, so a
+    /// caller whose fence or deadline lapsed while those awaits were pending never writes. On
+    /// refusal the untouched socket is returned to shared state. Legacy callers pass `None`.
+    async fn send_command_inner_admitted(
+        &self,
+        xml: &str,
+        request_attempted: &mut bool,
+        admit: Option<&(dyn Fn() -> Result<(), String> + Sync)>,
+    ) -> Result<InnerSend> {
         let timeouts = self.timeouts().await;
+        if admit.is_some() {
+            // Test seam only: lets a cancellation test park a fenced hook exactly between the
+            // pre-write awaits and the admission guard.
+            let gate = self
+                .pre_write_gate
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or(None);
+            if let Some((reached, release)) = gate {
+                reached.notify_one();
+                release.notified().await;
+            }
+        }
         // Move the transport out of shared state for the complete in-flight conversation. This is
         // the cancellation guard: ordinary errors reach the caller's `mark_disconnected`, but a
         // dropped future executes no async cleanup branch. Keeping `Some(connection)` in shared
@@ -4624,6 +4896,14 @@ impl HqpAdapter {
             .take()
             .ok_or_else(|| anyhow!("Not connected"))?;
         let mut in_flight = InFlightConnection::new(conn, self.transport_poisoned.clone());
+        if let Some(admit) = admit {
+            if let Err(reason) = admit() {
+                // Nothing was written: hand the socket back exactly as it was.
+                let mut slot = self.connection.lock().await;
+                in_flight.restore(&mut slot);
+                return Ok(InnerSend::NotAdmitted(reason));
+            }
+        }
         let conn = in_flight.connection_mut()?;
 
         // Past this point the daemon may have seen some or all of the request, so a one-shot command is
@@ -4864,7 +5144,7 @@ impl HqpAdapter {
         let response = String::from_utf8_lossy(&raw).trim().to_string();
         let mut slot = self.connection.lock().await;
         in_flight.restore(&mut slot);
-        Ok(response)
+        Ok(InnerSend::Reply(response))
     }
 
     // =========================================================================
@@ -7411,15 +7691,36 @@ impl HqpAdapter {
         let generation = snapshot.transport_generation;
 
         let junk_xml = Self::build_request("GetJunkFilters", &[]);
-        let junk_response = self
-            .send_command_on_transport(&junk_xml, generation)
-            .await
-            .context("HQPlayer junk-filter choices became unavailable during the coherent read")?;
-        let junk_filters = Self::parse_items(&junk_response, "JunkFiltersItem", |item| ListItem {
-            index: Self::parse_attr_u32(item, "index"),
-            name: Self::parse_attr(item, "name").unwrap_or_default(),
-            value: Self::parse_attr_i32(item, "value"),
-        });
+        // Desktop 5.35.10 explicitly rejects this optional enumeration. Do not discard
+        // supported matrix/processing controls; all other failures still fail the snapshot.
+        let (junk_filters, junk_filters_supported) =
+            match self.send_command_on_transport(&junk_xml, generation).await {
+                Ok(response) => (
+                    Self::parse_items(&response, "JunkFiltersItem", |item| ListItem {
+                        index: Self::parse_attr_u32(item, "index"),
+                        name: Self::parse_attr(item, "name").unwrap_or_default(),
+                        value: Self::parse_attr_i32(item, "value"),
+                    }),
+                    true,
+                ),
+                Err(error)
+                    if error
+                        .downcast_ref::<HqpRejected>()
+                        .is_some_and(|rejection| {
+                            rejection.element == "GetJunkFilters"
+                                && rejection.reason.as_deref().is_some_and(|reason| {
+                                    reason.trim().eq_ignore_ascii_case("Unknown command")
+                                })
+                        }) =>
+                {
+                    (Vec::new(), false)
+                }
+                Err(error) => {
+                    return Err(error.context(
+                        "HQPlayer junk-filter choices became unavailable during the coherent read",
+                    ))
+                }
+            };
 
         let matrix_xml = Self::build_request("MatrixListProfiles", &[]);
         let matrix_response = self
@@ -7450,6 +7751,7 @@ impl HqpAdapter {
             pipeline: snapshot.legacy,
             state: snapshot.state,
             junk_filters,
+            junk_filters_supported,
             matrix_profiles,
             current_matrix_profile,
         })
@@ -8539,6 +8841,9 @@ impl HqpAdapter {
     }
 
     async fn fetch_profiles_under_operation(&self) -> Result<Vec<HqpProfile>> {
+        if self.is_desktop().await {
+            return Err(anyhow!("Configuration profiles require HQPlayer Embedded; Desktop DSP settings use the native control connection."));
+        }
         if !self.has_web_credentials().await {
             return Err(anyhow!("Web credentials not configured"));
         }
@@ -8611,6 +8916,9 @@ impl HqpAdapter {
     /// root-run Embedded host that endpoint can attempt to archive the entire system.
     pub async fn load_profile(&self, profile_value: &str) -> Result<()> {
         let _operation_guard = self.operation_lock.lock().await;
+        if self.is_desktop().await {
+            return Err(anyhow!("Configuration profiles require HQPlayer Embedded."));
+        }
         if profile_value.is_empty() || profile_value.to_lowercase() == "default" {
             return Err(anyhow!("Profile value is required"));
         }
@@ -8667,6 +8975,17 @@ impl HqpAdapter {
             )
             })?;
         Ok(())
+    }
+
+    // An unconnected adapter has not reported a product yet; do not confuse that
+    // with a known Desktop endpoint and block Embedded's initial profile reads.
+    async fn is_desktop(&self) -> bool {
+        self.state
+            .read()
+            .await
+            .info
+            .as_ref()
+            .is_some_and(|info| info.product.to_lowercase().contains("desktop"))
     }
 
     /// Check if this is HQPlayer Embedded (supports profiles)
@@ -9078,12 +9397,776 @@ impl HqpAdapter {
 // Multi-instance manager
 // =============================================================================
 
+/// One coherent read of HQPlayer's transport for the output hook: state plus the track and
+/// position the resume step may restore.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeTransportSnapshot {
+    pub state: u8,
+    pub track: Option<String>,
+    pub position: Option<f64>,
+}
+
+/// Cancellation and ownership fence for the output hook, evaluated **inside** the native lease
+/// immediately before every irreversible write (Stop, Play, Seek). A wrapper `select!` outside the
+/// lease is not enough: a ready future can still be polled to completion after its token was
+/// cancelled, and a newer selection may already own the transport by the time the lease is won.
+#[derive(Clone)]
+pub struct NativeHookFence {
+    pub token: CancellationToken,
+    /// True while the issuing operation still owns its relay generation.
+    pub still_current: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl NativeHookFence {
+    /// A fence that always passes, for the owner that cannot be superseded (Stop itself).
+    pub fn unconditional() -> Self {
+        Self {
+            token: CancellationToken::new(),
+            still_current: Arc::new(|| true),
+        }
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if self.token.is_cancelled() {
+            return Err("operation cancelled".to_string());
+        }
+        if !(self.still_current)() {
+            return Err("operation superseded by Stop or a newer request".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// What a fenced native hook did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NativeHookOutcome<T> {
+    Done(T),
+    /// The fence or the deadline refused before any write entered the wire. Nothing changed.
+    NotAttempted(String),
+    /// A write entered the wire but no usable reply came back within the deadline. The native
+    /// transport has been invalidated; the caller must treat HQPlayer's state as unknown.
+    Indeterminate(String),
+}
+
+/// Native transport hook for output routing. Every method acquires the endpoint operation lease
+/// (`_operation_guard`) under the caller's whole-hook deadline, fences immediately before each
+/// irreversible write, and bounds every native reply by the same deadline. Only `State`, `Status`,
+/// `Stop`, `Play` and `Seek` are issued here: no configuration, profile, restart or track
+/// selection. A reply that times out drops the in-flight conversation, which poisons the
+/// transport exactly as any other cancelled native future does.
+impl HqpAdapter {
+    /// Whether native control is reachable at all, from the adapter's published connection state.
+    pub async fn output_native_reachable(&self) -> bool {
+        self.get_status().await.connected
+    }
+
+    async fn output_hook_lease(
+        &self,
+        fence: &NativeHookFence,
+        deadline: tokio::time::Instant,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
+        let guard = tokio::select! {
+            biased;
+            _ = fence.token.cancelled() => Err("operation cancelled while waiting for the native lease".to_string()),
+            guard = timeout_at(deadline, self.operation_lock.lock()) => guard
+                .map_err(|_| "native lease not acquired before the hook deadline".to_string()),
+        }?;
+        // A free lease is a ready future and `timeout_at` polls it first: an already-expired
+        // deadline must still refuse here, before any read or write.
+        if tokio::time::Instant::now() >= deadline {
+            return Err("hook deadline elapsed before the native lease was used".to_string());
+        }
+        fence.check()?;
+        Ok(guard)
+    }
+
+    /// Map typed delivery evidence onto the hook outcome: rejection is a failure, a pre-write
+    /// refusal is not attempted, and only a write without a usable reply is indeterminate.
+    fn delivery_outcome(
+        delivery: NativeSettingDelivery,
+        element: &str,
+    ) -> Result<NativeHookOutcome<()>> {
+        match delivery {
+            NativeSettingDelivery::DaemonAcknowledged => Ok(NativeHookOutcome::Done(())),
+            NativeSettingDelivery::NotAttempted { reason } => {
+                Ok(NativeHookOutcome::NotAttempted(reason))
+            }
+            NativeSettingDelivery::PossibleAttempt { reason } => Ok(
+                NativeHookOutcome::Indeterminate(format!("{element}: {reason}")),
+            ),
+            NativeSettingDelivery::DaemonRejected(rejected) => Err(anyhow!(
+                "HQPlayer rejected <{}>: {}",
+                rejected.element,
+                rejected
+                    .reason
+                    .unwrap_or_else(|| "no reason given".to_string())
+            )),
+        }
+    }
+
+    async fn output_bounded<T>(
+        deadline: tokio::time::Instant,
+        future: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        timeout_at(deadline, future)
+            .await
+            .map_err(|_| anyhow!("HQPlayer did not reply before the hook deadline"))?
+    }
+
+    /// A read that precedes any write: hitting the deadline (or a held lock) is "not attempted",
+    /// never a wire failure, because nothing was written. The dropped in-flight read poisons the
+    /// transport exactly as any cancelled native future does.
+    async fn output_read<T>(
+        deadline: tokio::time::Instant,
+        what: &str,
+        future: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<Result<T, String>> {
+        match timeout_at(deadline, future).await {
+            Ok(Ok(value)) => Ok(Ok(value)),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Ok(Err(format!(
+                "hook deadline elapsed during the {what} read; nothing was written"
+            ))),
+        }
+    }
+
+    #[doc(hidden)]
+    pub async fn output_hook_transport(
+        &self,
+        fence: &NativeHookFence,
+        deadline: tokio::time::Instant,
+    ) -> Result<NativeHookOutcome<NativeTransportSnapshot>> {
+        let _lease_guard = match self.output_hook_lease(fence, deadline).await {
+            Ok(guard) => guard,
+            Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
+        };
+        if let Err(reason) = fence.check() {
+            return Ok(NativeHookOutcome::NotAttempted(reason));
+        }
+        let (state, generation) =
+            match Self::output_read(deadline, "State", self.get_state_with_generation()).await? {
+                Ok(value) => value,
+                Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
+            };
+        let status_xml = Self::build_request("Status", &[("subscribe", "0")]);
+        // Track/position are informational; their absence never blocks routing.
+        let status = Self::output_bounded(
+            deadline,
+            self.send_command_on_transport(&status_xml, generation),
+        )
+        .await
+        .ok()
+        .map(|response| Self::parse_status_response(&response));
+        Ok(NativeHookOutcome::Done(NativeTransportSnapshot {
+            state: state.state,
+            track: status.as_ref().map(|s| s.track.to_string()),
+            position: status.map(|s| f64::from(s.position)),
+        }))
+    }
+
+    /// Native `Stop` verified to state 0 before `deadline`, on one native session. The deadline
+    /// covers lease acquisition and every held wire reply.
+    #[doc(hidden)]
+    pub async fn output_hook_stop_verified(
+        &self,
+        fence: &NativeHookFence,
+        deadline: tokio::time::Instant,
+    ) -> Result<NativeHookOutcome<()>> {
+        let _lease_guard = match self.output_hook_lease(fence, deadline).await {
+            Ok(guard) => guard,
+            Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
+        };
+        if let Err(reason) = fence.check() {
+            return Ok(NativeHookOutcome::NotAttempted(reason));
+        }
+        let (state, generation) =
+            match Self::output_read(deadline, "State", self.get_state_with_generation()).await? {
+                Ok(value) => value,
+                Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
+            };
+        if state.state == 0 {
+            return Ok(NativeHookOutcome::Done(()));
+        }
+        // The write itself is fenced at admission, inside the conversation lease.
+        let stop = Self::build_request("Stop", &[]);
+        match Self::delivery_outcome(
+            self.send_fenced_on_transport(&stop, generation, fence, deadline)
+                .await,
+            "Stop",
+        )? {
+            NativeHookOutcome::Done(()) => {}
+            other => return Ok(other),
+        }
+        loop {
+            let observed =
+                Self::output_bounded(deadline, self.get_state_on_transport(generation)).await?;
+            if observed.state == 0 {
+                return Ok(NativeHookOutcome::Done(()));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "HQPlayer reported state {} after Stop",
+                    observed.state
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Exactly one native `Play` on the current session, fenced under the lease.
+    #[doc(hidden)]
+    pub async fn output_hook_play(
+        &self,
+        fence: &NativeHookFence,
+        deadline: tokio::time::Instant,
+    ) -> Result<NativeHookOutcome<()>> {
+        let _lease_guard = match self.output_hook_lease(fence, deadline).await {
+            Ok(guard) => guard,
+            Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
+        };
+        if let Err(reason) = fence.check() {
+            return Ok(NativeHookOutcome::NotAttempted(reason));
+        }
+        let (_, generation) =
+            match Self::output_read(deadline, "State", self.get_state_with_generation()).await? {
+                Ok(value) => value,
+                Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
+            };
+        let play = Self::build_request("Play", &[("last", "0")]);
+        Self::delivery_outcome(
+            self.send_fenced_on_transport(&play, generation, fence, deadline)
+                .await,
+            "Play",
+        )
+    }
+
+    #[doc(hidden)]
+    pub async fn output_hook_state(
+        &self,
+        fence: &NativeHookFence,
+        deadline: tokio::time::Instant,
+    ) -> Result<NativeHookOutcome<u8>> {
+        let _lease_guard = match self.output_hook_lease(fence, deadline).await {
+            Ok(guard) => guard,
+            Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
+        };
+        if let Err(reason) = fence.check() {
+            return Ok(NativeHookOutcome::NotAttempted(reason));
+        }
+        match Self::output_read(deadline, "State", self.get_state()).await? {
+            Ok(state) => Ok(NativeHookOutcome::Done(state.state)),
+            Err(reason) => Ok(NativeHookOutcome::NotAttempted(reason)),
+        }
+    }
+
+    /// Restore `seconds` on `track` and confirm by readback: `Done(true)` confirmed, `Done(false)`
+    /// attempted but unconfirmed before `deadline`, `Err` refused or the track changed.
+    #[doc(hidden)]
+    pub async fn output_hook_restore_position(
+        &self,
+        fence: &NativeHookFence,
+        deadline: tokio::time::Instant,
+        track: &str,
+        seconds: u64,
+    ) -> Result<NativeHookOutcome<bool>> {
+        let _lease_guard = match self.output_hook_lease(fence, deadline).await {
+            Ok(guard) => guard,
+            Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
+        };
+        if let Err(reason) = fence.check() {
+            return Ok(NativeHookOutcome::NotAttempted(reason));
+        }
+        let (_, generation) =
+            match Self::output_read(deadline, "State", self.get_state_with_generation()).await? {
+                Ok(value) => value,
+                Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
+            };
+        let status_xml = Self::build_request("Status", &[("subscribe", "0")]);
+        let before = match Self::output_read(
+            deadline,
+            "Status",
+            self.send_command_on_transport(&status_xml, generation),
+        )
+        .await?
+        {
+            Ok(response) => Self::parse_status_response(&response),
+            Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
+        };
+        if before.track.to_string() != track {
+            return Err(anyhow!(
+                "the track changed (was {track}, now {}); position not restored",
+                before.track
+            ));
+        }
+        let started = tokio::time::Instant::now();
+        let seek = Self::build_request("Seek", &[("position", &seconds.to_string())]);
+        match Self::delivery_outcome(
+            self.send_fenced_on_transport(&seek, generation, fence, deadline)
+                .await,
+            "Seek",
+        )? {
+            NativeHookOutcome::Done(()) => {}
+            NativeHookOutcome::NotAttempted(reason) => {
+                return Ok(NativeHookOutcome::NotAttempted(reason))
+            }
+            NativeHookOutcome::Indeterminate(reason) => {
+                return Ok(NativeHookOutcome::Indeterminate(reason))
+            }
+        }
+        loop {
+            let after = Self::parse_status_response(
+                &Self::output_bounded(
+                    deadline,
+                    self.send_command_on_transport(&status_xml, generation),
+                )
+                .await?,
+            );
+            if after.track.to_string() != track {
+                return Err(anyhow!(
+                    "the track changed after Seek; position not confirmed"
+                ));
+            }
+            let position = f64::from(after.position);
+            // The integer-second target is floored. Allow elapsed playback plus modest reporting
+            // latency, never an unchanged zero or an unrelated later position.
+            if position >= seconds as f64
+                && position <= seconds as f64 + started.elapsed().as_secs_f64() + 1.0
+            {
+                return Ok(NativeHookOutcome::Done(true));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(NativeHookOutcome::Done(false));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Read the persistent configuration HQPlayer serves at `/backup`, through the instance's
+    /// existing web credential owner. Nothing is cached; every call is a fresh read.
+    #[cfg(feature = "naa-proxy")]
+    pub(crate) async fn output_setup_read_backup(&self) -> Result<Vec<u8>> {
+        let _operation_guard = self.operation_lock.lock().await;
+        if !self.has_web_credentials().await {
+            return Err(anyhow!("Web credentials not configured"));
+        }
+        let body = self.profile_web_request("/backup", "GET", None).await?;
+        Ok(body.into_bytes())
+    }
+
+    /// Read the `/config` page (the running configuration form) under the operation lease.
+    #[cfg(feature = "naa-proxy")]
+    pub(crate) async fn output_setup_fetch_form(&self) -> Result<String> {
+        let _operation_guard = self.operation_lock.lock().await;
+        if !self.has_web_credentials().await {
+            return Err(anyhow!("Web credentials not configured"));
+        }
+        self.profile_web_request("/config", "GET", None).await
+    }
+
+    /// Authenticated POST on the persistent lane with Digest retry, returning the status and body.
+    #[cfg(feature = "naa-proxy")]
+    async fn web_post_authenticated(
+        &self,
+        path: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Result<(reqwest::StatusCode, String)> {
+        let base_url = self.web_base_url().await?;
+        let url = format!("{base_url}{path}");
+        let send = |auth: Option<String>| {
+            let mut request = self
+                .profile_http_client
+                .post(&url)
+                .header(reqwest::header::CONTENT_TYPE, content_type.to_string())
+                .header(reqwest::header::ORIGIN, &base_url)
+                .header(reqwest::header::REFERER, format!("{base_url}{path}"))
+                .body(body.clone());
+            if let Some(auth) = auth {
+                request = request.header(reqwest::header::AUTHORIZATION, auth);
+            }
+            request
+        };
+        let mut response = self
+            .send_profile_request(send(self.build_digest_header("POST", path).await))
+            .await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let challenge = response
+                .headers()
+                .get("www-authenticate")
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| value.to_ascii_lowercase().starts_with("digest"))
+                .ok_or_else(|| anyhow!("Authentication failed"))?
+                .to_string();
+            self.parse_digest_challenge(&challenge).await;
+            response = self
+                .send_profile_request(send(self.build_digest_header("POST", path).await))
+                .await?;
+        }
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        Ok((status, text))
+    }
+
+    /// Apply a complete `/config` form (the running selection) under the operation lease, fenced.
+    ///
+    /// The form is re-read first and must still carry exactly the successful controls the preview
+    /// derived from (`expected_fingerprint`), so a profile load or an operator change since the
+    /// preview refuses the apply instead of overwriting it. The fence and deadline are checked
+    /// with the lease held immediately before the post.
+    #[cfg(feature = "naa-proxy")]
+    pub(crate) async fn output_setup_apply_form(
+        &self,
+        expected_fingerprint: &str,
+        fields: &[(String, String)],
+        fence: &NativeHookFence,
+        deadline: tokio::time::Instant,
+    ) -> Result<NativeHookOutcome<String>> {
+        let _lease_guard = match self.output_hook_lease(fence, deadline).await {
+            Ok(guard) => guard,
+            Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
+        };
+        if !self.has_web_credentials().await {
+            return Err(anyhow!("Web credentials not configured"));
+        }
+        // The re-read is a pre-write read: cancellation (a newer transaction or Stop) overtakes it
+        // so the superseded transaction releases the lease at once instead of holding it until the
+        // web reply or the deadline.
+        let html = tokio::select! {
+            biased;
+            _ = fence.token.cancelled() => {
+                return Ok(NativeHookOutcome::NotAttempted(
+                    "operation cancelled during the configuration re-read; nothing was posted".to_string(),
+                ));
+            }
+            read = Self::output_read(deadline, "configuration form", self.profile_web_request("/config", "GET", None)) => {
+                match read? {
+                    Ok(html) => html,
+                    Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
+                }
+            }
+        };
+        let current = naa::setup::parse_form(&html).map_err(|e| anyhow!(e))?;
+        if current.fingerprint() != expected_fingerprint {
+            return Ok(NativeHookOutcome::NotAttempted(
+                "the HQPlayer configuration form changed since the preview; run setup_preview again"
+                    .to_string(),
+            ));
+        }
+        if let Err(reason) = fence.check() {
+            return Ok(NativeHookOutcome::NotAttempted(reason));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(NativeHookOutcome::NotAttempted(
+                "setup deadline elapsed before the form was posted".to_string(),
+            ));
+        }
+        let body = naa::setup::encode(fields).into_bytes();
+        let posted = timeout_at(
+            deadline,
+            self.web_post_authenticated("/config", "application/x-www-form-urlencoded", body),
+        )
+        .await;
+        match posted {
+            Ok(Ok((status, text))) => {
+                // The daemon answers a rejected partial form with HTTP 200 and "Failed!" in the body.
+                if !status.is_success() || text.contains("Failed!") {
+                    return Err(anyhow!(
+                        "HQPlayer /config answered HTTP {status}{}",
+                        if text.contains("Failed!") {
+                            " with Failed!"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+                Ok(NativeHookOutcome::Done(format!("HTTP {status}")))
+            }
+            Ok(Err(error)) => Ok(NativeHookOutcome::Indeterminate(format!(
+                "the form post drew no usable reply: {error}"
+            ))),
+            Err(_) => Ok(NativeHookOutcome::Indeterminate(
+                "the setup deadline elapsed after the form post entered the wire".to_string(),
+            )),
+        }
+    }
+
+    /// Restore the on-disk persistent configuration through `/restore` (multipart `scope=system`,
+    /// `cfgfile`), fenced under the operation lease. This changes disk bytes only; the running
+    /// selection is restored by re-posting the form.
+    #[cfg(feature = "naa-proxy")]
+    pub(crate) async fn output_setup_restore_disk(
+        &self,
+        xml: &[u8],
+        fence: &NativeHookFence,
+        deadline: tokio::time::Instant,
+    ) -> Result<NativeHookOutcome<String>> {
+        let _lease_guard = match self.output_hook_lease(fence, deadline).await {
+            Ok(guard) => guard,
+            Err(reason) => return Ok(NativeHookOutcome::NotAttempted(reason)),
+        };
+        if !self.has_web_credentials().await {
+            return Err(anyhow!("Web credentials not configured"));
+        }
+        if let Err(reason) = fence.check() {
+            return Ok(NativeHookOutcome::NotAttempted(reason));
+        }
+        let boundary = format!("uhc-naa-setup-{}", uuid::Uuid::new_v4().simple());
+        let mut body = Vec::with_capacity(xml.len() + 512);
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"scope\"\r\n\r\nsystem\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"cfgfile\"; filename=\"hqplayerd.xml\"\r\nContent-Type: application/xml\r\n\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(xml);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        match timeout_at(
+            deadline,
+            self.web_post_authenticated("/restore", &content_type, body),
+        )
+        .await
+        {
+            Ok(Ok((status, text))) => {
+                if !status.is_success() || text.contains("Failed!") {
+                    return Err(anyhow!(
+                        "HQPlayer /restore answered HTTP {status}{}",
+                        if text.contains("Failed!") {
+                            " with Failed!"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+                Ok(NativeHookOutcome::Done(format!("HTTP {status}")))
+            }
+            Ok(Err(error)) => Ok(NativeHookOutcome::Indeterminate(format!(
+                "the restore upload drew no usable reply: {error}"
+            ))),
+            Err(_) => Ok(NativeHookOutcome::Indeterminate(
+                "the setup deadline elapsed after the restore upload entered the wire".to_string(),
+            )),
+        }
+    }
+
+    /// Wait (bounded) for the native control lane to answer `GetInfo` again after the daemon
+    /// reloaded its configuration. Returns whether it did.
+    #[cfg(feature = "naa-proxy")]
+    pub(crate) async fn output_setup_native_ready(&self, deadline: tokio::time::Instant) -> bool {
+        loop {
+            if self.get_info().await.is_ok() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// The settle budget the setup transaction uses for its readback loop.
+    #[cfg(feature = "naa-proxy")]
+    pub(crate) async fn output_setup_settle(&self) -> (Duration, Duration) {
+        let policy = self.profile_timeouts().await;
+        (policy.settle_deadline, policy.poll_interval)
+    }
+
+    /// Relay settings as persisted for this instance.
+    pub async fn output_relay_settings(&self) -> outputs::NaaRelaySettings {
+        self.state.read().await.naa_relay.clone()
+    }
+
+    /// Replace the persisted relay settings (the manager saves and restarts the relay).
+    pub async fn set_output_relay_settings(&self, settings: outputs::NaaRelaySettings) {
+        self.state.write().await.naa_relay = settings.clone();
+        #[cfg(feature = "naa-proxy")]
+        self.outputs.set_settings(settings);
+    }
+
+    pub(crate) async fn set_config_persister(&self, persister: Arc<dyn ConfigPersister>) {
+        *self.config_persister.write().await = Some(persister);
+    }
+
+    /// Test seam: park the next fenced native write between its pre-write awaits and its
+    /// admission guard. Returns `(reached, release)` notifiers; the gate is one-shot.
+    #[doc(hidden)]
+    pub fn arm_pre_write_gate_for_tests(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        if let Ok(mut gate) = self.pre_write_gate.lock() {
+            *gate = Some((reached.clone(), release.clone()));
+        }
+        (reached, release)
+    }
+
+    /// Test seam: disarm [`Self::arm_pre_write_gate_for_tests`].
+    #[doc(hidden)]
+    pub fn disarm_pre_write_gate_for_tests(&self) {
+        if let Ok(mut gate) = self.pre_write_gate.lock() {
+            *gate = None;
+        }
+    }
+
+    /// Test seam: hold the native connection slot so an in-flight hook blocks at its pre-write
+    /// await. Dropping the hold releases it.
+    #[doc(hidden)]
+    pub async fn hold_native_connection_for_tests(&self) -> NativeConnectionHold {
+        NativeConnectionHold(Arc::clone(&self.connection).lock_owned().await)
+    }
+
+    /// Test seam: hold the adapter state for writing so an in-flight hook blocks on its
+    /// `timeouts()` read before the first write.
+    #[doc(hidden)]
+    pub async fn hold_native_state_for_tests(&self) -> NativeStateHold {
+        NativeStateHold(Arc::clone(&self.state).write_owned().await)
+    }
+
+    /// Test seam over [`Self::persist_output_relay_settings`].
+    #[doc(hidden)]
+    pub async fn persist_output_relay_settings_for_tests(
+        &self,
+        settings: outputs::NaaRelaySettings,
+    ) -> Result<()> {
+        self.persist_output_relay_settings(settings).await
+    }
+
+    /// Called by the coordinator after a `relay_configure` lands: record and persist. `Err`
+    /// means the setting is live but not durable; the caller reports that, never success.
+    pub(crate) async fn persist_output_relay_settings(
+        &self,
+        settings: outputs::NaaRelaySettings,
+    ) -> Result<()> {
+        self.state.write().await.naa_relay = settings;
+        let persister = self.config_persister.read().await.clone();
+        match persister {
+            Some(persister) => persister.persist().await,
+            None => Err(anyhow!(
+                "no configuration persister is installed for this HQPlayer instance"
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "naa-proxy")]
+impl HqpAdapter {
+    /// Per-instance routes file. The readable prefix is lossy, so the exact instance name is also
+    /// carried as a digest: `Living Room` and `Living_Room` are different instances with different
+    /// files, before and after a restart.
+    #[doc(hidden)]
+    pub fn output_routes_path(instance: &str) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        let readable: String = instance
+            .chars()
+            .take(32)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let digest = hex::encode(Sha256::digest(instance.as_bytes()));
+        get_config_file_path(&format!(
+            "hqplayer-naa-routes-{readable}-{}.json",
+            &digest[..24]
+        ))
+    }
+
+    /// Start this instance's owned relay and output publisher with the instance lifecycle.
+    pub(crate) async fn start_outputs(self: &Arc<Self>, worker: Option<HqpNativeWorker>) {
+        let instance = self
+            .get_instance_name()
+            .await
+            .unwrap_or_else(|| "default".to_string());
+        let settings = self.output_relay_settings().await;
+        self.outputs.set_settings(settings.clone());
+        self.outputs
+            .start(&instance, worker, Some(Self::output_routes_path(&instance)))
+            .await;
+        let active = self.outputs.settings();
+        if active != settings {
+            if let Err(error) = self.persist_output_relay_settings(active).await {
+                tracing::warn!(%instance, %error, "Allocated relay address could not be persisted");
+            }
+        }
+    }
+
+    /// Stop the owned relay with the instance lifecycle; pending output work is cancelled first.
+    pub(crate) async fn stop_outputs(&self, reason: &str) {
+        self.outputs.stop(reason).await;
+    }
+
+    /// Execute one typed output command on the exact-instance endpoint.
+    pub(crate) async fn execute_output_command(
+        self: &Arc<Self>,
+        request: outputs::HqpOutputCommandRequest,
+        command_id: CommandId,
+    ) -> Result<outputs::HqpOutputOperation, outputs::HqpOutputRefusal> {
+        self.outputs
+            .execute(Arc::clone(self), request, command_id)
+            .await
+    }
+
+    /// Cancel pending output work (profile/pipeline reconfiguration, endpoint change, removal).
+    pub(crate) fn supersede_output_work(&self, reason: &str) {
+        self.outputs.supersede(reason);
+    }
+
+    #[cfg(feature = "naa-proxy")]
+    pub fn set_relay_source_control(&self, control: Arc<dyn naa::coordinator::RelaySourceControl>) {
+        self.outputs.set_source_control(control);
+    }
+
+    /// Composition publishes fallback metadata from the bound aggregator source.
+    #[cfg(feature = "naa-proxy")]
+    pub fn set_relay_metadata(&self, metadata: Option<naa::frame::MetadataPayload>) {
+        self.outputs.set_metadata(metadata);
+    }
+
+    /// The coordinator's current document (before aggregator stamping). Surfaces read the
+    /// aggregator; this exists for the composition and hermetic tests.
+    pub fn output_projection(&self) -> outputs::HqpOutputProjection {
+        self.outputs.projection()
+    }
+
+    /// Test seam: shorten the one-click budgets.
+    #[doc(hidden)]
+    pub fn set_output_timeouts(&self, timeouts: naa::coordinator::HqpOutputTimeouts) {
+        self.outputs.set_output_timeouts(timeouts);
+    }
+
+    /// Test seam: the pending setup transaction's generation.
+    #[doc(hidden)]
+    pub fn pending_setup_generation_for_tests(&self) -> Option<u64> {
+        self.outputs.pending_setup_generation_for_tests()
+    }
+}
+
+#[cfg(not(feature = "naa-proxy"))]
+impl HqpAdapter {
+    pub(crate) async fn start_outputs(self: &Arc<Self>, _worker: Option<HqpNativeWorker>) {}
+
+    pub(crate) async fn stop_outputs(&self, _reason: &str) {}
+
+    pub(crate) async fn execute_output_command(
+        self: &Arc<Self>,
+        _request: outputs::HqpOutputCommandRequest,
+        _command_id: CommandId,
+    ) -> Result<outputs::HqpOutputOperation, outputs::HqpOutputRefusal> {
+        Err(outputs::HqpOutputRefusal::FeatureUnavailable)
+    }
+
+    pub(crate) fn supersede_output_work(&self, _reason: &str) {}
+}
+
 /// Instance info for API responses
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HqpInstanceInfo {
     pub name: String,
     pub host: Option<String>,
     pub port: u16,
+    pub web_port: u16,
     pub connected: bool,
     pub info: Option<HqpInfo>,
 }
@@ -9115,6 +10198,63 @@ pub struct HqpInstanceManager {
     /// adapters retain their legacy direct observer path.
     command_gateway: Option<CommandGateway>,
     runtime_bridge: Option<Arc<HqpRuntimeBridge>>,
+}
+
+/// Holds the manager's instance map weakly: the map holds the adapters, the adapters hold this
+/// persister, so a strong reference here would be a cycle that keeps every adapter (and its relay)
+/// alive after the manager is gone. A retired manager is reported, never silently ignored.
+struct InstanceConfigPersister {
+    instances: std::sync::Weak<RwLock<HashMap<String, Arc<HqpAdapter>>>>,
+}
+
+#[async_trait::async_trait]
+impl ConfigPersister for InstanceConfigPersister {
+    async fn persist(&self) -> Result<()> {
+        let instances = self.instances.upgrade().ok_or_else(|| {
+            anyhow!("HQPlayer instance manager has been retired; configuration not persisted")
+        })?;
+        if save_instances_to_config(&instances).await {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "HQPlayer instance configuration could not be written"
+            ))
+        }
+    }
+}
+
+/// Serialize every configured instance (endpoint, credentials, relay settings) to the array file.
+/// Returns whether the file was written.
+async fn save_instances_to_config(instances: &RwLock<HashMap<String, Arc<HqpAdapter>>>) -> bool {
+    // Clone adapters while holding lock, then release before async operations
+    let adapters: Vec<(String, Arc<HqpAdapter>)> = {
+        let instances = instances.read().await;
+        instances
+            .iter()
+            .map(|(name, adapter)| (name.clone(), adapter.clone()))
+            .collect()
+    };
+
+    let mut configs = Vec::new();
+    for (name, adapter) in adapters {
+        let status = adapter.get_status().await;
+        if let Some(host) = status.host {
+            let state = adapter.state.read().await;
+            let naa_relay = (state.naa_relay != outputs::NaaRelaySettings::default())
+                .then(|| state.naa_relay.clone());
+            configs.push(HqpInstanceConfig {
+                name,
+                host,
+                port: status.port,
+                web_port: state.web_port,
+                username: state.web_username.clone(),
+                password: state.web_password.clone(),
+                naa_relay,
+            });
+        }
+    }
+
+    save_hqp_configs(&configs)
 }
 
 impl HqpInstanceManager {
@@ -9190,40 +10330,26 @@ impl HqpInstanceManager {
                     config.password,
                 )
                 .await;
+            adapter
+                .set_output_relay_settings(config.naa_relay.unwrap_or_default())
+                .await;
+            adapter.set_config_persister(self.config_persister()).await;
 
             let mut instances = self.instances.write().await;
             instances.insert(config.name, adapter);
         }
     }
 
+    /// A persister the adapters can call after a relay reconfiguration lands.
+    fn config_persister(&self) -> Arc<dyn ConfigPersister> {
+        Arc::new(InstanceConfigPersister {
+            instances: Arc::downgrade(&self.instances),
+        })
+    }
+
     /// Save all instances to config file
     pub async fn save_to_config(&self) {
-        // Clone adapters while holding lock, then release before async operations
-        let adapters: Vec<(String, Arc<HqpAdapter>)> = {
-            let instances = self.instances.read().await;
-            instances
-                .iter()
-                .map(|(name, adapter)| (name.clone(), adapter.clone()))
-                .collect()
-        };
-
-        let mut configs = Vec::new();
-        for (name, adapter) in adapters {
-            let status = adapter.get_status().await;
-            if let Some(host) = status.host {
-                let state = adapter.state.read().await;
-                configs.push(HqpInstanceConfig {
-                    name,
-                    host,
-                    port: status.port,
-                    web_port: state.web_port,
-                    username: state.web_username.clone(),
-                    password: state.web_password.clone(),
-                });
-            }
-        }
-
-        save_hqp_configs(&configs);
+        let _ = save_instances_to_config(&self.instances).await;
     }
 
     /// Get or create an instance by name while the manager lifecycle transaction is held.
@@ -9238,6 +10364,7 @@ impl HqpInstanceManager {
             adapter.disable_legacy_zone_events();
         }
         adapter.set_instance_name(name.to_string()).await;
+        adapter.set_config_persister(self.config_persister()).await;
         let epoch_floor = self
             .producer_epoch_floors
             .read()
@@ -9400,8 +10527,10 @@ impl HqpInstanceManager {
         let mut result = Vec::new();
         for (name, adapter) in adapters {
             let status = adapter.get_status().await;
+            let web_port = adapter.state.read().await.web_port;
             result.push(HqpInstanceInfo {
                 name,
+                web_port,
                 host: status.host,
                 port: status.port,
                 connected: status.connected,
@@ -9435,6 +10564,70 @@ impl HqpInstanceManager {
         adapter
     }
 
+    /// Configure a user-supplied endpoint without creating a second owner for it.
+    /// The duplicate check and mutation share the lifecycle lock, including concurrent requests.
+    pub async fn configure_unique_instance(
+        &self,
+        name: String,
+        host: String,
+        port: Option<u16>,
+        web_port: Option<u16>,
+        username: Option<String>,
+        password: Option<String>,
+    ) -> Result<Arc<HqpAdapter>> {
+        self.configure_instance(name, host, port, web_port, username, password, false)
+            .await
+    }
+
+    /// A create-only request cannot overwrite an existing configured identity.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn configure_instance(
+        &self,
+        name: String,
+        host: String,
+        port: Option<u16>,
+        web_port: Option<u16>,
+        username: Option<String>,
+        password: Option<String>,
+        create_only: bool,
+    ) -> Result<Arc<HqpAdapter>> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        let normalize = |host: &str| {
+            host.trim()
+                .trim_end_matches('.')
+                .trim_matches(['[', ']'])
+                .to_ascii_lowercase()
+        };
+        let requested = normalize(&host);
+        let port = port.unwrap_or(DEFAULT_PORT);
+        for existing in self.list_instances().await {
+            if create_only && existing.name == name && existing.host.is_some() {
+                anyhow::bail!("An HQPlayer named '{name}' already exists. Choose a different name or edit that instance.");
+            }
+            if existing.name != name
+                && existing.port == port
+                && existing
+                    .host
+                    .as_deref()
+                    .is_some_and(|h| normalize(h) == requested)
+            {
+                anyhow::bail!(
+                    "This address and port are already saved as '{}'. Edit that instance instead.",
+                    existing.name
+                );
+            }
+        }
+        let adapter = self.get_or_create_locked(&name).await;
+        adapter
+            .configure(host, Some(port), web_port, username, password)
+            .await;
+        self.save_to_config().await;
+        if self.running.load(Ordering::SeqCst) {
+            self.start_worker(name, adapter.clone()).await;
+        }
+        Ok(adapter)
+    }
+
     /// Remove an instance by name
     pub async fn remove_instance(&self, name: &str) -> bool {
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
@@ -9453,6 +10646,7 @@ impl HqpInstanceManager {
         }
 
         self.stop_worker(name).await;
+        adapter.stop_outputs("HQPlayer instance removed").await;
         // A removed instance is unlike a temporary native outage: its producer identity is gone.
         // Join first so no child can report a same-run observation behind this retirement.
         if let Some(sink) = &self.native_sink {
@@ -9513,6 +10707,8 @@ impl HqpInstanceManager {
             adapter.recovery_config().await,
         )));
         let supervisor_name = name.clone();
+        let outputs_name = name.clone();
+        let outputs_adapter = adapter.clone();
         let run_adapter = adapter.clone();
         let command_adapter = adapter.clone();
         let cleanup_adapter = adapter;
@@ -9546,6 +10742,10 @@ impl HqpInstanceManager {
                     let adapter = cleanup_adapter.clone();
                     async move {
                         adapter.disconnect_retaining_projection().await;
+                        // The relay is owned by this worker: no forwarding may outlive it.
+                        adapter
+                            .stop_outputs("HQPlayer instance worker stopped")
+                            .await;
                     }
                 },
             )
@@ -9586,6 +10786,11 @@ impl HqpInstanceManager {
                 phase,
             },
         );
+        drop(workers);
+        // The owned NAA relay follows the exact instance worker: one relay per explicit instance,
+        // started only while the instance is managed.
+        let outputs_worker = self.native_worker(&outputs_name);
+        outputs_adapter.start_outputs(outputs_worker).await;
     }
 
     fn native_worker(&self, instance_name: &str) -> Option<HqpNativeWorker> {
@@ -9607,6 +10812,14 @@ impl HqpInstanceManager {
                 if let Err(error) = command_join.await {
                     tracing::warn!("HQPlayer command endpoint failed to join: {error}");
                 }
+            }
+            // The relay is owned by this worker's instance; nothing may keep forwarding once the
+            // instance is no longer managed.
+            let adapter = self.instances.read().await.get(name).cloned();
+            if let Some(adapter) = adapter {
+                adapter
+                    .stop_outputs("HQPlayer instance lifecycle stopped")
+                    .await;
             }
         }
     }
@@ -9673,6 +10886,11 @@ impl HqpInstanceManager {
                 }
             }
         }
+        let adapters: Vec<Arc<HqpAdapter>> =
+            self.instances.read().await.values().cloned().collect();
+        for adapter in adapters {
+            adapter.stop_outputs("HQPlayer lifecycle stopped").await;
+        }
         if let Some(sink) = &self.native_sink {
             if let Err(error) = sink.manager_stopped().await {
                 tracing::warn!(%error, "HQPlayer native observation sink could not finish manager lifecycle");
@@ -9681,6 +10899,35 @@ impl HqpInstanceManager {
         self.bus.publish(BusEvent::AdapterStopped {
             adapter: "hqplayer".to_string(),
         });
+    }
+
+    /// Replace one instance's relay settings, persist them, and restart its owned relay when the
+    /// instance is currently managed. Unknown instances are reported, never created.
+    pub async fn set_instance_relay_settings(
+        &self,
+        name: &str,
+        settings: outputs::NaaRelaySettings,
+    ) -> Result<()> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        let adapter = self
+            .instances
+            .read()
+            .await
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow!("Unknown HQPlayer instance: {name}"))?;
+        adapter.set_output_relay_settings(settings).await;
+        if !save_instances_to_config(&self.instances).await {
+            return Err(anyhow!(
+                "HQPlayer instance configuration could not be written"
+            ));
+        }
+        let managed = self.workers.lock().await.contains_key(name);
+        if managed {
+            adapter.stop_outputs("relay reconfigured").await;
+            adapter.start_outputs(self.native_worker(name)).await;
+        }
+        Ok(())
     }
 
     /// Get instance count
@@ -9705,6 +10952,19 @@ impl HqpInstanceManager {
         HqpWorkerStatus {
             supervisor_enabled,
             phase,
+        }
+    }
+}
+
+impl Drop for HqpInstanceManager {
+    fn drop(&mut self) {
+        // A manager dropped without `stop()` must not leave supervisors, command endpoints or
+        // relay listeners running behind it. Cancellation is non-blocking here; each child's own
+        // cleanup (including `stop_outputs`) runs on its task.
+        if let Ok(workers) = self.workers.try_lock() {
+            for worker in workers.values() {
+                worker.shutdown.cancel();
+            }
         }
     }
 }
@@ -9764,6 +11024,23 @@ async fn run_hqplayer_command_endpoint(
             Err(_) => continue,
         };
         let command_id = permit.id();
+        if _reconfiguration_guard.is_some() {
+            // A profile load or pipeline change invalidates pending output work: it shares the
+            // adapter's operation lease and may restart the daemon under a half-finished switch.
+            adapter.supersede_output_work("superseded by an HQPlayer reconfiguration command");
+        }
+        if let RuntimeCommand::Hqplayer(HqpRuntimeCommand::Output(request)) =
+            &permit.request().command
+        {
+            // Output commands confirm through the output projection commit that names this
+            // command id (published by the coordinator), not through a native readback.
+            let request = (**request).clone();
+            match adapter.execute_output_command(request, command_id).await {
+                Ok(_) => permit.complete_native(NativeResult::Accepted),
+                Err(refusal) => permit.complete_native(NativeResult::Failed(refusal.encode())),
+            }
+            continue;
+        }
         let result = execute_hqplayer_runtime_command(&adapter, &permit.request().command).await;
         let projection = match result {
             Ok(projection) => projection,
@@ -9955,6 +11232,9 @@ async fn execute_hqplayer_runtime_command(
             .fetch_profiles()
             .await
             .map(|_| HqpRuntimeReadback::Profile),
+        RuntimeCommand::Hqplayer(HqpRuntimeCommand::Output(_)) => Err(anyhow!(
+            "HQPlayer output commands are executed by the exact-instance output coordinator"
+        )),
         RuntimeCommand::Control(
             Command::VolumeAbsolute { .. }
             | Command::VolumeRelative { .. }

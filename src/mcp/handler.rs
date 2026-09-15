@@ -128,6 +128,12 @@ impl ServerHandler for HifiMcpHandler {
             HifiTools::HifiZoneGroupTool(args) => {
                 tools::groups::handle_zone_group(state, args).await
             }
+            HifiTools::HifiHqplayerOutputsTool(args) => {
+                tools::hqp_outputs::handle_outputs(state, args).await
+            }
+            HifiTools::HifiHqplayerOutputControlTool(args) => {
+                tools::hqp_outputs::handle_output_control(state, args).await
+            }
         }
     }
 
