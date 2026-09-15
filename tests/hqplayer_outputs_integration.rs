@@ -3365,3 +3365,53 @@ async fn roon_source_bridge_requires_one_exact_binding_and_preserves_paused_stat
     daemon.shutdown().await;
     rig.shutdown().await;
 }
+
+#[tokio::test]
+#[serial_test::serial(hqp_output_config)]
+async fn repeated_config_load_preserves_all_instance_relay_settings() {
+    use unified_hifi_control::adapters::hqplayer::{
+        load_hqp_configs, save_hqp_configs, HqpInstanceConfig,
+    };
+    isolate_config_dir();
+    let configs: Vec<_> = ["default", "office"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| HqpInstanceConfig {
+            name: name.into(),
+            host: "127.0.0.1".into(),
+            port: 45000 + index as u16,
+            web_port: 8080,
+            username: None,
+            password: None,
+            naa_relay: Some(NaaRelaySettings {
+                enabled: true,
+                adapter_name: format!("My {name} relay"),
+                bind: format!("127.0.0.1:{}", 46000 + index),
+                ..Default::default()
+            }),
+        })
+        .collect();
+    assert!(save_hqp_configs(&configs));
+    for _ in 0..2 {
+        let manager = HqpInstanceManager::new(create_bus());
+        manager.load_from_config().await;
+        let saved = load_hqp_configs();
+        assert_eq!(
+            saved.len(),
+            configs.len(),
+            "loading must not rewrite the instance array as a legacy object"
+        );
+        for expected in &configs {
+            let actual = saved.iter().find(|c| c.name == expected.name).unwrap();
+            assert_eq!(
+                actual.naa_relay, expected.naa_relay,
+                "relay settings must survive every startup"
+            );
+            let adapter = manager.get(&expected.name).await.unwrap();
+            assert_eq!(
+                adapter.output_relay_settings().await,
+                expected.naa_relay.clone().unwrap()
+            );
+        }
+    }
+}

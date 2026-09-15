@@ -2795,6 +2795,12 @@ impl HqpAdapter {
     /// Save config to disk
     async fn save_config(&self) {
         let state = self.state.read().await;
+        // Named instances are persisted together by HqpInstanceManager. In particular,
+        // configure() runs while loading that array, before its relay settings are applied.
+        // Writing a legacy object here destroys every instance's saved relay configuration.
+        if state.instance_name.is_some() {
+            return;
+        }
         if let Some(ref host) = state.host {
             let saved = SavedHqpConfig {
                 host: host.clone(),
