@@ -1026,3 +1026,21 @@ fn dac_observations_replace_per_endpoint_and_isolate_same_ids_across_endpoints()
     a.close();
     b.close();
 }
+
+#[test]
+fn explicit_listener_restart_rearms_a_route_after_failed_resume() {
+    let relay = relay(true, reserved_port());
+    let naa = FakeNaa::start("restart", "hw:restart", 44100);
+    let (_, client) = forwarding_pair(&relay, &naa);
+    let generation = relay.observe().generation;
+    assert!(relay.disable_routing_after_failed_resume(generation, "fixture Play rejected".into()));
+    drop(client);
+    relay.stop_listener();
+    let addr = relay.start_listener().unwrap();
+    let mut retried = HqpNaaClient::connect(addr, "after-restart").unwrap();
+    retried
+        .handshake()
+        .expect("explicit restart must restore DAC enumeration without another Select");
+    relay.stop_listener();
+    naa.close();
+}

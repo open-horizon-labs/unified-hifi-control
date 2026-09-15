@@ -35,6 +35,7 @@ pub mod naa_relay {
     pub use super::naa::discovery::{
         own_addresses as discovery_own_addresses, scan as discovery_scan,
     };
+    pub use super::naa::frame::MetadataPayload;
     pub use super::naa::relay::{
         validate_route, NaaRelay, RelayObservation, RelayRoutesFile, RelaySharedState,
         RelayStopOutcome, RelayStopReport,
@@ -3398,25 +3399,6 @@ impl HqpAdapter {
         native_worker: Option<&HqpNativeWorker>,
     ) -> Result<()> {
         let snapshot = self.read_coherent_pipeline().await?;
-
-        // The HQPlayer zone is the relay's already-declared source binding. Keep the relay's
-        // NAA6 metadata projection in step with the same coherent observation that feeds the
-        // aggregator; no second metadata store or provider-specific lookup is needed.
-        #[cfg(feature = "naa-proxy")]
-        {
-            let status = &snapshot.playback_status;
-            let usable = !status.track_id.is_empty()
-                || status.title.as_deref().is_some_and(|v| !v.is_empty())
-                || status.artist.as_deref().is_some_and(|v| !v.is_empty())
-                || status.album.as_deref().is_some_and(|v| !v.is_empty());
-            let metadata = usable.then(|| naa::frame::MetadataPayload {
-                title: status.title.clone().unwrap_or_default(),
-                artist: status.artist.clone().unwrap_or_default(),
-                album: status.album.clone().unwrap_or_default(),
-                picture: None,
-            });
-            self.outputs.set_metadata(metadata);
-        }
 
         {
             let mut state = self.state.write().await;
@@ -10092,10 +10074,16 @@ impl HqpAdapter {
             .await
             .unwrap_or_else(|| "default".to_string());
         let settings = self.output_relay_settings().await;
-        self.outputs.set_settings(settings);
+        self.outputs.set_settings(settings.clone());
         self.outputs
             .start(&instance, worker, Some(Self::output_routes_path(&instance)))
             .await;
+        let active = self.outputs.settings();
+        if active != settings {
+            if let Err(error) = self.persist_output_relay_settings(active).await {
+                tracing::warn!(%instance, %error, "Allocated relay address could not be persisted");
+            }
+        }
     }
 
     /// Stop the owned relay with the instance lifecycle; pending output work is cancelled first.
@@ -10117,6 +10105,12 @@ impl HqpAdapter {
     /// Cancel pending output work (profile/pipeline reconfiguration, endpoint change, removal).
     pub(crate) fn supersede_output_work(&self, reason: &str) {
         self.outputs.supersede(reason);
+    }
+
+    /// Composition publishes fallback metadata from the bound aggregator source.
+    #[cfg(feature = "naa-proxy")]
+    pub fn set_relay_metadata(&self, metadata: Option<naa::frame::MetadataPayload>) {
+        self.outputs.set_metadata(metadata);
     }
 
     /// The coordinator's current document (before aggregator stamping). Surfaces read the

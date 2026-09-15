@@ -241,7 +241,17 @@ impl HqpOutputCoordinator {
             let mut ledger = lock(&self.ledger);
             ledger.lifecycle_stopped = None;
         }
-        let settings = self.settings();
+        let mut settings = self.settings();
+        if settings.enabled && settings.discovery_interface.is_none() {
+            match automatic_discovery_interface(&settings.bind) {
+                Ok(interface) => settings.discovery_interface = interface,
+                Err(error) => {
+                    self.record_error("RELAY_START", error);
+                    self.publish(None).await;
+                    return;
+                }
+            }
+        }
         let constructed: Result<Option<Arc<NaaRelay>>, String> = {
             let mut slot = lock(&self.relay);
             if slot.is_none() {
@@ -268,8 +278,15 @@ impl HqpOutputCoordinator {
         if let Some(relay) = relay {
             relay.set_settings(settings.clone());
             if settings.enabled {
-                if let Err(error) = relay.start_listener() {
-                    tracing::warn!(instance, %error, "HQPlayer NAA relay listener could not start");
+                match relay.start_listener() {
+                    Ok(address) => {
+                        settings.bind = address.to_string();
+                        relay.set_settings(settings.clone());
+                        *lock(&self.settings) = settings;
+                    }
+                    Err(error) => {
+                        tracing::warn!(instance, %error, "HQPlayer NAA relay listener could not start")
+                    }
                 }
             }
         }
@@ -852,10 +869,8 @@ impl HqpOutputCoordinator {
             } => {
                 let mut settings = self.settings();
                 if bind.is_none() && settings == NaaRelaySettings::default() {
-                    settings.bind = format!(
-                        "{}:0",
-                        discovery_interface.as_deref().unwrap_or("127.0.0.1")
-                    );
+                    settings.bind =
+                        format!("{}:0", discovery_interface.as_deref().unwrap_or("0.0.0.0"));
                     settings.adapter_name = format!("UHC {}", self.instance_name());
                 }
                 settings.enabled = enabled;
@@ -865,8 +880,32 @@ impl HqpOutputCoordinator {
                 if let Some(bind) = bind {
                     settings.bind = bind;
                 }
+                // A zero port requests automatic allocation, not a new identity on every Save.
+                if let (Ok(requested), Ok(current)) = (
+                    settings.bind.parse::<std::net::SocketAddr>(),
+                    self.settings().bind.parse::<std::net::SocketAddr>(),
+                ) {
+                    if requested.port() == 0 && requested.ip() == current.ip() {
+                        settings.bind = current.to_string();
+                    }
+                }
                 settings.hqp_allow = hqp_allow;
                 settings.discovery_interface = discovery_interface;
+                if enabled && settings.discovery_interface.is_none() {
+                    match automatic_discovery_interface(&settings.bind) {
+                        Ok(interface) => settings.discovery_interface = interface,
+                        Err(message) => {
+                            self.finish_operation(
+                                &operation_id,
+                                HqpOutputOutcome::Rejected,
+                                Some(message),
+                                |_| {},
+                            );
+                            self.publish(Some(command_id)).await;
+                            return Ok(self.operation(&operation_id).unwrap_or(operation));
+                        }
+                    }
+                }
                 if let Some(name) = adapter_name.filter(|n| !n.trim().is_empty()) {
                     settings.adapter_name = name;
                 }
@@ -878,28 +917,45 @@ impl HqpOutputCoordinator {
                         |_| {},
                     );
                 } else {
-                    self.supersede("relay reconfigured");
-                    *lock(&self.settings) = settings.clone();
-                    if let Some(relay) = relay.as_ref() {
-                        relay.stop_listener();
-                        relay.set_settings(settings.clone());
-                        lock(&self.ledger).lifecycle_stopped = None;
+                    let listener_matches = relay.as_ref().is_some_and(|relay| {
                         if settings.enabled {
-                            if let Err(error) = relay.start_listener() {
-                                self.record_error("RELAY_START", error);
-                            }
+                            relay.listener_addr().is_some()
+                        } else {
+                            relay.listener_addr().is_none()
                         }
-                    } else {
-                        let instance = self.instance_name();
-                        let worker = lock(&self.worker).clone();
-                        self.start(&instance, worker, None).await;
-                    }
-                    // Persist the allocated port, so automatic setup remains stable on restart.
-                    if let Some(active) = self.relay() {
-                        if let Some(address) = active.listener_addr() {
-                            settings.bind = address.to_string();
-                            active.set_settings(settings.clone());
-                            *lock(&self.settings) = settings.clone();
+                    });
+                    if settings != self.settings() || !listener_matches {
+                        self.supersede("relay reconfigured");
+                        *lock(&self.settings) = settings.clone();
+                        if let Some(relay) = relay.as_ref() {
+                            relay.stop_listener();
+                            relay.set_settings(settings.clone());
+                            lock(&self.ledger).lifecycle_stopped = None;
+                            if settings.enabled {
+                                if let Err(error) = relay.start_listener() {
+                                    self.record_error("RELAY_START", error.clone());
+                                    self.finish_operation(
+                                        &operation_id,
+                                        HqpOutputOutcome::Failed,
+                                        Some(error),
+                                        |_| {},
+                                    );
+                                    self.publish(Some(command_id)).await;
+                                    return Ok(self.operation(&operation_id).unwrap_or(operation));
+                                }
+                            }
+                        } else {
+                            let instance = self.instance_name();
+                            let worker = lock(&self.worker).clone();
+                            self.start(&instance, worker, None).await;
+                        }
+                        // Persist the allocated port, so automatic setup remains stable on restart.
+                        if let Some(active) = self.relay() {
+                            if let Some(address) = active.listener_addr() {
+                                settings.bind = address.to_string();
+                                active.set_settings(settings.clone());
+                                *lock(&self.settings) = settings.clone();
+                            }
                         }
                     }
                     self.bump_revision();
@@ -2433,4 +2489,44 @@ pub fn import_preview(
         conflicts,
         ignored_selected_route_id: config.selected_route_id,
     })
+}
+
+/// Ask the OS which local interface routes NAA multicast. UDP connect chooses a route;
+/// it sends no packet and does not depend on any HQPlayer instance or Internet service.
+fn automatic_discovery_interface(bind: &str) -> Result<Option<String>, String> {
+    let address: std::net::SocketAddr = bind
+        .parse()
+        .map_err(|e| format!("invalid relay bind: {e}"))?;
+    if address.ip().is_loopback() {
+        return Ok(None);
+    }
+    if let std::net::IpAddr::V4(ip) = address.ip() {
+        if !ip.is_unspecified() {
+            return Ok(Some(ip.to_string()));
+        }
+    }
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    socket.connect("239.192.0.199:43210").map_err(|e| {
+        format!("Cannot choose a LAN interface: {e}. Set the LAN address in Advanced networking.")
+    })?;
+    let ip = socket.local_addr().map_err(|e| e.to_string())?.ip();
+    if ip.is_loopback() || ip.is_unspecified() {
+        return Err("No LAN interface found. Set the LAN address in Advanced networking.".into());
+    }
+    Ok(Some(ip.to_string()))
+}
+
+#[cfg(test)]
+mod automatic_interface_tests {
+    #[test]
+    fn explicit_lan_bind_discovers_and_explicit_loopback_remains_isolated() {
+        assert_eq!(
+            super::automatic_discovery_interface("192.0.2.5:0").unwrap(),
+            Some("192.0.2.5".into())
+        );
+        assert_eq!(
+            super::automatic_discovery_interface("127.0.0.1:0").unwrap(),
+            None
+        );
+    }
 }

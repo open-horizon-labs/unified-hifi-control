@@ -220,7 +220,7 @@
           "type": "string"
         },
         "bind": {
-          "description": "Explicit relay bind address; loopback is required unless an allowlist is supplied.",
+          "description": "Optional relay listen address. New relays default to a LAN listener with an automatically allocated port.",
           "nullable": true,
           "type": "string"
         },
@@ -235,12 +235,12 @@
           "type": "string"
         },
         "discovery_interface": {
-          "description": "IPv4 interface used for NAA multicast discovery.",
+          "description": "Optional IPv4 interface for NAA multicast discovery; enabled LAN relays choose the interface automatically when omitted.",
           "nullable": true,
           "type": "string"
         },
         "discovery_port": {
-          "description": "NAA discovery answers on the port it advertises; omit to default to 43210.",
+          "description": "Shared NAA discovery query port; defaults to 43210. Replies advertise each relay’s own TCP port.",
           "nullable": true,
           "type": "integer"
         },

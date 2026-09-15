@@ -349,6 +349,7 @@ fn upstream_loop(
     virtual_id: &str,
 ) -> io::Result<()> {
     let mut sample_bytes = None;
+    let mut injected_metadata = None;
     loop {
         let (control, prefix, deadline) = probe(reader, None)?;
         if control {
@@ -387,6 +388,7 @@ fn upstream_loop(
                     .attribute("bits")
                     .and_then(|v| v.parse::<usize>().ok())
                     .ok_or_else(|| invalid("start has no valid bits"))?;
+                injected_metadata = None;
                 sample_bytes = Some(match (stream, bits) {
                     ("dsd", 1) => 1,
                     ("pcm", 8 | 16 | 24 | 32 | 64) => bits / 8,
@@ -447,8 +449,23 @@ fn upstream_loop(
                 .try_into()
                 .map_err(|_| invalid("short NAA audio header"))?;
             let metadata = relay.metadata();
-            let rewritten = rewrite_sections(&mut wire_header, &body, metadata.as_ref(), width)
-                .map_err(invalid)?;
+            let changed = match (&metadata, &injected_metadata) {
+                (Some(current), Some(previous)) => !std::sync::Arc::ptr_eq(current, previous),
+                (Some(_), None) => true,
+                _ => false,
+            };
+            let fallback = changed.then_some(metadata.as_deref()).flatten();
+            let original_meta_len = u32::from_le_bytes([
+                wire_header[12],
+                wire_header[13],
+                wire_header[14],
+                wire_header[15],
+            ]);
+            let rewritten =
+                rewrite_sections(&mut wire_header, &body, fallback, width).map_err(invalid)?;
+            if original_meta_len == 0 {
+                injected_metadata = metadata;
+            }
             writer.write_all(&wire_header)?;
             writer.write_all(&rewritten)?;
             relay.update(id, true, HEADER_LEN + rewritten.len(), Some("forwarding"));

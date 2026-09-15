@@ -33,13 +33,13 @@ pub const OPERATION_HISTORY_LIMIT: usize = 32;
 pub struct NaaRelaySettings {
     #[serde(default)]
     pub enabled: bool,
-    /// NAA TCP listener address. Loopback by default; a LAN address may be paired with `hqp_allow`.
+    /// NAA TCP listener address. Defaults to all IPv4 interfaces and a separate allocated port.
     #[serde(default = "default_bind")]
     pub bind: String,
     /// Optional source ACL: when empty, accept NAA/discovery from any peer that can reach the bind.
     #[serde(default)]
     pub hqp_allow: Vec<String>,
-    /// Opt-in NAA multicast discovery on this explicit local IPv4 interface.
+    /// NAA multicast interface override; enabled LAN relays resolve an omitted interface automatically.
     #[serde(default)]
     pub discovery_interface: Option<String>,
     /// UDP port NAA discovery uses; HQPlayer's scanner asks the standard 43210. The relay must
@@ -55,7 +55,7 @@ fn default_discovery_port() -> u16 {
 }
 
 fn default_bind() -> String {
-    format!("127.0.0.1:{DEFAULT_NAA_PORT}")
+    "0.0.0.0:0".to_string()
 }
 
 fn default_adapter_name() -> String {
@@ -932,5 +932,22 @@ impl HqpOutputRefusal {
     pub fn decode(detail: &str) -> Option<Self> {
         let (_, json) = detail.split_once('|')?;
         serde_json::from_str(json).ok()
+    }
+}
+
+#[cfg(test)]
+mod lan_default_tests {
+    #[test]
+    fn default_relay_listener_is_lan_reachable_with_its_own_port() {
+        let bind: std::net::SocketAddr = super::NaaRelaySettings::default().bind.parse().unwrap();
+        assert!(
+            bind.ip().is_unspecified(),
+            "normal relay setup must accept LAN HQPlayer connections"
+        );
+        assert_eq!(
+            bind.port(),
+            0,
+            "each instance needs a separately allocated port"
+        );
     }
 }

@@ -426,6 +426,11 @@ async fn relay_lifecycle_follows_the_managed_instance() {
         .outputs_when(|p| p.availability == HqpOutputAvailability::Available)
         .await;
     assert_eq!(
+        again.relay.bind.as_deref(),
+        Some(bind.to_string().as_str()),
+        "restart must retain the allocated listener port"
+    );
+    assert_eq!(
         again.routes[0].route_id, route,
         "route ids are stable across restarts"
     );
@@ -2925,4 +2930,200 @@ async fn live_desktop_advanced_readback() {
         .await
         .expect_err("Desktop must not use the Embedded profile endpoint");
     assert!(error.to_string().contains("require HQPlayer Embedded"));
+}
+
+#[tokio::test]
+#[serial_test::serial(hqp_output_config)]
+async fn relay_metadata_uses_declared_source_projection() {
+    let rig = Rig::new("bound-metadata").await;
+    let daemon = WireServer::start(Arc::new(playing_daemon()), WirePolicy::default()).await;
+    rig.attach(&daemon).await;
+    rig.state
+        .hqp_zone_links
+        .link_zone("roon:metadata-source".into(), rig.instance.clone())
+        .await
+        .unwrap();
+    let mut zone = rig
+        .state
+        .aggregator
+        .get_zone(&format!("hqplayer:{}", rig.instance))
+        .await
+        .unwrap();
+    zone.zone_id = "roon:metadata-source".into();
+    zone.source = "roon".into();
+    let np = zone.now_playing.as_mut().unwrap();
+    np.title = "Bound source title".into();
+    np.artist = "Bound source artist".into();
+    np.album = "Bound source album".into();
+    np.image_key = Some("bound-artwork".into());
+    rig.bus.publish(BusEvent::ZoneDiscovered { zone });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while rig
+            .state
+            .aggregator
+            .get_zone("roon:metadata-source")
+            .await
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (source, np) =
+        unified_hifi_control::coordinator::relay_metadata_source(&rig.state, &rig.instance)
+            .await
+            .unwrap();
+    assert_eq!(source, "roon:metadata-source");
+    assert_eq!(np.title, "Bound source title");
+    assert_eq!(np.image_key.as_deref(), Some("bound-artwork"));
+    rig.state
+        .hqp_zone_links
+        .unlink_zone("roon:metadata-source")
+        .await;
+    assert!(
+        unified_hifi_control::coordinator::relay_metadata_source(&rig.state, &rig.instance)
+            .await
+            .is_none(),
+        "Unlinking must clear fallback metadata"
+    );
+    daemon.shutdown().await;
+    rig.shutdown().await;
+}
+
+#[tokio::test]
+#[serial_test::serial(hqp_output_config)]
+async fn bound_source_text_and_artwork_reach_naa_without_changing_audio() {
+    let rig = Rig::new("metadata-wire").await;
+    let daemon = WireServer::start(Arc::new(playing_daemon()), WirePolicy::default()).await;
+    let (_, bind) = rig.attach(&daemon).await;
+    let naa = FakeNaa::start("metadata-dac", "hw:metadata", 44100);
+    let route = rig.add_route("metadata-dac", &naa, None).await;
+    rig.command(HqpOutputAction::Select { route_id: route }, None)
+        .await
+        .unwrap();
+    // The image service returns provider bytes unchanged for NAA, not a UI placeholder.
+    let picture = vec![0xff, 0xd8, 0xff, 0xd9];
+    let served = picture.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let image_server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/art",
+                axum::routing::get(move || {
+                    let bytes = served.clone();
+                    async move { ([("content-type", "image/jpeg")], bytes) }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let mut zone = rig.aggregator.get_zone(&rig.zone_id()).await.unwrap();
+    zone.zone_id = "openhome:bound-source".into();
+    zone.source = "openhome".into();
+    let np = zone.now_playing.as_mut().unwrap();
+    np.title = "Source track one".into();
+    np.artist = "Source artist".into();
+    np.album = "Source album".into();
+    np.image_key = Some(format!("http://{address}/art"));
+    rig.bus
+        .publish(BusEvent::ZoneDiscovered { zone: zone.clone() });
+    rig.state
+        .hqp_zone_links
+        .link_zone(zone.zone_id.clone(), rig.instance.clone())
+        .await
+        .unwrap();
+    let worker = tokio::spawn(unified_hifi_control::coordinator::run_relay_metadata(
+        rig.state.clone(),
+    ));
+    let client = AutoHqpClient::start(bind, 44100);
+    client.set_playing(true);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !naa.audio_records().iter().any(|r| r.picture == picture) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("bound artwork must reach NAA");
+    assert!(naa
+        .audio_records()
+        .iter()
+        .any(|r| String::from_utf8_lossy(&r.metadata).contains("song=Source track one")));
+    zone.now_playing.as_mut().unwrap().title = "Source track two".into();
+    rig.bus.publish(BusEvent::ZoneDiscovered { zone });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !naa
+            .audio_records()
+            .iter()
+            .any(|r| String::from_utf8_lossy(&r.metadata).contains("song=Source track two"))
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("track changes must update metadata in the same stream");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let records = naa.audio_records();
+    assert!(records
+        .iter()
+        .all(|r| r.payload == mock_servers::naa::auto_client_payload()));
+    assert!(
+        records.iter().filter(|r| !r.picture.is_empty()).count() <= 3,
+        "artwork must not repeat on every audio frame"
+    );
+    assert!(records.len() > 3);
+    rig.state.shutdown.cancel();
+    worker.await.unwrap();
+    client.close();
+    image_server.abort();
+    naa.close();
+    daemon.shutdown().await;
+    rig.shutdown().await;
+}
+
+#[tokio::test]
+#[serial_test::serial(hqp_output_config)]
+async fn saving_unchanged_relay_settings_preserves_port_and_audio_session() {
+    let rig = Rig::new("save-live-relay").await;
+    let daemon = WireServer::start(Arc::new(playing_daemon()), WirePolicy::default()).await;
+    let (_, bind) = rig.attach(&daemon).await;
+    let naa = FakeNaa::start("save-dac", "hw:save", 44100);
+    let route = rig.add_route("save-dac", &naa, None).await;
+    rig.command(HqpOutputAction::Select { route_id: route }, None)
+        .await
+        .unwrap();
+    let client = AutoHqpClient::start(bind, 44100);
+    client.set_playing(true);
+    let before = rig.outputs_when(|p| p.session_confirms_audio()).await;
+    let result = rig
+        .command(
+            HqpOutputAction::RelayConfigure {
+                enabled: true,
+                bind: Some("127.0.0.1:0".into()),
+                hqp_allow: vec![],
+                discovery_interface: None,
+                discovery_port: Some(43210),
+                adapter_name: Some(before.relay.adapter_name.clone()),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.operation.outcome, Some(HqpOutputOutcome::Complete));
+    assert_eq!(
+        result.projection.relay.bind, before.relay.bind,
+        "automatic port must be reused"
+    );
+    assert_eq!(
+        result.projection.session.as_ref().map(|s| s.session_id),
+        before.session.as_ref().map(|s| s.session_id),
+        "saving must not disconnect audio"
+    );
+    client.close();
+    naa.close();
+    daemon.shutdown().await;
+    rig.shutdown().await;
 }

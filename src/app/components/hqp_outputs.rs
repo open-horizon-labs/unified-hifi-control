@@ -869,7 +869,10 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
                 relay_enabled.set(p.relay.enabled);
                 let untouched = !p.relay.enabled
                     && p.relay.adapter_name == "HiPhi Router"
-                    && p.relay.bind.as_deref() == Some("127.0.0.1:43210")
+                    && matches!(
+                        p.relay.bind.as_deref(),
+                        Some("127.0.0.1:43210" | "0.0.0.0:0")
+                    )
                     && p.relay.discovery_interface.is_none();
                 relay_name.set(if untouched {
                     format!("UHC {}", instance())
@@ -1027,22 +1030,7 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        let bind = {
-            let value = relay_bind();
-            Some(if value.trim().is_empty() {
-                let interface = relay_discovery_interface();
-                format!(
-                    "{}:0",
-                    if interface.trim().is_empty() {
-                        "127.0.0.1"
-                    } else {
-                        interface.trim()
-                    }
-                )
-            } else {
-                value
-            })
-        };
+        let bind = Some(relay_listen_address(&relay_bind()));
         let discovery_interface = {
             let value = relay_discovery_interface();
             (!value.trim().is_empty()).then_some(value)
@@ -1420,13 +1408,19 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
                                 oninput: move |evt| { relay_form_dirty.set(true); relay_name.set(evt.value()); },
                             }
                         }
+
+                    }
+                    details { class: "mt-3",
+                        summary { class: "text-sm cursor-pointer", "Advanced networking" }
+                        p { class: "mt-2 text-xs text-muted", "LAN discovery is automatic. Leave these fields blank to use the server’s LAN interface and a separate port for this relay. An empty allowlist accepts any reachable HQPlayer." }
+                        div { class: "mt-2 grid grid-cols-1 sm:grid-cols-2 gap-3",
                         label { class: "block text-sm",
-                            span { class: "block mb-1", "This UHC server’s LAN IPv4 address" }
+                            span { class: "block mb-1", "LAN IPv4 address (optional)" }
                             input {
                                 class: "input",
                                 disabled: is_busy,
                                 r#type: "text",
-                                placeholder: "e.g. 192.168.1.2; blank keeps discovery off",
+                                placeholder: "Automatic — use this server’s LAN interface",
                                 value: "{relay_discovery_interface}",
                                 oninput: move |evt| {
                                     relay_form_dirty.set(true);
@@ -1434,11 +1428,6 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
                                 },
                             }
                         }
-                    }
-                    details { class: "mt-3",
-                        summary { class: "text-sm cursor-pointer", "Advanced networking" }
-                        p { class: "mt-2 text-xs text-muted", "Leave the listen address blank to assign a separate port. Relays share discovery port 43210. An empty allowlist accepts any reachable HQPlayer." }
-                        div { class: "mt-2 grid grid-cols-1 sm:grid-cols-2 gap-3",
                         label { class: "block text-sm",
                             span { class: "block mb-1", "Listen address and port (optional)" }
                             input {
@@ -1990,8 +1979,26 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
     }
 }
 
+/// Blank means automatic LAN binding, including when replacing an old loopback configuration.
+fn relay_listen_address(input: &str) -> String {
+    if input.trim().is_empty() {
+        "0.0.0.0:0".into()
+    } else {
+        input.trim().into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn blank_relay_listen_address_replaces_loopback_with_lan_binding() {
+        assert_eq!(super::relay_listen_address("  "), "0.0.0.0:0");
+        assert_eq!(
+            super::relay_listen_address("127.0.0.1:9000"),
+            "127.0.0.1:9000"
+        );
+    }
+
     use super::*;
     use crate::app::api::{HqpOutputAvailability, HqpOutputPhase, HqpRelaySessionView};
     use std::cell::RefCell;

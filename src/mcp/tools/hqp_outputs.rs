@@ -72,13 +72,13 @@ pub struct HifiHqplayerOutputControlTool {
     pub preview_id: Option<String>,
     /// Enable or disable the managed relay.
     pub enabled: Option<bool>,
-    /// Explicit relay bind address; loopback is required unless an allowlist is supplied.
+    /// Optional relay listen address. New relays default to a LAN listener with an automatically allocated port.
     pub bind: Option<String>,
     /// Optional HQPlayer source allowlist; empty accepts any reachable NAA peer.
     pub hqp_allow: Option<Vec<String>>,
-    /// IPv4 interface used for NAA multicast discovery.
+    /// Optional IPv4 interface for NAA multicast discovery; enabled LAN relays choose the interface automatically when omitted.
     pub discovery_interface: Option<String>,
-    /// NAA discovery answers on the port it advertises; omit to default to 43210.
+    /// Shared NAA discovery query port; defaults to 43210. Replies advertise each relay’s own TCP port.
     pub discovery_port: Option<u16>,
     /// Name presented by this proxy as the NAA endpoint/DAC.
     pub adapter_name: Option<String>,

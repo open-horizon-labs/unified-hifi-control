@@ -970,3 +970,122 @@ mod tests {
         assert!(!status["b"].enabled);
     }
 }
+
+/// Resolve an unambiguous playing source through the existing binding and aggregator.
+#[cfg(feature = "naa-proxy")]
+pub async fn relay_metadata_source(
+    state: &crate::api::AppState,
+    instance: &str,
+) -> Option<(String, crate::bus::NowPlaying)> {
+    let mut source = None;
+    for link in state.hqp_zone_links.get_links().await {
+        if link.instance != instance {
+            continue;
+        }
+        let Some(zone) = state.aggregator.get_zone(&link.zone_id).await else {
+            continue;
+        };
+        if zone.state != crate::bus::PlaybackState::Playing {
+            continue;
+        }
+        let Some(np) = zone.now_playing else {
+            continue;
+        };
+        if np.title.trim().is_empty() && np.artist.trim().is_empty() && np.album.trim().is_empty() {
+            continue;
+        }
+        // Multiple playing bindings provide no evidence of which one feeds this engine.
+        if source.is_some() {
+            return None;
+        }
+        source = Some((link.zone_id, np));
+    }
+    source
+}
+
+/// Keep relay fallback metadata synchronized without provider I/O in the audio worker.
+/// Artwork uses the same provider-neutral image service as the rest of UHC.
+#[cfg(feature = "naa-proxy")]
+pub async fn run_relay_metadata(state: crate::api::AppState) {
+    use crate::adapters::hqplayer::naa_relay::MetadataPayload;
+    struct CachedArtwork {
+        source: String,
+        key: Option<String>,
+        picture: Option<Vec<u8>>,
+        attempted: std::time::Instant,
+    }
+    let mut cache: HashMap<String, CachedArtwork> = HashMap::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    loop {
+        tokio::select! {
+            _ = state.shutdown.cancelled() => break,
+            _ = tick.tick() => {}
+        }
+        let instances = state.hqp_instances.list_instances().await;
+        cache.retain(|name, _| instances.iter().any(|instance| &instance.name == name));
+        for instance in instances {
+            let Some(adapter) = state.hqp_instances.get(&instance.name).await else {
+                continue;
+            };
+            let Some((source, np)) = relay_metadata_source(&state, &instance.name).await else {
+                adapter.set_relay_metadata(None);
+                cache.remove(&instance.name);
+                continue;
+            };
+            let cached = cache
+                .get(&instance.name)
+                .filter(|entry| entry.source == source && entry.key == np.image_key);
+            let mut metadata = MetadataPayload {
+                title: np.title.clone(),
+                artist: np.artist.clone(),
+                album: np.album.clone(),
+                picture: cached.and_then(|entry| entry.picture.clone()),
+            };
+            // Text arrives immediately, even while the image provider is slow or unavailable.
+            adapter.set_relay_metadata(Some(metadata.clone()));
+            let retry = cached.is_none_or(|entry| {
+                entry.picture.is_none() && entry.attempted.elapsed() >= Duration::from_secs(30)
+            });
+            if !retry {
+                continue;
+            }
+            let picture = if let Some(key) = &np.image_key {
+                tokio::select! {
+                    _ = state.shutdown.cancelled() => return,
+                    result = tokio::time::timeout(Duration::from_secs(2), state.get_image_bounded(&source, key, 1024 * 1024)) => {
+                        match result {
+                            Ok(Ok(image)) if matches!(image.content_type.split(';').next(), Some("image/jpeg" | "image/png")) => Some(image.data),
+                            _ => None,
+                        }
+                    }
+                }
+            } else {
+                None
+            };
+            // An image fetch must not publish a previous track or a removed binding.
+            let current = relay_metadata_source(&state, &instance.name).await;
+            if !current.as_ref().is_some_and(|(zone, now)| {
+                zone == &source
+                    && now.title == np.title
+                    && now.artist == np.artist
+                    && now.album == np.album
+                    && now.image_key == np.image_key
+            }) {
+                adapter.set_relay_metadata(None);
+                cache.remove(&instance.name);
+                continue;
+            }
+            metadata.picture = picture.clone();
+            adapter.set_relay_metadata(Some(metadata));
+            cache.insert(
+                instance.name,
+                CachedArtwork {
+                    source,
+                    key: np.image_key,
+                    picture,
+                    attempted: std::time::Instant::now(),
+                },
+            );
+        }
+    }
+}

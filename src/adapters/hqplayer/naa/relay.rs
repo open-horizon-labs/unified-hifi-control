@@ -151,7 +151,7 @@ struct RelayInner {
     injected_accept_failure: Option<String>,
     /// Latest metadata projection for this HQPlayer instance. The owner may update this while a
     /// session is active; the protocol worker reads a clone per audio frame.
-    metadata: Option<MetadataPayload>,
+    metadata: Option<Arc<MetadataPayload>>,
 }
 
 /// Shared worker state. Never joins threads; see the module docs for why.
@@ -395,6 +395,9 @@ impl NaaRelay {
         {
             let mut inner = lock(&self.core.inner);
             inner.listener = ListenerState::Bound(addr);
+            // An explicit listener restart is a fresh activation of the saved route. A failed
+            // earlier Play must not leave discovery/authentication permanently gated off.
+            inner.routing_enabled = true;
             inner.last_error = None;
         }
         *lock(&self.accept_loop) = Some(AcceptLoop { stop, join });
@@ -779,11 +782,14 @@ impl RelayCore {
     /// Install the effective metadata projection used by active NAA sessions. Empty/absent
     /// metadata leaves HQPlayer's original sections untouched.
     pub fn set_metadata(&self, metadata: Option<MetadataPayload>) {
-        lock(&self.inner).metadata = metadata;
-        self.changed.notify_one();
+        let mut inner = lock(&self.inner);
+        if inner.metadata.as_deref() != metadata.as_ref() {
+            inner.metadata = metadata.map(Arc::new);
+            self.changed.notify_one();
+        }
     }
 
-    pub(super) fn metadata(&self) -> Option<MetadataPayload> {
+    pub(super) fn metadata(&self) -> Option<Arc<MetadataPayload>> {
         lock(&self.inner).metadata.clone()
     }
 
