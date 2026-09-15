@@ -43,7 +43,7 @@ pub struct NaaRelaySettings {
     #[serde(default)]
     pub discovery_interface: Option<String>,
     /// UDP port NAA discovery uses; HQPlayer's scanner asks the standard 43210. The relay must
-    /// bind its TCP listener on the same port for discovery to name a reachable endpoint.
+    /// answers from each relay’s TCP port through a shared discovery receiver.
     #[serde(default = "default_discovery_port")]
     pub discovery_port: u16,
     #[serde(default = "default_adapter_name")]

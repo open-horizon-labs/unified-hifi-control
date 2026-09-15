@@ -545,7 +545,7 @@ use crate::app::sse::use_sse;
 
 /// Digital audio output (NAA / managed relay) routing section for the HQPlayer page.
 ///
-/// Selects which configured instance to show, then reads/mutates that exact instance's output
+/// Renders each configured instance separately, then reads/mutates that exact instance's output
 /// routing through the shared `/hqplayer/outputs*` surface — the same surface HTTP and MCP
 /// clients use, so there is exactly one client-side call site for every mutation. Software
 /// fixtures only: this never claims to select a physical household DAC on its own — it renders
@@ -562,78 +562,46 @@ pub struct HqpOutputInstance {
 
 #[component]
 pub fn HqpOutputRoutingSection(instances: Vec<HqpOutputInstance>) -> Element {
-    let mut selected_instance = use_signal(String::new);
-
-    // Default to the first known instance once the list arrives; do not clobber an operator's
-    // later selection on unrelated re-renders.
-    let instances_for_default = instances.clone();
-    use_effect(use_reactive!(|instances_for_default| {
-        if !instances_for_default
-            .iter()
-            .any(|i| i.name == *selected_instance.peek())
-        {
-            if let Some(first) = instances_for_default.first() {
-                selected_instance.set(first.name.clone());
-            }
-        }
-    }));
-
     if instances.is_empty() {
         return rsx! {};
     }
-
     rsx! {
         section { id: "hqp-outputs", class: "mb-8",
-            div { class: "mb-4 max-w-3xl flex flex-wrap items-baseline justify-between gap-3",
-                div {
-                    h2 { class: "text-lg font-semibold", "Digital audio output" }
-                    p { class: "mt-1 text-sm text-muted",
-                        "Choose an HQPlayer instance, then its NAA destination."
-                    }
-                    if let Some(instance) = instances.iter().find(|i| i.name == selected_instance()) {
-                        {
-                            let product = instance
-                                .product
-                                .as_deref()
-                                .filter(|v| !v.is_empty())
-                                .unwrap_or("HQPlayer");
-                            let version = instance
-                                .version
-                                .as_deref()
-                                .filter(|v| !v.is_empty())
-                                .unwrap_or("version unknown");
-                            let host = instance.host.as_deref().unwrap_or("host unknown");
-                            let status = if instance.connected { "connected" } else { "offline" };
-                            rsx! {
-                                p { class: "mt-2 text-xs font-medium text-muted",
-                                    "{instance.name} · {product} {version} · {host} · {status}"
-                                }
-                            }
-                        }
-                    }
-                }
-                if instances.len() > 1 {
-                    label { class: "text-sm",
-                        span { class: "block mb-1", "HQPlayer for NAA output" }
-                        select {
-                            class: "input",
-                            value: "{selected_instance}",
-                            onchange: move |evt| selected_instance.set(evt.value()),
-                            for instance in instances.iter() {
-                                {
-                                    let status = if instance.connected { "connected" } else { "offline" };
-                                    rsx! {
-                                        option { key: "{instance.name}", value: "{instance.name}", "{instance.name} — {status}" }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            h2 { class: "text-lg font-semibold", "HQPlayer relays" }
+            p { class: "mt-1 mb-5 max-w-2xl text-sm text-muted",
+                "Each HQPlayer has its own relay and NAA destination. Select the relay by name in HQPlayer's output settings."
             }
-            if !selected_instance().is_empty() {
-                HqpOutputRouting { key: "{selected_instance}", instance: selected_instance }
+            for instance in instances {
+                HqpInstanceRelay { key: "{instance.name}", info: instance }
             }
+        }
+    }
+}
+
+#[component]
+fn HqpInstanceRelay(info: HqpOutputInstance) -> Element {
+    let instance = use_signal(|| info.name.clone());
+    let product = info
+        .product
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .unwrap_or("HQPlayer");
+    let version = info
+        .version
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .unwrap_or("version unknown");
+    let host = info.host.as_deref().unwrap_or("host unknown");
+    let status = if info.connected {
+        "Connected"
+    } else {
+        "Offline · last reported"
+    };
+    rsx! {
+        section { class: "mb-8 border-t border-subtle pt-5", aria_label: "Relay for {info.name}",
+            h3 { class: "font-semibold text-lg", "{info.name}" }
+            p { class: "mt-1 mb-3 text-sm text-muted", "{product} {version} · {host} · {status}" }
+            HqpOutputRouting { instance }
         }
     }
 }
@@ -883,6 +851,7 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
     let mut relay_enabled = use_signal(|| false);
     let mut relay_form_dirty = use_signal(|| false);
     let mut relay_bind = use_signal(String::new);
+    let mut relay_name = use_signal(String::new);
     let mut relay_hqp_allow = use_signal(String::new);
     let mut relay_discovery_interface = use_signal(String::new);
     // Ordinary UI default is 43210 (the standard NAA port), matching what the backend itself
@@ -898,7 +867,20 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
         if !relay_form_dirty() {
             if let Some(p) = outputs() {
                 relay_enabled.set(p.relay.enabled);
-                relay_bind.set(p.relay.bind.clone().unwrap_or_default());
+                let untouched = !p.relay.enabled
+                    && p.relay.adapter_name == "HiPhi Router"
+                    && p.relay.bind.as_deref() == Some("127.0.0.1:43210")
+                    && p.relay.discovery_interface.is_none();
+                relay_name.set(if untouched {
+                    format!("UHC {}", instance())
+                } else {
+                    p.relay.adapter_name.clone()
+                });
+                relay_bind.set(if untouched {
+                    String::new()
+                } else {
+                    p.relay.bind.clone().unwrap_or_default()
+                });
                 relay_hqp_allow.set(p.relay.hqp_allow.join(", "));
                 relay_discovery_interface
                     .set(p.relay.discovery_interface.clone().unwrap_or_default());
@@ -1047,7 +1029,19 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
             .collect();
         let bind = {
             let value = relay_bind();
-            (!value.trim().is_empty()).then_some(value)
+            Some(if value.trim().is_empty() {
+                let interface = relay_discovery_interface();
+                format!(
+                    "{}:0",
+                    if interface.trim().is_empty() {
+                        "127.0.0.1"
+                    } else {
+                        interface.trim()
+                    }
+                )
+            } else {
+                value
+            })
         };
         let discovery_interface = {
             let value = relay_discovery_interface();
@@ -1059,7 +1053,7 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
             hqp_allow,
             discovery_interface,
             discovery_port: Some(relay_discovery_port()),
-            adapter_name: None,
+            adapter_name: Some(relay_name()),
         };
         let projection = outputs();
         let request = build_command(
@@ -1280,8 +1274,31 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
     let status_text = render_status_label(action, phase, audio_confirmed);
     let stop_disabled = stop_button_disabled(availability);
 
+    let destination_label = projection
+        .selected_route_id
+        .as_ref()
+        .and_then(|id| projection.routes.iter().find(|route| &route.route_id == id))
+        .map(|route| route.name.as_str())
+        .unwrap_or("No destination selected");
+    let relay_status = if !projection.relay.enabled {
+        "Relay off"
+    } else if audio_confirmed {
+        "Audio flowing"
+    } else if matches!(
+        availability,
+        Some(HqpOutputAvailability::Unavailable { .. })
+    ) {
+        "Relay unavailable"
+    } else {
+        "No audio confirmed"
+    };
+
     rsx! {
-        div { class: "card p-4 sm:p-5",
+        div { class: "py-2",
+            p { class: "mb-1 text-sm", "NAA output name: ", strong { "{projection.relay.adapter_name}" } }
+            p { class: "mb-3 text-sm", "{destination_label} · {relay_status}" }
+            details {
+                summary { class: "text-sm font-medium cursor-pointer mb-3", "Configure relay and choose destination" }
             if projection.routes.is_empty() {
                 p { class: "text-sm mb-4",
                     "Enable the relay, add an NAA destination, then select this relay in HQPlayer's output settings."
@@ -1396,12 +1413,39 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                             "Enabled"
                         }
                         label { class: "block text-sm",
-                            span { class: "block mb-1", "Listen address and port" }
+                            span { class: "block mb-1", "Relay name in HQPlayer" }
+                            input {
+                                class: "input", required: true, maxlength: "256", disabled: is_busy,
+                                value: "{relay_name}",
+                                oninput: move |evt| { relay_form_dirty.set(true); relay_name.set(evt.value()); },
+                            }
+                        }
+                        label { class: "block text-sm",
+                            span { class: "block mb-1", "This UHC server’s LAN IPv4 address" }
                             input {
                                 class: "input",
                                 disabled: is_busy,
                                 r#type: "text",
-                                placeholder: "Bind address, e.g. 127.0.0.1:43210",
+                                placeholder: "e.g. 192.168.1.2; blank keeps discovery off",
+                                value: "{relay_discovery_interface}",
+                                oninput: move |evt| {
+                                    relay_form_dirty.set(true);
+                                    relay_discovery_interface.set(evt.value());
+                                },
+                            }
+                        }
+                    }
+                    details { class: "mt-3",
+                        summary { class: "text-sm cursor-pointer", "Advanced networking" }
+                        p { class: "mt-2 text-xs text-muted", "Leave the listen address blank to assign a separate port. Relays share discovery port 43210. An empty allowlist accepts any reachable HQPlayer." }
+                        div { class: "mt-2 grid grid-cols-1 sm:grid-cols-2 gap-3",
+                        label { class: "block text-sm",
+                            span { class: "block mb-1", "Listen address and port (optional)" }
+                            input {
+                                class: "input",
+                                disabled: is_busy,
+                                r#type: "text",
+                                placeholder: "Automatic — a separate port for this relay",
                                 value: "{relay_bind}",
                                 oninput: move |evt| {
                                     relay_form_dirty.set(true);
@@ -1420,20 +1464,6 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                                 oninput: move |evt| {
                                     relay_form_dirty.set(true);
                                     relay_hqp_allow.set(evt.value());
-                                },
-                            }
-                        }
-                        label { class: "block text-sm",
-                            span { class: "block mb-1", "LAN IPv4 address for discovery (optional)" }
-                            input {
-                                class: "input",
-                                disabled: is_busy,
-                                r#type: "text",
-                                placeholder: "Discovery interface IPv4 (optional; blank disables discovery)",
-                                value: "{relay_discovery_interface}",
-                                oninput: move |evt| {
-                                    relay_form_dirty.set(true);
-                                    relay_discovery_interface.set(evt.value());
                                 },
                             }
                         }
@@ -1456,6 +1486,7 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                                 },
                             }
                         }
+                        }
                     }
                     if discovery_responder_unsupported(
                         projection.relay.discovery_interface.as_deref(),
@@ -1473,7 +1504,7 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                             class: "btn btn-primary btn-sm",
                             disabled: is_busy,
                             r#type: "submit",
-                            "Save relay configuration"
+                            "Save relay settings"
                         }
                     }
                 }
@@ -1951,6 +1982,7 @@ fn HqpOutputRouting(instance: Signal<String>) -> Element {
                 }
             }
 
+            }
         }
     }
 }

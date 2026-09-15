@@ -457,10 +457,8 @@ async fn discover_after_relay_configure_reaches_a_terminal_discovery_result() {
     let source_epoch = initial["source_epoch"].as_u64().unwrap();
     let output_revision = initial["output_revision"].as_u64().unwrap();
 
-    // NAA discovery answers on the TCP port it advertises: with discovery enabled the relay must
-    // actually be bound to that same port, not an ephemeral `:0` bind (which the daemon cannot
-    // answer discovery on). Reserve one real, explicitly loopback ephemeral port and use it for
-    // both `bind` and `discovery_port`, so the two agree the way production requires.
+    // Exercise the supported legacy same-port layout here. Multi-relay lifecycle tests
+    // separately verify distinct TCP reply ports behind one shared discovery receiver.
     let discovery_port = mock_servers::naa::reserved_port();
     let configure_receipt = expect_envelope_data(
         &rig,

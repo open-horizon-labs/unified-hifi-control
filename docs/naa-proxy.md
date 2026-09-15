@@ -48,8 +48,9 @@ output commands do not accept passwords, upload URLs or arbitrary XML.
 
 ## Straight pass-through setup
 
-Configure the relay once, select `HiPhi Router` in HQPlayer, and leave that
-device selected. After that, output changes happen through UHC's route command;
+Configure one relay for each HQPlayer instance, select its advertised name in
+HQPlayer, and leave that device selected. New relays suggest `UHC <instance>`;
+existing relay names are preserved. After that, output changes happen through UHC's route command;
 HQPlayer stays connected to the same virtual device.
 
 The relay forwards the NAA authentication handshake and control messages to the
@@ -62,12 +63,15 @@ DAC.
 
 1. Configure the HQPlayer instance through UHC's existing instance settings.
    Read its output projection to obtain `source_epoch` and `output_revision`.
-2. Submit `relay_configure` with `enabled: true`, an explicit TCP `bind`,
-   optionally supply `hqp_allow` to restrict source IPs, and set the local IPv4
-   `discovery_interface`. An empty allow-list accepts any reachable NAA peer. The default discovery port is 43210. For standard
-   HQPlayer discovery, use TCP and UDP port 43210 on the selected address.
-   A custom discovery port requires a peer configured to query that port;
-   it does not make an unmodified Embedded scanner discover arbitrary ports.
+2. Submit `relay_configure` with `enabled: true` and the local IPv4
+   `discovery_interface`. On first setup, omit `bind` to allocate a separate TCP
+   port; the assigned address is persisted. An explicit `bind` remains supported.
+   Set `adapter_name` to the name you want HQPlayer to show. Optionally supply
+   `hqp_allow` to restrict source IPs; an empty list accepts any reachable peer.
+   Keep `discovery_port` at 43210 for ordinary HQPlayer discovery. Relays share
+   one discovery receiver and each replies from its own TCP port, so HQPlayer
+   discovers multiple relays on the same machine. Disabling one relay removes
+   only its advertisement and listener.
 3. Run `discover`. This is NAA's XML multicast discovery, not mDNS. It discovers
    NAA hosts without initiating authentication or playback. Add chosen hosts
    with `route_add`, including a physical `device_id` when known.

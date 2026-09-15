@@ -1107,6 +1107,47 @@ async fn import_preview_and_apply_preserve_ids_and_ignore_the_files_selection() 
     rig.shutdown().await;
 }
 
+/// The UI and MCP may omit ports for first setup: allocate and persist the concrete endpoint.
+#[tokio::test]
+#[serial_test::serial(hqp_output_config)]
+async fn first_relay_configuration_allocates_and_persists_its_own_endpoint() {
+    let daemon = WireServer::start(Arc::new(playing_daemon()), WirePolicy::default()).await;
+    let rig = Rig::new("automatic-relay").await;
+    let (adapter, _) = rig.attach(&daemon).await;
+    adapter
+        .set_output_relay_settings(NaaRelaySettings::default())
+        .await;
+    let receipt = rig
+        .command(
+            HqpOutputAction::RelayConfigure {
+                enabled: true,
+                bind: None,
+                hqp_allow: vec![],
+                discovery_interface: Some("127.0.0.1".into()),
+                discovery_port: Some(mock_servers::naa::reserved_port()),
+                adapter_name: None,
+            },
+            None,
+        )
+        .await
+        .expect("configure through command service");
+    assert_eq!(receipt.operation.outcome, Some(HqpOutputOutcome::Complete));
+    let saved = adapter.output_relay_settings().await;
+    let address: SocketAddr = saved.bind.parse().unwrap();
+    assert_ne!(address.port(), 0, "allocated port must survive restart");
+    assert_eq!(saved.adapter_name, "UHC automatic-relay");
+    assert!(port_is_listening(address));
+    let projection = rig
+        .outputs_when(|p| p.relay.adapter_name == "UHC automatic-relay")
+        .await;
+    assert_eq!(
+        projection.relay.discovery_responder.as_deref(),
+        Some(saved.bind.as_str())
+    );
+    daemon.shutdown().await;
+    rig.shutdown().await;
+}
+
 /// Settings arrive through the same typed command; disabling closes the listener and Stop-like
 /// reads stay possible; re-enabling binds again and the change persists in the instance file.
 #[tokio::test]

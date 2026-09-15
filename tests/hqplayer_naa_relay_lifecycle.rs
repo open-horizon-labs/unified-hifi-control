@@ -17,8 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mock_servers::naa::{
-    attribute, device_children, port_is_listening, reserved_port, FakeNaa, HqpNaaClient, NaaEvent,
-    VIRTUAL_DEVICE_ID,
+    attribute, port_is_listening, reserved_port, FakeNaa, HqpNaaClient, VIRTUAL_DEVICE_ID,
 };
 use unified_hifi_control::adapters::hqplayer::naa_relay::NaaRelay;
 use unified_hifi_control::adapters::hqplayer::outputs::{HqpOutputAvailability, NaaRelaySettings};
@@ -640,39 +639,91 @@ fn discovery_responder_advertises_the_stable_identity_and_follows_the_listener()
     relay.stop_listener();
 }
 
-/// Finding 27: discovery is refused, before any socket opens, when the relay's TCP port differs
-/// from the discovery port HQPlayer's scanner asks. An advertisement for an unreachable port is
-/// worse than none.
+/// One discovery query must enumerate both independent relays at their actual TCP ports.
 #[test]
-fn discovery_is_refused_when_the_tcp_port_differs_from_the_discovery_port() {
-    let tcp_port = reserved_port();
-    let relay = Arc::new(
-        NaaRelay::new(
-            NaaRelaySettings {
-                enabled: true,
-                bind: format!("127.0.0.1:{tcp_port}"),
-                hqp_allow: vec![],
-                discovery_interface: Some("127.0.0.1".into()),
-                discovery_port: 43210,
-                adapter_name: "HiPhi Router".into(),
-            },
-            None,
-        )
-        .expect("constructs"),
-    );
-    relay.start_listener().expect("tcp listener still works");
+fn shared_discovery_advertises_each_relay_and_survives_removing_one() {
+    use std::net::UdpSocket;
+    let query = UdpSocket::bind("127.0.0.1:0").unwrap();
+    query
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let discovery_port = reserved_port();
+    let make = |name: &str| {
+        let mut config = settings(true, 0);
+        config.adapter_name = name.into();
+        config.discovery_interface = Some("127.0.0.1".into());
+        config.discovery_port = discovery_port;
+        let relay = Arc::new(NaaRelay::new(config, None).unwrap());
+        let tcp = relay.start_listener().unwrap();
+        assert!(
+            relay.responder_addr().is_some(),
+            "relay must advertise: {:?}",
+            relay.last_error()
+        );
+        (relay, tcp)
+    };
+    let (a, a_addr) = make("Office relay");
+    let (b, b_addr) = make("Bedroom relay");
+    let request = b"<networkaudio><discover version=\"HQPlayer Desktop 5\">network audio</discover></networkaudio>\0";
+    query
+        .send_to(request, ("127.0.0.1", discovery_port))
+        .unwrap();
+    let mut seen = std::collections::BTreeMap::new();
+    let mut buf = [0; 4096];
+    for _ in 0..2 {
+        let (n, peer) = query.recv_from(&mut buf).unwrap();
+        seen.insert(peer, String::from_utf8_lossy(&buf[..n]).to_string());
+    }
+    assert!(seen[&a_addr].contains("Office relay"));
+    assert!(seen[&b_addr].contains("Bedroom relay"));
+    let naa_a = FakeNaa::start("A", "dac-a", 44100);
+    let naa_b = FakeNaa::start("B", "dac-b", 44100);
+    let (_, mut client_a) = forwarding_pair(&a, &naa_a);
+    let (_, mut client_b) = forwarding_pair(&b, &naa_b);
+    client_a.start(44100).unwrap();
+    client_b.start(44100).unwrap();
+    client_a.send_audio(&[0x11; 256]).unwrap();
+    client_b.send_audio(&[0x22; 512]).unwrap();
+    assert!(naa_a.wait_until(|n| n.audio_bytes() == 256, Duration::from_secs(2)));
+    assert!(naa_b.wait_until(|n| n.audio_bytes() == 512, Duration::from_secs(2)));
+    a.stop_listener();
+    client_b.send_audio(&[0x33; 256]).unwrap();
     assert!(
-        relay.responder_addr().is_none(),
-        "no responder for an unreachable advertisement"
+        naa_b.wait_until(|n| n.audio_bytes() == 768, Duration::from_secs(2)),
+        "stopping A must not interrupt B's stream"
     );
+    query
+        .send_to(request, ("127.0.0.1", discovery_port))
+        .unwrap();
+    let (_, peer) = query.recv_from(&mut buf).unwrap();
+    assert_eq!(peer, b_addr);
     assert!(
-        relay
-            .last_error()
-            .is_some_and(|e| e.contains("discovery_port")),
-        "{:?}",
-        relay.last_error()
+        query.recv_from(&mut buf).is_err(),
+        "removed relay must not advertise"
     );
-    relay.stop_listener();
+    let mut restricted = settings(true, 0);
+    restricted.adapter_name = "Restricted relay".into();
+    restricted.discovery_interface = Some("127.0.0.1".into());
+    restricted.discovery_port = discovery_port;
+    restricted.hqp_allow = vec!["192.0.2.1".into()];
+    let restricted = NaaRelay::new(restricted, None).unwrap();
+    restricted.start_listener().unwrap();
+    assert!(restricted.responder_addr().is_some());
+    query
+        .send_to(request, ("127.0.0.1", discovery_port))
+        .unwrap();
+    let (_, peer) = query.recv_from(&mut buf).unwrap();
+    assert_eq!(peer, b_addr);
+    assert!(
+        query.recv_from(&mut buf).is_err(),
+        "one relay's empty ACL must not expose another relay"
+    );
+    restricted.stop_listener();
+    b.stop_listener();
+    assert!(
+        UdpSocket::bind(("127.0.0.1", discovery_port)).is_ok(),
+        "last owner releases discovery port"
+    );
 }
 
 /// Finding 27: the real scanner path (multicast query on the configured port, replies collected

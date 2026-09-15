@@ -26,7 +26,7 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -169,11 +169,6 @@ struct AcceptLoop {
     join: JoinHandle<()>,
 }
 
-struct Responder {
-    stop: Arc<AtomicBool>,
-    join: JoinHandle<()>,
-}
-
 /// Snapshot of relay state for the owner's projection builder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayObservation {
@@ -221,7 +216,7 @@ pub struct RelaySharedState(#[allow(dead_code)] Arc<RelayCore>);
 pub struct NaaRelay {
     core: Arc<RelayCore>,
     accept_loop: Mutex<Option<AcceptLoop>>,
-    responder: Mutex<Option<Responder>>,
+    responder: Mutex<Option<discovery::Registration>>,
     stop_in_progress: AtomicBool,
 }
 
@@ -408,8 +403,8 @@ impl NaaRelay {
         Ok(addr)
     }
 
-    /// Advertise the stable virtual NAA on UDP discovery (same port as the TCP listener, as the
-    /// protocol requires) when the settings name an explicit interface. Failure to bind is
+    /// Register this NAA with shared discovery, replying from its TCP listener's port,
+    /// when the settings name an explicit interface. Failure to bind is
     /// recorded, never hidden; the TCP relay keeps working without discovery.
     fn start_responder(&self, settings: &NaaRelaySettings, tcp: SocketAddr, allow: &[IpAddr]) {
         let Some(interface) = settings.discovery_interface.as_deref() else {
@@ -435,104 +430,24 @@ impl NaaRelay {
             ));
             return;
         }
-        // HQPlayer's scanner asks the standard discovery port and connects to the port the
-        // answering socket used. Advertising a relay whose TCP listener is elsewhere would name
-        // an unreachable endpoint, so discovery requires the two to agree.
-        if tcp.port() != settings.discovery_port {
-            lock(&self.core.inner).last_error = Some(format!(
-                "discovery requires the relay TCP port ({}) to equal discovery_port ({})",
-                tcp.port(),
-                settings.discovery_port
-            ));
-            return;
-        }
-        let advertisement = match discovery::advertisement(&settings.adapter_name) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                lock(&self.core.inner).last_error = Some(e);
-                return;
+        match discovery::register(
+            interface,
+            settings.discovery_port,
+            tcp.port(),
+            &settings.adapter_name,
+            allow,
+        ) {
+            Ok(registration) => {
+                *lock(&self.responder) = Some(registration);
+                lock(&self.core.inner).responder =
+                    Some(SocketAddr::new(interface.into(), tcp.port()));
             }
-        };
-        // A loopback-configured relay must not be reachable from the LAN through its discovery
-        // socket either: bind the responder to loopback. A LAN interface needs the wildcard bind
-        // to receive multicast, and its optional allow-list gates replies.
-        let bind_ip = if interface.is_loopback() {
-            interface
-        } else {
-            Ipv4Addr::UNSPECIFIED
-        };
-        let socket = match UdpSocket::bind((bind_ip, tcp.port())) {
-            Ok(socket) => socket,
-            Err(e) => {
-                lock(&self.core.inner).last_error = Some(format!(
-                    "cannot bind NAA discovery responder on UDP {}:{}: {e}",
-                    bind_ip,
-                    tcp.port()
-                ));
-                return;
-            }
-        };
-        if !interface.is_loopback() {
-            for group in discovery::GROUPS {
-                if let Err(e) = socket.join_multicast_v4(&group, &interface) {
-                    tracing::warn!(%group, %interface, %e, "NAA discovery multicast join failed");
-                }
-            }
+            Err(error) => lock(&self.core.inner).last_error = Some(error),
         }
-        let allow: Vec<IpAddr> = if allow.is_empty() && interface.is_loopback() {
-            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
-        } else {
-            allow.to_vec()
-        };
-        if socket
-            .set_read_timeout(Some(Duration::from_millis(200)))
-            .is_err()
-        {
-            return;
-        }
-        let bound = match socket.local_addr() {
-            Ok(addr) => addr,
-            Err(_) => return,
-        };
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_flag = stop.clone();
-        let join = match thread::Builder::new()
-            .name(format!("naa-relay-discovery-{}", tcp.port()))
-            .spawn(move || {
-                let mut buf = [0u8; 4097];
-                while !stop_flag.load(Ordering::Acquire) {
-                    match socket.recv_from(&mut buf) {
-                        Ok((n, peer)) => {
-                            if (allow.is_empty() || allow.contains(&peer.ip()))
-                                && discovery::valid_request(&buf[..n])
-                            {
-                                let _ = socket.send_to(&advertisement, peer);
-                            }
-                        }
-                        Err(e)
-                            if matches!(
-                                e.kind(),
-                                io::ErrorKind::WouldBlock
-                                    | io::ErrorKind::TimedOut
-                                    | io::ErrorKind::Interrupted
-                            ) => {}
-                        Err(_) => break,
-                    }
-                }
-                // Socket drops here, releasing the UDP port.
-            }) {
-            Ok(join) => join,
-            Err(_) => return,
-        };
-        *lock(&self.responder) = Some(Responder { stop, join });
-        lock(&self.core.inner).responder = Some(bound);
     }
 
     fn stop_responder(&self) {
-        if let Some(responder) = lock(&self.responder).take() {
-            responder.stop.store(true, Ordering::Release);
-            let _ = responder.join.join();
-        }
+        lock(&self.responder).take();
         lock(&self.core.inner).responder = None;
     }
 

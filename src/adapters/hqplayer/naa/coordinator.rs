@@ -851,6 +851,13 @@ impl HqpOutputCoordinator {
                 adapter_name,
             } => {
                 let mut settings = self.settings();
+                if bind.is_none() && settings == NaaRelaySettings::default() {
+                    settings.bind = format!(
+                        "{}:0",
+                        discovery_interface.as_deref().unwrap_or("127.0.0.1")
+                    );
+                    settings.adapter_name = format!("UHC {}", self.instance_name());
+                }
                 settings.enabled = enabled;
                 if let Some(port) = discovery_port {
                     settings.discovery_port = port;
@@ -886,6 +893,14 @@ impl HqpOutputCoordinator {
                         let instance = self.instance_name();
                         let worker = lock(&self.worker).clone();
                         self.start(&instance, worker, None).await;
+                    }
+                    // Persist the allocated port, so automatic setup remains stable on restart.
+                    if let Some(active) = self.relay() {
+                        if let Some(address) = active.listener_addr() {
+                            settings.bind = address.to_string();
+                            active.set_settings(settings.clone());
+                            *lock(&self.settings) = settings.clone();
+                        }
                     }
                     self.bump_revision();
                     // Persist through the adapter's instance configuration. A live-but-not-durable
@@ -2315,13 +2330,6 @@ fn validate_settings(settings: &NaaRelaySettings) -> Result<(), String> {
             .bind
             .parse()
             .map_err(|e| format!("invalid bind address {:?}: {e}", settings.bind))?;
-        if bind.port() != settings.discovery_port {
-            return Err(format!(
-                "NAA discovery answers on the TCP port it advertises: with discovery enabled the relay must bind port {} (discovery_port), not {}",
-                settings.discovery_port,
-                bind.port()
-            ));
-        }
         if !bind.ip().is_unspecified() && bind.ip() != std::net::IpAddr::V4(ip) {
             return Err("discovery_interface must match the relay bind address".into());
         }

@@ -222,6 +222,181 @@ fn collect(
     Ok(found.into_values().collect())
 }
 
+// One receiver per discovery bind; registrations own their reply socket and ACL. Keeping the
+// registry locked through final shutdown prevents a replacement racing a still-bound receiver.
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
+
+struct Advertisement {
+    socket: Arc<UdpSocket>,
+    bytes: Vec<u8>,
+    allow: Vec<IpAddr>,
+}
+struct Hub {
+    socket: Arc<UdpSocket>,
+    entries: Arc<Mutex<BTreeMap<SocketAddr, Advertisement>>>,
+    interfaces: Vec<Ipv4Addr>,
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+impl Drop for Hub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+static HUBS: OnceLock<Mutex<BTreeMap<SocketAddr, Hub>>> = OnceLock::new();
+fn hubs() -> &'static Mutex<BTreeMap<SocketAddr, Hub>> {
+    HUBS.get_or_init(Mutex::default)
+}
+fn guard<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+pub struct Registration {
+    receiver: SocketAddr,
+    endpoint: SocketAddr,
+}
+impl Drop for Registration {
+    fn drop(&mut self) {
+        let mut hubs = guard(hubs());
+        let empty = if let Some(hub) = hubs.get(&self.receiver) {
+            let mut entries = guard(&hub.entries);
+            entries.remove(&self.endpoint);
+            entries.is_empty()
+        } else {
+            false
+        };
+        if empty {
+            hubs.remove(&self.receiver);
+        }
+    }
+}
+
+pub fn register(
+    interface: Ipv4Addr,
+    discovery_port: u16,
+    tcp_port: u16,
+    name: &str,
+    allow: &[IpAddr],
+) -> Result<Registration, String> {
+    let bytes = advertisement(name)?;
+    let receiver = SocketAddr::from((
+        if interface.is_loopback() {
+            interface
+        } else {
+            Ipv4Addr::UNSPECIFIED
+        },
+        discovery_port,
+    ));
+    let endpoint = SocketAddr::from((interface, tcp_port));
+    let mut hubs = guard(hubs());
+    if let std::collections::btree_map::Entry::Vacant(entry) = hubs.entry(receiver) {
+        let socket = Arc::new(
+            UdpSocket::bind(receiver)
+                .map_err(|e| format!("cannot bind NAA discovery receiver {receiver}: {e}"))?,
+        );
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .map_err(|e| e.to_string())?;
+        let entries = Arc::new(Mutex::new(BTreeMap::<SocketAddr, Advertisement>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_socket = socket.clone();
+        let worker_entries = entries.clone();
+        let worker_stop = stop.clone();
+        let join = std::thread::Builder::new()
+            .name(format!("naa-discovery-{discovery_port}"))
+            .spawn(move || {
+                let mut buf = [0; 4097];
+                while !worker_stop.load(Ordering::Acquire) {
+                    match worker_socket.recv_from(&mut buf) {
+                        Ok((n, peer)) if valid_request(&buf[..n]) => {
+                            for advert in guard(&worker_entries).values() {
+                                if advert.allow.is_empty() || advert.allow.contains(&peer.ip()) {
+                                    let _ = advert.socket.send_to(&advert.bytes, peer);
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                io::ErrorKind::WouldBlock
+                                    | io::ErrorKind::TimedOut
+                                    | io::ErrorKind::Interrupted
+                            ) => {}
+                        Err(e) => {
+                            tracing::warn!(%e, "NAA discovery receiver stopped");
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        entry.insert(Hub {
+            socket,
+            entries,
+            interfaces: Vec::new(),
+            stop,
+            join: Some(join),
+        });
+    }
+    let result = (|| {
+        let hub = hubs
+            .get_mut(&receiver)
+            .ok_or("discovery receiver unavailable")?;
+        if guard(&hub.entries).contains_key(&endpoint) {
+            return Err("relay endpoint already advertised".into());
+        }
+        if !hub.interfaces.contains(&interface) {
+            for group in GROUPS {
+                hub.socket
+                    .join_multicast_v4(&group, &interface)
+                    .map_err(|e| format!("cannot join NAA discovery on {interface}: {e}"))?;
+            }
+            hub.interfaces.push(interface);
+        }
+        // Legacy listeners can keep using the discovery port. All other advertisements must
+        // originate at the TCP port: HQPlayer takes the reply's source port as the endpoint.
+        let socket = if tcp_port == discovery_port {
+            hub.socket.clone()
+        } else {
+            Arc::new(
+                UdpSocket::bind(endpoint)
+                    .map_err(|e| format!("cannot bind NAA advertisement {endpoint}: {e}"))?,
+            )
+        };
+        let allow = if interface.is_loopback() && allow.is_empty() {
+            vec![interface.into()]
+        } else {
+            allow.to_vec()
+        };
+        guard(&hub.entries).insert(
+            endpoint,
+            Advertisement {
+                socket,
+                bytes,
+                allow,
+            },
+        );
+        Ok(Registration { receiver, endpoint })
+    })();
+    if result.is_err()
+        && hubs
+            .get(&receiver)
+            .is_some_and(|hub| guard(&hub.entries).is_empty())
+    {
+        hubs.remove(&receiver);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
