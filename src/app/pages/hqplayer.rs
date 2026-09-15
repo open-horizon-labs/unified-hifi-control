@@ -905,7 +905,7 @@ fn hqp_instance_url(instance: &str, suffix: &str) -> String {
 
 #[component]
 fn HqpInstanceDsp(instance: String, connected: bool) -> Element {
-    let instance = use_signal(|| instance);
+    let target_instance = use_memo(use_reactive!(|instance| instance));
     let sse = use_sse();
     let mut hqp_loading = use_signal(|| false);
     let mut hqp_error = use_signal(|| None::<String>);
@@ -913,7 +913,9 @@ fn HqpInstanceDsp(instance: String, connected: bool) -> Element {
     let mut pipeline_error = use_signal(|| None::<String>);
     let mut pipeline_cache = use_signal(|| None::<HqpPipeline>);
     let mut pipeline = use_resource(move || async move {
-        match api::fetch_json::<HqpPipeline>(&hqp_instance_url(&instance(), "pipeline")).await {
+        match api::fetch_json::<HqpPipeline>(&hqp_instance_url(&target_instance(), "pipeline"))
+            .await
+        {
             Ok(value) => {
                 pipeline_error.set(None);
                 pipeline_cache.set(Some(value.clone()));
@@ -930,7 +932,9 @@ fn HqpInstanceDsp(instance: String, connected: bool) -> Element {
     let mut profiles_error = use_signal(|| None::<String>);
     let mut profiles_cache = use_signal(|| None::<Vec<HqpProfile>>);
     let mut profiles = use_resource(move || async move {
-        match api::fetch_json::<Vec<HqpProfile>>(&hqp_instance_url(&instance(), "profiles")).await {
+        match api::fetch_json::<Vec<HqpProfile>>(&hqp_instance_url(&target_instance(), "profiles"))
+            .await
+        {
             Ok(value) => {
                 profiles_error.set(None);
                 profiles_cache.set(Some(value.clone()));
@@ -949,7 +953,13 @@ fn HqpInstanceDsp(instance: String, connected: bool) -> Element {
     let matrix_error = use_signal(|| None::<String>);
     let matrix_refresh = use_signal(CoalescingRefresh::default);
     use_effect(move || {
-        refresh_advanced_projection(matrix, matrix_refresh, true, instance(), matrix_error)
+        refresh_advanced_projection(
+            matrix,
+            matrix_refresh,
+            true,
+            target_instance(),
+            matrix_error,
+        )
     });
 
     // Pipeline setting handler
@@ -964,7 +974,8 @@ fn HqpInstanceDsp(instance: String, connected: bool) -> Element {
             }
             let req = PipelineRequest { setting, value };
             if let Err(e) =
-                api::post_json_no_response(&hqp_instance_url(&instance(), "pipeline"), &req).await
+                api::post_json_no_response(&hqp_instance_url(&target_instance(), "pipeline"), &req)
+                    .await
             {
                 hqp_error.set(Some(format!("Pipeline update failed: {e}")));
             } else {
@@ -975,7 +986,7 @@ fn HqpInstanceDsp(instance: String, connected: bool) -> Element {
                     matrix,
                     matrix_refresh,
                     false,
-                    instance(),
+                    target_instance(),
                     matrix_error,
                 );
             }
@@ -994,7 +1005,8 @@ fn HqpInstanceDsp(instance: String, connected: bool) -> Element {
             }
             let req = ProfileRequest { profile };
             if let Err(e) =
-                api::post_json_no_response(&hqp_instance_url(&instance(), "profile"), &req).await
+                api::post_json_no_response(&hqp_instance_url(&target_instance(), "profile"), &req)
+                    .await
             {
                 hqp_error.set(Some(format!("Profile load failed: {e}")));
             } else {
@@ -1004,7 +1016,7 @@ fn HqpInstanceDsp(instance: String, connected: bool) -> Element {
                     matrix,
                     matrix_refresh,
                     false,
-                    instance(),
+                    target_instance(),
                     matrix_error,
                 );
             }
@@ -1027,7 +1039,8 @@ fn HqpInstanceDsp(instance: String, connected: bool) -> Element {
                 value: profile_name,
             };
             if let Err(e) =
-                api::post_json_no_response(&hqp_instance_url(&instance(), "pipeline"), &req).await
+                api::post_json_no_response(&hqp_instance_url(&target_instance(), "pipeline"), &req)
+                    .await
             {
                 hqp_error.set(Some(format!("Matrix profile failed: {e}")));
             } else {
@@ -1035,7 +1048,7 @@ fn HqpInstanceDsp(instance: String, connected: bool) -> Element {
                     matrix,
                     matrix_refresh,
                     false,
-                    instance(),
+                    target_instance(),
                     matrix_error,
                 );
             }
@@ -1074,7 +1087,7 @@ fn HqpInstanceDsp(instance: String, connected: bool) -> Element {
                                     matrix,
                                     matrix_refresh,
                                     false,
-                                    instance(),
+                                    target_instance(),
                                     matrix_error,
                                 );
                             },
@@ -1085,7 +1098,7 @@ fn HqpInstanceDsp(instance: String, connected: bool) -> Element {
             }
             if pipeline.read().as_ref().is_some_and(Option::is_some) {
                 DspSettings {
-                    instance: instance(),
+                    instance: target_instance(),
                     pipeline: pipeline.read().clone().flatten(),
                     profiles: profiles.read().clone().flatten().unwrap_or_default(),
                     matrix: matrix(),
