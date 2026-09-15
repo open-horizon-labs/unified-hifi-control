@@ -2998,7 +2998,28 @@ fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
 /// GET /hqp/instances - List all HQPlayer instances
 pub async fn hqp_instances_handler(State(state): State<AppState>) -> impl IntoResponse {
     let instances = state.hqp_instances.list_instances().await;
+    let settings = load_app_settings();
+    let instances = instances
+        .into_iter()
+        .map(|instance| {
+            let display_name = settings
+                .custom_zone_name(&format!("hqplayer:{}", instance.name))
+                .unwrap_or(&instance.name)
+                .to_string();
+            NamedHqpInstance {
+                instance,
+                display_name,
+            }
+        })
+        .collect::<Vec<_>>();
     Json(InstancesWrapper { instances })
+}
+
+#[derive(Serialize)]
+struct NamedHqpInstance {
+    #[serde(flatten)]
+    instance: crate::adapters::hqplayer::HqpInstanceInfo,
+    display_name: String,
 }
 
 /// HQPlayer add instance request

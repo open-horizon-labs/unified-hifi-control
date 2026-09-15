@@ -44,6 +44,8 @@ struct InstancesResponse {
 #[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
 struct HqpInstance {
     name: String,
+    #[serde(default)]
+    display_name: String,
     host: Option<String>,
     #[serde(default)]
     port: u16,
@@ -53,6 +55,16 @@ struct HqpInstance {
     connected: bool,
     #[serde(default)]
     info: Option<HqpInstanceInfo>,
+}
+
+impl HqpInstance {
+    fn label(&self) -> &str {
+        if self.display_name.is_empty() {
+            &self.name
+        } else {
+            &self.display_name
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
@@ -85,14 +97,15 @@ fn HqpInstanceRow(
     let mut busy = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
     let name = instance.name.clone();
+    let label = instance.label().to_string();
     let edit = instance.clone();
     let reconnect = instance.clone();
     rsx! {
         article { class: "py-4 border-b border-subtle",
             div { class: "flex flex-wrap items-center justify-between gap-3",
-                div { class: "flex gap-2",
+                div { class: "flex flex-wrap gap-2",
                     button {
-                        aria_label: "Edit {instance.name}",
+                        aria_label: "Edit {label}",
                         class: "btn btn-ghost btn-sm",
                         disabled: busy(),
                         onclick: move |_| on_edit.call(edit.clone()),
@@ -101,7 +114,7 @@ fn HqpInstanceRow(
                     button {
                         class: "btn btn-ghost btn-sm",
                         disabled: busy(),
-                        aria_label: "Reconnect {instance.name}",
+                        aria_label: "Reconnect {label}",
                         onclick: move |_| {
                             let target = reconnect.clone();
                             busy.set(true);
@@ -138,7 +151,7 @@ fn HqpInstanceRow(
                         "Reconnect"
                     }
                     button {
-                        aria_label: "Remove {instance.name}",
+                        aria_label: "Remove {label}",
                         class: "btn btn-ghost btn-sm",
                         disabled: busy(),
                         onclick: move |_| confirming.set(true),
@@ -152,9 +165,9 @@ fn HqpInstanceRow(
             if confirming() {
                 div { class: "mt-3 space-y-2",
                     p { class: "text-sm",
-                        "Remove {instance.name}? This stops its UHC relay and removes its saved connection and zone pairings."
+                        "Remove {label}? This stops its UHC relay and removes its saved connection and zone pairings."
                     }
-                    div { class: "flex gap-2",
+                    div { class: "flex flex-wrap gap-2",
                         button {
                             class: "btn btn-primary btn-sm",
                             disabled: busy(),
@@ -178,7 +191,7 @@ fn HqpInstanceRow(
                             }
                         }
                         button {
-                            aria_label: "Cancel removal of {instance.name}",
+                            aria_label: "Cancel removal of {label}",
                             class: "btn btn-ghost btn-sm",
                             disabled: busy(),
                             onclick: move |_| confirming.set(false),
@@ -309,6 +322,7 @@ pub fn HqPlayer() -> Element {
 
     // Form fields for config
     let mut instance_name = use_signal(|| "default".to_string());
+    let mut display_name = use_signal(String::new);
     let mut host = use_signal(String::new);
     let mut port = use_signal(|| 4321u16);
     let mut web_port = use_signal(|| 8088u16);
@@ -497,22 +511,60 @@ pub fn HqPlayer() -> Element {
         if config_busy() {
             return;
         }
-        let name = instance_name().trim().to_string();
+        let label = display_name().trim().to_string();
+        let editing = editing_instance();
+        let name = if editing {
+            instance_name()
+        } else {
+            label.clone()
+        };
         let h = host().trim().to_string();
         let p = port();
         let wp = web_port();
         let u = username();
         let pw = password();
 
-        if h.is_empty() || name.is_empty() {
+        if h.is_empty() || label.is_empty() {
             config_status.set(Some("Enter a name and host for HQPlayer.".to_string()));
             return;
         }
 
+        let previous = instances
+            .peek()
+            .as_ref()
+            .and_then(|r| r.as_ref())
+            .and_then(|r| r.instances.iter().find(|i| i.name == name))
+            .cloned();
+        let connection_changed = previous.as_ref().is_none_or(|i| {
+            i.host.as_deref() != Some(h.as_str())
+                || i.port != p
+                || i.web_port != wp
+                || !u.is_empty()
+                || !pw.is_empty()
+        });
         config_busy.set(true);
-        config_status.set(Some("Testing connection…".to_string()));
+        config_status.set(Some("Saving…".to_string()));
 
         spawn(async move {
+            if editing && previous.as_ref().is_some_and(|i| i.label() != label) {
+                let request = api::ZoneNameRequest {
+                    zone_id: format!("hqplayer:{name}"),
+                    name: Some(label),
+                };
+                if let Err(error) = api::post_json_no_response("/api/zones/name", &request).await {
+                    config_status.set(Some(format!("Could not save name: {error}")));
+                    config_busy.set(false);
+                    return;
+                }
+                instances.restart();
+                zones.restart();
+            }
+            if editing && !connection_changed {
+                config_status.set(Some("Saved.".into()));
+                config_busy.set(false);
+                return;
+            }
+            instance_name.set(name.clone());
             let req = HqpConfigureRequest {
                 name,
                 host: h,
@@ -573,6 +625,7 @@ pub fn HqPlayer() -> Element {
                     disabled: config_busy(),
                     onclick: move |_| {
                         instance_name.set(String::new());
+                        display_name.set(String::new());
                         host.set(String::new());
                         port.set(4321);
                         web_port.set(8088);
@@ -610,7 +663,7 @@ pub fn HqPlayer() -> Element {
                 section { class: "mb-6 border-b border-subtle pb-5",
                     h2 { class: "text-lg font-semibold mb-3", "Add HQPlayer" }
                     ConfigForm {
-                        instance_name,
+                        instance_name: display_name,
                         host,
                         port,
                         web_port,
@@ -638,6 +691,7 @@ pub fn HqPlayer() -> Element {
             for instance in instances_list.iter().filter(|i| i.host.is_some()) {
                 {
                     let name = instance.name.clone();
+                    let label = instance.label().to_string();
                     let address = instance.host.as_deref().unwrap_or("");
                     let product = instance
                         .info
@@ -663,9 +717,9 @@ pub fn HqPlayer() -> Element {
                     rsx! {
                         section {
                             key: "{name}",
-                            aria_label: "HQPlayer instance {name}",
+                            aria_label: "HQPlayer instance {label}",
                             class: "mb-10 border-t border-subtle pt-5",
-                            h2 { class: "text-xl font-semibold break-words", "{name}" }
+                            h2 { class: "text-xl font-semibold break-words", "{label}" }
                             p { class: "text-sm mt-1", "{product} {version}" }
                             p { class: "text-sm text-muted mb-4",
                                 "{address}:{instance.port} · "
@@ -705,6 +759,7 @@ pub fn HqPlayer() -> Element {
                             HqpInstanceDsp {
                                 key: "dsp-{name}",
                                 instance: name.clone(),
+                                display_name: label.clone(),
                                 connected: instance.connected,
                             }
                             details {
@@ -720,6 +775,7 @@ pub fn HqPlayer() -> Element {
                                         zone_links.restart();
                                     },
                                     on_edit: move |instance: HqpInstance| {
+                                        display_name.set(instance.label().to_string());
                                         instance_name.set(instance.name);
                                         host.set(instance.host.unwrap_or_default());
                                         port.set(instance.port);
@@ -733,7 +789,7 @@ pub fn HqPlayer() -> Element {
                                 }
                                 if show_config() && editing_instance() && instance_name() == name {
                                     ConfigForm {
-                                        instance_name,
+                                        instance_name: display_name,
                                         host,
                                         port,
                                         web_port,
@@ -904,7 +960,7 @@ fn hqp_instance_url(instance: &str, suffix: &str) -> String {
 }
 
 #[component]
-fn HqpInstanceDsp(instance: String, connected: bool) -> Element {
+fn HqpInstanceDsp(instance: String, display_name: String, connected: bool) -> Element {
     let target_instance = use_memo(use_reactive!(|instance| instance));
     let sse = use_sse();
     let mut hqp_loading = use_signal(|| false);
@@ -1077,7 +1133,7 @@ fn HqpInstanceDsp(instance: String, connected: bool) -> Element {
             {
                 if let Some(problem) = problem {
                     div { role: "alert", class: "mt-3 text-sm",
-                        p { "{label} unavailable for {instance}. {problem}" }
+                        p { "{label} unavailable for {display_name}. {problem}" }
                         button {
                             class: "btn btn-ghost btn-sm",
                             onclick: move |_| {
@@ -1648,7 +1704,7 @@ fn ConfigForm(
                     }
                     input {
                         id: "hqp-instance-name",
-                        disabled: editing || busy,
+                        disabled: busy,
                         class: "input",
                         r#type: "text",
                         required: true,
@@ -1657,7 +1713,7 @@ fn ConfigForm(
                         oninput: move |evt| instance_name.set(evt.value()),
                     }
                     p { class: "mt-1 text-xs text-muted",
-                        "Choose a name when adding HQPlayer. Editing an existing connection keeps its name and pairings."
+                        "Shown in UHC. Renaming keeps your relay and source pairings."
                     }
                 }
                 div {
@@ -1773,9 +1829,11 @@ fn ConfigForm(
                         class: "btn btn-primary",
                         disabled: busy,
                         if busy {
-                            "Testing…"
+                            "Saving…"
+                        } else if editing {
+                            "Save changes"
                         } else {
-                            "Save and test connection"
+                            "Add and test connection"
                         }
                     }
                     if let Some(ref msg) = config_status {
@@ -2493,8 +2551,10 @@ fn ZoneLinkTable(
                                 let instance_detail = instances
                                     .iter()
                                     .find(|instance| instance.name == link.instance)
-                                    .and_then(|instance| instance.host.as_deref())
-                                    .map(|host| format!("{} at {}", link.instance, host))
+                                    .map(|instance| match instance.host.as_deref() {
+                                        Some(host) => format!("{} at {}", instance.label(), host),
+                                        None => instance.label().to_string(),
+                                    })
                                     .unwrap_or_else(|| link.instance.clone());
                                 let zone_id = link.zone_id.clone();
                                 rsx! {
@@ -2613,9 +2673,9 @@ fn ZoneLinkTable(
                                                 value: "{instance.name}",
                                                 selected: instance.name == selected_instance(),
                                                 if let Some(ref host) = instance.host {
-                                                    "{instance.name} ({host})"
+                                                    "{instance.label()} ({host})"
                                                 } else {
-                                                    "{instance.name}"
+                                                    "{instance.label()}"
                                                 }
                                             }
                                         }

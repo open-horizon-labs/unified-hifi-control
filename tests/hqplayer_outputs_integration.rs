@@ -2744,3 +2744,68 @@ async fn instance_pipeline_controls_never_fall_back_to_default() {
     daemon.shutdown().await;
     rig.shutdown().await;
 }
+
+#[tokio::test]
+#[serial_test::serial(hqp_output_config)]
+async fn renaming_hqplayer_preserves_identity_pairings_and_running_relay() {
+    use axum::{extract::State, response::IntoResponse, Json};
+    use unified_hifi_control::api::{hqp_instances_handler, zone_name_post, ZoneNameRequest};
+    let daemon = WireServer::start(Arc::new(playing_daemon()), WirePolicy::default()).await;
+    let rig = Rig::new("rename-target").await;
+    let (adapter, bind) = rig.attach(&daemon).await;
+    rig.state
+        .hqp_zone_links
+        .link_zone("roon:source".into(), rig.instance.clone())
+        .await
+        .unwrap();
+    let before = rig.manager.instance_count().await;
+    let response = zone_name_post(Json(ZoneNameRequest {
+        zone_id: rig.zone_id(),
+        name: Some("Listening Room".into()),
+    }))
+    .await;
+    assert_eq!(
+        response.into_response().status(),
+        axum::http::StatusCode::OK
+    );
+    let response = hqp_instances_handler(State(rig.state.clone()))
+        .await
+        .into_response();
+    let bytes = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    let row = body["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "rename-target")
+        .unwrap();
+    assert_eq!(row["display_name"], "Listening Room");
+    assert_eq!(rig.manager.instance_count().await, before);
+    assert!(Arc::ptr_eq(
+        &adapter,
+        &rig.manager.get(&rig.instance).await.unwrap()
+    ));
+    assert_eq!(
+        rig.state
+            .hqp_zone_links
+            .get_instance_for_zone("roon:source")
+            .await
+            .as_deref(),
+        Some("rename-target")
+    );
+    let projection = rig
+        .outputs_when(|p| p.availability == HqpOutputAvailability::Available)
+        .await;
+    assert_eq!(
+        projection.relay.bind.as_deref(),
+        Some(bind.to_string().as_str())
+    );
+    assert_eq!(
+        unified_hifi_control::api::load_app_settings().custom_zone_name(&rig.zone_id()),
+        Some("Listening Room")
+    );
+    daemon.shutdown().await;
+    rig.shutdown().await;
+}
