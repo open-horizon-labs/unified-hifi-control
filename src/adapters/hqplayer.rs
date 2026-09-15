@@ -31,7 +31,7 @@ pub mod outputs {
 /// exposed publicly for hermetic lifecycle tests and deliberately without any control listener.
 #[cfg(feature = "naa-proxy")]
 pub mod naa_relay {
-    pub use super::naa::coordinator::HqpOutputTimeouts;
+    pub use super::naa::coordinator::{HqpOutputTimeouts, RelaySourceControl};
     pub use super::naa::discovery::{
         own_addresses as discovery_own_addresses, scan as discovery_scan,
     };
@@ -10105,6 +10105,11 @@ impl HqpAdapter {
     /// Cancel pending output work (profile/pipeline reconfiguration, endpoint change, removal).
     pub(crate) fn supersede_output_work(&self, reason: &str) {
         self.outputs.supersede(reason);
+    }
+
+    #[cfg(feature = "naa-proxy")]
+    pub fn set_relay_source_control(&self, control: Arc<dyn naa::coordinator::RelaySourceControl>) {
+        self.outputs.set_source_control(control);
     }
 
     /// Composition publishes fallback metadata from the bound aggregator source.

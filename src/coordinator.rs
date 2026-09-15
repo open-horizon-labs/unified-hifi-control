@@ -1027,6 +1027,7 @@ pub async fn run_relay_metadata(state: crate::api::AppState) {
             let Some(adapter) = state.hqp_instances.get(&instance.name).await else {
                 continue;
             };
+            adapter.set_relay_source_control(relay_source_control(&state, &instance.name));
             let Some((source, np)) = relay_metadata_source(&state, &instance.name).await else {
                 adapter.set_relay_metadata(None);
                 cache.remove(&instance.name);
@@ -1088,4 +1089,122 @@ pub async fn run_relay_metadata(state: crate::api::AppState) {
             );
         }
     }
+}
+
+/// A source transport bridge scoped to one HQPlayer instance. Weak bindings avoid retaining
+/// the manager (and its adapters) after shutdown.
+#[cfg(feature = "naa-proxy")]
+struct RoonRelaySource {
+    instance: String,
+    links: std::sync::Weak<crate::adapters::hqplayer::HqpZoneLinkService>,
+    aggregator: Arc<crate::aggregator::ZoneAggregator>,
+    gateway: Option<crate::bus::runtime::CommandGateway>,
+}
+
+#[cfg(feature = "naa-proxy")]
+impl RoonRelaySource {
+    async fn source(&self) -> Result<Option<String>, String> {
+        let links = self
+            .links
+            .upgrade()
+            .ok_or("HQPlayer bindings unavailable")?;
+        let sources: Vec<_> = links
+            .get_links()
+            .await
+            .into_iter()
+            .filter(|link| link.instance == self.instance && link.zone_id.starts_with("roon:"))
+            .map(|link| link.zone_id)
+            .collect();
+        match sources.as_slice() {
+            [] => Ok(None),
+            [source] => Ok(Some(source.clone())),
+            _ => Err("Multiple Roon zones are paired; choose one pairing before switching.".into()),
+        }
+    }
+}
+
+#[cfg(feature = "naa-proxy")]
+#[async_trait::async_trait]
+impl crate::adapters::hqplayer::naa_relay::RelaySourceControl for RoonRelaySource {
+    async fn pause_for_switch(&self) -> Result<Option<(String, bool)>, String> {
+        use crate::bus::{Command, PlaybackState};
+        let Some(source) = self.source().await? else {
+            return Ok(None);
+        };
+        let zone = self
+            .aggregator
+            .get_zone(&source)
+            .await
+            .ok_or("Paired Roon zone is unavailable")?;
+        let playing = match zone.state {
+            PlaybackState::Playing => true,
+            PlaybackState::Paused | PlaybackState::Stopped => false,
+            _ => return Err("Paired Roon playback state is not settled; try again.".into()),
+        };
+        if playing {
+            crate::api::dispatch_roon_runtime_command_via(
+                self.gateway.as_ref(),
+                &source,
+                Command::Pause,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if self.source().await?.as_deref() != Some(&source) {
+                    return Err("Roon pairing changed during pause".into());
+                }
+                if self.aggregator.get_zone(&source).await.is_some_and(|zone| {
+                    matches!(zone.state, PlaybackState::Paused | PlaybackState::Stopped)
+                }) {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err("Roon pause was not confirmed; destination unchanged".into());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        Ok(Some((source, playing)))
+    }
+
+    async fn pause_after_failed_resume(&self, source: &str) -> Result<(), String> {
+        if self.source().await?.as_deref() != Some(source) {
+            return Err("Roon pairing changed; no cleanup command sent".into());
+        }
+        crate::api::dispatch_roon_runtime_command_via(
+            self.gateway.as_ref(),
+            source,
+            crate::bus::Command::Pause,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    async fn resume_after_switch(&self, source: &str) -> Result<(), String> {
+        if self.source().await?.as_deref() != Some(source) {
+            return Err("Roon pairing changed; playback was not resumed".into());
+        }
+        crate::api::dispatch_roon_runtime_command_via(
+            self.gateway.as_ref(),
+            source,
+            crate::bus::Command::Play,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+}
+
+/// Compose the exact-instance Roon transport bridge without exposing adapters to surfaces.
+#[cfg(feature = "naa-proxy")]
+pub fn relay_source_control(
+    state: &crate::api::AppState,
+    instance: &str,
+) -> Arc<dyn crate::adapters::hqplayer::naa_relay::RelaySourceControl> {
+    Arc::new(RoonRelaySource {
+        instance: instance.to_string(),
+        links: Arc::downgrade(&state.hqp_zone_links),
+        aggregator: state.aggregator.clone(),
+        gateway: state.reliable_commands.clone(),
+    })
 }

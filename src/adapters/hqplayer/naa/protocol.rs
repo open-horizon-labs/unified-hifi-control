@@ -454,13 +454,18 @@ fn upstream_loop(
                 (Some(_), None) => true,
                 _ => false,
             };
-            let fallback = changed.then_some(metadata.as_deref()).flatten();
+
             let original_meta_len = u32::from_le_bytes([
                 wire_header[12],
                 wire_header[13],
                 wire_header[14],
                 wire_header[15],
             ]);
+            // Native text packets can clear an endpoint's artwork: accompany those packets
+            // with fallback art, but never resend artwork on every audio-only frame.
+            let fallback = (changed || original_meta_len > 0)
+                .then_some(metadata.as_deref())
+                .flatten();
             let rewritten =
                 rewrite_sections(&mut wire_header, &body, fallback, width).map_err(invalid)?;
             if original_meta_len == 0 {

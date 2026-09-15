@@ -149,7 +149,17 @@ struct Publisher {
     join: tokio::task::JoinHandle<()>,
 }
 
+/// Source transport supplied by composition; the relay never depends on a Roon adapter.
+#[async_trait::async_trait]
+pub trait RelaySourceControl: Send + Sync {
+    /// None means this instance is not Roon-paired. A paired source must confirm pause.
+    async fn pause_for_switch(&self) -> Result<Option<(String, bool)>, String>;
+    async fn resume_after_switch(&self, source: &str) -> Result<(), String>;
+    async fn pause_after_failed_resume(&self, source: &str) -> Result<(), String>;
+}
+
 pub struct HqpOutputCoordinator {
+    source_control: Mutex<Option<Arc<dyn RelaySourceControl>>>,
     instance: Mutex<Option<String>>,
     settings: Mutex<NaaRelaySettings>,
     relay: Mutex<Option<Arc<NaaRelay>>>,
@@ -168,6 +178,7 @@ pub struct HqpOutputCoordinator {
 impl HqpOutputCoordinator {
     pub fn new(settings: NaaRelaySettings) -> Self {
         Self {
+            source_control: Mutex::new(None),
             instance: Mutex::new(None),
             settings: Mutex::new(settings),
             relay: Mutex::new(None),
@@ -180,6 +191,10 @@ impl HqpOutputCoordinator {
             persist_path: Mutex::new(None),
             timeouts: Mutex::new(HqpOutputTimeouts::default()),
         }
+    }
+
+    pub fn set_source_control(&self, control: Arc<dyn RelaySourceControl>) {
+        *lock(&self.source_control) = Some(control);
     }
 
     pub fn settings(&self) -> NaaRelaySettings {
@@ -1144,7 +1159,7 @@ impl HqpOutputCoordinator {
                     operation_id: operation_id.clone(),
                 });
                 let session_exists = relay.observe().session.is_some();
-                if !session_exists {
+                if !session_exists && lock(&self.source_control).is_none() {
                     // Nothing can be playing through the relay: commit without native traffic.
                     match relay.commit_selection(&route_id) {
                         Ok(generation) => {
@@ -1965,6 +1980,110 @@ impl HqpOutputCoordinator {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn select_paired_source(
+        &self,
+        relay: &Arc<NaaRelay>,
+        token: &CancellationToken,
+        op: &str,
+        route_id: &str,
+        control: Arc<dyn RelaySourceControl>,
+        source: String,
+        was_playing: bool,
+    ) -> Result<(), SelectAbort> {
+        if token.is_cancelled() {
+            return Err(SelectAbort::Cancelled);
+        }
+        let generation = match relay.commit_selection(route_id) {
+            Ok(generation) => generation,
+            Err(error) => {
+                self.finish_operation(
+                    op,
+                    HqpOutputOutcome::Failed,
+                    Some(format!("Roon remains paused. {error}")),
+                    |_| {},
+                );
+                return Ok(());
+            }
+        };
+        self.bump_revision();
+        self.update_operation(op, |o| o.route_generation = Some(generation));
+        if !was_playing {
+            self.finish_operation(
+                op,
+                HqpOutputOutcome::Complete,
+                Some("Destination selected; Roon remains paused.".into()),
+                |_| {},
+            );
+            return Ok(());
+        }
+        if token.is_cancelled() || relay.generation() != generation {
+            return Err(SelectAbort::Cancelled);
+        }
+        self.set_phase(op, HqpOutputPhase::Resuming);
+        self.publish(None).await;
+        let resumed = cancellable(
+            token,
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                control.resume_after_switch(&source),
+            ),
+        )
+        .await?;
+        if !matches!(resumed, Ok(Ok(()))) {
+            self.finish_operation(
+                op,
+                HqpOutputOutcome::Failed,
+                Some(format!(
+                    "Destination selected; Roon resume failed: {resumed:?}"
+                )),
+                |_| {},
+            );
+            return Ok(());
+        }
+        // Roon supplies a fresh HTTP stream and drives HQPlayer's reconnect itself.
+        // Waiting for NAA initialization before asking Roon to play would deadlock this flow.
+        let connected = self
+            .await_session(
+                relay,
+                token,
+                generation,
+                tokio::time::Instant::now() + Duration::from_secs(30),
+                self.timeouts().poll,
+                |view| view.initialized && view.started && view.current_stream_audio_bytes > 0,
+            )
+            .await?;
+        match connected {
+            Ok(view) => {
+                self.finish_operation(
+                    op,
+                    HqpOutputOutcome::Complete,
+                    Some("Roon resumed on the selected destination.".into()),
+                    |o| {
+                        o.evidence.session_id = Some(view.session_id);
+                        o.evidence.initialized = true;
+                        o.evidence.started = true;
+                        o.evidence.current_stream_audio_bytes = view.current_stream_audio_bytes;
+                    },
+                );
+            }
+            Err(error) => {
+                // Preserve discovery/reconnect availability; never close the routing gate for
+                // a source-managed failure. Do not replay HQPlayer's stale HTTP URI.
+                let _ = cancellable(
+                    token,
+                    tokio::time::timeout(
+                        Duration::from_secs(20),
+                        control.pause_after_failed_resume(&source),
+                    ),
+                )
+                .await?;
+                self.finish_operation(op, HqpOutputOutcome::Failed, Some(format!("Destination selected but audio was not confirmed; requested Roon pause. {error}")), |_| {});
+            }
+        }
+        Ok(())
+    }
+
     async fn select_sequence(
         &self,
         adapter: &Arc<HqpAdapter>,
@@ -1973,6 +2092,57 @@ impl HqpOutputCoordinator {
         op: &str,
         route_id: &str,
     ) -> Result<(), SelectAbort> {
+        let source_control = { lock(&self.source_control).clone() };
+        if let Some(control) = source_control {
+            self.set_phase(op, HqpOutputPhase::Stopping);
+            self.publish(None).await;
+            let prepared = cancellable(
+                token,
+                tokio::time::timeout(Duration::from_secs(30), control.pause_for_switch()),
+            )
+            .await?;
+            match prepared {
+                Ok(Ok(Some((source, was_playing)))) => {
+                    return self
+                        .select_paired_source(
+                            relay,
+                            token,
+                            op,
+                            route_id,
+                            control,
+                            source,
+                            was_playing,
+                        )
+                        .await;
+                }
+                Ok(Ok(None)) => {}
+                error => {
+                    self.finish_operation(
+                        op,
+                        HqpOutputOutcome::Failed,
+                        Some(format!(
+                            "Route unchanged: could not pause paired Roon zone: {error:?}"
+                        )),
+                        |_| {},
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        if relay.observe().session.is_none() {
+            match relay.commit_selection(route_id) {
+                Ok(generation) => {
+                    self.bump_revision();
+                    self.finish_operation(op, HqpOutputOutcome::Complete, None, |o| {
+                        o.route_generation = Some(generation)
+                    });
+                }
+                Err(error) => {
+                    self.finish_operation(op, HqpOutputOutcome::Failed, Some(error), |_| {});
+                }
+            }
+            return Ok(());
+        }
         let timeouts = self.timeouts();
         let step = |d: Duration| tokio::time::Instant::now() + d;
         // Before the commit the operation owns the generation that `supersede` produced.

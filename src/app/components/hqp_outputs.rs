@@ -1502,6 +1502,9 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
 
             div { class: "mb-4",
                 h3 { class: "text-sm font-semibold mb-2", "NAA destinations" }
+                p { class: "text-xs text-muted",
+                    "For a paired Roon zone, switching briefly pauses Roon and resumes it on the new destination. A paused zone stays paused."
+                }
                 if projection.routes.is_empty() {
                     p { class: "text-sm text-muted",
                         "No destinations saved. Discover NAA hosts or add one by address."

@@ -3127,3 +3127,241 @@ async fn saving_unchanged_relay_settings_preserves_port_and_audio_session() {
     daemon.shutdown().await;
     rig.shutdown().await;
 }
+
+struct PairedSourceFixture {
+    client: Arc<AutoHqpClient>,
+    paused: AtomicBool,
+    resumed: AtomicBool,
+    was_playing: AtomicBool,
+    fail_pause: AtomicBool,
+    hold_pause: AtomicBool,
+}
+#[async_trait::async_trait]
+impl unified_hifi_control::adapters::hqplayer::naa_relay::RelaySourceControl
+    for PairedSourceFixture
+{
+    async fn pause_for_switch(&self) -> Result<Option<(String, bool)>, String> {
+        self.paused.store(true, Ordering::Release);
+        while self.hold_pause.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if self.fail_pause.load(Ordering::Acquire) {
+            return Err("pause rejected".into());
+        }
+        self.client.set_playing(false);
+        Ok(Some((
+            "roon:paired".into(),
+            self.was_playing.load(Ordering::Acquire),
+        )))
+    }
+    async fn pause_after_failed_resume(&self, source: &str) -> Result<(), String> {
+        assert_eq!(source, "roon:paired");
+        self.client.set_playing(false);
+        Ok(())
+    }
+    async fn resume_after_switch(&self, source: &str) -> Result<(), String> {
+        assert_eq!(source, "roon:paired");
+        assert!(self.paused.load(Ordering::Acquire));
+        self.client.set_playing(true);
+        self.resumed.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+#[tokio::test]
+#[serial_test::serial(hqp_output_config)]
+async fn paired_source_switch_uses_source_transport_without_native_stop_or_play() {
+    let model = playing_daemon();
+    let daemon = WireServer::start(Arc::new(model.clone()), WirePolicy::default()).await;
+    let rig = Rig::new("paired").await;
+    let (adapter, bind) = rig.attach(&daemon).await;
+    let a = FakeNaa::start("A", "hw:CARD=A,DEV=0", 44100);
+    let b = FakeNaa::start("B", "hw:CARD=B,DEV=0", 44100);
+    let route_a = rig.add_route("A", &a, None).await;
+    let route_b = rig.add_route("B", &b, None).await;
+    rig.command(
+        HqpOutputAction::Select {
+            route_id: route_a.clone(),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let client = Arc::new(AutoHqpClient::start(bind, 44100));
+    client.set_playing(true);
+    rig.outputs_when(|p| p.session_confirms_audio()).await;
+    let source = Arc::new(PairedSourceFixture {
+        client: client.clone(),
+        paused: AtomicBool::new(false),
+        resumed: AtomicBool::new(false),
+        was_playing: AtomicBool::new(true),
+        fail_pause: AtomicBool::new(false),
+        hold_pause: AtomicBool::new(false),
+    });
+    adapter.set_relay_source_control(source.clone());
+    let receipt = rig
+        .command(
+            HqpOutputAction::Select {
+                route_id: route_b.clone(),
+            },
+            Some("paired-switch"),
+        )
+        .await
+        .unwrap();
+    let done = rig
+        .operation_when(&receipt.operation.operation_id, |o| o.is_terminal())
+        .await;
+    assert_eq!(done.outcome, Some(HqpOutputOutcome::Complete), "{done:?}");
+    assert!(
+        source.paused.load(Ordering::Acquire),
+        "must pause the paired source"
+    );
+    assert!(
+        source.resumed.load(Ordering::Acquire),
+        "must resume the paired source"
+    );
+    assert_eq!(model.request_count("Stop"), 0);
+    assert_eq!(model.request_count("Play"), 0);
+    assert!(b.audio_bytes() > 0);
+    // An idempotent retry must not pause/play a second time.
+    source.paused.store(false, Ordering::Release);
+    let retry = rig
+        .command(
+            HqpOutputAction::Select {
+                route_id: route_b.clone(),
+            },
+            Some("paired-switch"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.operation.operation_id, receipt.operation.operation_id);
+    assert!(!source.paused.load(Ordering::Acquire));
+
+    source.was_playing.store(false, Ordering::Release);
+    source.resumed.store(false, Ordering::Release);
+    client.set_playing(false);
+    let paused = rig
+        .command(
+            HqpOutputAction::Select {
+                route_id: route_a.clone(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let paused = rig
+        .operation_when(&paused.operation.operation_id, |o| o.is_terminal())
+        .await;
+    assert_eq!(paused.outcome, Some(HqpOutputOutcome::Complete));
+    assert!(
+        !source.resumed.load(Ordering::Acquire),
+        "paused source must stay paused"
+    );
+
+    source.fail_pause.store(true, Ordering::Release);
+    let failed = rig
+        .command(
+            HqpOutputAction::Select {
+                route_id: route_b.clone(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let failed = rig
+        .operation_when(&failed.operation.operation_id, |o| o.is_terminal())
+        .await;
+    assert_eq!(failed.outcome, Some(HqpOutputOutcome::Failed));
+    let unchanged = read_hqp_outputs(&rig.state, &rig.zone_id()).await.unwrap();
+    assert_eq!(
+        unchanged.selected_route_id.as_deref(),
+        Some(route_a.as_str())
+    );
+    assert!(!source.resumed.load(Ordering::Acquire));
+
+    // Stop cancels an in-flight source pause; completing it later cannot resume audio.
+    source.fail_pause.store(false, Ordering::Release);
+    source.hold_pause.store(true, Ordering::Release);
+    source.paused.store(false, Ordering::Release);
+    let held = rig
+        .command(HqpOutputAction::Select { route_id: route_b }, None)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !source.paused.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    rig.command(HqpOutputAction::Stop, None).await.unwrap();
+    source.hold_pause.store(false, Ordering::Release);
+    let cancelled = rig
+        .operation_when(&held.operation.operation_id, |o| o.is_terminal())
+        .await;
+    assert_eq!(cancelled.outcome, Some(HqpOutputOutcome::Cancelled));
+    assert!(!source.resumed.load(Ordering::Acquire));
+    drop(source);
+    drop(adapter);
+    rig.shutdown().await;
+    drop(client);
+}
+
+#[tokio::test]
+#[serial_test::serial(hqp_output_config)]
+async fn roon_source_bridge_requires_one_exact_binding_and_preserves_paused_state() {
+    use unified_hifi_control::coordinator::relay_source_control;
+    let rig = Rig::new("paired-resolution").await;
+    let daemon = WireServer::start(Arc::new(playing_daemon()), WirePolicy::default()).await;
+    rig.attach(&daemon).await;
+    let control = relay_source_control(&rig.state, &rig.instance);
+    assert_eq!(control.pause_for_switch().await.unwrap(), None);
+    rig.state
+        .hqp_zone_links
+        .link_zone("roon:source".into(), rig.instance.clone())
+        .await
+        .unwrap();
+    assert!(
+        control.pause_for_switch().await.is_err(),
+        "missing source must fail closed"
+    );
+    let mut zone = rig.state.aggregator.get_zone(&rig.zone_id()).await.unwrap();
+    zone.zone_id = "roon:source".into();
+    zone.source = "roon".into();
+    zone.state = unified_hifi_control::bus::PlaybackState::Paused;
+    rig.bus.publish(BusEvent::ZoneDiscovered { zone });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while rig.state.aggregator.get_zone("roon:source").await.is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // There is no Roon command endpoint in this fixture: paused must require no command.
+    assert_eq!(
+        control.pause_for_switch().await.unwrap(),
+        Some(("roon:source".into(), false))
+    );
+    rig.state
+        .hqp_zone_links
+        .link_zone("roon:other".into(), rig.instance.clone())
+        .await
+        .unwrap();
+    assert!(
+        control.pause_for_switch().await.is_err(),
+        "ambiguous pairing must not choose a zone"
+    );
+    rig.state.hqp_zone_links.unlink_zone("roon:source").await;
+    assert!(
+        control.resume_after_switch("roon:source").await.is_err(),
+        "changed binding must not resume old source"
+    );
+    assert!(
+        control
+            .pause_after_failed_resume("roon:source")
+            .await
+            .is_err(),
+        "cleanup must not pause a newly bound zone"
+    );
+    daemon.shutdown().await;
+    rig.shutdown().await;
+}

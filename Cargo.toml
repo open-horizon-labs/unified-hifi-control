@@ -214,6 +214,10 @@ tempfile = "3"
 # this is the "mock/in-process broker" the issue's acceptance criteria calls for.
 rumqttd = { version = "0.19", default-features = false }
 
+[profile.dev]
+# Keep file/line backtraces without full variable and type debug information.
+debug = "line-tables-only"
+
 [profile.release]
 lto = true
 codegen-units = 1
