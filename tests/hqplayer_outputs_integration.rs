@@ -2809,3 +2809,120 @@ async fn renaming_hqplayer_preserves_identity_pairings_and_running_relay() {
     daemon.shutdown().await;
     rig.shutdown().await;
 }
+
+#[tokio::test]
+#[serial_test::serial(hqp_output_config)]
+async fn optional_unknown_junk_filter_does_not_break_advanced_readback() {
+    use axum::{
+        extract::{Path, State},
+        response::IntoResponse,
+    };
+    let model = playing_daemon();
+    let daemon = WireServer::start(Arc::new(model.clone()), WirePolicy::default()).await;
+    let rig = Rig::new("optional-junk").await;
+    rig.attach(&daemon).await;
+    model.arm(|faults| {
+        faults
+            .reject_next
+            .push(("GetJunkFilters".into(), "Unknown command".into()))
+    });
+    let response = api::hqp_instance_matrix_profiles_handler(
+        State(rig.state.clone()),
+        Path(rig.instance.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["junk_filters_supported"], false);
+    assert_eq!(value["junk_filters"], serde_json::json!([]));
+    assert!(value["profiles"].is_array());
+    let adapter = rig.manager.get(&rig.instance).await.unwrap();
+    model.arm(|faults| {
+        faults
+            .reject_next
+            .push(("GetJunkFilters".into(), "Internal failure".into()))
+    });
+    assert!(
+        adapter.get_advanced_options_snapshot().await.is_err(),
+        "Only an explicit unknown-command rejection is optional"
+    );
+    daemon.shutdown().await;
+    rig.shutdown().await;
+}
+
+#[tokio::test]
+#[serial_test::serial(hqp_output_config)]
+async fn create_only_configure_cannot_replace_an_existing_instance() {
+    use axum::{extract::State, response::IntoResponse, Json};
+    let rig = Rig::new("create-only").await;
+    rig.manager
+        .add_instance(
+            rig.instance.clone(),
+            "original.invalid".into(),
+            Some(4321),
+            None,
+            None,
+            None,
+        )
+        .await;
+    let response = api::hqp_configure_handler(
+        State(rig.state.clone()),
+        Json(
+            serde_json::from_value(serde_json::json!({
+                "name": rig.instance, "host":"replacement.invalid", "create_only":true
+            }))
+            .unwrap(),
+        ),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    assert_eq!(
+        rig.manager
+            .get(&rig.instance)
+            .await
+            .unwrap()
+            .get_status()
+            .await
+            .host
+            .as_deref(),
+        Some("original.invalid")
+    );
+    rig.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "read-only verification against an explicitly supplied HQPlayer host"]
+#[serial_test::serial(hqp_output_config)]
+async fn live_desktop_advanced_readback() {
+    isolate_config_dir();
+    let host = std::env::var("UHC_HQP_TEST_HOST").expect("explicit test host required");
+    let adapter = HqpAdapter::new(create_bus());
+    adapter.configure(host, Some(4321), None, None, None).await;
+    adapter
+        .connect()
+        .await
+        .expect("connect to requested HQPlayer");
+    let snapshot = adapter
+        .get_advanced_options_snapshot()
+        .await
+        .expect("advanced readback");
+    println!(
+        "Advanced readback: junk supported={}, matrix profiles={}",
+        snapshot.junk_filters_supported,
+        snapshot.matrix_profiles.len()
+    );
+    assert!(
+        !snapshot.junk_filters_supported,
+        "this probe targets Desktop's known unsupported enumeration"
+    );
+    let error = adapter
+        .fetch_profiles()
+        .await
+        .expect_err("Desktop must not use the Embedded profile endpoint");
+    assert!(error.to_string().contains("require HQPlayer Embedded"));
+}

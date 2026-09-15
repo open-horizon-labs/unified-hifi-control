@@ -1575,6 +1575,7 @@ pub struct HqpAdvancedOptionsSnapshot {
     pub pipeline: PipelineStatus,
     pub state: HqpState,
     pub junk_filters: Vec<ListItem>,
+    pub junk_filters_supported: bool,
     pub matrix_profiles: Vec<MatrixProfile>,
     pub current_matrix_profile: Option<MatrixProfile>,
 }
@@ -7702,15 +7703,36 @@ impl HqpAdapter {
         let generation = snapshot.transport_generation;
 
         let junk_xml = Self::build_request("GetJunkFilters", &[]);
-        let junk_response = self
-            .send_command_on_transport(&junk_xml, generation)
-            .await
-            .context("HQPlayer junk-filter choices became unavailable during the coherent read")?;
-        let junk_filters = Self::parse_items(&junk_response, "JunkFiltersItem", |item| ListItem {
-            index: Self::parse_attr_u32(item, "index"),
-            name: Self::parse_attr(item, "name").unwrap_or_default(),
-            value: Self::parse_attr_i32(item, "value"),
-        });
+        // Desktop 5.35.10 explicitly rejects this optional enumeration. Do not discard
+        // supported matrix/processing controls; all other failures still fail the snapshot.
+        let (junk_filters, junk_filters_supported) =
+            match self.send_command_on_transport(&junk_xml, generation).await {
+                Ok(response) => (
+                    Self::parse_items(&response, "JunkFiltersItem", |item| ListItem {
+                        index: Self::parse_attr_u32(item, "index"),
+                        name: Self::parse_attr(item, "name").unwrap_or_default(),
+                        value: Self::parse_attr_i32(item, "value"),
+                    }),
+                    true,
+                ),
+                Err(error)
+                    if error
+                        .downcast_ref::<HqpRejected>()
+                        .is_some_and(|rejection| {
+                            rejection.element == "GetJunkFilters"
+                                && rejection.reason.as_deref().is_some_and(|reason| {
+                                    reason.trim().eq_ignore_ascii_case("Unknown command")
+                                })
+                        }) =>
+                {
+                    (Vec::new(), false)
+                }
+                Err(error) => {
+                    return Err(error.context(
+                        "HQPlayer junk-filter choices became unavailable during the coherent read",
+                    ))
+                }
+            };
 
         let matrix_xml = Self::build_request("MatrixListProfiles", &[]);
         let matrix_response = self
@@ -7741,6 +7763,7 @@ impl HqpAdapter {
             pipeline: snapshot.legacy,
             state: snapshot.state,
             junk_filters,
+            junk_filters_supported,
             matrix_profiles,
             current_matrix_profile,
         })
@@ -8830,6 +8853,9 @@ impl HqpAdapter {
     }
 
     async fn fetch_profiles_under_operation(&self) -> Result<Vec<HqpProfile>> {
+        if self.is_desktop().await {
+            return Err(anyhow!("Configuration profiles require HQPlayer Embedded; Desktop DSP settings use the native control connection."));
+        }
         if !self.has_web_credentials().await {
             return Err(anyhow!("Web credentials not configured"));
         }
@@ -8902,6 +8928,9 @@ impl HqpAdapter {
     /// root-run Embedded host that endpoint can attempt to archive the entire system.
     pub async fn load_profile(&self, profile_value: &str) -> Result<()> {
         let _operation_guard = self.operation_lock.lock().await;
+        if self.is_desktop().await {
+            return Err(anyhow!("Configuration profiles require HQPlayer Embedded."));
+        }
         if profile_value.is_empty() || profile_value.to_lowercase() == "default" {
             return Err(anyhow!("Profile value is required"));
         }
@@ -8958,6 +8987,17 @@ impl HqpAdapter {
             )
             })?;
         Ok(())
+    }
+
+    // An unconnected adapter has not reported a product yet; do not confuse that
+    // with a known Desktop endpoint and block Embedded's initial profile reads.
+    async fn is_desktop(&self) -> bool {
+        self.state
+            .read()
+            .await
+            .info
+            .as_ref()
+            .is_some_and(|info| info.product.to_lowercase().contains("desktop"))
     }
 
     /// Check if this is HQPlayer Embedded (supports profiles)
@@ -10530,6 +10570,22 @@ impl HqpInstanceManager {
         username: Option<String>,
         password: Option<String>,
     ) -> Result<Arc<HqpAdapter>> {
+        self.configure_instance(name, host, port, web_port, username, password, false)
+            .await
+    }
+
+    /// A create-only request cannot overwrite an existing configured identity.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn configure_instance(
+        &self,
+        name: String,
+        host: String,
+        port: Option<u16>,
+        web_port: Option<u16>,
+        username: Option<String>,
+        password: Option<String>,
+        create_only: bool,
+    ) -> Result<Arc<HqpAdapter>> {
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
         let normalize = |host: &str| {
             host.trim()
@@ -10540,6 +10596,9 @@ impl HqpInstanceManager {
         let requested = normalize(&host);
         let port = port.unwrap_or(DEFAULT_PORT);
         for existing in self.list_instances().await {
+            if create_only && existing.name == name && existing.host.is_some() {
+                anyhow::bail!("An HQPlayer named '{name}' already exists. Choose a different name or edit that instance.");
+            }
             if existing.name != name
                 && existing.port == port
                 && existing

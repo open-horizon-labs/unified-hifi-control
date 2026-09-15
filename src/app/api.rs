@@ -1136,6 +1136,8 @@ pub struct HqpMatrixProfilesResponse {
     pub current: Option<HqpMatrixProfile>,
     #[serde(default)]
     pub junk_filters: Vec<HqpNativeChoice>,
+    #[serde(default)]
+    pub junk_filters_supported: Option<bool>,
     pub junk_filter: Option<u32>,
     pub convolution: Option<bool>,
     pub adaptive_volume: Option<bool>,

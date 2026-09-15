@@ -1594,6 +1594,9 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
                                             button {
                                                 class: "btn btn-ghost btn-sm",
                                                 disabled: is_busy,
+                                                aria_label: if pending_remove().as_deref() == Some(route.route_id.as_str()) {
+                                                    "Confirm removal of {route.name}"
+                                                } else { "Remove {route.name}" },
                                                 onclick: move |_| {
                                                     if pending_remove().as_deref() != Some(route_id_remove.as_str()) {
                                                         pending_remove.set(Some(route_id_remove.clone()));

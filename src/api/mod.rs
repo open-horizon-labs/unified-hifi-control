@@ -2127,6 +2127,7 @@ pub async fn hqp_matrix_profiles_handler(State(state): State<AppState>) -> impl 
                 "profiles": snapshot.matrix_profiles,
                 "current": snapshot.current_matrix_profile,
                 "junk_filters": snapshot.junk_filters,
+                "junk_filters_supported": snapshot.junk_filters_supported,
                 "junk_filter": snapshot.state.filter_junk,
                 "convolution": snapshot.state.convolution,
                 "adaptive_volume": snapshot.state.adaptive,
@@ -2762,6 +2763,9 @@ fn default_hqp_instance_name() -> String {
 /// HQPlayer configuration request
 #[derive(Deserialize)]
 pub struct HqpConfigRequest {
+    /// Add refuses an existing identity; omitted preserves the legacy upsert behavior.
+    #[serde(default)]
+    pub create_only: bool,
     #[serde(default = "default_hqp_instance_name")]
     pub name: String,
     pub host: String,
@@ -2791,13 +2795,14 @@ pub async fn hqp_configure_handler(
     }
     let adapter = match state
         .hqp_instances
-        .configure_unique_instance(
+        .configure_instance(
             name,
             host,
             req.port,
             req.web_port,
             req.username,
             req.password,
+            req.create_only,
         )
         .await
     {
@@ -3281,6 +3286,7 @@ pub async fn hqp_instance_matrix_profiles_handler(
                 "profiles": snapshot.matrix_profiles,
                 "current": snapshot.current_matrix_profile,
                 "junk_filters": snapshot.junk_filters,
+                "junk_filters_supported": snapshot.junk_filters_supported,
                 "junk_filter": snapshot.state.filter_junk,
                 "convolution": snapshot.state.convolution,
                 "adaptive_volume": snapshot.state.adaptive,

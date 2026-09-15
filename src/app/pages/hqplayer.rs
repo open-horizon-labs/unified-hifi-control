@@ -13,6 +13,7 @@ use crate::app::sse::use_sse;
 /// HQP configure request
 #[derive(Clone, serde::Serialize)]
 struct HqpConfigureRequest {
+    create_only: bool,
     name: String,
     host: String,
     port: u16,
@@ -121,6 +122,7 @@ fn HqpInstanceRow(
                             error.set(None);
                             spawn(async move {
                                 let request = HqpConfigureRequest {
+                                    create_only: false,
                                     name: target.name,
                                     host: target.host.unwrap_or_default(),
                                     port: target.port,
@@ -566,6 +568,7 @@ pub fn HqPlayer() -> Element {
             }
             instance_name.set(name.clone());
             let req = HqpConfigureRequest {
+                create_only: !editing,
                 name,
                 host: h,
                 port: p,
@@ -618,6 +621,7 @@ pub fn HqPlayer() -> Element {
 
     rsx! {
         Layout { title: "HQPlayer".to_string(), nav_active: "hqplayer".to_string(),
+            style { "main summary {{ min-height: 44px; align-content: center; }}" }
             div { class: "flex items-center justify-between gap-3 mb-6",
                 h1 { class: "text-2xl font-bold", "HQPlayer" }
                 button {
@@ -760,6 +764,7 @@ pub fn HqPlayer() -> Element {
                                 key: "dsp-{name}",
                                 instance: name.clone(),
                                 display_name: label.clone(),
+                                embedded: instance.info.as_ref().is_some_and(|info| info.product.to_lowercase().contains("embedded")),
                                 connected: instance.connected,
                             }
                             details {
@@ -960,7 +965,31 @@ fn hqp_instance_url(instance: &str, suffix: &str) -> String {
 }
 
 #[component]
-fn HqpInstanceDsp(instance: String, display_name: String, connected: bool) -> Element {
+fn HqpInstanceDsp(
+    instance: String,
+    display_name: String,
+    embedded: bool,
+    connected: bool,
+) -> Element {
+    let mut requested = use_signal(|| false);
+    rsx! {
+        details { class: "mt-5", ontoggle: move |_| requested.set(true),
+            summary { class: "text-base font-semibold cursor-pointer", "DSP and profiles" }
+            if requested() {
+                HqpInstanceDspControls { instance, display_name, embedded, connected }
+            }
+        }
+    }
+}
+
+#[component]
+fn HqpInstanceDspControls(
+    instance: String,
+    display_name: String,
+    embedded: bool,
+    connected: bool,
+) -> Element {
+    let supports_profiles = use_memo(use_reactive!(|embedded| embedded));
     let target_instance = use_memo(use_reactive!(|instance| instance));
     let sse = use_sse();
     let mut hqp_loading = use_signal(|| false);
@@ -988,6 +1017,9 @@ fn HqpInstanceDsp(instance: String, display_name: String, connected: bool) -> El
     let mut profiles_error = use_signal(|| None::<String>);
     let mut profiles_cache = use_signal(|| None::<Vec<HqpProfile>>);
     let mut profiles = use_resource(move || async move {
+        if !supports_profiles() {
+            return Some(Vec::new());
+        }
         match api::fetch_json::<Vec<HqpProfile>>(&hqp_instance_url(&target_instance(), "profiles"))
             .await
         {
@@ -1119,8 +1151,10 @@ fn HqpInstanceDsp(instance: String, display_name: String, connected: bool) -> El
         }
     });
     rsx! {
-        details { class: "mt-5",
-            summary { class: "text-base font-semibold cursor-pointer", "DSP and profiles" }
+        div {
+            if !embedded {
+                p { class: "text-sm text-muted mt-3", "Configuration profiles require HQPlayer Embedded. Native DSP settings are available below." }
+            }
             if !connected {
                 p { class: "text-sm mt-3", "HQPlayer is offline. Reconnect before changing DSP." }
             }
@@ -2099,7 +2133,11 @@ fn DspSettings(
                             "Immediate HQPlayer engine controls. Changes are verified against the live native state before the UI refreshes."
                         }
                     }
+                    if matrix.as_ref().is_some_and(|advanced| advanced.junk_filters_supported == Some(false)) {
+                        p { class: "text-sm text-muted mb-3", "This HQPlayer version does not provide junk-filter controls." }
+                    }
                     div { class: "grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3",
+                        if junk_filter_opts.is_some() {
                         HqpSelect {
                             id: format!("hqp-{}-junk-filter", urlencoding::encode(&instance)),
                             label: "Junk filter",
@@ -2107,6 +2145,7 @@ fn DspSettings(
                             options: junk_filter_opts,
                             disabled: loading,
                             on_change: on_set_pipeline,
+                        }
                         }
                         HqpSelect {
                             id: format!("hqp-{}-repeat", urlencoding::encode(&instance)),
@@ -2511,9 +2550,7 @@ fn ZoneLinkTable(
                     small { "DSP and output" }
                 }
             }
-            p { class: "mb-6 max-w-3xl text-sm text-muted",
-                "Pairing does not change audio routing or either app’s configuration."
-            }
+
 
             if current_links.is_empty()
                 && matches!(
@@ -2524,7 +2561,7 @@ fn ZoneLinkTable(
                 div { class: "mb-5",
                     h3 { class: "font-semibold", "Nothing paired yet" }
                     p { class: "mt-1 text-sm text-muted",
-                        "Choose the zone where you start playback and the HQPlayer instance it already feeds."
+                        "Choose the playback zone that already feeds this HQPlayer."
                     }
                 }
             }
