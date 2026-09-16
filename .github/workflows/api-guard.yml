@@ -35,7 +35,7 @@ jobs:
 
       - name: Require approval label for API changes
         if: steps.check.outputs.api_changed == 'true'
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const { data: pr } = await github.rest.pulls.get({
