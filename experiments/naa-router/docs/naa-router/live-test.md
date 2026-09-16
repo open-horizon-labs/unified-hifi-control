@@ -2,7 +2,11 @@
 
 ## Final live qualification — 2026-09-14, renewed test authorization
 
-This result supersedes the earlier pending/blocked qualification entries.
+This result supersedes the earlier pending/blocked qualification entries, including
+the pre-renewal restoration boundary and blocked audit retained below. See
+[qualification evidence](qualification-evidence.md) for the implementation and
+saved observations checked on 2026-09-16. This qualifies the named experimental
+binary only, not subsequent UHC builds.
 The frozen macOS arm64 binary is `naa-router-af3f14ca20ac`, SHA-256
 `af3f14ca20ac870ec735e00b4822087e58b0f0dce7ce85fb650921d8bfa54c0c`.
 
@@ -165,9 +169,10 @@ The private evidence is `different-actual-auth-peers-live.json` and
 3,838,464 accepted bytes; every accepted payload exactly matched its simulated
 rendered WAV payload. This checks the recording sink, not physical playback.
 
-## Final restoration and qualification boundary
+## Historical restoration boundary — before renewed authorization
 
-The final integrated one-click controller was **not live-qualified**. Tool dispatch
+At this earlier cutoff, the integrated one-click controller was **not yet live-qualified**.
+This boundary was superseded by the renewed qualification documented above. Tool dispatch
 stalled across the authorized 02:00 ET cutoff and recovered around 07:04 ET;
 work then stopped at restoring the environment. Manual real Embedded A → B → A,
 actual-provider auth forwarding, seek semantics and capability observations above

@@ -50,5 +50,5 @@
   },
   "live_integrated_controller_verified": true,
   "combined_source_encoding": "JSON source_sha256 object, sort_keys=True, default Python separators, UTF-8",
-  "live_evidence": "docs/naa-router/live-test.md, final live qualification"
+  "live_evidence": "docs/naa-router/live-test.md and docs/naa-router/qualification-evidence.md; September 14 standalone experimental binary only"
 }

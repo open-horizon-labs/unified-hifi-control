@@ -2,7 +2,11 @@
 
 ## Final live qualification — 2026-09-14, renewed test authorization
 
-This result supersedes the earlier pending/blocked qualification entries.
+This result supersedes the earlier pending/blocked qualification entries, including
+the pre-renewal restoration boundary and blocked audit retained below. See
+[qualification evidence](qualification-evidence.md) for the implementation and
+saved observations checked on 2026-09-16. This qualifies the named experimental
+binary only, not subsequent UHC builds.
 The frozen macOS arm64 binary is `naa-router-af3f14ca20ac`, SHA-256
 `af3f14ca20ac870ec735e00b4822087e58b0f0dce7ce85fb650921d8bfa54c0c`.
 
@@ -245,12 +249,12 @@ without bypassing signing, and only this task's files were unstaged to leave the
 shared index available for concurrent metadata work. Source and the qualified
 release artifact are preserved; the NAA changes remain uncommitted.
 
-## Blocked audit — 07:23 ET
+## Historical blocked audit — 07:23 ET, before renewed authorization
 
 The release artifact still exists and every recorded source and binary hash
 matches the current worktree. No new qualification run is needed to re-establish
-the unchanged software result. The manifest still correctly records that the
-integrated controller is not live-qualified.
+the unchanged software result. At that checkpoint the manifest recorded that the integrated controller was not
+yet live-qualified. The renewed qualification above supersedes this status.
 
 The expired live-test window has remained the completion blocker through the
 cutoff/restoration turn, the local software-repair continuation, and this current

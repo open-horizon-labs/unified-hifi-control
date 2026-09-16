@@ -2,7 +2,11 @@
 
 ## Final live qualification — 2026-09-14, renewed test authorization
 
-This result supersedes the earlier pending/blocked qualification entries.
+This result supersedes the earlier pending/blocked qualification entries, including
+the pre-renewal restoration boundary and blocked audit retained below. See
+[qualification evidence](qualification-evidence.md) for the implementation and
+saved observations checked on 2026-09-16. This qualifies the named experimental
+binary only, not subsequent UHC builds.
 The frozen macOS arm64 binary is `naa-router-af3f14ca20ac`, SHA-256
 `af3f14ca20ac870ec735e00b4822087e58b0f0dce7ce85fb650921d8bfa54c0c`.
 
@@ -124,8 +128,8 @@ authentication only; subsequent operations and audio stayed in recording sinks.
 
 Actual Embedded reconnect and transport-assisted A → B → A observations are
 recorded separately in that live report, with unchanged Embedded PID and
-persistent configuration. They do not substitute for the still-outstanding
-integrated selector retest. Physical listening, USB/internal output grants and
+persistent configuration. Those earlier manual observations did not establish integrated selector behavior;
+the renewed qualification above separately records that test. Physical listening, USB/internal output grants and
 independent payload measurements at a DAC remain separate again.
 
 The optional native control integration has a deliberate boundary: without an
@@ -222,7 +226,8 @@ At 390px viewport width, document scroll width also measured 390px. The displaye
 stream state uses actual stream-audio counters rather than auth/control bytes.
 Temporary browser state and fixture services were cleaned up.
 
-**Still outstanding:** the frozen controller's own one-click sequence against
+**Historical pending checks (subsequently completed in the renewed qualification above):**
+the frozen controller's own one-click sequence against
 actual Embedded, including A → B → A, position, paused/stopped behavior,
-cancellation and incompatible-format refusal. Embedded remains restored; a new
-live-test window has been requested. The overall goal is not complete.
+cancellation and incompatible-format refusal. At that earlier checkpoint, Embedded was restored and a new
+live-test window had been requested; the goal was not yet complete.
