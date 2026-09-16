@@ -95,7 +95,9 @@ pub fn rewrite_sections(
         new_mask |= TYPE_PIC;
     }
     if old_pic.is_empty() && !picture.is_empty() {
-        let selector = if picture.starts_with(&[255, 216, 255]) {
+        let selector = if is_url_picture(picture) {
+            1
+        } else if picture.starts_with(&[255, 216, 255]) {
             2
         } else if picture.starts_with(b"\x89PNG\r\n\x1a\n") {
             3
@@ -192,5 +194,54 @@ mod artwork_regressions {
             u32::from_le_bytes(header[0..4].try_into().unwrap()) >> 24,
             3
         );
+    }
+}
+
+#[cfg(test)]
+mod url_picture_tests {
+    use super::*;
+    #[test]
+    fn url_picture_uses_selector_one_and_raw_url_bytes() {
+        let url = b"http://192.168.1.2:8088/roon/image?image_key=cover%2F1";
+        let meta = MetadataPayload {
+            picture: Some(url.to_vec()),
+            ..Default::default()
+        };
+        let mut header = [0; 32];
+        let body = rewrite_sections(&mut header, &[], Some(&meta), 1).unwrap();
+        assert_eq!(u32::from_le_bytes(header[..4].try_into().unwrap()) >> 24, 1);
+        assert_eq!(
+            u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize,
+            url.len()
+        );
+        assert!(body.ends_with(url));
+    }
+}
+
+pub fn is_url_picture(picture: &[u8]) -> bool {
+    picture.starts_with(b"http://") || picture.starts_with(b"https://")
+}
+pub fn picture_refresh_due(picture: Option<&[u8]>, elapsed: std::time::Duration) -> bool {
+    picture.is_some_and(is_url_picture) && elapsed >= std::time::Duration::from_secs(2)
+}
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+    use std::time::Duration;
+    #[test]
+    fn only_urls_refresh_at_two_seconds() {
+        assert!(!picture_refresh_due(
+            Some(b"http://host/art"),
+            Duration::from_millis(1999)
+        ));
+        assert!(picture_refresh_due(
+            Some(b"http://host/art"),
+            Duration::from_secs(2)
+        ));
+        assert!(!picture_refresh_due(
+            Some(&[255, 216, 255]),
+            Duration::from_secs(20)
+        ));
+        assert!(!picture_refresh_due(None, Duration::from_secs(20)));
     }
 }

@@ -1007,6 +1007,13 @@ pub async fn relay_metadata_source(
 /// Artwork uses the same provider-neutral image service as the rest of UHC.
 #[cfg(feature = "naa-proxy")]
 pub async fn run_relay_metadata(state: crate::api::AppState) {
+    run_relay_metadata_with_listener(state, None).await;
+}
+#[cfg(feature = "naa-proxy")]
+pub async fn run_relay_metadata_with_listener(
+    state: crate::api::AppState,
+    listener: Option<std::net::SocketAddr>,
+) {
     use crate::adapters::hqplayer::naa_relay::MetadataPayload;
     struct CachedArtwork {
         source: String,
@@ -1033,6 +1040,22 @@ pub async fn run_relay_metadata(state: crate::api::AppState) {
                 cache.remove(&instance.name);
                 continue;
             };
+            let interface = adapter.output_projection().relay.discovery_interface;
+            if let Some(url) = relay_artwork_url(
+                listener,
+                interface.as_deref(),
+                &source,
+                np.image_key.as_deref(),
+            ) {
+                adapter.set_relay_metadata(Some(MetadataPayload {
+                    title: np.title,
+                    artist: np.artist,
+                    album: np.album,
+                    picture: Some(url.into_bytes()),
+                }));
+                cache.remove(&instance.name);
+                continue;
+            }
             let cached = cache
                 .get(&instance.name)
                 .filter(|entry| entry.source == source && entry.key == np.image_key);
@@ -1207,4 +1230,35 @@ pub fn relay_source_control(
         aggregator: state.aggregator.clone(),
         gateway: state.reliable_commands.clone(),
     })
+}
+
+/// Use the existing image-keyed endpoint, never a mutable current-cover URL.
+#[cfg(feature = "naa-proxy")]
+pub fn relay_artwork_url(
+    listener: Option<std::net::SocketAddr>,
+    interface: Option<&str>,
+    source: &str,
+    key: Option<&str>,
+) -> Option<String> {
+    if !source.starts_with("roon:") {
+        return None;
+    }
+    let key = key.filter(|key| !key.is_empty())?;
+    let listener = listener?;
+    let ip = if listener.ip().is_unspecified() {
+        interface?.parse::<std::net::IpAddr>().ok()?
+    } else {
+        listener.ip()
+    };
+    if ip.is_loopback() || ip.is_unspecified() || listener.port() == 0 {
+        return None;
+    }
+    let address = std::net::SocketAddr::new(ip, listener.port());
+    let mut url = reqwest::Url::parse(&format!("http://{address}/roon/image")).ok()?;
+    url.query_pairs_mut()
+        .append_pair("image_key", key)
+        .append_pair("width", "300")
+        .append_pair("height", "300");
+    let url = url.to_string();
+    (url.len() <= 2048).then_some(url)
 }

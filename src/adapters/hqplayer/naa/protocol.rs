@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::frame::rewrite_sections;
+use super::frame::{picture_refresh_due, rewrite_sections};
 use super::outputs::{HqpDacDevice, HqpOutputRoute};
 use super::relay::RelayCore;
 
@@ -350,6 +350,7 @@ fn upstream_loop(
 ) -> io::Result<()> {
     let mut sample_bytes = None;
     let mut injected_metadata = None;
+    let mut injected_at = Instant::now();
     loop {
         let (control, prefix, deadline) = probe(reader, None)?;
         if control {
@@ -463,12 +464,17 @@ fn upstream_loop(
             ]);
             // Native text packets can clear an endpoint's artwork: accompany those packets
             // with fallback art, but never resend artwork on every audio-only frame.
-            let fallback = (changed || original_meta_len > 0)
+            let refresh = picture_refresh_due(
+                metadata.as_ref().and_then(|m| m.picture.as_deref()),
+                injected_at.elapsed(),
+            );
+            let fallback = (changed || refresh || original_meta_len > 0)
                 .then_some(metadata.as_deref())
                 .flatten();
             let rewritten =
                 rewrite_sections(&mut wire_header, &body, fallback, width).map_err(invalid)?;
-            if original_meta_len == 0 {
+            if fallback.is_some() {
+                injected_at = Instant::now();
                 injected_metadata = metadata;
             }
             writer.write_all(&wire_header)?;

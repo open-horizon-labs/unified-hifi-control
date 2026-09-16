@@ -3425,3 +3425,102 @@ async fn repeated_config_load_preserves_all_instance_relay_settings() {
         }
     }
 }
+
+#[test]
+fn relay_artwork_urls_are_keyed_encoded_and_use_the_actual_listener() {
+    use unified_hifi_control::coordinator::relay_artwork_url;
+    let listener = Some("0.0.0.0:9099".parse().unwrap());
+    let url =
+        relay_artwork_url(listener, Some("192.168.1.2"), "roon:source", Some("a/b&c")).unwrap();
+    let parsed = reqwest::Url::parse(&url).unwrap();
+    assert_eq!(parsed.host_str(), Some("192.168.1.2"));
+    assert_eq!(parsed.port(), Some(9099));
+    assert_eq!(parsed.path(), "/roon/image");
+    assert!(parsed
+        .query_pairs()
+        .any(|(k, v)| k == "image_key" && v == "a/b&c"));
+    assert_ne!(
+        Some(url),
+        relay_artwork_url(
+            listener,
+            Some("192.168.1.2"),
+            "roon:source",
+            Some("different")
+        )
+    );
+    assert!(relay_artwork_url(listener, None, "roon:source", Some("key")).is_none());
+    assert!(relay_artwork_url(
+        Some("127.0.0.1:9099".parse().unwrap()),
+        None,
+        "roon:source",
+        Some("key")
+    )
+    .is_none());
+    assert!(relay_artwork_url(
+        listener,
+        Some("192.168.1.2"),
+        "openhome:source",
+        Some("key")
+    )
+    .is_none());
+}
+
+#[tokio::test]
+#[serial_test::serial(hqp_output_config)]
+async fn url_artwork_repeats_during_unchanged_audio_without_repeating_every_frame() {
+    let rig = Rig::new("url-art-wire").await;
+    let daemon = WireServer::start(Arc::new(playing_daemon()), WirePolicy::default()).await;
+    let (_adapter, bind) = rig.attach(&daemon).await;
+    let naa = FakeNaa::start("url-dac", "hw:url", 44100);
+    let route = rig.add_route("url-dac", &naa, None).await;
+    rig.command(HqpOutputAction::Select { route_id: route }, None)
+        .await
+        .unwrap();
+    let url = b"http://192.168.1.2:8088/roon/image?image_key=one&width=300&height=300".to_vec();
+    let mut zone = rig.aggregator.get_zone(&rig.zone_id()).await.unwrap();
+    zone.zone_id = "roon:url-source".into();
+    zone.source = "roon".into();
+    let np = zone.now_playing.as_mut().unwrap();
+    np.title = "URL track".into();
+    np.image_key = Some("one".into());
+    rig.bus
+        .publish(BusEvent::ZoneDiscovered { zone: zone.clone() });
+    rig.state
+        .hqp_zone_links
+        .link_zone(zone.zone_id, rig.instance.clone())
+        .await
+        .unwrap();
+    let worker = tokio::spawn(
+        unified_hifi_control::coordinator::run_relay_metadata_with_listener(
+            rig.state.clone(),
+            Some("192.168.1.2:8088".parse().unwrap()),
+        ),
+    );
+    let client = AutoHqpClient::start(bind, 44100);
+    client.set_playing(true);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while naa
+            .audio_records()
+            .iter()
+            .filter(|r| r.picture == url)
+            .count()
+            < 2
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("URL must repeat without a track change");
+    let records = naa.audio_records();
+    assert!(records.iter().filter(|r| r.picture == url).count() <= 3);
+    assert!(records.len() > 10);
+    assert!(records
+        .iter()
+        .all(|r| r.payload == mock_servers::naa::auto_client_payload()));
+    rig.state.shutdown.cancel();
+    worker.await.unwrap();
+    client.close();
+    naa.close();
+    daemon.shutdown().await;
+    rig.shutdown().await;
+}

@@ -885,7 +885,10 @@ mod server {
         let api_ha_integration_status = api::ha_integration::status;
         let api_mqtt_configure = api::mqtt_settings::configure;
         #[cfg(feature = "naa-proxy")]
-        tokio::spawn(coordinator::run_relay_metadata(state.clone()));
+        tokio::spawn(coordinator::run_relay_metadata_with_listener(
+            state.clone(),
+            Some(listener.local_addr()?),
+        ));
 
         #[rustfmt::skip]
         let router = Router::new()
