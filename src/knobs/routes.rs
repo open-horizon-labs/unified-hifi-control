@@ -1171,6 +1171,24 @@ async fn control_roon(
                 output_id: None,
             })
         }
+        // Dial's detail-screen seek-jog (encoder scrubs position, committed
+        // after a short idle debounce) - same validation the HQPlayer path
+        // above already applies to this action name, just without the
+        // duration ceiling: this handler has no pre-fetched zone/now_playing
+        // to clamp against, so it relies on the client having already
+        // clamped to [0, track length] before sending (roon-knob's
+        // common/ui.c does).
+        "seek" => match value.and_then(|v| v.as_f64()) {
+            Some(position) if position.is_finite() && position >= 0.0 => {
+                Ok(Command::Seek { position })
+            }
+            Some(_) => Err(anyhow::anyhow!(
+                "seek position must be a non-negative number of seconds"
+            )),
+            None => Err(anyhow::anyhow!(
+                "seek requires a numeric position in seconds"
+            )),
+        },
         _ => Err(anyhow::anyhow!("Unknown action: {action}")),
     };
 
