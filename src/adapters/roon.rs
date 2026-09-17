@@ -11,7 +11,7 @@ use roon_api::{
     },
     image::{Args as ImageArgs, Format as ImageFormat, Image, Scale, Scaling},
     status::{self, Status},
-    transport::{self, volume, Control, Transport, Zone as RoonZone},
+    transport::{self, volume, Control, Seek, Transport, Zone as RoonZone},
     CoreEvent, Info, Parsed, RoonApi, RoonApiError, Services, Svc,
 };
 use serde::{Deserialize, Serialize};
@@ -1151,6 +1151,13 @@ enum RoonObservationExpectation {
         seek_position: Option<f64>,
     },
     Volume(f32),
+    /// Target absolute position in seconds. Roon's zone state only reports
+    /// whole seconds, and there's normal round-trip lag between the seek
+    /// landing and the next zone callback carrying it, so this accepts
+    /// anything within 2s of the target rather than requiring an exact
+    /// match - the same tolerance PreviousApplied already uses for "did the
+    /// position reset" below.
+    SeekPosition(f64),
 }
 
 impl RoonObservationExpectation {
@@ -1179,6 +1186,11 @@ impl RoonObservationExpectation {
                 .volume_control
                 .as_ref()
                 .is_some_and(|volume| (volume.value - expected).abs() <= 0.01),
+            Self::SeekPosition(expected) => zone
+                .now_playing
+                .as_ref()
+                .and_then(|now_playing| now_playing.seek_position)
+                .is_some_and(|observed| (observed - expected).abs() <= 2.0),
         }
     }
 }
@@ -1572,6 +1584,25 @@ impl RoonAdapter {
         };
 
         transport.control(zone_id, &control).await;
+        Ok(())
+    }
+
+    /// Seek to an absolute position in the currently playing track. `seconds`
+    /// is whole seconds from the start, matching the granularity Roon's own
+    /// zone state already reports position/duration at (`NowPlaying::seek_position`/
+    /// `length` below) - there is no finer-grained seek on this transport.
+    pub async fn seek(&self, zone_id: &str, seconds: i32) -> Result<()> {
+        let zone_id = strip_roon_prefix(zone_id);
+
+        let transport = {
+            let state = self.state.read().await;
+            state
+                .transport
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Not connected to Roon"))?
+        };
+
+        transport.seek(zone_id, &Seek::Absolute, seconds).await;
         Ok(())
     }
 
@@ -4141,6 +4172,9 @@ async fn roon_expectation(
                 max,
             )))
         }
+        RuntimeCommand::Control(Command::Seek { position }) => {
+            Ok(RoonObservationExpectation::SeekPosition(*position))
+        }
         RuntimeCommand::Control(_) | RuntimeCommand::Hqplayer(_) => {
             anyhow::bail!("Roon command has no authoritative observation predicate")
         }
@@ -4167,9 +4201,13 @@ async fn execute_roon_runtime_command(
             delta,
             output_id: None,
         } => adapter.change_volume(zone_id, delta, true).await,
+        // control_roon() (src/knobs/routes.rs) already validated this is
+        // finite and non-negative before building the command; Roon's own
+        // transport takes whole seconds, so this only loses precision Roon
+        // itself has no way to use.
+        Command::Seek { position } => adapter.seek(zone_id, position.round() as i32).await,
         Command::Mute { .. }
         | Command::MuteToggle { .. }
-        | Command::Seek { .. }
         | Command::SeekRelative { .. }
         | Command::Shuffle { .. }
         | Command::Repeat { .. }

@@ -299,6 +299,43 @@ async fn roon_core_publishes_zones() {
     core.stop().await;
 }
 
+/// The Dial's detail-screen seek-jog (roon-knob, encoder scrubs position) needs
+/// this: `RoonAdapter::seek` reaching the wire as an absolute-seconds request,
+/// not silently no-op'd. Before this, `control_roon`'s "seek" action had no
+/// Roon-side implementation at all - only HQPlayer's did - so a knob's seek
+/// command would 400 with "Unknown action" before ever reaching this adapter.
+#[tokio::test]
+async fn seek_sends_absolute_seconds_to_the_core() {
+    let core = FakeRoonCore::start().await;
+    let adapter = connected(&core).await;
+
+    adapter
+        .seek("zone_fake_1", 245)
+        .await
+        .expect("seek should reach the fake core");
+
+    let requests = core
+        .requests_named("com.roonlabs.transport:2/seek")
+        .await;
+    assert_eq!(requests.len(), 1, "expected exactly one seek request");
+    assert_eq!(
+        requests[0].body.get("zone_or_output_id").and_then(serde_json::Value::as_str),
+        Some("zone_fake_1"),
+        "seek must target the requested zone, not an output or a stale id"
+    );
+    assert_eq!(
+        requests[0].body.get("how").and_then(serde_json::Value::as_str),
+        Some("absolute"),
+        "the knob always previews and commits an absolute position, never a relative jump"
+    );
+    assert_eq!(
+        requests[0].body.get("seconds").and_then(serde_json::Value::as_i64),
+        Some(245)
+    );
+
+    core.stop().await;
+}
+
 // =============================================================================
 // THE REGRESSION TEST THIS ISSUE EXISTS FOR (#408 acceptance criterion)
 // =============================================================================
