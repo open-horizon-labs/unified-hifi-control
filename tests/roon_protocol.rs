@@ -309,14 +309,38 @@ async fn seek_sends_absolute_seconds_to_the_core() {
     let core = FakeRoonCore::start().await;
     let adapter = connected(&core).await;
 
+    // is_browse_connected() flipping true doesn't mean Transport's own
+    // connection is ready to send yet - subscribe_zones() is fired in the
+    // same CoreEvent::Registered handler as browse readiness, but there is
+    // a real window where it silently no-ops (see roon_core_publishes_zones,
+    // which works around exactly this by polling get_zones() rather than
+    // asserting immediately after connected()). Wait for a zone to actually
+    // arrive - the only observable proof Transport's subscription round trip
+    // completed - before exercising seek() on the same Transport.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while adapter.get_zones().await.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !adapter.get_zones().await.is_empty(),
+        "zone never arrived - Transport subscription did not complete"
+    );
+
     adapter
         .seek("zone_fake_1", 245)
         .await
         .expect("seek should reach the fake core");
 
-    let requests = core
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut requests = core
         .requests_named("com.roonlabs.transport:2/seek")
         .await;
+    while requests.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        requests = core
+            .requests_named("com.roonlabs.transport:2/seek")
+            .await;
+    }
     assert_eq!(requests.len(), 1, "expected exactly one seek request");
     assert_eq!(
         requests[0].body.get("zone_or_output_id").and_then(serde_json::Value::as_str),
