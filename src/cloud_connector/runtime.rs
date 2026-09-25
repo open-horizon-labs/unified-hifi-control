@@ -46,11 +46,61 @@ const ARTWORK_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_mil
 const MAX_SESSION_GRANT_RESPONSE_BYTES: usize = 16 * 1024;
 const SHUTDOWN_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
-fn snapshot_refresh_interval() -> tokio::time::Interval {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(20));
-    // A stalled task needs one current snapshot, not a burst of every missed tick.
+const SNAPSHOT_PERIOD: std::time::Duration = std::time::Duration::from_secs(20);
+const COMMAND_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Preserve the earliest publication deadline and retain the latest command's
+/// settle deadline, so a burst neither starves snapshots nor loses its tail.
+struct SnapshotRefresh {
+    interval: tokio::time::Interval,
+    next_snapshot_at: tokio::time::Instant,
+    settle_at: Option<tokio::time::Instant>,
+}
+
+impl SnapshotRefresh {
+    /// Consume one publication, coalescing any later command into a follow-up.
+    /// This remains cancellation-safe in the connection loop's select.
+    async fn tick(&mut self) -> tokio::time::Instant {
+        let tick = self.interval.tick().await;
+        let now = tokio::time::Instant::now();
+        self.next_snapshot_at = match self.settle_at {
+            Some(settle_at) if settle_at > now => {
+                // Never publish a catch-up burst, even after many commands.
+                settle_at.max(now + COMMAND_SETTLE_DELAY)
+            }
+            _ => {
+                self.settle_at = None;
+                now + SNAPSHOT_PERIOD
+            }
+        };
+        self.interval.reset_at(self.next_snapshot_at);
+        tick
+    }
+}
+
+/// Start with an immediate initial tick, followed by bounded idle refreshes.
+fn snapshot_refresh_interval() -> SnapshotRefresh {
+    let now = tokio::time::Instant::now();
+    let mut interval = tokio::time::interval_at(now, SNAPSHOT_PERIOD);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    interval
+    SnapshotRefresh {
+        interval,
+        next_snapshot_at: now,
+        settle_at: None,
+    }
+}
+
+/// Bring a deadline forward, never push it back; remember later commands for
+/// a settled follow-up after the already-promised publication.
+fn refresh_after_command(refresh: &mut SnapshotRefresh, newly_executed: bool) {
+    if newly_executed {
+        let settle_at = tokio::time::Instant::now() + COMMAND_SETTLE_DELAY;
+        refresh.settle_at = Some(settle_at);
+        if settle_at < refresh.next_snapshot_at {
+            refresh.next_snapshot_at = settle_at;
+            refresh.interval.reset_at(settle_at);
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -684,6 +734,7 @@ where
                     let request_id = command.request_id;
                     let now = now_ms();
                     let payload_hash = command.payload.canonical_hash().ok();
+                    let mut newly_executed = false;
                     let outcome = match verifier.verify(&command, now) {
                         Ok(verified) => {
                             let Some(payload_hash) = payload_hash.as_deref() else {
@@ -699,6 +750,7 @@ where
                                 Ok(None) if ledger.is_full() => CommandOutcome::Busy,
                                 Ok(None) => {
                                     let outcome = dispatch(state, store, &verified.payload).await;
+                                    newly_executed = outcome == CommandOutcome::Executed;
                                     if ledger
                                         .record_command_at(
                                             command.idempotency_key.to_string(),
@@ -747,6 +799,7 @@ where
                         outcome,
                     )
                     .await?;
+                    refresh_after_command(&mut refresh, newly_executed);
                 }
                 RelayMessage::ArtworkRequest(request) => {
                     if !traffic.artwork() {
@@ -1322,6 +1375,138 @@ mod tests {
                 .await
                 .is_err(),
             "missed snapshots must not catch up back-to-back"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_command_publishes_settled_state_without_waiting_twenty_seconds() {
+        let mut refresh = super::snapshot_refresh_interval();
+        refresh.tick().await;
+        super::refresh_after_command(&mut refresh, true);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1900), refresh.tick())
+                .await
+                .is_err(),
+            "do not sample before the provider has had time to settle"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), refresh.tick())
+                .await
+                .is_ok(),
+            "a successful command must publish settled state at two seconds"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(19), refresh.tick())
+                .await
+                .is_err(),
+            "the one-shot refresh must not turn idle publication into fast polling"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejected_or_replayed_commands_do_not_accelerate_publication() {
+        let mut refresh = super::snapshot_refresh_interval();
+        refresh.tick().await;
+        super::refresh_after_command(&mut refresh, false);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), refresh.tick())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replay_does_not_postpone_a_pending_settled_publication() {
+        let mut refresh = super::snapshot_refresh_interval();
+        refresh.tick().await;
+        super::refresh_after_command(&mut refresh, true);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        super::refresh_after_command(&mut refresh, false);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1100), refresh.tick())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consecutive_commands_cannot_postpone_snapshot_and_get_a_settled_followup() {
+        let mut refresh = super::snapshot_refresh_interval();
+        refresh.tick().await;
+        super::refresh_after_command(&mut refresh, true);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        super::refresh_after_command(&mut refresh, true);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1100), refresh.tick())
+                .await
+                .is_ok(),
+            "the second command must not move the first publication past two seconds"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1900), refresh.tick())
+                .await
+                .is_err(),
+            "follow-up publications must remain spaced apart"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), refresh.tick())
+                .await
+                .is_ok(),
+            "the later command still needs a settled publication"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(19), refresh.tick())
+                .await
+                .is_err(),
+            "after the follow-up, restore idle cadence"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sustained_commands_publish_through_the_old_idle_deadline() {
+        let mut refresh = super::snapshot_refresh_interval();
+        refresh.tick().await;
+        let start = tokio::time::Instant::now();
+        for _ in 0..15 {
+            super::refresh_after_command(&mut refresh, true);
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            super::refresh_after_command(&mut refresh, true);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(1100), refresh.tick())
+                    .await
+                    .is_ok()
+            );
+        }
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(30));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(2100), refresh.tick())
+                .await
+                .is_ok(),
+            "publish settled state for the last command too"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(19), refresh.tick())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn command_near_idle_deadline_does_not_postpone_it() {
+        let mut refresh = super::snapshot_refresh_interval();
+        refresh.tick().await;
+        tokio::time::advance(std::time::Duration::from_millis(19500)).await;
+        super::refresh_after_command(&mut refresh, true);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(600), refresh.tick())
+                .await
+                .is_ok()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(2100), refresh.tick())
+                .await
+                .is_ok(),
+            "the command still gets a settled follow-up after the idle publication"
         );
     }
 
