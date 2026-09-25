@@ -53,6 +53,14 @@ fn snapshot_refresh_interval() -> tokio::time::Interval {
     interval
 }
 
+fn refresh_after_command(refresh: &mut tokio::time::Interval, newly_executed: bool) {
+    if newly_executed {
+        // Let the provider settle without holding up results, heartbeats or
+        // artwork. Reset only the next deadline; the interval stays at 20s.
+        refresh.reset_after(std::time::Duration::from_secs(2));
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GrantResponse {
@@ -684,6 +692,7 @@ where
                     let request_id = command.request_id;
                     let now = now_ms();
                     let payload_hash = command.payload.canonical_hash().ok();
+                    let mut newly_executed = false;
                     let outcome = match verifier.verify(&command, now) {
                         Ok(verified) => {
                             let Some(payload_hash) = payload_hash.as_deref() else {
@@ -699,6 +708,7 @@ where
                                 Ok(None) if ledger.is_full() => CommandOutcome::Busy,
                                 Ok(None) => {
                                     let outcome = dispatch(state, store, &verified.payload).await;
+                                    newly_executed = outcome == CommandOutcome::Executed;
                                     if ledger
                                         .record_command_at(
                                             command.idempotency_key.to_string(),
@@ -747,6 +757,7 @@ where
                         outcome,
                     )
                     .await?;
+                    refresh_after_command(&mut refresh, newly_executed);
                 }
                 RelayMessage::ArtworkRequest(request) => {
                     if !traffic.artwork() {
@@ -1322,6 +1333,57 @@ mod tests {
                 .await
                 .is_err(),
             "missed snapshots must not catch up back-to-back"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_command_publishes_settled_state_without_waiting_twenty_seconds() {
+        let mut refresh = super::snapshot_refresh_interval();
+        refresh.tick().await;
+        super::refresh_after_command(&mut refresh, true);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1900), refresh.tick())
+                .await
+                .is_err(),
+            "do not sample before the provider has had time to settle"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), refresh.tick())
+                .await
+                .is_ok(),
+            "a successful command must publish settled state at two seconds"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(19), refresh.tick())
+                .await
+                .is_err(),
+            "the one-shot refresh must not turn idle publication into fast polling"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejected_or_replayed_commands_do_not_accelerate_publication() {
+        let mut refresh = super::snapshot_refresh_interval();
+        refresh.tick().await;
+        super::refresh_after_command(&mut refresh, false);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), refresh.tick())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replay_does_not_postpone_a_pending_settled_publication() {
+        let mut refresh = super::snapshot_refresh_interval();
+        refresh.tick().await;
+        super::refresh_after_command(&mut refresh, true);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        super::refresh_after_command(&mut refresh, false);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1100), refresh.tick())
+                .await
+                .is_ok()
         );
     }
 
