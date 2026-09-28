@@ -31,7 +31,13 @@ native sections pass through unchanged.
 Track identity is sent on track changes. Position updates and two-second POS
 heartbeats maintain the current track without repeating META, which downstream
 clients may interpret as a new track and clear their artwork and timing. Artwork
-updates likewise do not introduce a track boundary. Unknown times stay unknown.
+updates likewise do not introduce a track boundary. While the bound source is
+playing, positions are projected every 250 ms from its last changed report, for
+at most two seconds and never beyond the reported duration. Each changed source
+position (including backward seeks) immediately replaces the estimate. Track or
+source changes reset the clock; pause or loss of the playing binding discards it.
+Unknown times stay unknown. A slow artwork fetch re-reads source timing before
+publishing, so fetching art cannot rewind the position.
 
 Server builds include this feature by default. A relay-free server remains
 available explicitly with `--no-default-features --features server`. The imported

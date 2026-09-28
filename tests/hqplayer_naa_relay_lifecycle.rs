@@ -1077,3 +1077,29 @@ fn relay_metadata_refresh_keeps_the_same_track_and_position() {
     );
     relay.stop_listener();
 }
+
+#[test]
+fn frequent_source_positions_do_not_starve_artwork_refresh() {
+    use unified_hifi_control::adapters::hqplayer::naa_relay::MetadataPayload;
+    let relay = relay(true, 0);
+    let naa = FakeNaa::start("metadata-clock", "hw:clock", 44100);
+    let (_, mut client) = forwarding_pair(&relay, &naa);
+    client.start(44100).unwrap();
+    for step in 0..10 {
+        relay.set_metadata(Some(MetadataPayload {
+            title: "Same track".into(),
+            picture: Some(b"http://127.0.0.1/art.jpg".to_vec()),
+            position: Some(Duration::from_millis(step * 250)),
+            ..Default::default()
+        }));
+        client.send_audio(&[1, 2, 3, 4]).unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let records = naa.audio_records();
+    assert_eq!(records.iter().filter(|r| !r.metadata.is_empty()).count(), 1);
+    assert!(
+        records.iter().filter(|r| !r.picture.is_empty()).count() >= 2,
+        "source position updates must not postpone periodic artwork URL refresh"
+    );
+    relay.stop_listener();
+}

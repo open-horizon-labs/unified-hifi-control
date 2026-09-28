@@ -364,6 +364,7 @@ fn upstream_loop(
     let mut sample_bytes = None;
     let mut injected_metadata = None;
     let mut injected_at = Instant::now();
+    let mut artwork_refreshed_at = Instant::now();
     loop {
         let (control, prefix, deadline) = probe(reader, None)?;
         if control {
@@ -403,6 +404,7 @@ fn upstream_loop(
                     .and_then(|v| v.parse::<usize>().ok())
                     .ok_or_else(|| invalid("start has no valid bits"))?;
                 injected_metadata = None;
+                artwork_refreshed_at = Instant::now();
                 sample_bytes = Some(start_sample_bytes(stream, bits)?);
             }
             let rewritten = apply(&raw, edits)?;
@@ -469,7 +471,14 @@ fn upstream_loop(
             // While a source is injected, every native display section (including empty
             // clears) must be rewritten. Audio-only frames need only source updates/heartbeats.
             let refresh = injected_at.elapsed() >= Duration::from_secs(2);
-            let fallback = (changed || refresh || native_display_sections)
+            // Position updates can arrive more often than the artwork refresh interval.
+            // They must not indefinitely postpone retransmitting a URL after an image fetch fails.
+            let refresh_artwork = artwork_refreshed_at.elapsed() >= Duration::from_secs(2)
+                && metadata
+                    .as_ref()
+                    .and_then(|m| m.picture.as_deref())
+                    .is_some_and(super::frame::is_url_picture);
+            let fallback = (changed || refresh || refresh_artwork || native_display_sections)
                 .then_some(metadata.as_deref())
                 .flatten();
             let rewritten = rewrite_sections_since(
@@ -477,16 +486,15 @@ fn upstream_loop(
                 &body,
                 fallback,
                 injected_metadata.as_deref(),
-                refresh
-                    && metadata
-                        .as_ref()
-                        .and_then(|m| m.picture.as_deref())
-                        .is_some_and(super::frame::is_url_picture),
+                refresh_artwork,
                 width,
             )
             .map_err(invalid)?;
             if fallback.is_some() {
                 injected_at = Instant::now();
+            }
+            if refresh_artwork {
+                artwork_refreshed_at = Instant::now();
             }
             injected_metadata = metadata;
             writer.write_all(&wire_header)?;

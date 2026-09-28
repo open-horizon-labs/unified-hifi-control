@@ -3057,9 +3057,37 @@ async fn bound_source_text_and_artwork_reach_naa_without_changing_audio() {
     assert!(
         naa.audio_records().iter().any(|record| {
             let position = String::from_utf8_lossy(&record.position);
-            position.contains("position=42\n") && position.contains("length=180\n")
+            position.contains("length=180\n")
+                && position.lines().any(|line| {
+                    line.strip_prefix("position=")
+                        .and_then(|value| value.parse::<f64>().ok())
+                        .is_some_and(|position| (42.0..42.5).contains(&position))
+                })
         }),
         "the bound source's reported times must reach the endpoint"
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !naa.audio_records().iter().any(|record| {
+            String::from_utf8_lossy(&record.position)
+                .lines()
+                .any(|line| {
+                    line.strip_prefix("position=")
+                        .and_then(|value| value.parse::<f64>().ok())
+                        .is_some_and(|position| position >= 42.5 && position <= 44.0)
+                })
+        }) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("playing position must advance between source reports");
+    assert_eq!(
+        naa.audio_records()
+            .iter()
+            .filter(|r| !r.metadata.is_empty())
+            .count(),
+        1,
+        "position interpolation must not reset track metadata"
     );
     zone.now_playing.as_mut().unwrap().title = "Source track two".into();
     rig.bus.publish(BusEvent::ZoneDiscovered { zone });
