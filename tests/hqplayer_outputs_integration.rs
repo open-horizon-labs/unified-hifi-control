@@ -3028,6 +3028,8 @@ async fn bound_source_text_and_artwork_reach_naa_without_changing_audio() {
     np.title = "Source track one".into();
     np.artist = "Source artist".into();
     np.album = "Source album".into();
+    np.seek_position = Some(42.0);
+    np.duration = Some(180.0);
     np.image_key = Some(format!("http://{address}/art"));
     rig.bus
         .publish(BusEvent::ZoneDiscovered { zone: zone.clone() });
@@ -3052,6 +3054,13 @@ async fn bound_source_text_and_artwork_reach_naa_without_changing_audio() {
         .audio_records()
         .iter()
         .any(|r| String::from_utf8_lossy(&r.metadata).contains("song=Source track one")));
+    assert!(
+        naa.audio_records().iter().any(|record| {
+            let position = String::from_utf8_lossy(&record.position);
+            position.contains("position=42\n") && position.contains("length=180\n")
+        }),
+        "the bound source's reported times must reach the endpoint"
+    );
     zone.now_playing.as_mut().unwrap().title = "Source track two".into();
     rig.bus.publish(BusEvent::ZoneDiscovered { zone });
     tokio::time::timeout(Duration::from_secs(5), async {

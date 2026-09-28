@@ -1052,6 +1052,12 @@ pub async fn run_relay_metadata_with_listener(
                     artist: np.artist,
                     album: np.album,
                     picture: Some(url.into_bytes()),
+                    position: np
+                        .seek_position
+                        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok()),
+                    duration: np
+                        .duration
+                        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok()),
                 }));
                 cache.remove(&instance.name);
                 continue;
@@ -1064,6 +1070,12 @@ pub async fn run_relay_metadata_with_listener(
                 artist: np.artist.clone(),
                 album: np.album.clone(),
                 picture: cached.and_then(|entry| entry.picture.clone()),
+                position: np
+                    .seek_position
+                    .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok()),
+                duration: np
+                    .duration
+                    .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok()),
             };
             // Text arrives immediately, even while the image provider is slow or unavailable.
             adapter.set_relay_metadata(Some(metadata.clone()));

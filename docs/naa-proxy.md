@@ -16,13 +16,18 @@ HQPlayer
 This is a transparent relay in the RooNAA6 sense. UHC does not resample,
 mix, or otherwise process PCM or DSD. It changes only the length-delimited NAA6
 metadata sections when metadata is available, so the downstream device can show
-the current title, artist, and album. The frame writer also accepts artwork
-payloads; the current HQPlayer adapter does not yet fetch its cover bytes for
-injection. The audio payload passes through unchanged.
+the current title, artist, album, artwork, and reported position/duration. The
+audio payload passes through unchanged.
 
-UHC takes metadata from the already-bound HQPlayer zone projection. An optional
-source-zone fallback is only relevant when HQPlayer supplies no usable track
-metadata; it is not required for ordinary HQPlayer playback.
+UHC resolves fallback metadata from the aggregator through the instance's source
+binding, requiring one unambiguous playing source. Artwork uses the shared image
+service, as a URL when reachable or bounded image bytes otherwise. Native NAA
+text, artwork, and position sections take precedence over corresponding fallbacks.
+
+Track identity is sent on track changes. Position updates and two-second POS
+heartbeats maintain the current track without repeating META, which downstream
+clients may interpret as a new track and clear their artwork and timing. Artwork
+updates likewise do not introduce a track boundary. Unknown times stay unknown.
 
 Server builds include this feature by default. A relay-free server remains
 available explicitly with `--no-default-features --features server`. The imported

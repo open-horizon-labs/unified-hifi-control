@@ -1,8 +1,9 @@
 //! NAA6 audio-frame section rewriting.
 //!
 //! The PCM/DSD section is deliberately treated as opaque.  Only the length-delimited META and
-//! PIC sections are replaced, which lets the relay enrich a stream without changing its samples.
+//! PIC sections and missing position updates are enriched without changing audio samples.
 
+pub const TYPE_POSITION: u32 = 0x04;
 pub const TYPE_META: u32 = 0x08;
 pub const TYPE_PIC: u32 = 0x10;
 
@@ -12,6 +13,8 @@ pub struct MetadataPayload {
     pub artist: String,
     pub album: String,
     pub picture: Option<Vec<u8>>,
+    pub position: Option<std::time::Duration>,
+    pub duration: Option<std::time::Duration>,
 }
 
 /// Build the NAA6 metadata section used by HQPlayer's NAA endpoints.
@@ -34,10 +37,22 @@ fn escape_line(value: &str) -> String {
 /// Rewrite a complete NAA6 frame body. `pcm_len` is a sample count, while the other lengths are
 /// byte counts. The input section order is PCM, POS, META, PIC, matching the 32-byte header.
 /// When `metadata` is `None`, all sections are preserved byte-for-byte.
+#[cfg(test)]
 pub fn rewrite_sections(
     header: &mut [u8; 32],
     body: &[u8],
     metadata: Option<&MetadataPayload>,
+    sample_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    rewrite_sections_since(header, body, metadata, None, sample_bytes)
+}
+
+/// META is a track boundary to NAA clients. Same-track timing/art updates must not emit META.
+pub fn rewrite_sections_since(
+    header: &mut [u8; 32],
+    body: &[u8],
+    metadata: Option<&MetadataPayload>,
+    previous: Option<&MetadataPayload>,
     sample_bytes: usize,
 ) -> Result<Vec<u8>, String> {
     if metadata.is_none() {
@@ -71,24 +86,54 @@ pub fn rewrite_sections(
     at += lengths[2];
     let old_pic = &body[at..];
     let metadata = metadata.ok_or("metadata unexpectedly absent")?;
-    let fallback_text = metadata_section(metadata);
-    let meta = if old_meta.is_empty() {
-        fallback_text.as_slice()
-    } else {
-        old_meta
-    };
-    // Text and artwork are independent fallbacks. Never replace an upstream picture.
-    let picture = if old_pic.is_empty() {
-        metadata.picture.as_deref().unwrap_or(old_pic)
-    } else {
-        old_pic
-    };
     let mask = u32::from_le_bytes(
         header[0..4]
             .try_into()
             .map_err(|_| "invalid NAA frame header")?,
     );
-    let mut new_mask = mask | TYPE_META;
+    let track_changed = previous.is_none_or(|old| {
+        old.title != metadata.title || old.artist != metadata.artist || old.album != metadata.album
+    });
+    let picture_changed = previous.is_none_or(|old| old.picture != metadata.picture);
+    let fallback_text = if track_changed {
+        metadata_section(metadata)
+    } else {
+        Vec::new()
+    };
+    let meta = if old_meta.is_empty() {
+        fallback_text.as_slice()
+    } else {
+        old_meta
+    };
+    // Native metadata also starts a new client track, so pair it with available art.
+    let picture =
+        if old_pic.is_empty() && (track_changed || picture_changed || !old_meta.is_empty()) {
+            metadata.picture.as_deref().unwrap_or(old_pic)
+        } else {
+            old_pic
+        };
+    // Refresh the existing track through POS, never by declaring another track. Preserve native
+    // position, including explicit empty/clear packets. Unknown position/duration stay unknown.
+    let mut fallback_position = String::from("[position]\nstate=PLAYING\n");
+    if let Some(position) = metadata.position {
+        fallback_position.push_str(&format!("position={}\n", position.as_secs_f64()));
+    }
+    if let Some(duration) = metadata.duration {
+        fallback_position.push_str(&format!("length={}\n", duration.as_secs_f64()));
+    }
+    fallback_position.push('\0');
+    let pos = if pos.is_empty() && mask & TYPE_POSITION == 0 {
+        fallback_position.as_bytes()
+    } else {
+        pos
+    };
+    let mut new_mask = mask;
+    if !meta.is_empty() {
+        new_mask |= TYPE_META;
+    }
+    if !pos.is_empty() {
+        new_mask |= TYPE_POSITION;
+    }
     if picture.is_empty() {
         new_mask &= !TYPE_PIC;
     } else {
@@ -107,6 +152,7 @@ pub fn rewrite_sections(
         new_mask = (new_mask & 0x00ff_ffff) | (selector << 24);
     }
     header[0..4].copy_from_slice(&new_mask.to_le_bytes());
+    header[8..12].copy_from_slice(&(pos.len() as u32).to_le_bytes());
     header[12..16].copy_from_slice(&(meta.len() as u32).to_le_bytes());
     header[16..20].copy_from_slice(&(picture.len() as u32).to_le_bytes());
     let mut out = Vec::with_capacity(pcm.len() + pos.len() + meta.len() + picture.len());
@@ -140,6 +186,7 @@ mod tests {
             artist: "Artist".into(),
             album: "Album".into(),
             picture: Some(b"JPEG".to_vec()),
+            ..Default::default()
         };
         let out = rewrite_sections(&mut h, body, Some(&replacement), 1).unwrap();
         assert_eq!(&out[..6], b"PCM!PO");
@@ -172,7 +219,9 @@ mod artwork_regressions {
             ..Default::default()
         };
         let body = rewrite_sections(&mut header, native, Some(&meta), 1).unwrap();
-        assert!(body.starts_with(native));
+        let position_len = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+        let metadata_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+        assert_eq!(&body[position_len..position_len + metadata_len], native);
         assert!(body.ends_with(meta.picture.as_ref().unwrap()));
         assert_eq!(
             u32::from_le_bytes(header[0..4].try_into().unwrap()) >> 24,
@@ -221,27 +270,86 @@ mod url_picture_tests {
 pub fn is_url_picture(picture: &[u8]) -> bool {
     picture.starts_with(b"http://") || picture.starts_with(b"https://")
 }
-pub fn picture_refresh_due(picture: Option<&[u8]>, elapsed: std::time::Duration) -> bool {
-    picture.is_some_and(is_url_picture) && elapsed >= std::time::Duration::from_secs(2)
-}
+
 #[cfg(test)]
-mod refresh_tests {
+mod stable_track_tests {
     use super::*;
     use std::time::Duration;
+
+    fn audio_header() -> [u8; 32] {
+        let mut h = [0; 32];
+        h[..4].copy_from_slice(&2u32.to_le_bytes());
+        h[4..8].copy_from_slice(&4u32.to_le_bytes());
+        h
+    }
+    fn metadata() -> MetadataPayload {
+        MetadataPayload {
+            title: "Track one".into(),
+            picture: Some(b"http://endpoint/art".to_vec()),
+            position: Some(Duration::from_secs(42)),
+            duration: Some(Duration::from_secs(180)),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn only_urls_refresh_at_two_seconds() {
-        assert!(!picture_refresh_due(
-            Some(b"http://host/art"),
-            Duration::from_millis(1999)
-        ));
-        assert!(picture_refresh_due(
-            Some(b"http://host/art"),
-            Duration::from_secs(2)
-        ));
-        assert!(!picture_refresh_due(
-            Some(&[255, 216, 255]),
-            Duration::from_secs(20)
-        ));
-        assert!(!picture_refresh_due(None, Duration::from_secs(20)));
+    fn timing_updates_do_not_reset_identity_or_artwork() {
+        let previous = metadata();
+        let mut current = previous.clone();
+        current.position = Some(Duration::from_secs(43));
+        let mut h = audio_header();
+        let body =
+            rewrite_sections_since(&mut h, b"PCM!", Some(&current), Some(&previous), 1).unwrap();
+        assert_eq!(&body[..4], b"PCM!");
+        assert_eq!(
+            u32::from_le_bytes(h[..4].try_into().unwrap()),
+            2 | TYPE_POSITION
+        );
+        assert_eq!(&h[12..20], &[0; 8]);
+        let position = String::from_utf8_lossy(&body[4..]);
+        assert!(position.contains("position=43\n"));
+        assert!(position.contains("length=180\n"));
+    }
+
+    #[test]
+    fn late_artwork_does_not_start_another_track() {
+        let mut previous = metadata();
+        previous.picture = None;
+        let current = metadata();
+        let mut h = audio_header();
+        let body =
+            rewrite_sections_since(&mut h, b"PCM!", Some(&current), Some(&previous), 1).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(h[..4].try_into().unwrap()) & TYPE_META,
+            0
+        );
+        assert!(body.ends_with(current.picture.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn actual_track_change_still_sends_identity_and_artwork() {
+        let previous = metadata();
+        let mut current = previous.clone();
+        current.title = "Track two".into();
+        let mut h = audio_header();
+        let body =
+            rewrite_sections_since(&mut h, b"PCM!", Some(&current), Some(&previous), 1).unwrap();
+        assert_ne!(
+            u32::from_le_bytes(h[..4].try_into().unwrap()) & TYPE_META,
+            0
+        );
+        assert!(String::from_utf8_lossy(&body).contains("song=Track two"));
+        assert!(body.ends_with(current.picture.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn explicit_native_position_clear_is_preserved() {
+        let current = metadata();
+        let mut h = audio_header();
+        h[..4].copy_from_slice(&(2 | TYPE_POSITION).to_le_bytes());
+        let body =
+            rewrite_sections_since(&mut h, b"PCM!", Some(&current), Some(&current), 1).unwrap();
+        assert_eq!(body, b"PCM!");
+        assert_eq!(&h[8..12], &[0; 4]);
     }
 }

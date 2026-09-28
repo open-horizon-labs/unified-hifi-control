@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::frame::{picture_refresh_due, rewrite_sections};
+use super::frame::rewrite_sections_since;
 use super::outputs::{HqpDacDevice, HqpOutputRoute};
 use super::relay::RelayCore;
 
@@ -467,21 +467,24 @@ fn upstream_loop(
                 wire_header[14],
                 wire_header[15],
             ]);
-            // Native text packets can clear an endpoint's artwork: accompany those packets
-            // with fallback art, but never resend artwork on every audio-only frame.
-            let refresh = picture_refresh_due(
-                metadata.as_ref().and_then(|m| m.picture.as_deref()),
-                injected_at.elapsed(),
-            );
+            // POS heartbeats keep metadata fresh without repeatedly resetting the endpoint's
+            // track identity, artwork and position. Refresh works with or without artwork.
+            let refresh = injected_at.elapsed() >= Duration::from_secs(2);
             let fallback = (changed || refresh || original_meta_len > 0)
                 .then_some(metadata.as_deref())
                 .flatten();
-            let rewritten =
-                rewrite_sections(&mut wire_header, &body, fallback, width).map_err(invalid)?;
+            let rewritten = rewrite_sections_since(
+                &mut wire_header,
+                &body,
+                fallback,
+                injected_metadata.as_deref(),
+                width,
+            )
+            .map_err(invalid)?;
             if fallback.is_some() {
                 injected_at = Instant::now();
-                injected_metadata = metadata;
             }
+            injected_metadata = metadata;
             writer.write_all(&wire_header)?;
             writer.write_all(&rewritten)?;
             relay.update(id, true, HEADER_LEN + rewritten.len(), Some("forwarding"));
