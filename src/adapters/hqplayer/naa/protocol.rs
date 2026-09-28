@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::frame::rewrite_sections_since;
+use super::frame::{rewrite_sections_since, TYPE_META, TYPE_PIC, TYPE_POSITION};
 use super::outputs::{HqpDacDevice, HqpOutputRoute};
 use super::relay::RelayCore;
 
@@ -451,6 +451,11 @@ fn upstream_loop(
                 body.extend_from_slice(&buffer[..n]);
                 remaining -= n;
             }
+            let native_display_sections = get(0)? as u32 & (TYPE_POSITION | TYPE_META | TYPE_PIC)
+                != 0
+                || get(8)? > 0
+                || get(12)? > 0
+                || get(16)? > 0;
             let mut wire_header: [u8; HEADER_LEN] = header
                 .try_into()
                 .map_err(|_| invalid("short NAA audio header"))?;
@@ -461,16 +466,10 @@ fn upstream_loop(
                 _ => false,
             };
 
-            let original_meta_len = u32::from_le_bytes([
-                wire_header[12],
-                wire_header[13],
-                wire_header[14],
-                wire_header[15],
-            ]);
-            // POS heartbeats keep metadata fresh without repeatedly resetting the endpoint's
-            // track identity, artwork and position. Refresh works with or without artwork.
+            // While a source is injected, every native display section (including empty
+            // clears) must be rewritten. Audio-only frames need only source updates/heartbeats.
             let refresh = injected_at.elapsed() >= Duration::from_secs(2);
-            let fallback = (changed || refresh || original_meta_len > 0)
+            let fallback = (changed || refresh || native_display_sections)
                 .then_some(metadata.as_deref())
                 .flatten();
             let rewritten = rewrite_sections_since(

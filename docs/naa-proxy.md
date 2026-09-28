@@ -21,8 +21,12 @@ audio payload passes through unchanged.
 
 UHC resolves fallback metadata from the aggregator through the instance's source
 binding, requiring one unambiguous playing source. Artwork uses the shared image
-service, as a URL when reachable or bounded image bytes otherwise. Native NAA
-text, artwork, and position sections take precedence over corresponding fallbacks.
+service, as a URL when reachable or bounded image bytes otherwise. While a source
+is injected, it owns all displayed metadata: track identity, artwork, position,
+duration, and playing state. Native HQPlayer META/PIC/POS bodies and their flags
+are replaced, including explicit clears, so native messages cannot reset the
+source's display or introduce a competing stream clock. With no injected source,
+native sections pass through unchanged.
 
 Track identity is sent on track changes. Position updates and two-second POS
 heartbeats maintain the current track without repeating META, which downstream
