@@ -1485,6 +1485,10 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
         div { class: "py-2",
             p { class: "mb-1 text-sm", "NAA output name: ", strong { "{projection.relay.adapter_name}" } }
             p { class: "mb-3 text-sm", "{destination_label} · {relay_status}" }
+            p { class: "mb-3 max-w-3xl text-sm text-muted",
+                strong { "About metadata injection: " }
+                "When audio flows through this relay and one paired source zone is playing, that zone supplies the endpoint's track info, artwork, elapsed time and duration. With a Roon pairing, Roon's values take precedence over HQPlayer's. If multiple paired zones are playing, injection waits until only one is playing."
+            }
             if !audio_confirmed {
                 if let Some(last_error) = projection.last_error.as_ref() {
                     if let Some(age) = historical_error_age(last_error.at, notice_time) {
