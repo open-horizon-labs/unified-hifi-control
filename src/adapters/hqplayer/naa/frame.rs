@@ -44,7 +44,7 @@ pub fn rewrite_sections(
     metadata: Option<&MetadataPayload>,
     sample_bytes: usize,
 ) -> Result<Vec<u8>, String> {
-    rewrite_sections_since(header, body, metadata, None, sample_bytes)
+    rewrite_sections_since(header, body, metadata, None, false, sample_bytes)
 }
 
 /// META is a track boundary to NAA clients. Same-track timing/art updates must not emit META.
@@ -53,6 +53,7 @@ pub fn rewrite_sections_since(
     body: &[u8],
     metadata: Option<&MetadataPayload>,
     previous: Option<&MetadataPayload>,
+    refresh_artwork: bool,
     sample_bytes: usize,
 ) -> Result<Vec<u8>, String> {
     if metadata.is_none() {
@@ -106,12 +107,13 @@ pub fn rewrite_sections_since(
         old_meta
     };
     // Native metadata also starts a new client track, so pair it with available art.
-    let picture =
-        if old_pic.is_empty() && (track_changed || picture_changed || !old_meta.is_empty()) {
-            metadata.picture.as_deref().unwrap_or(old_pic)
-        } else {
-            old_pic
-        };
+    let picture = if old_pic.is_empty()
+        && (track_changed || picture_changed || refresh_artwork || !old_meta.is_empty())
+    {
+        metadata.picture.as_deref().unwrap_or(old_pic)
+    } else {
+        old_pic
+    };
     // Refresh the existing track through POS, never by declaring another track. Preserve native
     // position, including explicit empty/clear packets. Unknown position/duration stay unknown.
     let mut fallback_position = String::from("[position]\nstate=PLAYING\n");
@@ -299,7 +301,8 @@ mod stable_track_tests {
         current.position = Some(Duration::from_secs(43));
         let mut h = audio_header();
         let body =
-            rewrite_sections_since(&mut h, b"PCM!", Some(&current), Some(&previous), 1).unwrap();
+            rewrite_sections_since(&mut h, b"PCM!", Some(&current), Some(&previous), false, 1)
+                .unwrap();
         assert_eq!(&body[..4], b"PCM!");
         assert_eq!(
             u32::from_le_bytes(h[..4].try_into().unwrap()),
@@ -318,7 +321,8 @@ mod stable_track_tests {
         let current = metadata();
         let mut h = audio_header();
         let body =
-            rewrite_sections_since(&mut h, b"PCM!", Some(&current), Some(&previous), 1).unwrap();
+            rewrite_sections_since(&mut h, b"PCM!", Some(&current), Some(&previous), false, 1)
+                .unwrap();
         assert_eq!(
             u32::from_le_bytes(h[..4].try_into().unwrap()) & TYPE_META,
             0
@@ -333,7 +337,8 @@ mod stable_track_tests {
         current.title = "Track two".into();
         let mut h = audio_header();
         let body =
-            rewrite_sections_since(&mut h, b"PCM!", Some(&current), Some(&previous), 1).unwrap();
+            rewrite_sections_since(&mut h, b"PCM!", Some(&current), Some(&previous), false, 1)
+                .unwrap();
         assert_ne!(
             u32::from_le_bytes(h[..4].try_into().unwrap()) & TYPE_META,
             0
@@ -348,7 +353,8 @@ mod stable_track_tests {
         let mut h = audio_header();
         h[..4].copy_from_slice(&(2 | TYPE_POSITION).to_le_bytes());
         let body =
-            rewrite_sections_since(&mut h, b"PCM!", Some(&current), Some(&current), 1).unwrap();
+            rewrite_sections_since(&mut h, b"PCM!", Some(&current), Some(&current), false, 1)
+                .unwrap();
         assert_eq!(body, b"PCM!");
         assert_eq!(&h[8..12], &[0; 4]);
     }

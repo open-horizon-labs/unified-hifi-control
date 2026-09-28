@@ -478,6 +478,11 @@ fn upstream_loop(
                 &body,
                 fallback,
                 injected_metadata.as_deref(),
+                refresh
+                    && metadata
+                        .as_ref()
+                        .and_then(|m| m.picture.as_deref())
+                        .is_some_and(super::frame::is_url_picture),
                 width,
             )
             .map_err(invalid)?;
