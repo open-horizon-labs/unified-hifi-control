@@ -1489,6 +1489,9 @@ pub struct HqpOutputProjection {
     pub selected_route_id: Option<String>,
     pub desired_destination: Option<HqpEndpointRef>,
     pub observed_forwarding_destination: Option<HqpEndpointRef>,
+    /// Zone supplying the relay's effective metadata, not proof of audio or metadata delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_source_zone_id: Option<String>,
     pub session: Option<HqpRelaySessionView>,
     /// `None` = never scanned / scan unavailable.
     pub discovery: Option<HqpDiscoveryObservation>,

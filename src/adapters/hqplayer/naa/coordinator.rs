@@ -417,6 +417,9 @@ impl HqpOutputCoordinator {
         let instance = self.instance_name();
         let settings = self.settings();
         let observation = self.relay().map(|r| r.observe());
+        let metadata_source_zone_id = observation
+            .as_ref()
+            .and_then(|o| o.metadata_source_zone_id.clone());
         let ledger = lock(&self.ledger);
         let (
             availability,
@@ -519,6 +522,7 @@ impl HqpOutputCoordinator {
             selected_route_id: selected,
             desired_destination: desired,
             observed_forwarding_destination: observed,
+            metadata_source_zone_id,
             session,
             discovery,
             dac_observations: dacs,

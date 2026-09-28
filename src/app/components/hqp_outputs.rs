@@ -921,6 +921,18 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
     let sse = use_sse();
 
     let outputs = use_signal(|| None::<HqpOutputProjection>);
+    let source_id = use_memo(move || outputs().and_then(|p| p.metadata_source_zone_id));
+    let source_zone = use_resource(move || {
+        let id = source_id();
+        async move {
+            let id = id?;
+            let zones =
+                crate::app::api::fetch_json::<crate::app::api::ZonesResponse>("/knob/zones")
+                    .await
+                    .ok()?;
+            zones.zones.into_iter().find(|zone| zone.zone_id == id)
+        }
+    });
     // Start from server time to avoid browser clock skew; keep aging notices while disconnected.
     let mut notice_clock = use_signal(notice_now);
     let mut notice_received_at = use_signal(notice_now);
@@ -1485,6 +1497,25 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
         div { class: "py-2",
             p { class: "mb-1 text-sm", "NAA output name: ", strong { "{projection.relay.adapter_name}" } }
             p { class: "mb-3 text-sm", "{destination_label} · {relay_status}" }
+            p { class: "mb-3 text-sm",
+                strong { "Metadata source: " }
+                if let Some(id) = projection.metadata_source_zone_id.as_deref() {
+                    if let Some(Some(zone)) = source_zone.read().as_ref().filter(|zone| zone.as_ref().is_some_and(|zone| zone.zone_id == id)) {
+                        {format!("{} · {}", match zone.source.as_deref() {
+                            Some("roon") => "Roon",
+                            Some("openhome") => "OpenHome",
+                            Some("upnp") => "UPnP",
+                            Some("lms") => "LMS",
+                            Some(source) => source,
+                            None => "Source",
+                        }, zone.zone_name)}
+                    } else {
+                        "{id}"
+                    }
+                } else {
+                    "No source reported"
+                }
+            }
             p { class: "mb-3 max-w-3xl text-sm text-muted",
                 strong { "About metadata injection: " }
                 "When audio flows through this relay and one paired source zone is playing, that zone supplies the endpoint's track info, artwork, elapsed time and duration. With a Roon pairing, Roon's values take precedence over HQPlayer's. If multiple paired zones are playing, injection waits until only one is playing."
@@ -2691,6 +2722,7 @@ mod tests {
             selected_route_id: None,
             desired_destination: None,
             observed_forwarding_destination: None,
+            metadata_source_zone_id: None,
             session: None,
             discovery: None,
             dac_observations: vec![],
@@ -2836,6 +2868,7 @@ mod operation_driver_tests {
             selected_route_id: None,
             desired_destination: None,
             observed_forwarding_destination: None,
+            metadata_source_zone_id: None,
             session: None,
             discovery: None,
             dac_observations: vec![],
@@ -3310,6 +3343,7 @@ mod command_projection_guard_tests {
             selected_route_id: None,
             desired_destination: None,
             observed_forwarding_destination: None,
+            metadata_source_zone_id: None,
             session: None,
             discovery: None,
             dac_observations: vec![],

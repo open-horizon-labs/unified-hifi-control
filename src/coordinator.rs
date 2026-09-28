@@ -1060,6 +1060,7 @@ pub async fn run_relay_metadata_with_listener(
                 np.image_key.as_deref(),
             ) {
                 adapter.set_relay_metadata(Some(MetadataPayload {
+                    source_zone_id: Some(source.clone()),
                     title: np.title,
                     artist: np.artist,
                     album: np.album,
@@ -1076,6 +1077,7 @@ pub async fn run_relay_metadata_with_listener(
                 .get(&instance.name)
                 .filter(|entry| entry.source == source && entry.key == np.image_key);
             let mut metadata = MetadataPayload {
+                source_zone_id: Some(source.clone()),
                 title: np.title.clone(),
                 artist: np.artist.clone(),
                 album: np.album.clone(),

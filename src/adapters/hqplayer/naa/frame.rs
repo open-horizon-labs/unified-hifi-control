@@ -9,6 +9,8 @@ pub const TYPE_PIC: u32 = 0x10;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetadataPayload {
+    /// Aggregator zone supplying this effective metadata; never encoded into NAA frames.
+    pub source_zone_id: Option<String>,
     pub title: String,
     pub artist: String,
     pub album: String,

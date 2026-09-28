@@ -200,3 +200,13 @@ launcher, or its test exiting successfully, is not a UI acceptance test: record
 the actual browser interactions, public operations and forwarding evidence
 separately. It does not supply an Embedded configuration web server or claim
 hardware/authentication qualification.
+
+### Metadata source pointer
+
+The HQPlayer output projection optionally includes `metadata_source_zone_id`, the
+aggregator zone ID supplying the relay's effective metadata payload. It is omitted
+when that payload has no source (including after the source is unlinked or no
+longer eligible). Clients may resolve the ID through the existing zone inventory.
+This identifies metadata authority; it does not confirm audio flow or delivery of
+a particular metadata frame. Audio forwarding remains separately evidenced by
+the output session.

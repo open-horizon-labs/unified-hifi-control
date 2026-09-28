@@ -190,6 +190,7 @@ pub struct RelayObservation {
     pub generation: u64,
     pub desired_destination: Option<HqpEndpointRef>,
     pub observed_forwarding_destination: Option<HqpEndpointRef>,
+    pub metadata_source_zone_id: Option<String>,
     pub session: Option<HqpRelaySessionView>,
     pub discovery: Option<HqpDiscoveryObservation>,
     pub dac_observations: Vec<HqpDacObservation>,
@@ -1172,6 +1173,10 @@ impl RelayCore {
                 .as_ref()
                 .filter(|s| s.view.initialized)
                 .map(|s| s.endpoint.clone()),
+            metadata_source_zone_id: inner
+                .metadata
+                .as_ref()
+                .and_then(|m| m.source_zone_id.clone()),
             session: inner.session.as_ref().map(|s| s.view.clone()),
             discovery: inner.discovery.clone(),
             dac_observations: inner.dac_observations.clone(),

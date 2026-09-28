@@ -3038,6 +3038,10 @@ async fn bound_source_text_and_artwork_reach_naa_without_changing_audio() {
         .link_zone(zone.zone_id.clone(), rig.instance.clone())
         .await
         .unwrap();
+    assert!(serde_json::to_value(rig.outputs().await)
+        .unwrap()
+        .get("metadata_source_zone_id")
+        .is_none());
     let worker = tokio::spawn(unified_hifi_control::coordinator::run_relay_metadata(
         rig.state.clone(),
     ));
@@ -3050,6 +3054,9 @@ async fn bound_source_text_and_artwork_reach_naa_without_changing_audio() {
     })
     .await
     .expect("bound artwork must reach NAA");
+    let projection = rig.outputs().await;
+    let wire = serde_json::to_value(&projection).unwrap();
+    assert_eq!(wire["metadata_source_zone_id"], "openhome:bound-source");
     assert!(naa
         .audio_records()
         .iter()
@@ -3112,6 +3119,21 @@ async fn bound_source_text_and_artwork_reach_naa_without_changing_audio() {
         "artwork must not repeat on every audio frame"
     );
     assert!(records.len() > 3);
+    rig.state
+        .hqp_zone_links
+        .unlink_zone("openhome:bound-source")
+        .await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let wire = serde_json::to_value(rig.outputs().await).unwrap();
+            if wire.get("metadata_source_zone_id").is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("unlinking must omit the metadata source pointer, not retain or null it");
     rig.state.shutdown.cancel();
     worker.await.unwrap();
     client.close();

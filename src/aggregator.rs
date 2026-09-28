@@ -1110,6 +1110,7 @@ mod tests {
             selected_route_id: Some(format!("r-{revision}")),
             desired_destination: None,
             observed_forwarding_destination: None,
+            metadata_source_zone_id: None,
             session: Some(HqpRelaySessionView {
                 session_id: 1,
                 route_id: format!("r-{revision}"),
