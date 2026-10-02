@@ -99,6 +99,15 @@ pub fn Layout(props: LayoutProps) -> Element {
         }
         footer { class: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center py-3",
             small { class: "text-muted", "Unified Hi-Fi Control v{version} ({git_sha})" }
+            div { class: "app-attribution",
+                a {
+                    href: "https://hiphi.audio/",
+                    target: "_blank",
+                    rel: "noopener noreferrer",
+                    "A HiPhi project"
+                }
+                span { " by Open Horizon Labs · Local control, optional Cloud" }
+            }
         }
     }
 }

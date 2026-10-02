@@ -4,6 +4,8 @@ Choose the host that already stays on with your hi-fi. All local playback and
 discovery remain local; a HiPhi account is optional and is used only for hosted
 features such as authenticated remote controllers and Spotify's secure callback.
 
+Free for individuals to use on their own systems for noncommercial purposes. Installers, integrators, dealers, and anyone deploying for clients or as part of a paid service need a [commercial license](COMMERCIAL-LICENSE.md). The [PolyForm Noncommercial 1.0.0 license](LICENSE) contains the governing terms.
+
 ## Home Assistant OS, Green, or Supervised
 
 The supported add-on is the shortest path: it runs UHC, embeds the UI through
