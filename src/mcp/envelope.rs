@@ -272,6 +272,7 @@ impl Observed {
 /// | [`Self::RateLimited`]        | `error`       | retry after the stated delay |
 /// | [`Self::QuotaExceeded`]      | `error`       | wait for provider quota recovery |
 /// | [`Self::BackendError`]       | `error`       | retrying may work |
+/// | [`Self::MusicDetails`]       | `invalid` / `error` | use the shared context refusal code |
 ///
 /// The variant determines the [`Outcome`] — see [`Self::outcome`] and
 /// [`Envelope::refuse`] — so the two can never contradict each other.
@@ -333,12 +334,18 @@ pub enum Refusal {
     QuotaExceeded { code: &'static str, detail: String },
     /// The operation was attempted and the backend failed.
     BackendError { detail: String },
+    /// Sanitized optional Cloud-context failure, shared with the HTTP contract.
+    MusicDetails { code: &'static str, detail: String },
 }
 
 impl Refusal {
     /// The outcome this refusal implies. The single mapping; see [`Envelope::refuse`].
     pub fn outcome(&self) -> Outcome {
         match self {
+            Self::MusicDetails { code, .. } => match *code {
+                "INVALID_REQUEST" | "ZONE_NOT_FOUND" => Outcome::Invalid,
+                _ => Outcome::Error,
+            },
             Self::ProviderLimitation { .. } | Self::NotImplemented { .. } => Outcome::Unsupported,
             Self::InvalidParameter { .. } | Self::UnknownTarget { .. } => Outcome::Invalid,
             Self::RateLimited { .. } | Self::QuotaExceeded { .. } | Self::BackendError { .. } => {

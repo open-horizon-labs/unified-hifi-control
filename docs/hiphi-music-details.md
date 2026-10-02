@@ -27,3 +27,25 @@ Identity may contain `artist`, `title`, `album`, `duration_ms`, `artist_mbid`, `
 The response is bounded to 512 KiB and echoes `version: 1` and `item_token`, with `status` (`complete`, `partial`, `ambiguous`, or `unavailable`), `catalog`, `sources`, `entities`, `genres`, `unavailable`, `language` and `stale`. Current enrichment returns partial whenever content is available because source coverage is not assumed complete. Per-source facts include provenance, source revision, attribution and license; retained raw source responses are not sent to clients. Absence, outage, ambiguity and stale data must remain distinguishable in a consuming surface.
 
 Unknown/removed installations and invalid/expired signatures return 401; replay and rate limits return 429; disabled/unavailable service returns 503. Treat every such outcome as optional context unavailable, never as a playback or pairing failure.
+
+## Local HTTP and MCP reads
+
+The same on-demand music-context read is available through UHC's local HTTP API and MCP. Both require an explicit prefixed zone ID and a language, and use the existing HiPhi Cloud pairing. No enrichment is triggered by ordinary now-playing reads, playback commands, seeks or volume changes.
+
+```sh
+curl 'http://localhost:8088/zones/roon:EXPLICIT_ZONE_ID/music-details?language=en'
+```
+
+When controller authentication is enabled, use the same authenticated controller session as other protected UHC reads. The LAN compatibility policy is unchanged. Responses use `Cache-Control: private, no-store`. Missing language, unknown query parameters and malformed inputs are rejected; there is no default-zone fallback.
+
+MCP clients call `hifi_music_details` with:
+
+```json
+{"zone_id":"roon:EXPLICIT_ZONE_ID","language":"en"}
+```
+
+HTTP returns `version`, `zone_id`, `identity`, `language` and `details`; MCP returns that same payload inside the existing structured result envelope. The identity says which music the context describes, not which queue occurrence is current. Both surfaces compare identity before and after the Cloud request and refuse changed music. An A→B→A transition or two entries with identical metadata cannot be distinguished; consumers must compare the returned identity with their current selection and live UIs must also own their occurrence token.
+
+`details` retains the Cloud response's status, sources, attribution/license information, catalog, entities, genres, unavailable sections, language and stale flag. A catalog answer marked partial, ambiguous or unavailable is a successful read, distinct from failing to reach the service. Consumers must preserve these distinctions and render source text as text rather than executable markup.
+
+HTTP errors use `{ "error": "safe explanation", "code": "MACHINE_CODE" }`: `INVALID_REQUEST` (400), `ZONE_NOT_FOUND` (404), `NO_MUSIC` or `MUSIC_CHANGED` (409), and `CLOUD_NOT_PAIRED` or `MUSIC_DETAILS_UNAVAILABLE` (503). Existing controller-auth errors are unchanged. MCP carries the same music-context code in a structured refusal. Cloud failures never affect local playback. Requests have bounded concurrency, response size and deadlines; overload is reported as unavailable.

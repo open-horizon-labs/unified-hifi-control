@@ -389,6 +389,31 @@
       "type": "object"
     }
   },
+  "hifi_music_details": {
+    "annotations": {
+      "destructiveHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "Read source-attributed HiPhi Cloud music context for an explicit zone and supported wiki language. Returns identity-level context, not a playback occurrence guarantee. Partial, ambiguous or unavailable catalog answers are successful reads; compare returned identity with your current selection. Makes an optional external Cloud request and never changes playback.",
+    "inputSchema": {
+      "properties": {
+        "language": {
+          "description": "Supported wiki language code, for example en; required, with no default.",
+          "type": "string"
+        },
+        "zone_id": {
+          "description": "Explicit prefixed zone ID from hifi_zones; no default zone is selected.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "zone_id",
+        "language"
+      ],
+      "type": "object"
+    }
+  },
   "hifi_now_playing": {
     "annotations": {
       "readOnlyHint": true
