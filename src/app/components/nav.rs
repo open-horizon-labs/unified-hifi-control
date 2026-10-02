@@ -71,7 +71,7 @@ pub fn Nav(props: NavProps) -> Element {
                         img {
                             // base-path-ok: an inlined data: URL carries no path to map.
                             src: "{*LOGO_DATA_URL}",
-                            alt: "Hi-Fi Control",
+                            alt: "Unified Hi-Fi Control",
                             class: "h-6 w-6 rounded"
                         }
                     }

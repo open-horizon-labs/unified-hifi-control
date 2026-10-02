@@ -4,7 +4,9 @@
 [![GitHub Release](https://img.shields.io/github/v/release/open-horizon-labs/unified-hifi-control)](https://github.com/open-horizon-labs/unified-hifi-control/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/open-horizon-labs/unified-hifi-control/total)](https://github.com/open-horizon-labs/unified-hifi-control/releases)
 
-Control your hi-fi system from anywhere — a hardware knob on your couch, your phone, or just ask Claude.
+A [HiPhi project](https://hiphi.audio/) by Open Horizon Labs. Unified Hi-Fi Control is the source-available bridge that runs on your network; HiPhi provides physical controllers and optional Cloud services. Local playback control keeps working without HiPhi Cloud.
+
+Control your hi-fi system from a hardware controller on your couch, your phone, or compatible AI agents.
 
 This bridge connects your music sources (Roon, LMS, UPnP) to any control surface you prefer. No vendor lock-in: mix and match sources, add HQPlayer DSP processing, and control it all from one place.
 
@@ -13,7 +15,7 @@ This bridge connects your music sources (Roon, LMS, UPnP) to any control surface
 Once the bridge is running, control your system from:
 
 - **Web UI** — Built-in at `http://your-bridge:8088`
-- **[roon-knob](https://github.com/muness/roon-knob)** — ESP32-S3 hardware knob with OLED display
+- **[HiPhi controllers](https://hiphi.audio/#controllers)** — Dial, displays, and remotes for supported hardware. Start with Stable Dial on the Waveshare ESP32-S3 Knob; other controllers and firmware channels have their own hardware and testing requirements.
 - **iPhone, iPad & Apple Watch** — In alpha testing. [Request TestFlight access](https://github.com/open-horizon-labs/unified-hifi-control/issues/new?title=Request%20Apple%20Music%20Companion%20TestFlight%20access).
 - **Claude & AI agents** — Via the built-in MCP server (see [MCP Server](#mcp-server-claude-integration) below)
 
@@ -164,7 +166,7 @@ If your network is flat and you would rather not have guest devices reach the br
 
 If you route audio through HQPlayer for upsampling or filtering, this bridge lets you control HQPlayer's DSP settings (profiles, filters, shapers) alongside your zone controls.
 
-**Note:** You need to set up audio routing to HQPlayer separately (via Roon, LMS/BubbleUPnP, or OpenHome). This bridge exposes the DSP controls, not the audio path.
+Set up your source-to-HQPlayer route through Roon, LMS/BubbleUPnP, or OpenHome. UHC can also provide an optional NAA proxy relay for the HQPlayer-to-output path; enable it only for an output that needs that relay. DSP controls and zone linking remain available without the relay.
 
 ### Setup
 
@@ -368,4 +370,4 @@ As of v2.5.0, this project is licensed under the [PolyForm Noncommercial 1.0.0](
 
 Versions up to and including v2.4.1-prior-license were released under a custom source-available license (see [docs/LICENSE-PRIOR.md](docs/LICENSE-PRIOR.md)).
 
-For commercial licensing inquiries, see [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
+Free for individuals to use on their own systems for noncommercial purposes. Installers, integrators, dealers, and anyone deploying for clients or as part of a paid service need a [commercial license](COMMERCIAL-LICENSE.md). The [PolyForm Noncommercial 1.0.0 license](LICENSE) contains the governing terms.

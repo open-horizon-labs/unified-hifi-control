@@ -276,7 +276,7 @@ fn HiphiCloudPairing() -> Element {
                         if status.pause_reason.as_deref() == Some("cost_limit") {
                             p { class: "mt-2 text-sm", "Cloud traffic or repeated connection attempts reached a safety limit. Local playback is unaffected. Resume after the Cloud issue is resolved; cost protection stays enabled." }
                             button {
-                                r#type: "button", class: "btn-primary mt-3",
+                                r#type: "button", class: "btn btn-primary mt-3",
                                 disabled: !status.can_resume || matches!(action(), ProviderActionState::Loading),
                                 onclick: resume_cloud,
                                 "Resume Cloud connection"
@@ -297,7 +297,7 @@ fn HiphiCloudPairing() -> Element {
                     p { class: "mt-1 text-sm text-secondary", "The private installation key stays with this UHC installation. Only its public key is shown." }
                     button {
                         r#type: "button",
-                        class: "btn-primary mt-3",
+                        class: "btn btn-primary mt-3",
                         disabled: matches!(action(), ProviderActionState::Loading),
                         onclick: prepare,
                         if prepared().is_some() { "Show installation identity" } else { "Prepare installation identity" }
@@ -308,13 +308,13 @@ fn HiphiCloudPairing() -> Element {
                             div { class: "mt-2 flex flex-col gap-2 sm:flex-row",
                                 code { class: "min-w-0 flex-1 break-all", "{identity.installation_public_key}" }
                                 button {
-                                    r#type: "button", class: "btn-secondary shrink-0",
+                                    r#type: "button", class: "btn btn-outline shrink-0",
                                     onclick: move |_| copy_to_clipboard(identity.installation_public_key.clone(), public_key_copy),
                                     "{public_key_copy().label(\"Copy public key\")}"
                                 }
                             }
                             p { class: "mt-3 text-xs text-muted", "Fingerprint: {identity.installation_fingerprint}" }
-                            a { class: "btn-primary mt-4 inline-block", href: "https://app.hiphi.audio/", target: "_blank", rel: "noopener noreferrer", "Open HiPhi Cloud" }
+                            a { class: "btn btn-primary mt-4", href: "https://app.hiphi.audio/", target: "_blank", rel: "noopener noreferrer", "Open HiPhi Cloud" }
                         }
                     }
                 }
@@ -347,7 +347,7 @@ fn HiphiCloudPairing() -> Element {
                     }
                     button {
                         r#type: "button",
-                        class: "btn-primary mt-3",
+                        class: "btn btn-primary mt-3",
                         disabled: handoff().is_none() || matches!(action(), ProviderActionState::Loading),
                         onclick: start_pairing,
                         "Start pairing"
@@ -358,12 +358,12 @@ fn HiphiCloudPairing() -> Element {
                             label { class: "text-sm font-medium", "Pairing ID" }
                             div { class: "flex flex-col gap-2 sm:flex-row",
                                 code { class: "min-w-0 flex-1 break-all", "{pairing.pairing_id}" }
-                                button { r#type: "button", class: "btn-secondary shrink-0", onclick: move |_| copy_to_clipboard(pairing.pairing_id.clone(), pairing_id_copy), "{pairing_id_copy().label(\"Copy ID\")}" }
+                                button { r#type: "button", class: "btn btn-outline shrink-0", onclick: move |_| copy_to_clipboard(pairing.pairing_id.clone(), pairing_id_copy), "{pairing_id_copy().label(\"Copy ID\")}" }
                             }
                             label { class: "text-sm font-medium", "One-time pairing secret" }
                             div { class: "flex flex-col gap-2 sm:flex-row",
                                 code { class: "min-w-0 flex-1 break-all", "{pairing.pairing_secret}" }
-                                button { r#type: "button", class: "btn-secondary shrink-0", onclick: move |_| copy_to_clipboard(pairing.pairing_secret.clone(), pairing_secret_copy), "{pairing_secret_copy().label(\"Copy secret\")}" }
+                                button { r#type: "button", class: "btn btn-outline shrink-0", onclick: move |_| copy_to_clipboard(pairing.pairing_secret.clone(), pairing_secret_copy), "{pairing_secret_copy().label(\"Copy secret\")}" }
                             }
                             p { class: "text-sm font-medium", "Pairing fingerprint" }
                             code { class: "block break-all", "{pairing.installation_fingerprint}" }
@@ -376,7 +376,7 @@ fn HiphiCloudPairing() -> Element {
                     p { class: "mt-1 text-sm text-secondary", "After confirming the exact fingerprint in HiPhi Cloud, paste the account ID it shows." }
                     label { class: "mt-3 block text-sm font-medium", r#for: "hiphi-account-id", "HiPhi account ID" }
                     input { id: "hiphi-account-id", class: "input mt-2 w-full", value: "{account_id}", oninput: move |event| account_id.set(event.value()) }
-                    button { r#type: "button", class: "btn-primary mt-3", disabled: initiated().is_none() || matches!(action(), ProviderActionState::Loading), onclick: complete_pairing, "Complete pairing" }
+                    button { r#type: "button", class: "btn btn-primary mt-3", disabled: initiated().is_none() || matches!(action(), ProviderActionState::Loading), onclick: complete_pairing, "Complete pairing" }
                     if let Some(result) = completed() {
                         div { class: "mt-4 status-ok", role: "status",
                             p { class: "font-medium", "This UHC installation is paired." }

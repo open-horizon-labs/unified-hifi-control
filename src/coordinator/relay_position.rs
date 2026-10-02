@@ -15,7 +15,6 @@ struct Anchor {
     title: String,
     artist: String,
     album: String,
-    image_key: Option<String>,
     position: Duration,
     observed: Instant,
 }
@@ -41,7 +40,6 @@ impl RelayPosition {
                 && anchor.title == np.title
                 && anchor.artist == np.artist
                 && anchor.album == np.album
-                && anchor.image_key == np.image_key
                 && anchor.position == position
         });
         if !unchanged {
@@ -50,7 +48,6 @@ impl RelayPosition {
                 title: np.title.clone(),
                 artist: np.artist.clone(),
                 album: np.album.clone(),
-                image_key: np.image_key.clone(),
                 position,
                 observed: now,
             });
@@ -101,6 +98,19 @@ mod tests {
         assert_eq!(
             clock.project("roon:a", &np, now + Duration::from_secs(30)),
             Some(Duration::from_secs(44))
+        );
+    }
+
+    #[test]
+    fn artwork_only_changes_preserve_the_position_anchor() {
+        let now = Instant::now();
+        let mut clock = RelayPosition::default();
+        let mut np = track(Some(42.0));
+        clock.project("roon:a", &np, now);
+        np.image_key = Some("refreshed-art".into());
+        assert_eq!(
+            clock.project("roon:a", &np, now + Duration::from_millis(750)),
+            Some(Duration::from_millis(42750))
         );
     }
 

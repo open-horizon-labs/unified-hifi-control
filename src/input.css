@@ -113,6 +113,30 @@
     color: var(--text-secondary);
   }
 
+  .app-attribution {
+    color: var(--text-secondary);
+    font-size: var(--text-sm);
+    line-height: 1.5;
+  }
+
+  .app-attribution a {
+    display: inline-flex;
+    min-height: 44px;
+    align-items: center;
+    color: var(--text-secondary);
+    text-decoration: underline;
+    text-underline-offset: 0.2em;
+  }
+
+  .app-attribution a:hover {
+    color: var(--text-primary);
+  }
+
+  .app-attribution a:focus-visible {
+    outline: 2px solid var(--text-primary);
+    outline-offset: 3px;
+  }
+
   /* Desktop nav - hidden on mobile */
   .nav-desktop {
     @apply hidden lg:block;

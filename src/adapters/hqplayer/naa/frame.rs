@@ -88,7 +88,10 @@ pub fn rewrite_sections_since(
             .map_err(|_| "invalid NAA frame header")?,
     );
     let track_changed = previous.is_none_or(|old| {
-        old.title != metadata.title || old.artist != metadata.artist || old.album != metadata.album
+        old.source_zone_id != metadata.source_zone_id
+            || old.title != metadata.title
+            || old.artist != metadata.artist
+            || old.album != metadata.album
     });
     let picture_changed = previous.is_none_or(|old| old.picture != metadata.picture);
     let fallback_text = if track_changed {
@@ -321,6 +324,24 @@ mod stable_track_tests {
             0
         );
         assert!(body.ends_with(current.picture.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn source_switch_with_identical_text_still_emits_a_track_boundary() {
+        let mut previous = metadata();
+        previous.source_zone_id = Some("roon:a".into());
+        let mut current = previous.clone();
+        current.source_zone_id = Some("roon:b".into());
+        let mut h = audio_header();
+        let body =
+            rewrite_sections_since(&mut h, b"PCM!", Some(&current), Some(&previous), false, 1)
+                .unwrap();
+        assert_ne!(
+            u32::from_le_bytes(h[..4].try_into().unwrap()) & TYPE_META,
+            0
+        );
+        assert!(String::from_utf8_lossy(&body).contains("song=Track one"));
+        assert_eq!(&body[..4], b"PCM!");
     }
 
     #[test]

@@ -36,6 +36,10 @@ pub mod app;
 // Dioxus components (official dx components)
 pub mod components;
 
+// Device identity catalog is shared by the server and controller management UI.
+#[path = "firmware/catalog.rs"]
+pub mod firmware_catalog;
+
 // Server-only modules (excluded from WASM build)
 #[cfg(feature = "server")]
 pub mod adapters;

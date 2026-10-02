@@ -459,7 +459,7 @@ mod ui_endpoints {
         assert_eq!(
             response.headers().get(axum::http::header::LOCATION),
             Some(&axum::http::HeaderValue::from_static(
-                "https://roon-knob.muness.com/"
+                "https://firmware.hiphi.audio/"
             ))
         );
     }
@@ -474,7 +474,7 @@ mod ui_endpoints {
 
         assert!(
             source.contains("href: crate::app::KNOB_FLASHER_URL"),
-            "Flash a new knob must link directly to the shared HTTPS flasher URL"
+            "Firmware installation must link directly to the shared HTTPS firmware origin"
         );
         assert!(
             !source.contains("href: \"/knobs/flash\", \"Flash a new knob\""),

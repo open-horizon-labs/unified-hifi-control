@@ -15,7 +15,7 @@ use axum::{
     body::Body,
     extract::{ConnectInfo, Query, State},
     http::{header, HeaderMap, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -86,6 +86,15 @@ fn extract_knob_version(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Identity is accepted only from the explicit device header, never inferred from a version.
+fn extract_device_type(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("x-device-type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(crate::firmware_catalog::FirmwareTarget::parse)
+        .map(|target| target.slug())
+}
+
 /// DSP info for zones linked to HQPlayer (iOS compatible)
 #[derive(Serialize, Clone)]
 pub struct DspInfo {
@@ -132,8 +141,18 @@ pub struct ZonesResponse {
 /// GET /knob/zones - List all zones from all adapters
 pub async fn knob_zones_handler(
     State(state): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Json<ZonesResponse> {
+    if let Some(id) = extract_knob_id(&headers, None) {
+        state
+            .knobs
+            .get_or_create_with_device_type(
+                &id,
+                extract_knob_version(&headers).as_deref(),
+                extract_device_type(&headers),
+            )
+            .await;
+    }
     let zones = get_all_zones_internal(&state).await;
     Json(ZonesResponse { zones })
 }
@@ -296,7 +315,14 @@ pub async fn knob_now_playing_handler(
 
     let mut volume_step_override = None;
     if let Some(ref id) = knob_id {
-        let knob = state.knobs.get_or_create(id, knob_version.as_deref()).await;
+        let knob = state
+            .knobs
+            .get_or_create_with_device_type(
+                id,
+                knob_version.as_deref(),
+                extract_device_type(&headers),
+            )
+            .await;
         volume_step_override = knob.config.volume_step_override;
         let battery_level = params.battery_level.filter(|&level| level <= 100);
         let battery_charging = params
@@ -593,9 +619,19 @@ pub struct KnobControlRequest {
 /// POST /knob/control - Send control command (routes by zone_id prefix)
 pub async fn knob_control_handler(
     State(state): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(req): Json<KnobControlRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if let Some(id) = extract_knob_id(&headers, None) {
+        state
+            .knobs
+            .get_or_create_with_device_type(
+                &id,
+                extract_knob_version(&headers).as_deref(),
+                extract_device_type(&headers),
+            )
+            .await;
+    }
     // Route based on zone_id prefix
     if req.zone_id.starts_with("lms:") {
         // LMS player control
@@ -1336,6 +1372,19 @@ pub async fn knob_config_handler(
         )
     })?;
 
+    let knob = if extract_device_type(&headers).is_some() {
+        state
+            .knobs
+            .get_or_create_with_device_type(
+                &knob_id,
+                extract_knob_version(&headers).as_deref(),
+                extract_device_type(&headers),
+            )
+            .await
+    } else {
+        knob
+    };
+
     // Build config response with name included in config object (matches frontend expected format)
     let mut config = serde_json::to_value(&knob.config).unwrap_or_default();
     if let serde_json::Value::Object(ref mut obj) = config {
@@ -1422,7 +1471,7 @@ pub async fn knob_config_by_path_handler(
     // Get or create knob (ensures it exists for newly connected devices)
     let knob = state
         .knobs
-        .get_or_create(&knob_id, version.as_deref())
+        .get_or_create_with_device_type(&knob_id, version.as_deref(), extract_device_type(&headers))
         .await;
 
     // Build config response matching Node.js format
@@ -1484,171 +1533,186 @@ struct FirmwareVersionInfo {
     file: Option<String>,
 }
 
-/// GET /firmware/version - Get available firmware version
-#[allow(clippy::unwrap_used)] // Response::builder().body().unwrap() cannot fail with valid inputs
-pub async fn firmware_version_handler() -> Response {
-    let fw_dir = firmware_dir();
-
-    if !fw_dir.exists() {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                r#"{"error":"No firmware available","error_code":"FIRMWARE_NOT_FOUND"}"#,
-            ))
-            .unwrap();
-    }
-
-    // Look for .bin files
-    let bin_files: Vec<_> = std::fs::read_dir(&fw_dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|ext| ext == "bin")
-                .unwrap_or(false)
-        })
-        .collect();
-
-    if bin_files.is_empty() {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                r#"{"error":"No firmware available","error_code":"FIRMWARE_NOT_FOUND"}"#,
-            ))
-            .unwrap();
-    }
-
-    // Try to read version.json
-    let version_path = fw_dir.join("version.json");
-    let version_info: FirmwareVersionInfo = if version_path.exists() {
-        std::fs::read_to_string(&version_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
-    } else {
-        FirmwareVersionInfo::default()
-    };
-
-    let firmware_file = version_info
-        .file
-        .unwrap_or_else(|| "roon_knob.bin".to_string());
-    let version = version_info.version.or_else(|| {
-        // Try to extract version from filename
-        let re = regex::Regex::new(r"roon_knob[_-]?v?(\d+\.\d+\.\d+)\.bin").ok()?;
-        re.captures(&firmware_file)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string())
-    });
-
-    let version = match version {
-        Some(v) => v,
-        None => {
-            return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"error":"No firmware version available","error_code":"FIRMWARE_NOT_FOUND"}"#))
-                .unwrap();
-        }
-    };
-
-    let firmware_path = fw_dir.join(&firmware_file);
-    let size = std::fs::metadata(&firmware_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::json!({
-                "version": version,
-                "size": size,
-                "file": firmware_file
-            })
-            .to_string(),
-        ))
-        .unwrap()
+/// Selection is explicit and closed. Conflicting firmware identity never chooses an image.
+#[derive(Deserialize, Default)]
+pub struct FirmwareQuery {
+    pub device_type: Option<String>,
+    pub channel: Option<String>,
 }
 
-/// GET /firmware/download - Download firmware binary
-#[allow(clippy::unwrap_used)] // Response::builder().body().unwrap() cannot fail with valid inputs
-pub async fn firmware_download_handler() -> Response {
-    let fw_dir = firmware_dir();
+enum FirmwareSelectionError {
+    Invalid,
+}
 
-    if !fw_dir.exists() {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                r#"{"error":"No firmware available","error_code":"FIRMWARE_NOT_FOUND"}"#,
-            ))
-            .unwrap();
+impl IntoResponse for FirmwareSelectionError {
+    fn into_response(self) -> Response {
+        (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"Invalid or conflicting firmware selection", "error_code":"INVALID_FIRMWARE_SELECTION"}))).into_response()
     }
+}
 
-    // Determine firmware file
-    let version_path = fw_dir.join("version.json");
-    let firmware_file = if version_path.exists() {
-        std::fs::read_to_string(&version_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<FirmwareVersionInfo>(&s).ok())
-            .and_then(|v| v.file)
-            .unwrap_or_else(|| "roon_knob.bin".to_string())
-    } else {
-        "roon_knob.bin".to_string()
-    };
-
-    let firmware_path = fw_dir.join(&firmware_file);
-
-    // Fall back to first .bin file if specified file doesn't exist
-    let firmware_path = if firmware_path.exists() {
-        firmware_path
-    } else {
-        let bin_files: Vec<_> = std::fs::read_dir(&fw_dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .map(|ext| ext == "bin")
-                    .unwrap_or(false)
+impl FirmwareQuery {
+    fn selection(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<
+        (
+            crate::firmware_catalog::FirmwareTarget,
+            crate::firmware_catalog::FirmwareChannel,
+        ),
+        FirmwareSelectionError,
+    > {
+        use crate::firmware_catalog::{FirmwareChannel, FirmwareTarget};
+        let invalid = || FirmwareSelectionError::Invalid;
+        let query = self
+            .device_type
+            .as_deref()
+            .map(|value| FirmwareTarget::parse(value).ok_or_else(invalid))
+            .transpose()?;
+        let header = headers
+            .get("X-Device-Type")
+            .map(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(FirmwareTarget::parse)
+                    .ok_or_else(invalid)
             })
-            .map(|e| e.path())
-            .collect();
-
-        if bin_files.is_empty() {
-            return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"error":"Firmware file not found","error_code":"FIRMWARE_NOT_FOUND"}"#,
-                ))
-                .unwrap();
+            .transpose()?;
+        if matches!((query, header), (Some(query), Some(header)) if query != header) {
+            return Err(invalid());
         }
-        bin_files[0].clone()
-    };
+        let channel = self
+            .channel
+            .as_deref()
+            .map(|value| FirmwareChannel::parse(value).ok_or_else(invalid))
+            .transpose()?
+            .unwrap_or_default();
+        Ok((
+            query.or(header).unwrap_or(FirmwareTarget::LegacyKnob),
+            channel,
+        ))
+    }
+}
 
-    // Read file
-    let data = match std::fs::read(&firmware_path) {
-        Ok(d) => d,
-        Err(_) => {
-            return Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"error":"Failed to read firmware file"}"#))
-                .unwrap();
+fn firmware_artifact(
+    target: crate::firmware_catalog::FirmwareTarget,
+    channel: crate::firmware_catalog::FirmwareChannel,
+) -> Option<(std::path::PathBuf, FirmwareVersionInfo)> {
+    use crate::firmware_catalog::{FirmwareChannel, FirmwareTarget};
+    let root = firmware_dir();
+    let directory = target.cache_directory(&root, channel);
+    if !std::fs::symlink_metadata(&root).ok()?.is_dir() {
+        return None;
+    }
+    if (target != FirmwareTarget::LegacyKnob || channel != FirmwareChannel::Stable)
+        && !std::fs::symlink_metadata(root.join(channel.slug()))
+            .ok()?
+            .is_dir()
+    {
+        return None;
+    }
+    if !std::fs::symlink_metadata(&directory).ok()?.is_dir() {
+        return None;
+    }
+    let version_path = directory.join("version.json");
+    let version: FirmwareVersionInfo = match std::fs::symlink_metadata(&version_path) {
+        Ok(metadata) if metadata.is_file() => {
+            serde_json::from_str(&std::fs::read_to_string(version_path).ok()?).ok()?
         }
+        Ok(_) => return None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            FirmwareVersionInfo::default()
+        }
+        Err(_) => return None,
     };
+    let default_file = target.application_file();
+    let filename = version.file.as_deref().unwrap_or(&default_file);
+    if !target.valid_application_filename(filename) {
+        return None;
+    }
+    let named_version = target.filename_version(filename);
+    if target != FirmwareTarget::LegacyKnob || channel != FirmwareChannel::Stable {
+        version.version.as_deref()?;
+    }
+    if let Some(selected_version) = version.version.as_deref().or(named_version) {
+        if !channel.matches_version(selected_version.trim_start_matches('v')) {
+            return None;
+        }
+    }
+    if let (Some(named), Some(metadata)) = (named_version, version.version.as_deref()) {
+        if named != metadata.trim_start_matches('v') {
+            return None;
+        }
+    }
+    let path = directory.join(filename);
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return None;
+    }
+    Some((path, version))
+}
 
-    let filename = firmware_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("firmware.bin");
+fn firmware_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "No firmware available", "error_code": "FIRMWARE_NOT_FOUND"
+        })),
+    )
+        .into_response()
+}
 
+/// GET /firmware/version - Get available firmware version
+pub async fn firmware_version_handler(
+    Query(query): Query<FirmwareQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let (target, channel) = match query.selection(&headers) {
+        Ok(selection) => selection,
+        Err(error) => return error.into_response(),
+    };
+    let Some((path, version_info)) = firmware_artifact(target, channel) else {
+        return firmware_not_found();
+    };
+    let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+        return firmware_not_found();
+    };
+    let version = version_info
+        .version
+        .or_else(|| target.filename_version(filename).map(str::to_string));
+    let Some(version) = version else {
+        return firmware_not_found();
+    };
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return firmware_not_found();
+    };
+    Json(serde_json::json!({"version": version, "size": metadata.len(), "file": filename}))
+        .into_response()
+}
+
+/// GET /firmware/download - Download only the selected target/channel OTA application
+#[allow(clippy::unwrap_used)] // Response::builder().body().unwrap() cannot fail with valid inputs
+pub async fn firmware_download_handler(
+    Query(query): Query<FirmwareQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let (target, channel) = match query.selection(&headers) {
+        Ok(selection) => selection,
+        Err(error) => return error.into_response(),
+    };
+    let Some((path, _)) = firmware_artifact(target, channel) else {
+        return firmware_not_found();
+    };
+    let Ok(data) = std::fs::read(&path) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Failed to read firmware file"})),
+        )
+            .into_response();
+    };
+    let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+        return firmware_not_found();
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -1661,40 +1725,12 @@ pub async fn firmware_download_handler() -> Response {
         .unwrap()
 }
 
-/// GET /manifest-s3.json - ESP Web Tools manifest
-#[allow(clippy::unwrap_used)] // Response::builder().body().unwrap() cannot fail with valid inputs
+/// GET /manifest-s3.json - ESP Web Tools clean installation
 pub async fn manifest_handler() -> Response {
-    let fw_dir = firmware_dir();
-    let version_path = fw_dir.join("version.json");
-
-    let version = if version_path.exists() {
-        std::fs::read_to_string(&version_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<FirmwareVersionInfo>(&s).ok())
-            .and_then(|v| v.version)
-            .unwrap_or_else(|| "latest".to_string())
-    } else {
-        "latest".to_string()
-    };
-
-    let manifest = serde_json::json!({
-        "name": "Hi-Fi Control Knob",
-        "version": version,
-        "new_install_prompt_erase": true,
-        "builds": [{
-            "chipFamily": "ESP32-S3",
-            "parts": [{
-                "path": "/firmware/download",
-                "offset": 0
-            }]
-        }]
-    });
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(manifest.to_string()))
-        .unwrap()
+    // /firmware/download serves an OTA application, not a merged installation image.
+    // Advertising it at offset zero overwrites the bootloader. Browser installation is
+    // excluded from this OTA scope; fail closed instead of offering a bad flash.
+    firmware_not_found()
 }
 
 /// POST /admin/fetch-firmware - Manually trigger firmware download from GitHub
@@ -1711,7 +1747,7 @@ pub async fn admin_fetch_firmware_handler(
                 Ok(Json(serde_json::json!({
                     "ok": true,
                     "version": version,
-                    "message": format!("Firmware v{} downloaded", version)
+                    "message": "Firmware caches updated"
                 })))
             } else {
                 let version = FirmwareService::get_current_version();
@@ -1734,6 +1770,28 @@ pub async fn admin_fetch_firmware_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_header_uses_catalog_identity_and_ignores_invalid_values() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(extract_device_type(&headers), None);
+        for (header, expected) in [
+            ("hiphi-frame", Some("frame")),
+            ("hiphi-dial-beta", Some("m5dial")),
+            ("roon-knob", Some("knob")),
+            ("../frame", None),
+            ("frmae", None),
+            ("", None),
+        ] {
+            headers.insert("x-device-type", header.parse().unwrap());
+            assert_eq!(extract_device_type(&headers), expected);
+        }
+        headers.insert(
+            "x-device-type",
+            axum::http::HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert_eq!(extract_device_type(&headers), None);
+    }
 
     fn make_zone(id: &str, name: &str) -> ZoneInfo {
         ZoneInfo {
