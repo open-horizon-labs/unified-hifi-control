@@ -39,7 +39,7 @@ use super::discovery;
 use super::frame::MetadataPayload;
 use super::outputs::{
     HqpDacDevice, HqpDacObservation, HqpDiscoveryObservation, HqpEndpointRef,
-    HqpOutputAvailability, HqpOutputRoute, HqpRelayConfigView, HqpRelaySessionView,
+    HqpOutputAvailability, HqpOutputError, HqpOutputRoute, HqpRelayConfigView, HqpRelaySessionView,
     NaaRelaySettings, DEFAULT_NAA_PORT, VIRTUAL_DEVICE_ID,
 };
 use super::protocol;
@@ -57,6 +57,15 @@ const MAX_ROUTES: usize = 128;
 const WORKER_JOIN_BUDGET: Duration = Duration::from_secs(3);
 /// Accept-loop wake interval while idle. Bounds `stop` latency.
 const ACCEPT_POLL: Duration = Duration::from_millis(25);
+
+// Capture occurrence time once; observations must never re-date a retained failure.
+fn relay_error(message: String) -> HqpOutputError {
+    HqpOutputError {
+        code: "RELAY".into(),
+        message,
+        at: now(),
+    }
+}
 
 fn now() -> u64 {
     SystemTime::now()
@@ -134,7 +143,7 @@ struct RelayInner {
     /// continuations check before acting.
     generation: u64,
     session: Option<Session>,
-    last_error: Option<String>,
+    last_error: Option<HqpOutputError>,
     dac_observations: Vec<HqpDacObservation>,
     discovery: Option<HqpDiscoveryObservation>,
     /// Closed after a failed automatic resume so the selected route stays visible but cannot
@@ -181,11 +190,12 @@ pub struct RelayObservation {
     pub generation: u64,
     pub desired_destination: Option<HqpEndpointRef>,
     pub observed_forwarding_destination: Option<HqpEndpointRef>,
+    pub metadata_source_zone_id: Option<String>,
     pub session: Option<HqpRelaySessionView>,
     pub discovery: Option<HqpDiscoveryObservation>,
     pub dac_observations: Vec<HqpDacObservation>,
     pub routing_enabled: bool,
-    pub last_error: Option<String>,
+    pub last_error: Option<HqpOutputError>,
     pub observed_at: u64,
 }
 
@@ -421,21 +431,23 @@ impl NaaRelay {
         let interface: Ipv4Addr = match interface.parse() {
             Ok(ip) => ip,
             Err(e) => {
-                lock(&self.core.inner).last_error =
-                    Some(format!("discovery interface {interface:?} is invalid: {e}"));
+                lock(&self.core.inner).last_error = Some(relay_error(format!(
+                    "discovery interface {interface:?} is invalid: {e}"
+                )));
                 return;
             }
         };
         if interface.is_unspecified() || interface.is_multicast() {
-            lock(&self.core.inner).last_error =
-                Some("discovery requires an explicit local IPv4 interface".to_string());
+            lock(&self.core.inner).last_error = Some(relay_error(
+                "discovery requires an explicit local IPv4 interface".to_string(),
+            ));
             return;
         }
         if !tcp.ip().is_unspecified() && tcp.ip() != IpAddr::V4(interface) {
-            lock(&self.core.inner).last_error = Some(format!(
+            lock(&self.core.inner).last_error = Some(relay_error(format!(
                 "discovery interface {interface} must match the relay bind address {}",
                 tcp.ip()
-            ));
+            )));
             return;
         }
         match discovery::register(
@@ -450,7 +462,7 @@ impl NaaRelay {
                 lock(&self.core.inner).responder =
                     Some(SocketAddr::new(interface.into(), tcp.port()));
             }
-            Err(error) => lock(&self.core.inner).last_error = Some(error),
+            Err(error) => lock(&self.core.inner).last_error = Some(relay_error(error)),
         }
     }
 
@@ -679,7 +691,7 @@ impl NaaRelay {
         let persist_error = self.core.persist(&inner.routes, &None).err().map(|e| {
             format!("Stopped, but the selection could not be saved; a restart would reconnect to the previous route. {e}")
         });
-        inner.last_error = persist_error.clone();
+        inner.last_error = persist_error.clone().map(relay_error);
         let generation = inner.generation;
         drop(inner);
         self.core.changed.notify_one();
@@ -706,7 +718,7 @@ impl NaaRelay {
         }
         RelayCore::disconnect_locked(&mut inner);
         inner.routing_enabled = false;
-        inner.last_error = Some(message);
+        inner.last_error = Some(relay_error(message));
         drop(inner);
         self.core.changed.notify_one();
         true
@@ -736,7 +748,10 @@ impl NaaRelay {
     }
 
     pub fn last_error(&self) -> Option<String> {
-        lock(&self.core.inner).last_error.clone()
+        lock(&self.core.inner)
+            .last_error
+            .as_ref()
+            .map(|error| error.message.clone())
     }
 
     // ------------------------------------------------------------------------------------------
@@ -961,7 +976,9 @@ impl RelayCore {
             // HQPlayer retries automatically after Stop. The routine hint must not erase a more
             // important standing error such as an unsaved Stop.
             if inner.last_error.is_none() {
-                inner.last_error = Some("Select a route before connecting HQPlayer".into());
+                inner.last_error = Some(relay_error(
+                    "Select a route before connecting HQPlayer".into(),
+                ));
             }
             return Err("no route selected".into());
         };
@@ -1115,7 +1132,7 @@ impl RelayCore {
                     let _ = downstream.shutdown(Shutdown::Both);
                 }
             }
-            inner.last_error = error;
+            inner.last_error = error.map(relay_error);
         }
         drop(inner);
         self.changed.notify_one();
@@ -1156,6 +1173,10 @@ impl RelayCore {
                 .as_ref()
                 .filter(|s| s.view.initialized)
                 .map(|s| s.endpoint.clone()),
+            metadata_source_zone_id: inner
+                .metadata
+                .as_ref()
+                .and_then(|m| m.source_zone_id.clone()),
             session: inner.session.as_ref().map(|s| s.view.clone()),
             discovery: inner.discovery.clone(),
             dac_observations: inner.dac_observations.clone(),

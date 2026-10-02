@@ -408,6 +408,9 @@ pub struct HqpOutputProjection {
     pub selected_route_id: Option<String>,
     pub desired_destination: Option<HqpEndpointRef>,
     pub observed_forwarding_destination: Option<HqpEndpointRef>,
+    /// Zone supplying the relay's effective metadata, not proof of audio or metadata delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_source_zone_id: Option<String>,
     pub session: Option<HqpRelaySessionView>,
     pub discovery: Option<HqpDiscoveryObservation>,
     pub dac_observations: Vec<HqpDacObservation>,
@@ -719,6 +722,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn metadata_source_pointer_is_optional_and_absent_when_empty() {
+        let mut projection = projection();
+        let old_wire = serde_json::to_value(&projection).unwrap();
+        assert!(old_wire.get("metadata_source_zone_id").is_none());
+        let decoded: HqpOutputProjection = serde_json::from_value(old_wire.clone()).unwrap();
+        assert!(decoded.metadata_source_zone_id.is_none());
+        let client: crate::app::api::HqpOutputProjection =
+            serde_json::from_value(old_wire).unwrap();
+        assert!(client.metadata_source_zone_id.is_none());
+        projection.metadata_source_zone_id = Some("roon:source".into());
+        let wire = serde_json::to_value(&projection).unwrap();
+        assert_eq!(wire["metadata_source_zone_id"], "roon:source");
+        let client: crate::app::api::HqpOutputProjection = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            client.metadata_source_zone_id.as_deref(),
+            Some("roon:source")
+        );
+    }
+
     fn projection() -> HqpOutputProjection {
         HqpOutputProjection {
             zone_id: "hqplayer:a".into(),
@@ -742,6 +765,7 @@ mod tests {
             selected_route_id: Some("r-1".into()),
             desired_destination: None,
             observed_forwarding_destination: None,
+            metadata_source_zone_id: None,
             session: Some(session("r-1", 7, 4)),
             discovery: None,
             dac_observations: vec![],

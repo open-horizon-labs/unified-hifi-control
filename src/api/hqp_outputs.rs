@@ -143,6 +143,7 @@ fn feature_unavailable_projection(instance: &str) -> HqpOutputProjection {
         selected_route_id: None,
         desired_destination: None,
         observed_forwarding_destination: None,
+        metadata_source_zone_id: None,
         session: None,
         discovery: None,
         dac_observations: vec![],
