@@ -408,7 +408,7 @@ jobs:
         run: make css
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
         with:
           components: clippy, rustfmt
 
@@ -429,6 +429,32 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy -- -D warnings
+
+      - name: Explain blocking lint result
+        if: always()
+        run: echo 'Blocking lint uses the reviewed rust-toolchain.toml baseline and rejects every warning. Latest-stable findings are advisory.' >> "$GITHUB_STEP_SUMMARY"
+
+  lint-latest-stable:
+    name: Latest stable lint (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup latest stable Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Build embedded CSS prerequisite
+        run: make css
+      - name: Discover new stable warnings
+        id: lint
+        run: cargo +stable clippy -- -D warnings
+      - name: Explain advisory result
+        if: always()
+        run: |
+          echo 'Latest stable lint is advisory; it does not gate merging or advance the reviewed baseline.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Lint outcome: ${{ steps.lint.outcome }}. Maintainers should track new warnings in GitHub issues and review a baseline upgrade separately.' >> "$GITHUB_STEP_SUMMARY"
 
   test:
     name: Test
@@ -453,7 +479,7 @@ jobs:
         run: make css
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
 
       # On self-hosted fleet runners sccache is already in the image and
       # RUSTC_WRAPPER/SCCACHE_DIR point at a persistent local cache; the GHA
@@ -546,7 +572,7 @@ jobs:
 
       - name: Setup Rust
         if: steps.check-cache.outputs.needs_build == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
         with:
           targets: wasm32-unknown-unknown
 
@@ -639,7 +665,7 @@ jobs:
           echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
         with:
           targets: x86_64-unknown-linux-musl
 
@@ -953,7 +979,7 @@ jobs:
           echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.target }}
 
@@ -1077,7 +1103,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
         with:
           targets: x86_64-apple-darwin
 
@@ -1135,7 +1161,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
         with:
           targets: aarch64-apple-darwin
 
@@ -1350,7 +1376,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.11
