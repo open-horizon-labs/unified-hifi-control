@@ -15,7 +15,7 @@ use axum::{
     body::Body,
     extract::{ConnectInfo, Query, State},
     http::{header, HeaderMap, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -1484,171 +1484,101 @@ struct FirmwareVersionInfo {
     file: Option<String>,
 }
 
-/// GET /firmware/version - Get available firmware version
-#[allow(clippy::unwrap_used)] // Response::builder().body().unwrap() cannot fail with valid inputs
-pub async fn firmware_version_handler() -> Response {
-    let fw_dir = firmware_dir();
-
-    if !fw_dir.exists() {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                r#"{"error":"No firmware available","error_code":"FIRMWARE_NOT_FOUND"}"#,
-            ))
-            .unwrap();
-    }
-
-    // Look for .bin files
-    let bin_files: Vec<_> = std::fs::read_dir(&fw_dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|ext| ext == "bin")
-                .unwrap_or(false)
-        })
-        .collect();
-
-    if bin_files.is_empty() {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                r#"{"error":"No firmware available","error_code":"FIRMWARE_NOT_FOUND"}"#,
-            ))
-            .unwrap();
-    }
-
-    // Try to read version.json
-    let version_path = fw_dir.join("version.json");
-    let version_info: FirmwareVersionInfo = if version_path.exists() {
-        std::fs::read_to_string(&version_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
-    } else {
-        FirmwareVersionInfo::default()
-    };
-
-    let firmware_file = version_info
-        .file
-        .unwrap_or_else(|| "roon_knob.bin".to_string());
-    let version = version_info.version.or_else(|| {
-        // Try to extract version from filename
-        let re = regex::Regex::new(r"roon_knob[_-]?v?(\d+\.\d+\.\d+)\.bin").ok()?;
-        re.captures(&firmware_file)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string())
-    });
-
-    let version = match version {
-        Some(v) => v,
-        None => {
-            return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"error":"No firmware version available","error_code":"FIRMWARE_NOT_FOUND"}"#))
-                .unwrap();
-        }
-    };
-
-    let firmware_path = fw_dir.join(&firmware_file);
-    let size = std::fs::metadata(&firmware_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::json!({
-                "version": version,
-                "size": size,
-                "file": firmware_file
-            })
-            .to_string(),
-        ))
-        .unwrap()
+/// Resolve only a known legacy application image. Directory order must never select hardware.
+fn legacy_filename_version(filename: &str) -> Option<String> {
+    let re = regex::Regex::new(r"^roon_knob[_-]?v?(\d+\.\d+\.\d+)\.bin$").ok()?;
+    re.captures(filename)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
 }
 
-/// GET /firmware/download - Download firmware binary
+fn legacy_firmware_artifact() -> Option<(std::path::PathBuf, FirmwareVersionInfo)> {
+    use crate::firmware_catalog::FirmwareTarget;
+    // The current poller publishes in the root. A proposed per-target cache must not
+    // shadow it until that publisher is migrated as part of multi-device OTA.
+    let directory = firmware_dir();
+    if !std::fs::symlink_metadata(&directory).ok()?.is_dir() {
+        return None;
+    }
+    let version_path = directory.join("version.json");
+    let version: FirmwareVersionInfo = match std::fs::symlink_metadata(&version_path) {
+        Ok(metadata) if metadata.is_file() => {
+            serde_json::from_str(&std::fs::read_to_string(version_path).ok()?).ok()?
+        }
+        Ok(_) => return None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            FirmwareVersionInfo::default()
+        }
+        Err(_) => return None,
+    };
+    let filename = version.file.as_deref().unwrap_or("roon_knob.bin");
+    if !FirmwareTarget::LegacyKnob.valid_application_filename(filename) {
+        return None;
+    }
+    if let (Some(named_version), Some(metadata_version)) = (
+        legacy_filename_version(filename),
+        version.version.as_deref(),
+    ) {
+        if named_version != metadata_version.trim_start_matches('v') {
+            return None;
+        }
+    }
+    let path = directory.join(filename);
+    // Reject leaf symlinks as well as directory/metadata redirection above.
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return None;
+    }
+    Some((path, version))
+}
+
+fn firmware_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "No firmware available", "error_code": "FIRMWARE_NOT_FOUND"
+        })),
+    )
+        .into_response()
+}
+
+/// GET /firmware/version - Get available firmware version
+pub async fn firmware_version_handler() -> Response {
+    let Some((path, version_info)) = legacy_firmware_artifact() else {
+        return firmware_not_found();
+    };
+    let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+        return firmware_not_found();
+    };
+    let version = version_info
+        .version
+        .or_else(|| legacy_filename_version(filename));
+    let Some(version) = version else {
+        return firmware_not_found();
+    };
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return firmware_not_found();
+    };
+    Json(serde_json::json!({"version": version, "size": metadata.len(), "file": filename}))
+        .into_response()
+}
+
+/// GET /firmware/download - Download the legacy OTA application binary
 #[allow(clippy::unwrap_used)] // Response::builder().body().unwrap() cannot fail with valid inputs
 pub async fn firmware_download_handler() -> Response {
-    let fw_dir = firmware_dir();
-
-    if !fw_dir.exists() {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                r#"{"error":"No firmware available","error_code":"FIRMWARE_NOT_FOUND"}"#,
-            ))
-            .unwrap();
-    }
-
-    // Determine firmware file
-    let version_path = fw_dir.join("version.json");
-    let firmware_file = if version_path.exists() {
-        std::fs::read_to_string(&version_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<FirmwareVersionInfo>(&s).ok())
-            .and_then(|v| v.file)
-            .unwrap_or_else(|| "roon_knob.bin".to_string())
-    } else {
-        "roon_knob.bin".to_string()
+    let Some((path, _)) = legacy_firmware_artifact() else {
+        return firmware_not_found();
     };
-
-    let firmware_path = fw_dir.join(&firmware_file);
-
-    // Fall back to first .bin file if specified file doesn't exist
-    let firmware_path = if firmware_path.exists() {
-        firmware_path
-    } else {
-        let bin_files: Vec<_> = std::fs::read_dir(&fw_dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .map(|ext| ext == "bin")
-                    .unwrap_or(false)
-            })
-            .map(|e| e.path())
-            .collect();
-
-        if bin_files.is_empty() {
-            return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"error":"Firmware file not found","error_code":"FIRMWARE_NOT_FOUND"}"#,
-                ))
-                .unwrap();
-        }
-        bin_files[0].clone()
+    let Ok(data) = std::fs::read(&path) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Failed to read firmware file"})),
+        )
+            .into_response();
     };
-
-    // Read file
-    let data = match std::fs::read(&firmware_path) {
-        Ok(d) => d,
-        Err(_) => {
-            return Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"error":"Failed to read firmware file"}"#))
-                .unwrap();
-        }
+    let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+        return firmware_not_found();
     };
-
-    let filename = firmware_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("firmware.bin");
-
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -1661,40 +1591,12 @@ pub async fn firmware_download_handler() -> Response {
         .unwrap()
 }
 
-/// GET /manifest-s3.json - ESP Web Tools manifest
-#[allow(clippy::unwrap_used)] // Response::builder().body().unwrap() cannot fail with valid inputs
+/// GET /manifest-s3.json - ESP Web Tools clean installation
 pub async fn manifest_handler() -> Response {
-    let fw_dir = firmware_dir();
-    let version_path = fw_dir.join("version.json");
-
-    let version = if version_path.exists() {
-        std::fs::read_to_string(&version_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<FirmwareVersionInfo>(&s).ok())
-            .and_then(|v| v.version)
-            .unwrap_or_else(|| "latest".to_string())
-    } else {
-        "latest".to_string()
-    };
-
-    let manifest = serde_json::json!({
-        "name": "Hi-Fi Control Knob",
-        "version": version,
-        "new_install_prompt_erase": true,
-        "builds": [{
-            "chipFamily": "ESP32-S3",
-            "parts": [{
-                "path": "/firmware/download",
-                "offset": 0
-            }]
-        }]
-    });
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(manifest.to_string()))
-        .unwrap()
+    // /firmware/download serves an OTA application, not a merged installation image.
+    // Advertising it at offset zero overwrites the bootloader. Until installation has
+    // its own approved artifact selector, fail closed instead of offering a bad flash.
+    firmware_not_found()
 }
 
 /// POST /admin/fetch-firmware - Manually trigger firmware download from GitHub
