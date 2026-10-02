@@ -1,12 +1,11 @@
-# CodeRabbit configuration
-# https://docs.coderabbit.ai/guides/configure-coderabbit
-
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit is disabled for this repository by owner request.
 reviews:
-  # Disable auto-labeling - it triggers our build workflow unnecessarily
-  auto_label: false
-
-  # Keep reviews enabled
-  enabled: true
-
-  # Request changes instead of just commenting
-  request_changes_workflow: true
+  auto_apply_labels: false
+  request_changes_workflow: false
+  commit_status: false
+  review_progress: false
+  review_status: false
+  auto_review:
+    enabled: false
+    auto_incremental_review: false
