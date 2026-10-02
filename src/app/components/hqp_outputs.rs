@@ -194,6 +194,31 @@ pub fn audio_confirmed_for(projection: &HqpOutputProjection) -> bool {
     session_confirms_audio(session, projection.route_generation)
 }
 
+#[cfg(target_arch = "wasm32")]
+fn notice_now() -> u64 {
+    (js_sys::Date::now() / 1000.0) as u64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn notice_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Historical notices expire even if the page stops receiving server updates.
+fn historical_error_age(at: u64, now: u64) -> Option<String> {
+    let age = now.saturating_sub(at);
+    match age {
+        0..=1 => Some("just now".into()),
+        2..=59 => Some(format!("{age} seconds ago")),
+        60..=119 => Some("1 minute ago".into()),
+        120..=299 => Some(format!("{} minutes ago", age / 60)),
+        _ => None,
+    }
+}
+
 /// The exact text rendered for the current status line. Action-aware: reaching a confirming
 /// phase (`Forwarding`/`Complete`) means something different depending on *what* completed — a
 /// completed Stop, relay configuration save, discovery scan, route edit, or import/setup step
@@ -823,11 +848,105 @@ fn run_output_command<F>(
     });
 }
 
+/// Select a destination only after its add operation is terminal and a fresh projection confirms
+/// the route exists. This keeps the follow-up command on the committed output revision instead
+/// of racing the admission-time projection carried by the add receipt.
+#[allow(clippy::too_many_arguments)]
+fn select_added_route_after_refresh(
+    instance: Signal<String>,
+    route_id: String,
+    mut mutation_fence: Signal<OutputCommandFence>,
+    read_fence: Signal<OutputCommandFence>,
+    mut error: Signal<Option<String>>,
+    mut busy: Signal<bool>,
+    outputs: Signal<Option<HqpOutputProjection>>,
+    loaded_once: Signal<bool>,
+    current_operation_id: Signal<Option<String>>,
+    polled_operation: Signal<Option<HqpOutputOperation>>,
+) {
+    let zone_id = resolve_command_target(move || instance());
+    let generation = mutation_fence.write().begin();
+    busy.set(true);
+    spawn(async move {
+        let Some(projection) = fetch_outputs(zone_id.clone()).await else {
+            if mutation_fence.read().accept(generation) {
+                busy.set(false);
+                error.set(Some(
+                    "Destination added, but its saved state could not be refreshed. Use Refresh, then select it.".to_string(),
+                ));
+            }
+            return;
+        };
+        if !mutation_fence.read().accept(generation)
+            || resolve_command_target(move || instance()) != zone_id
+        {
+            return;
+        }
+        if !projection
+            .routes
+            .iter()
+            .any(|route| route.route_id == route_id)
+        {
+            busy.set(false);
+            error.set(Some(
+                "Destination added, but the saved route is not visible yet. Refresh, then select it.".to_string(),
+            ));
+            return;
+        }
+        apply_projection_read(outputs, loaded_once, Some(projection.clone()));
+        let request = build_command(
+            zone_id,
+            Some(new_correlation_id("select")),
+            HqpOutputAction::Select { route_id },
+            Some(&projection),
+        );
+        run_output_command(
+            request,
+            mutation_fence,
+            read_fence,
+            error,
+            busy,
+            outputs,
+            loaded_once,
+            current_operation_id,
+            polled_operation,
+            false,
+            |_operation| {},
+        );
+    });
+}
+
 #[component]
 pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
     let sse = use_sse();
 
     let outputs = use_signal(|| None::<HqpOutputProjection>);
+    let source_id = use_memo(move || outputs().and_then(|p| p.metadata_source_zone_id));
+    let source_zone = use_resource(move || {
+        let id = source_id();
+        async move {
+            let id = id?;
+            let zones =
+                crate::app::api::fetch_json::<crate::app::api::ZonesResponse>("/knob/zones")
+                    .await
+                    .ok()?;
+            zones.zones.into_iter().find(|zone| zone.zone_id == id)
+        }
+    });
+    // Start from server time to avoid browser clock skew; keep aging notices while disconnected.
+    let mut notice_clock = use_signal(notice_now);
+    let mut notice_received_at = use_signal(notice_now);
+    use_effect(move || {
+        if outputs().is_some() {
+            notice_received_at.set(notice_now());
+        }
+    });
+    use_future(move || async move {
+        loop {
+            sleep_ms(1000).await;
+            notice_clock.set(notice_now());
+        }
+    });
     let loaded_once = use_signal(|| false);
     // Deliberately separate: see the doc comments on `refresh_outputs`/`run_output_command`.
     let read_fence = use_signal(OutputCommandFence::default);
@@ -847,6 +966,30 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
     // or replace it (see `run_output_command`'s doc comment).
     let current_operation_id = use_signal(|| None::<String>);
     let polled_operation = use_signal(|| None::<HqpOutputOperation>);
+
+    let select_route = move |route_id: String| {
+        let zone_id = resolve_command_target(move || instance());
+        let projection = outputs();
+        let request = build_command(
+            zone_id,
+            Some(new_correlation_id("select")),
+            HqpOutputAction::Select { route_id },
+            projection.as_ref(),
+        );
+        run_output_command(
+            request,
+            mutation_fence,
+            read_fence,
+            error,
+            busy,
+            outputs,
+            loaded_once,
+            current_operation_id,
+            polled_operation,
+            false,
+            |_operation| {},
+        );
+    };
 
     let mut relay_enabled = use_signal(|| false);
     let mut relay_form_dirty = use_signal(|| false);
@@ -971,6 +1114,7 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
 
     let mut submit_route_form = move || {
         let zone_id = resolve_command_target(move || instance());
+        let select_after_add = editing_route_id().is_none();
         let name = form_name();
         let host = form_host();
         let port = form_port();
@@ -1016,7 +1160,70 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
             current_operation_id,
             polled_operation,
             false,
-            |_operation| {},
+            move |operation| {
+                if select_after_add && operation.outcome == Some(HqpOutputOutcome::Complete) {
+                    if let Some(route_id) = operation.route_id {
+                        select_added_route_after_refresh(
+                            instance,
+                            route_id,
+                            mutation_fence,
+                            read_fence,
+                            error,
+                            busy,
+                            outputs,
+                            loaded_once,
+                            current_operation_id,
+                            polled_operation,
+                        );
+                    }
+                }
+            },
+        );
+    };
+
+    let add_and_select_endpoint = move |name: String, host: String, port: u16| {
+        let zone_id = resolve_command_target(move || instance());
+        let projection = outputs();
+        let request = build_command(
+            zone_id,
+            Some(new_correlation_id("discovered-route")),
+            HqpOutputAction::RouteAdd {
+                name,
+                host,
+                port: Some(port),
+                device_id: None,
+            },
+            projection.as_ref(),
+        );
+        run_output_command(
+            request,
+            mutation_fence,
+            read_fence,
+            error,
+            busy,
+            outputs,
+            loaded_once,
+            current_operation_id,
+            polled_operation,
+            false,
+            move |operation| {
+                if operation.outcome == Some(HqpOutputOutcome::Complete) {
+                    if let Some(route_id) = operation.route_id {
+                        select_added_route_after_refresh(
+                            instance,
+                            route_id,
+                            mutation_fence,
+                            read_fence,
+                            error,
+                            busy,
+                            outputs,
+                            loaded_once,
+                            current_operation_id,
+                            polled_operation,
+                        );
+                    }
+                }
+            },
         );
     };
 
@@ -1232,6 +1439,9 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
         };
     }
 
+    let notice_time = projection
+        .observed_at
+        .saturating_add(notice_clock().saturating_sub(notice_received_at()));
     let availability = projection.availability();
     // Tracked client-side (`current_operation_id`) takes priority over the projection's own
     // `current_operation_id`: the tracked signal survives a stale/rejected background GET
@@ -1269,22 +1479,59 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
         .map(|route| route.name.as_str())
         .unwrap_or("No destination selected");
     let relay_status = if !projection.relay.enabled {
-        "Relay off"
+        "Relay off · not carrying audio"
     } else if audio_confirmed {
-        "Audio flowing"
+        "Audio flowing through relay"
     } else if matches!(
         availability,
         Some(HqpOutputAvailability::Unavailable { .. })
     ) {
-        "Relay unavailable"
+        "Relay unavailable · audio not confirmed"
+    } else if projection.session.is_none() {
+        "No active NAA session · not carrying audio"
     } else {
-        "No audio confirmed"
+        "NAA session active · audio not confirmed"
     };
 
     rsx! {
         div { class: "py-2",
             p { class: "mb-1 text-sm", "NAA output name: ", strong { "{projection.relay.adapter_name}" } }
             p { class: "mb-3 text-sm", "{destination_label} · {relay_status}" }
+            p { class: "mb-3 text-sm",
+                strong { "Metadata source: " }
+                if let Some(id) = projection.metadata_source_zone_id.as_deref() {
+                    if let Some(Some(zone)) = source_zone.read().as_ref().filter(|zone| zone.as_ref().is_some_and(|zone| zone.zone_id == id)) {
+                        {format!("{} · {}", match zone.source.as_deref() {
+                            Some("roon") => "Roon",
+                            Some("openhome") => "OpenHome",
+                            Some("upnp") => "UPnP",
+                            Some("lms") => "LMS",
+                            Some(source) => source,
+                            None => "Source",
+                        }, zone.zone_name)}
+                    } else {
+                        "{id}"
+                    }
+                } else {
+                    "No source reported"
+                }
+            }
+            p { class: "mb-3 max-w-3xl text-sm text-muted",
+                strong { "About metadata injection: " }
+                "When audio flows through this relay and one paired source zone is playing, that zone supplies the endpoint's track info, artwork, elapsed time and duration. With a Roon pairing, Roon's values take precedence over HQPlayer's. If multiple paired zones are playing, injection waits until only one is playing."
+            }
+            if !audio_confirmed {
+                if let Some(last_error) = projection.last_error.as_ref() {
+                    if let Some(age) = historical_error_age(last_error.at, notice_time) {
+                        p { class: "text-xs text-muted m-0 mt-2",
+                            "Previous relay error · {age}: {last_error.message}"
+                        }
+                        p { class: "text-xs text-muted m-0 mt-1",
+                            "From an earlier attempt; expires after five minutes."
+                        }
+                    }
+                }
+            }
             details {
                 summary { class: "text-sm font-medium cursor-pointer mb-3", "Configure relay and choose destination" }
             if projection.routes.is_empty() {
@@ -1336,12 +1583,6 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
                     "Refresh"
                 }
                 button {
-                    class: "btn btn-outline btn-sm",
-                    disabled: is_busy,
-                    onclick: discover,
-                    "Discover devices"
-                }
-                button {
                     class: "btn btn-ghost btn-sm",
                     disabled: stop_disabled,
                     onclick: stop,
@@ -1362,13 +1603,15 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
                         if let Some(device) = selected.device_id.as_ref() {
                             p { class: "text-xs text-muted m-0 mt-1", "DAC: {device}" }
                         }
-                        p { role: "status", class: "text-sm m-0 mt-2",
+                        p { role: "status", class: if audio_confirmed { "text-sm m-0 mt-2 text-green-400" } else { "text-sm m-0 mt-2 text-amber-400" },
                             if !projection.relay.enabled {
-                                "Relay off. This destination is saved but is not receiving audio through this relay."
+                                "Not carrying audio. Relay is off; this destination is only saved."
                             } else if audio_confirmed {
-                                "Audio confirmed at the relay."
+                                "Audio is flowing through this relay to the selected destination."
+                            } else if projection.session.is_none() {
+                                "Not carrying audio. No NAA session is connected to this relay. In HQPlayer, select this relay as the output and start playback."
                             } else {
-                                "Selection saved; audio has not been confirmed yet."
+                                "An NAA session is connected, but audio data has not been confirmed for the current stream."
                             }
                         }
                     }
@@ -1378,7 +1621,7 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
             details {
                 class: "mb-4 border-b border-subtle pb-4",
                 open: !projection.relay.enabled,
-                summary { class: "text-sm font-semibold mb-2 cursor-pointer", "Relay settings" }
+                summary { class: "text-sm font-semibold mb-2 cursor-pointer", "1. Enable the relay" }
                 p { class: "text-xs text-muted mb-2",
                     "Select this relay as HQPlayer's NAA output. It forwards audio to the destination below without changing PCM or DSD samples."
                 }
@@ -1409,6 +1652,29 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
                             }
                         }
 
+                    }
+                    if relay_form_dirty() {
+                        p { role: "status", class: "text-xs text-muted mt-2 mb-0",
+                            if !projection.relay.enabled && relay_enabled() {
+                                "Not saved yet — the relay is still off."
+                            } else {
+                                "Relay settings have unsaved changes."
+                            }
+                        }
+                    }
+                    div { class: "mt-3",
+                        button {
+                            class: "btn btn-primary btn-sm",
+                            disabled: is_busy,
+                            r#type: "submit",
+                            if !projection.relay.enabled && relay_enabled() {
+                                "Enable relay"
+                            } else if projection.relay.enabled && !relay_enabled() {
+                                "Disable relay"
+                            } else {
+                                "Save relay settings"
+                            }
+                        }
                     }
                     details { class: "mt-3",
                         summary { class: "text-sm cursor-pointer", "Advanced networking" }
@@ -1488,26 +1754,23 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
                             }
                         }
                     }
-                    div { class: "mt-3",
-                        button {
-                            class: "btn btn-primary btn-sm",
-                            disabled: is_busy,
-                            r#type: "submit",
-                            "Save relay settings"
-                        }
-                    }
                 }
 
             }
 
             div { class: "mb-4",
-                h3 { class: "text-sm font-semibold mb-2", "NAA destinations" }
+                h3 { class: "text-sm font-semibold mb-2", "2. Choose a destination" }
                 p { class: "text-xs text-muted",
-                    "For a paired Roon zone, switching briefly pauses Roon and resumes it on the new destination. A paused zone stays paused."
+                    "A new destination is selected automatically. Select another saved destination to switch later. Paired Roon playback pauses briefly and resumes; a paused zone stays paused."
+                }
+                if !matches!(availability, Some(HqpOutputAvailability::Available)) {
+                    p { role: "status", class: "text-sm text-muted",
+                        "Turn on the relay before adding, discovering, or selecting a destination."
+                    }
                 }
                 if projection.routes.is_empty() {
                     p { class: "text-sm text-muted",
-                        "No destinations saved. Discover NAA hosts or add one by address."
+                        "No destinations saved yet. Add one below; it will be selected automatically."
                     }
                 } else {
                     ul { class: "space-y-2",
@@ -1541,7 +1804,7 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
                                             button {
                                                 class: "btn btn-secondary btn-sm",
                                                 aria_label: "Select {route.name}",
-                                                disabled: is_busy || is_selected,
+                                                disabled: is_busy || is_selected || !matches!(availability, Some(HqpOutputAvailability::Available)),
                                                 onclick: move |_| {
                                                     let zone_id = resolve_command_target(move || instance());
                                                     let projection = outputs();
@@ -1764,12 +2027,16 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
                     div { class: "flex items-center gap-2 mt-3",
                         button {
                             class: "btn btn-primary btn-sm",
-                            disabled: is_busy || form_name().trim().is_empty() || form_host().trim().is_empty(),
+                            disabled: is_busy
+                                || form_name().trim().is_empty()
+                                || form_host().trim().is_empty()
+                                || (editing_route_id().is_none()
+                                    && !matches!(availability, Some(HqpOutputAvailability::Available))),
                             r#type: "submit",
                             if editing_route_id().is_some() {
                                 "Save changes"
                             } else {
-                                "Add destination"
+                                "Add & select"
                             }
                         }
                         if editing_route_id().is_some() {
@@ -1794,10 +2061,18 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
             }
 
             div { class: "mb-4",
-                h3 { class: "text-sm font-semibold mb-2", "Discovered NAA hosts" }
+                div { class: "flex flex-wrap items-center justify-between gap-2 mb-2",
+                    h3 { class: "text-sm font-semibold m-0", "Nearby NAA endpoints" }
+                    button {
+                        class: "btn btn-outline btn-sm",
+                        disabled: is_busy || !matches!(availability, Some(HqpOutputAvailability::Available)),
+                        onclick: discover,
+                        "Discover endpoints"
+                    }
+                }
                 match projection.discovery.as_ref() {
                     None => rsx! {
-                        p { class: "text-sm text-muted", "Not yet scanned. Use \"Discover devices\" above." }
+                        p { class: "text-sm text-muted", "Discover finds NAA hosts on your network. Use an address to add it as a destination; adding selects it automatically." }
                     },
                     Some(discovery) if discovery.endpoints.is_empty() => rsx! {
                         p { class: "text-sm text-muted", "Scan completed and found no NAA hosts on the network." }
@@ -1813,36 +2088,100 @@ pub fn HqpOutputRouting(instance: Signal<String>) -> Element {
                                     // route already existing at this host:port must never block
                                     // adding a *second* route there with a different device id —
                                     // never disable on host:port collision alone.
-                                    let existing_route_count = projection
+                                    let endpoint_routes: Vec<_> = projection
                                         .routes
                                         .iter()
-                                        .filter(|route| route.host == endpoint.host && route.port == endpoint.port)
-                                        .count();
+                                        .filter(|route| {
+                                            route.host == endpoint.host && route.port == endpoint.port
+                                        })
+                                        .collect();
+                                    let existing_route_count = endpoint_routes.len();
+                                    let existing_route_id = (existing_route_count == 1)
+                                        .then(|| endpoint_routes[0].route_id.clone());
+                                    let existing_route_selected = existing_route_id.as_ref().is_some_and(|route_id| {
+                                        projection.selected_route_id.as_ref() == Some(route_id)
+                                    });
                                     rsx! {
                                         li {
                                             key: "{endpoint.host}:{endpoint.port}",
                                             class: "text-sm flex items-center justify-between gap-3",
                                             span {
                                                 "{endpoint.name} — {endpoint.host}:{endpoint.port} ({endpoint.protocol})"
-                                                if existing_route_count > 0 {
-                                                    span { class: "text-xs text-muted ml-2",
-                                                        "({existing_route_count} route(s) already configured here)"
+                                            }
+                                            if existing_route_count == 0 {
+                                                button {
+                                                    class: "btn btn-primary btn-sm shrink-0",
+                                                    disabled: is_busy || !matches!(availability, Some(HqpOutputAvailability::Available)),
+                                                    title: "Add this endpoint as a destination and select it.",
+                                                    onclick: move |_| {
+                                                        add_and_select_endpoint(
+                                                            endpoint_name.clone(),
+                                                            endpoint_host.clone(),
+                                                            endpoint_port,
+                                                        );
+                                                    },
+                                                    "Add & select"
+                                                }
+                                            } else if let Some(route_id) = existing_route_id {
+                                                div { class: "flex flex-wrap items-center gap-2",
+                                                button {
+                                                    class: "btn btn-secondary btn-sm shrink-0",
+                                                    disabled: is_busy
+                                                        || existing_route_selected
+                                                        || !matches!(availability, Some(HqpOutputAvailability::Available)),
+                                                    onclick: move |_| select_route(route_id.clone()),
+                                                    if existing_route_selected { "Selected" } else { "Select" }
+                                                }
+                                                    button {
+                                                        class: "btn btn-ghost btn-sm",
+                                                        disabled: is_busy || !matches!(availability, Some(HqpOutputAvailability::Available)),
+                                                        title: "Fill the destination form to add a second DAC from this endpoint.",
+                                                        onclick: move |_| {
+                                                            editing_route_id.set(None);
+                                                            route_form_open.set(true);
+                                                            form_name.set(endpoint_name.clone());
+                                                            form_host.set(endpoint_host.clone());
+                                                            form_port.set(Some(endpoint_port));
+                                                            form_device.set(String::new());
+                                                        },
+                                                        "Add another DAC"
                                                     }
                                                 }
-                                            }
-                                            button {
-                                                class: "btn btn-ghost btn-sm shrink-0",
-                                                disabled: is_busy,
-                                                title: "Fill in the destination form with this host — pick a different device id for a second DAC on the same endpoint",
-                                                onclick: move |_| {
-                                                    editing_route_id.set(None);
-                                                    route_form_open.set(true);
-                                                    form_name.set(endpoint_name.clone());
-                                                    form_host.set(endpoint_host.clone());
-                                                    form_port.set(Some(endpoint_port));
-                                                    form_device.set(String::new());
-                                                },
-                                                "Use this host"
+                                            } else {
+                                                div { class: "flex flex-wrap items-center gap-2",
+                                                    for route in endpoint_routes.iter() {
+                                                        {
+                                                            let route_id = route.route_id.clone();
+                                                            let route_name = route.name.clone();
+                                                            let route_selected = projection.selected_route_id.as_ref() == Some(&route_id);
+                                                            rsx! {
+                                                                button {
+                                                                    key: "{route_id}",
+                                                                    class: "btn btn-secondary btn-sm",
+                                                                    disabled: is_busy
+                                                                        || route_selected
+                                                                        || !matches!(availability, Some(HqpOutputAvailability::Available)),
+                                                                    onclick: move |_| select_route(route_id.clone()),
+                                                                    if route_selected { "{route_name} · Selected" } else { "Select {route_name}" }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    button {
+                                                        class: "btn btn-ghost btn-sm",
+                                                        disabled: is_busy || !matches!(availability, Some(HqpOutputAvailability::Available)),
+                                                        title: "Fill the destination form to add a second DAC from this endpoint.",
+                                                        onclick: move |_| {
+                                                            editing_route_id.set(None);
+                                                            route_form_open.set(true);
+                                                            form_name.set(endpoint_name.clone());
+                                                            form_host.set(endpoint_host.clone());
+                                                            form_port.set(Some(endpoint_port));
+                                                            form_device.set(String::new());
+                                                        },
+                                                        "Add another DAC"
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -2383,6 +2722,7 @@ mod tests {
             selected_route_id: None,
             desired_destination: None,
             observed_forwarding_destination: None,
+            metadata_source_zone_id: None,
             session: None,
             discovery: None,
             dac_observations: vec![],
@@ -2528,6 +2868,7 @@ mod operation_driver_tests {
             selected_route_id: None,
             desired_destination: None,
             observed_forwarding_destination: None,
+            metadata_source_zone_id: None,
             session: None,
             discovery: None,
             dac_observations: vec![],
@@ -3002,6 +3343,7 @@ mod command_projection_guard_tests {
             selected_route_id: None,
             desired_destination: None,
             observed_forwarding_destination: None,
+            metadata_source_zone_id: None,
             session: None,
             discovery: None,
             dac_observations: vec![],
@@ -3186,5 +3528,25 @@ mod command_projection_guard_tests {
             !should_apply_projection(Some(&newer), &older),
             "a stale background read must never overwrite fresher data already displayed"
         );
+    }
+}
+
+#[cfg(test)]
+mod historical_error_tests {
+    #[test]
+    fn error_notices_show_elapsed_time_and_expire_at_five_minutes() {
+        assert_eq!(
+            super::historical_error_age(100, 102).as_deref(),
+            Some("2 seconds ago")
+        );
+        assert_eq!(
+            super::historical_error_age(100, 160).as_deref(),
+            Some("1 minute ago")
+        );
+        assert_eq!(
+            super::historical_error_age(100, 399).as_deref(),
+            Some("4 minutes ago")
+        );
+        assert_eq!(super::historical_error_age(100, 400), None);
     }
 }

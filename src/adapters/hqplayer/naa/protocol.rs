@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::frame::{picture_refresh_due, rewrite_sections};
+use super::frame::{rewrite_sections_since, TYPE_META, TYPE_PIC, TYPE_POSITION};
 use super::outputs::{HqpDacDevice, HqpOutputRoute};
 use super::relay::RelayCore;
 
@@ -364,6 +364,7 @@ fn upstream_loop(
     let mut sample_bytes = None;
     let mut injected_metadata = None;
     let mut injected_at = Instant::now();
+    let mut artwork_refreshed_at = Instant::now();
     loop {
         let (control, prefix, deadline) = probe(reader, None)?;
         if control {
@@ -403,6 +404,7 @@ fn upstream_loop(
                     .and_then(|v| v.parse::<usize>().ok())
                     .ok_or_else(|| invalid("start has no valid bits"))?;
                 injected_metadata = None;
+                artwork_refreshed_at = Instant::now();
                 sample_bytes = Some(start_sample_bytes(stream, bits)?);
             }
             let rewritten = apply(&raw, edits)?;
@@ -451,6 +453,11 @@ fn upstream_loop(
                 body.extend_from_slice(&buffer[..n]);
                 remaining -= n;
             }
+            let native_display_sections = get(0)? as u32 & (TYPE_POSITION | TYPE_META | TYPE_PIC)
+                != 0
+                || get(8)? > 0
+                || get(12)? > 0
+                || get(16)? > 0;
             let mut wire_header: [u8; HEADER_LEN] = header
                 .try_into()
                 .map_err(|_| invalid("short NAA audio header"))?;
@@ -461,27 +468,35 @@ fn upstream_loop(
                 _ => false,
             };
 
-            let original_meta_len = u32::from_le_bytes([
-                wire_header[12],
-                wire_header[13],
-                wire_header[14],
-                wire_header[15],
-            ]);
-            // Native text packets can clear an endpoint's artwork: accompany those packets
-            // with fallback art, but never resend artwork on every audio-only frame.
-            let refresh = picture_refresh_due(
-                metadata.as_ref().and_then(|m| m.picture.as_deref()),
-                injected_at.elapsed(),
-            );
-            let fallback = (changed || refresh || original_meta_len > 0)
+            // While a source is injected, every native display section (including empty
+            // clears) must be rewritten. Audio-only frames need only source updates/heartbeats.
+            let refresh = injected_at.elapsed() >= Duration::from_secs(2);
+            // Position updates can arrive more often than the artwork refresh interval.
+            // They must not indefinitely postpone retransmitting a URL after an image fetch fails.
+            let refresh_artwork = artwork_refreshed_at.elapsed() >= Duration::from_secs(2)
+                && metadata
+                    .as_ref()
+                    .and_then(|m| m.picture.as_deref())
+                    .is_some_and(super::frame::is_url_picture);
+            let fallback = (changed || refresh || refresh_artwork || native_display_sections)
                 .then_some(metadata.as_deref())
                 .flatten();
-            let rewritten =
-                rewrite_sections(&mut wire_header, &body, fallback, width).map_err(invalid)?;
+            let rewritten = rewrite_sections_since(
+                &mut wire_header,
+                &body,
+                fallback,
+                injected_metadata.as_deref(),
+                refresh_artwork,
+                width,
+            )
+            .map_err(invalid)?;
             if fallback.is_some() {
                 injected_at = Instant::now();
-                injected_metadata = metadata;
             }
+            if refresh_artwork {
+                artwork_refreshed_at = Instant::now();
+            }
+            injected_metadata = metadata;
             writer.write_all(&wire_header)?;
             writer.write_all(&rewritten)?;
             relay.update(id, true, HEADER_LEN + rewritten.len(), Some("forwarding"));
