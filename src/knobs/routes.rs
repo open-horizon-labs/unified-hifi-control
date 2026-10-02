@@ -86,6 +86,15 @@ fn extract_knob_version(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Identity is accepted only from the explicit device header, never inferred from a version.
+fn extract_device_type(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("x-device-type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(crate::firmware_catalog::FirmwareTarget::parse)
+        .map(|target| target.slug())
+}
+
 /// DSP info for zones linked to HQPlayer (iOS compatible)
 #[derive(Serialize, Clone)]
 pub struct DspInfo {
@@ -132,8 +141,18 @@ pub struct ZonesResponse {
 /// GET /knob/zones - List all zones from all adapters
 pub async fn knob_zones_handler(
     State(state): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Json<ZonesResponse> {
+    if let Some(id) = extract_knob_id(&headers, None) {
+        state
+            .knobs
+            .get_or_create_with_device_type(
+                &id,
+                extract_knob_version(&headers).as_deref(),
+                extract_device_type(&headers),
+            )
+            .await;
+    }
     let zones = get_all_zones_internal(&state).await;
     Json(ZonesResponse { zones })
 }
@@ -296,7 +315,14 @@ pub async fn knob_now_playing_handler(
 
     let mut volume_step_override = None;
     if let Some(ref id) = knob_id {
-        let knob = state.knobs.get_or_create(id, knob_version.as_deref()).await;
+        let knob = state
+            .knobs
+            .get_or_create_with_device_type(
+                id,
+                knob_version.as_deref(),
+                extract_device_type(&headers),
+            )
+            .await;
         volume_step_override = knob.config.volume_step_override;
         let battery_level = params.battery_level.filter(|&level| level <= 100);
         let battery_charging = params
@@ -593,9 +619,19 @@ pub struct KnobControlRequest {
 /// POST /knob/control - Send control command (routes by zone_id prefix)
 pub async fn knob_control_handler(
     State(state): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(req): Json<KnobControlRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if let Some(id) = extract_knob_id(&headers, None) {
+        state
+            .knobs
+            .get_or_create_with_device_type(
+                &id,
+                extract_knob_version(&headers).as_deref(),
+                extract_device_type(&headers),
+            )
+            .await;
+    }
     // Route based on zone_id prefix
     if req.zone_id.starts_with("lms:") {
         // LMS player control
@@ -1336,6 +1372,19 @@ pub async fn knob_config_handler(
         )
     })?;
 
+    let knob = if extract_device_type(&headers).is_some() {
+        state
+            .knobs
+            .get_or_create_with_device_type(
+                &knob_id,
+                extract_knob_version(&headers).as_deref(),
+                extract_device_type(&headers),
+            )
+            .await
+    } else {
+        knob
+    };
+
     // Build config response with name included in config object (matches frontend expected format)
     let mut config = serde_json::to_value(&knob.config).unwrap_or_default();
     if let serde_json::Value::Object(ref mut obj) = config {
@@ -1422,7 +1471,7 @@ pub async fn knob_config_by_path_handler(
     // Get or create knob (ensures it exists for newly connected devices)
     let knob = state
         .knobs
-        .get_or_create(&knob_id, version.as_deref())
+        .get_or_create_with_device_type(&knob_id, version.as_deref(), extract_device_type(&headers))
         .await;
 
     // Build config response matching Node.js format
@@ -1484,19 +1533,84 @@ struct FirmwareVersionInfo {
     file: Option<String>,
 }
 
-/// Resolve only a known legacy application image. Directory order must never select hardware.
-fn legacy_filename_version(filename: &str) -> Option<String> {
-    let re = regex::Regex::new(r"^roon_knob[_-]?v?(\d+\.\d+\.\d+)\.bin$").ok()?;
-    re.captures(filename)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
+/// Selection is explicit and closed. Conflicting firmware identity never chooses an image.
+#[derive(Deserialize, Default)]
+pub struct FirmwareQuery {
+    pub device_type: Option<String>,
+    pub channel: Option<String>,
 }
 
-fn legacy_firmware_artifact() -> Option<(std::path::PathBuf, FirmwareVersionInfo)> {
-    use crate::firmware_catalog::FirmwareTarget;
-    // The current poller publishes in the root. A proposed per-target cache must not
-    // shadow it until that publisher is migrated as part of multi-device OTA.
-    let directory = firmware_dir();
+enum FirmwareSelectionError {
+    Invalid,
+}
+
+impl IntoResponse for FirmwareSelectionError {
+    fn into_response(self) -> Response {
+        (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"Invalid or conflicting firmware selection", "error_code":"INVALID_FIRMWARE_SELECTION"}))).into_response()
+    }
+}
+
+impl FirmwareQuery {
+    fn selection(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<
+        (
+            crate::firmware_catalog::FirmwareTarget,
+            crate::firmware_catalog::FirmwareChannel,
+        ),
+        FirmwareSelectionError,
+    > {
+        use crate::firmware_catalog::{FirmwareChannel, FirmwareTarget};
+        let invalid = || FirmwareSelectionError::Invalid;
+        let query = self
+            .device_type
+            .as_deref()
+            .map(|value| FirmwareTarget::parse(value).ok_or_else(invalid))
+            .transpose()?;
+        let header = headers
+            .get("X-Device-Type")
+            .map(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(FirmwareTarget::parse)
+                    .ok_or_else(invalid)
+            })
+            .transpose()?;
+        if matches!((query, header), (Some(query), Some(header)) if query != header) {
+            return Err(invalid());
+        }
+        let channel = self
+            .channel
+            .as_deref()
+            .map(|value| FirmwareChannel::parse(value).ok_or_else(invalid))
+            .transpose()?
+            .unwrap_or_default();
+        Ok((
+            query.or(header).unwrap_or(FirmwareTarget::LegacyKnob),
+            channel,
+        ))
+    }
+}
+
+fn firmware_artifact(
+    target: crate::firmware_catalog::FirmwareTarget,
+    channel: crate::firmware_catalog::FirmwareChannel,
+) -> Option<(std::path::PathBuf, FirmwareVersionInfo)> {
+    use crate::firmware_catalog::{FirmwareChannel, FirmwareTarget};
+    let root = firmware_dir();
+    let directory = target.cache_directory(&root, channel);
+    if !std::fs::symlink_metadata(&root).ok()?.is_dir() {
+        return None;
+    }
+    if (target != FirmwareTarget::LegacyKnob || channel != FirmwareChannel::Stable)
+        && !std::fs::symlink_metadata(root.join(channel.slug()))
+            .ok()?
+            .is_dir()
+    {
+        return None;
+    }
     if !std::fs::symlink_metadata(&directory).ok()?.is_dir() {
         return None;
     }
@@ -1511,20 +1625,26 @@ fn legacy_firmware_artifact() -> Option<(std::path::PathBuf, FirmwareVersionInfo
         }
         Err(_) => return None,
     };
-    let filename = version.file.as_deref().unwrap_or("roon_knob.bin");
-    if !FirmwareTarget::LegacyKnob.valid_application_filename(filename) {
+    let default_file = target.application_file();
+    let filename = version.file.as_deref().unwrap_or(&default_file);
+    if !target.valid_application_filename(filename) {
         return None;
     }
-    if let (Some(named_version), Some(metadata_version)) = (
-        legacy_filename_version(filename),
-        version.version.as_deref(),
-    ) {
-        if named_version != metadata_version.trim_start_matches('v') {
+    let named_version = target.filename_version(filename);
+    if target != FirmwareTarget::LegacyKnob || channel != FirmwareChannel::Stable {
+        version.version.as_deref()?;
+    }
+    if let Some(selected_version) = version.version.as_deref().or(named_version) {
+        if !channel.matches_version(selected_version.trim_start_matches('v')) {
+            return None;
+        }
+    }
+    if let (Some(named), Some(metadata)) = (named_version, version.version.as_deref()) {
+        if named != metadata.trim_start_matches('v') {
             return None;
         }
     }
     let path = directory.join(filename);
-    // Reject leaf symlinks as well as directory/metadata redirection above.
     let metadata = std::fs::symlink_metadata(&path).ok()?;
     if !metadata.is_file() || metadata.len() == 0 {
         return None;
@@ -1543,8 +1663,15 @@ fn firmware_not_found() -> Response {
 }
 
 /// GET /firmware/version - Get available firmware version
-pub async fn firmware_version_handler() -> Response {
-    let Some((path, version_info)) = legacy_firmware_artifact() else {
+pub async fn firmware_version_handler(
+    Query(query): Query<FirmwareQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let (target, channel) = match query.selection(&headers) {
+        Ok(selection) => selection,
+        Err(error) => return error.into_response(),
+    };
+    let Some((path, version_info)) = firmware_artifact(target, channel) else {
         return firmware_not_found();
     };
     let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
@@ -1552,7 +1679,7 @@ pub async fn firmware_version_handler() -> Response {
     };
     let version = version_info
         .version
-        .or_else(|| legacy_filename_version(filename));
+        .or_else(|| target.filename_version(filename).map(str::to_string));
     let Some(version) = version else {
         return firmware_not_found();
     };
@@ -1563,10 +1690,17 @@ pub async fn firmware_version_handler() -> Response {
         .into_response()
 }
 
-/// GET /firmware/download - Download the legacy OTA application binary
+/// GET /firmware/download - Download only the selected target/channel OTA application
 #[allow(clippy::unwrap_used)] // Response::builder().body().unwrap() cannot fail with valid inputs
-pub async fn firmware_download_handler() -> Response {
-    let Some((path, _)) = legacy_firmware_artifact() else {
+pub async fn firmware_download_handler(
+    Query(query): Query<FirmwareQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let (target, channel) = match query.selection(&headers) {
+        Ok(selection) => selection,
+        Err(error) => return error.into_response(),
+    };
+    let Some((path, _)) = firmware_artifact(target, channel) else {
         return firmware_not_found();
     };
     let Ok(data) = std::fs::read(&path) else {
@@ -1594,8 +1728,8 @@ pub async fn firmware_download_handler() -> Response {
 /// GET /manifest-s3.json - ESP Web Tools clean installation
 pub async fn manifest_handler() -> Response {
     // /firmware/download serves an OTA application, not a merged installation image.
-    // Advertising it at offset zero overwrites the bootloader. Until installation has
-    // its own approved artifact selector, fail closed instead of offering a bad flash.
+    // Advertising it at offset zero overwrites the bootloader. Browser installation is
+    // excluded from this OTA scope; fail closed instead of offering a bad flash.
     firmware_not_found()
 }
 
@@ -1613,7 +1747,7 @@ pub async fn admin_fetch_firmware_handler(
                 Ok(Json(serde_json::json!({
                     "ok": true,
                     "version": version,
-                    "message": format!("Firmware v{} downloaded", version)
+                    "message": "Firmware caches updated"
                 })))
             } else {
                 let version = FirmwareService::get_current_version();
@@ -1636,6 +1770,28 @@ pub async fn admin_fetch_firmware_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_header_uses_catalog_identity_and_ignores_invalid_values() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(extract_device_type(&headers), None);
+        for (header, expected) in [
+            ("hiphi-frame", Some("frame")),
+            ("hiphi-dial-beta", Some("m5dial")),
+            ("roon-knob", Some("knob")),
+            ("../frame", None),
+            ("frmae", None),
+            ("", None),
+        ] {
+            headers.insert("x-device-type", header.parse().unwrap());
+            assert_eq!(extract_device_type(&headers), expected);
+        }
+        headers.insert(
+            "x-device-type",
+            axum::http::HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert_eq!(extract_device_type(&headers), None);
+    }
 
     fn make_zone(id: &str, name: &str) -> ZoneInfo {
         ZoneInfo {

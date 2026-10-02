@@ -1272,6 +1272,54 @@ mod error_handling {
 mod integration {
     use super::*;
 
+    #[tokio::test]
+    async fn device_identity_header_survives_legacy_reconnect_and_restart() {
+        let app = create_test_app().await;
+        let id = "identity-frame-http";
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/zones")
+                    .header("X-Knob-Id", id)
+                    .header("X-Device-Type", "hiphi-frame")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        for identity in [None, Some("frmae")] {
+            let mut request = Request::builder().uri("/zones").header("X-Knob-Id", id);
+            if let Some(identity) = identity {
+                request = request.header("X-Device-Type", identity);
+            }
+            assert_eq!(
+                app.clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+        }
+        for router in [app, create_test_app().await] {
+            let (status, body) = get_request(&router, "/knob/devices").await;
+            assert_eq!(status, StatusCode::OK);
+            let summary: Value = serde_json::from_str(&body).unwrap();
+            let device = summary["knobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["knob_id"] == id)
+                .expect("controller header must register a device");
+            assert_eq!(device["device_type"], "frame");
+            for legacy_key in ["knob_id", "name", "last_seen", "version", "status"] {
+                assert!(device.get(legacy_key).is_some());
+            }
+        }
+    }
+
     /// Simulate full knob boot sequence
     #[tokio::test]
     async fn knob_boot_sequence() {

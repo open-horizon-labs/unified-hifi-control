@@ -1637,6 +1637,8 @@ pub struct KnobDevicesResponse {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct KnobDevice {
     pub knob_id: String,
+    #[serde(default)]
+    pub device_type: Option<String>,
     pub name: Option<String>,
     pub version: Option<String>,
     pub last_seen: Option<String>,

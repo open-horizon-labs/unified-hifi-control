@@ -361,16 +361,17 @@ pub fn Knobs() -> Element {
             section { id: "firmware-section", class: "mb-8",
                 div { class: "mb-4",
                     h2 { class: "text-xl font-semibold", "Firmware" }
-                    p { class: "text-muted text-sm", "Manage knob firmware updates" }
+                    p { class: "text-muted text-sm", "Local OTA firmware for registered controllers" }
                 }
                 div { class: "card p-6",
+                    p { class: "mb-4 text-sm text-muted", "OTA availability depends on each controller’s reported device type and a matching application image on this Bridge. The version below is for the legacy knob target. Refresh downloads matching published images into the Bridge cache; it does not flash a controller. Use the firmware site for initial installation and USB-only devices." }
                     p { class: "mb-4",
-                        "Current: "
+                        "Legacy knob image on this Bridge: "
                         span { class: "font-semibold",
                             if let Some(ref v) = fw_version {
                                 "v{v}"
                             } else {
-                                "Not installed"
+                                "Not available"
                             }
                         }
                     }
@@ -381,12 +382,14 @@ pub fn Knobs() -> Element {
                             disabled: fw_fetching(),
                             aria_busy: if fw_fetching() { "true" } else { "false" },
                             onclick: fetch_firmware,
-                            "Fetch Latest from GitHub"
+                            "Refresh OTA images"
                         }
                         a {
                             class: "link inline-flex min-h-11 items-center",
-                            href: crate::app::KNOB_FLASHER_URL,
-                            "Flash a new knob"
+                            href: "https://firmware.hiphi.audio/",
+                            target: "_blank",
+                            rel: "noopener noreferrer",
+                            "Firmware releases and installation"
                         }
                         if let Some((is_err, ref msg)) = fw_message() {
                             if is_err {
@@ -510,6 +513,15 @@ fn knob_display_name(knob: &KnobDevice) -> String {
     }
 }
 
+fn controller_type_name(device_type: Option<&str>) -> &'static str {
+    match device_type {
+        Some(value) => crate::firmware_catalog::FirmwareTarget::parse(value)
+            .map(|target| target.name())
+            .unwrap_or("Unknown controller type"),
+        None => "Device type not reported",
+    }
+}
+
 /// Knob row component
 #[component]
 fn KnobRow(knob: KnobDevice, zones: Vec<Zone>, on_config: EventHandler<String>) -> Element {
@@ -541,11 +553,15 @@ fn KnobRow(knob: KnobDevice, zones: Vec<Zone>, on_config: EventHandler<String>) 
 
     let version = knob.version.clone().unwrap_or_else(|| "—".to_string());
     let display_name = knob_display_name(&knob);
+    let device_name = controller_type_name(knob.device_type.as_deref());
     let last_seen = format_ago(knob.last_seen.as_deref());
 
     rsx! {
         tr { class: "border-b border-default",
-            td { class: "py-2", "{display_name}" }
+            td { class: "py-2",
+                div { "{display_name}" }
+                div { class: "text-sm text-muted", "{device_name}" }
+            }
             td { class: "py-2", "{version}" }
             td { class: "py-2", "{ip}" }
             td { class: "py-2", "{zone_name}" }
@@ -1032,5 +1048,39 @@ fn ConfigModal(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod controller_identity_tests {
+    use super::{controller_type_name, KnobDevice};
+
+    #[test]
+    fn older_registration_without_device_type_still_renders() {
+        let device: KnobDevice = serde_json::from_str(r#"{"knob_id":"legacy"}"#).unwrap();
+        assert_eq!(device.device_type, None);
+        assert_eq!(
+            controller_type_name(device.device_type.as_deref()),
+            "Device type not reported"
+        );
+    }
+
+    #[test]
+    fn reported_type_survives_wire_parsing_and_uses_catalog_name() {
+        let device: KnobDevice =
+            serde_json::from_str(r#"{"knob_id":"frame1","device_type":"frame"}"#).unwrap();
+        assert_eq!(device.device_type.as_deref(), Some("frame"));
+        assert_eq!(
+            controller_type_name(device.device_type.as_deref()),
+            "HiPhi Frame"
+        );
+        assert_eq!(
+            controller_type_name(Some("stackchan")),
+            "Kizz Playback Companion"
+        );
+        assert_eq!(
+            controller_type_name(Some("future-model")),
+            "Unknown controller type"
+        );
     }
 }

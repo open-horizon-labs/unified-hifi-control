@@ -120,9 +120,15 @@ pub struct KnobStatus {
     pub ip: Option<String>,
 }
 
+fn legacy_device_type() -> String {
+    "knob".into()
+}
+
 /// Registered knob device
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Knob {
+    #[serde(default = "legacy_device_type")]
+    pub device_type: String,
     pub name: String,
     pub last_seen: DateTime<Utc>,
     pub version: Option<String>,
@@ -200,27 +206,41 @@ impl KnobStore {
         knobs.get(knob_id).cloned()
     }
 
-    /// Get or create knob, updating last_seen and version
+    /// Legacy requests keep the device identity previously observed from explicit headers.
     pub async fn get_or_create(&self, knob_id: &str, version: Option<&str>) -> Knob {
-        let mut knobs = self.knobs.write().await;
+        self.get_or_create_with_device_type(knob_id, version, None)
+            .await
+    }
 
+    /// Register a validated canonical identity, retaining identity when a header is absent or invalid.
+    pub async fn get_or_create_with_device_type(
+        &self,
+        knob_id: &str,
+        version: Option<&str>,
+        device_type: Option<&str>,
+    ) -> Knob {
+        let identity = device_type.and_then(crate::firmware_catalog::FirmwareTarget::parse);
+        let mut knobs = self.knobs.write().await;
         if let Some(knob) = knobs.get_mut(knob_id) {
             knob.last_seen = Utc::now();
             if let Some(v) = version {
                 knob.version = Some(v.to_string());
+            }
+            if let Some(target) = identity {
+                knob.device_type = target.slug().to_string();
             }
             let result = knob.clone();
             drop(knobs);
             self.save_to_disk().await;
             return result;
         }
-
-        // Create new knob
+        // Identity must not silently rewrite a user's power/display configuration.
         let config = KnobConfig::default();
         let name = String::new();
         let config_sha = compute_sha(&config, &name);
-
         let knob = Knob {
+            device_type: identity
+                .map_or_else(legacy_device_type, |target| target.slug().to_string()),
             name,
             last_seen: Utc::now(),
             version: version.map(|s| s.to_string()),
@@ -228,11 +248,9 @@ impl KnobStore {
             config_sha,
             status: KnobStatus::default(),
         };
-
         knobs.insert(knob_id.to_string(), knob.clone());
         drop(knobs);
         self.save_to_disk().await;
-
         tracing::info!("Created new knob: {}", knob_id);
         knob
     }
@@ -340,6 +358,7 @@ impl KnobStore {
             .iter()
             .map(|(id, knob)| KnobSummary {
                 knob_id: id.clone(),
+                device_type: knob.device_type.clone(),
                 name: knob.name.clone(),
                 last_seen: knob.last_seen,
                 version: knob.version.clone(),
@@ -417,6 +436,7 @@ pub struct KnobConfigUpdate {
 /// Summary for listing knobs
 #[derive(Debug, Serialize)]
 pub struct KnobSummary {
+    pub device_type: String,
     pub knob_id: String,
     pub name: String,
     pub last_seen: DateTime<Utc>,

@@ -89,35 +89,34 @@ impl FirmwareTarget {
         }
     }
 
-    pub fn storage_directories(self, root: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut directories = vec![root.join(self.slug())];
-        if self == Self::LegacyKnob {
-            directories.push(root.to_path_buf());
+    pub fn cache_directory(
+        self,
+        root: &std::path::Path,
+        channel: FirmwareChannel,
+    ) -> std::path::PathBuf {
+        if self == Self::LegacyKnob && channel == FirmwareChannel::Stable {
+            root.to_path_buf()
+        } else {
+            root.join(channel.slug()).join(self.slug())
         }
-        directories
+    }
+
+    pub fn filename_version(self, filename: &str) -> Option<&str> {
+        let application = self.application_file();
+        let stem = application.strip_suffix(".bin")?;
+        let suffix = filename.strip_prefix(stem)?.strip_suffix(".bin")?;
+        let version = if self == Self::LegacyKnob {
+            suffix
+                .trim_start_matches(['_', '-'])
+                .trim_start_matches('v')
+        } else {
+            suffix.strip_prefix("_v")?
+        };
+        parse_firmware_version(version).map(|_| version)
     }
 
     pub fn valid_application_filename(self, filename: &str) -> bool {
-        if filename == self.application_file() {
-            return true;
-        }
-        if self != Self::LegacyKnob {
-            return false;
-        }
-        let Some(version) = filename
-            .strip_prefix("roon_knob")
-            .and_then(|s| s.strip_suffix(".bin"))
-        else {
-            return false;
-        };
-        let version = version
-            .trim_start_matches(['_', '-'])
-            .trim_start_matches('v');
-        let parts: Vec<_> = version.split('.').collect();
-        parts.len() == 3
-            && parts
-                .iter()
-                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        filename == self.application_file() || self.filename_version(filename).is_some()
     }
 
     pub fn chip_family(self) -> &'static str {
@@ -198,12 +197,12 @@ mod artifact_tests {
     fn explicit_frame_never_searches_legacy_directory() {
         let root = Path::new("firmware");
         assert_eq!(
-            FirmwareTarget::Frame.storage_directories(root),
-            vec![root.join("frame")]
+            FirmwareTarget::Frame.cache_directory(root, FirmwareChannel::Stable),
+            root.join("stable/frame")
         );
         assert_eq!(
-            FirmwareTarget::LegacyKnob.storage_directories(root),
-            vec![root.join("knob"), root.to_path_buf()]
+            FirmwareTarget::LegacyKnob.cache_directory(root, FirmwareChannel::Stable),
+            root.to_path_buf()
         );
     }
 
@@ -239,4 +238,106 @@ mod deployed_alias_tests {
             assert_eq!(FirmwareTarget::parse(identity), Some(target));
         }
     }
+}
+
+#[cfg(test)]
+mod multi_device_catalog_tests {
+    use super::*;
+    #[test]
+    fn each_target_accepts_only_its_own_valid_versioned_application() {
+        for target in FirmwareTarget::ALL {
+            let stem = target
+                .application_file()
+                .trim_end_matches(".bin")
+                .to_string();
+            for version in ["3.0.0", "3.0.0-beta.2", "3.0.0-alpha.10"] {
+                assert!(target.valid_application_filename(&format!("{stem}_v{version}.bin")));
+            }
+            assert!(!target.valid_application_filename(&format!("{stem}_v../escape.bin")));
+        }
+    }
+}
+
+/// Serving a prerelease requires an explicit query selection; caches are isolated by channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FirmwareChannel {
+    #[default]
+    Stable,
+    Beta,
+    Alpha,
+}
+impl FirmwareChannel {
+    pub const ALL: &'static [Self] = &[Self::Stable, Self::Beta, Self::Alpha];
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "stable" => Some(Self::Stable),
+            "beta" => Some(Self::Beta),
+            "alpha" => Some(Self::Alpha),
+            _ => None,
+        }
+    }
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+            Self::Alpha => "alpha",
+        }
+    }
+    pub fn matches_version(self, version: &str) -> bool {
+        parse_firmware_version(version).is_some_and(|parts| match self {
+            Self::Stable => parts.3 == 2,
+            Self::Beta => parts.3 == 1,
+            Self::Alpha => parts.3 == 0,
+        })
+    }
+}
+
+/// Closed published version grammar: three numeric components, optionally alpha.N/beta.N.
+/// Parsed tuples order alpha before beta before stable, and compare numeric counters correctly.
+fn parse_firmware_version(version: &str) -> Option<(u64, u64, u64, u8, u64)> {
+    let (core, suffix) = version
+        .split_once('-')
+        .map_or((version, None), |(core, suffix)| (core, Some(suffix)));
+    let number = |part: &str| {
+        if part.is_empty()
+            || !part.bytes().all(|b| b.is_ascii_digit())
+            || (part.len() > 1 && part.starts_with('0'))
+        {
+            None
+        } else {
+            part.parse::<u64>().ok()
+        }
+    };
+    let components: Vec<_> = core.split('.').collect();
+    if components.len() != 3 {
+        return None;
+    }
+    let (stage, counter) = match suffix {
+        None => (2, 0),
+        Some(suffix) => {
+            let (stage, counter) = suffix.split_once('.')?;
+            (
+                match stage {
+                    "alpha" => 0,
+                    "beta" => 1,
+                    _ => return None,
+                },
+                number(counter)?,
+            )
+        }
+    };
+    Some((
+        number(components[0])?,
+        number(components[1])?,
+        number(components[2])?,
+        stage,
+        counter,
+    ))
+}
+
+pub fn compare_firmware_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    Some(
+        parse_firmware_version(left.trim_start_matches('v'))?
+            .cmp(&parse_firmware_version(right.trim_start_matches('v'))?),
+    )
 }

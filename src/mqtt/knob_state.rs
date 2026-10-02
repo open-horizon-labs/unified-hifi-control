@@ -60,6 +60,7 @@ mod tests {
 
     fn knob_fixture(last_seen: DateTime<Utc>) -> Knob {
         Knob {
+            device_type: "knob".into(),
             name: "Kitchen Knob".to_string(),
             last_seen,
             version: Some("1.2.3".to_string()),
