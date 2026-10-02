@@ -7,6 +7,7 @@ pub mod artwork;
 pub mod commands;
 pub mod config;
 pub mod identity;
+pub mod music;
 pub mod pairing;
 pub mod protocol;
 mod retry;
