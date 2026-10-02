@@ -137,11 +137,6 @@ impl FirmwareService {
         release_url: &str,
     ) -> Result<()> {
         let fw_dir = Self::firmware_dir();
-        std::fs::create_dir_all(&fw_dir)?;
-
-        let firmware_path = fw_dir.join(FIRMWARE_FILENAME);
-        let temp_path = fw_dir.join(format!("{}.tmp", FIRMWARE_FILENAME));
-
         tracing::info!(
             "Downloading firmware v{} from {}",
             version,
@@ -158,22 +153,8 @@ impl FirmwareService {
         }
 
         let bytes = response.bytes().await?;
-        std::fs::write(&temp_path, &bytes)?;
-
-        // Rename temp to final
-        std::fs::rename(&temp_path, &firmware_path)?;
-
-        // Write version.json
-        let version_info = FirmwareVersion {
-            version: version.to_string(),
-            file: FIRMWARE_FILENAME.to_string(),
-            fetched_at: chrono::Utc::now().to_rfc3339(),
-            release_url: Some(release_url.to_string()),
-        };
-
-        let version_path = fw_dir.join("version.json");
-        std::fs::write(&version_path, serde_json::to_string_pretty(&version_info)?)?;
-
+        let firmware_path =
+            publish_firmware_with_checkpoint(&fw_dir, &bytes, version, release_url, || {})?;
         let size = std::fs::metadata(&firmware_path)?.len();
         tracing::info!(
             "Firmware v{} downloaded successfully ({} bytes)",
@@ -313,5 +294,233 @@ impl FirmwareService {
                 }
             }
         });
+    }
+}
+
+// Polling and manual fetch create separate service instances. Serialize publication,
+// not networking, so their metadata switches cannot interleave or downgrade the cache.
+static PUBLICATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A unique owned temporary file cleans up on every error path. create_new prevents
+/// sharing a staging filename between concurrent fetches; UUIDs do not name public files.
+struct TemporaryFirmwareFile {
+    path: PathBuf,
+}
+
+impl TemporaryFirmwareFile {
+    fn create(directory: &std::path::Path, bytes: &[u8]) -> Result<Self> {
+        use std::io::Write;
+        let path = directory.join(format!(".firmware-{}.tmp", uuid::Uuid::new_v4()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        let temporary = Self { path };
+        let result = file.write_all(bytes).and_then(|_| file.sync_all());
+        drop(file);
+        result?;
+        Ok(temporary)
+    }
+}
+
+impl Drop for TemporaryFirmwareFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn publish_firmware_with_checkpoint(
+    directory: &std::path::Path,
+    bytes: &[u8],
+    version: &str,
+    release_url: &str,
+    before_metadata: impl FnOnce(),
+) -> Result<PathBuf> {
+    let parts: Vec<_> = version.split('.').collect();
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(anyhow!("Invalid stable firmware version"));
+    }
+    if bytes.is_empty() {
+        return Err(anyhow!("Empty firmware image"));
+    }
+    let _publication = PUBLICATION_LOCK
+        .lock()
+        .map_err(|_| anyhow!("Firmware publication lock poisoned"))?;
+    std::fs::create_dir_all(directory)?;
+    if !std::fs::symlink_metadata(directory)?.is_dir() {
+        return Err(anyhow!("Firmware directory is not a directory"));
+    }
+    let metadata_path = directory.join("version.json");
+    if std::fs::symlink_metadata(&metadata_path).is_ok_and(|metadata| metadata.is_file()) {
+        if let Ok(previous) = std::fs::read(&metadata_path).and_then(|bytes| {
+            serde_json::from_slice::<FirmwareVersion>(&bytes).map_err(std::io::Error::other)
+        }) {
+            if FirmwareService::is_newer_version(&previous.version, version) {
+                return Err(anyhow!("Refusing to replace newer firmware metadata"));
+            }
+        }
+    }
+    let filename = format!("roon_knob_v{version}.bin");
+    let path = directory.join(&filename);
+    let temporary = TemporaryFirmwareFile::create(directory, bytes)?;
+    // hard_link publishes a complete file without replacing an existing version.
+    // A repeated download is idempotent only when the published bytes match exactly.
+    match std::fs::hard_link(&temporary.path, &path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !std::fs::symlink_metadata(&path)?.is_file() || std::fs::read(&path)? != bytes {
+                return Err(anyhow!("Published firmware version has different bytes"));
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    before_metadata();
+    let info = FirmwareVersion {
+        version: version.to_string(),
+        file: filename,
+        fetched_at: chrono::Utc::now().to_rfc3339(),
+        release_url: Some(release_url.to_string()),
+    };
+    let metadata = TemporaryFirmwareFile::create(directory, &serde_json::to_vec_pretty(&info)?)?;
+    std::fs::rename(&metadata.path, metadata_path)?;
+    Ok(path)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod publication_tests {
+    use super::*;
+
+    fn current(directory: &std::path::Path) -> FirmwareVersion {
+        serde_json::from_slice(&std::fs::read(directory.join("version.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn reader_during_publication_sees_old_consistent_bundle_until_metadata_switches() {
+        let directory = tempfile::tempdir().unwrap();
+        publish_firmware_with_checkpoint(directory.path(), b"old bytes", "2.5.2", "release", || {})
+            .unwrap();
+        publish_firmware_with_checkpoint(
+            directory.path(),
+            b"new bytes",
+            "2.5.3",
+            "release",
+            || {
+                let metadata = current(directory.path());
+                assert_eq!(metadata.version, "2.5.2");
+                assert_eq!(
+                    std::fs::read(directory.path().join(metadata.file)).unwrap(),
+                    b"old bytes"
+                );
+            },
+        )
+        .unwrap();
+        let metadata = current(directory.path());
+        assert_eq!(metadata.version, "2.5.3");
+        assert_eq!(
+            std::fs::read(directory.path().join(metadata.file)).unwrap(),
+            b"new bytes"
+        );
+    }
+
+    #[test]
+    fn invalid_version_cannot_name_an_artifact_or_replace_previous_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        publish_firmware_with_checkpoint(directory.path(), b"old", "2.5.2", "release", || {})
+            .unwrap();
+        for invalid in ["../../escape", "", "alpha", "2.5.3/evil", "2.5.3-alpha.1"] {
+            assert!(publish_firmware_with_checkpoint(
+                directory.path(),
+                b"bad",
+                invalid,
+                "release",
+                || {}
+            )
+            .is_err());
+            assert_eq!(current(directory.path()).version, "2.5.2");
+        }
+    }
+
+    #[test]
+    fn same_version_cannot_overwrite_published_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        publish_firmware_with_checkpoint(directory.path(), b"original", "2.5.2", "release", || {})
+            .unwrap();
+        assert!(publish_firmware_with_checkpoint(
+            directory.path(),
+            b"replacement",
+            "2.5.2",
+            "release",
+            || {}
+        )
+        .is_err());
+        let metadata = current(directory.path());
+        assert_eq!(
+            std::fs::read(directory.path().join(metadata.file)).unwrap(),
+            b"original"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod publication_isolation_tests {
+    use super::*;
+    #[test]
+    fn temporary_files_are_unique_and_cleaned_up() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = TemporaryFirmwareFile::create(directory.path(), b"one").unwrap();
+        let second = TemporaryFirmwareFile::create(directory.path(), b"two").unwrap();
+        assert_ne!(first.path, second.path);
+        assert_eq!(std::fs::read(&first.path).unwrap(), b"one");
+        assert_eq!(std::fs::read(&second.path).unwrap(), b"two");
+        let paths = [first.path.clone(), second.path.clone()];
+        drop(first);
+        drop(second);
+        assert!(paths.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn older_concurrent_fetch_cannot_downgrade_newer_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        publish_firmware_with_checkpoint(directory.path(), b"new", "2.5.3", "release", || {})
+            .unwrap();
+        assert!(publish_firmware_with_checkpoint(
+            directory.path(),
+            b"old",
+            "2.5.2",
+            "release",
+            || {}
+        )
+        .is_err());
+        let metadata: FirmwareVersion =
+            serde_json::from_slice(&std::fs::read(directory.path().join("version.json")).unwrap())
+                .unwrap();
+        assert_eq!(metadata.version, "2.5.3");
+        assert_eq!(
+            std::fs::read(directory.path().join(metadata.file)).unwrap(),
+            b"new"
+        );
+    }
+
+    #[test]
+    fn identical_version_retry_is_safe_but_empty_image_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let first =
+            publish_firmware_with_checkpoint(directory.path(), b"valid", "2.5.2", "release", || {})
+                .unwrap();
+        let second =
+            publish_firmware_with_checkpoint(directory.path(), b"valid", "2.5.2", "release", || {})
+                .unwrap();
+        assert_eq!(first, second);
+        assert!(
+            publish_firmware_with_checkpoint(directory.path(), b"", "2.5.3", "release", || {})
+                .is_err()
+        );
+        assert!(!directory.path().join("roon_knob_v2.5.3.bin").exists());
     }
 }
