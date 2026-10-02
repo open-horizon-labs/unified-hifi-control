@@ -24,13 +24,17 @@ The owner authorized merging open work already tested on 192.168.1.2 and request
 |---|---|---|
 | Tested relay work | PR #745 integrated and merged to v4 | Deployed exact SHA, owner use, green CI, 122 passing local tests |
 | Relay display stability | Artwork changes retain clock anchor; source changes emit metadata boundaries even when text matches; sole-source guidance corrected | Both new regressions failed first; 5 clock and 10 frame tests pass; audio preservation tests retained |
-| HiPhi identity (#668) | Shared footer links “A HiPhi project” to hiphi.audio; accessible product name and README updated | Copy checks, strict Clippy, formatting; runtime visual review remains a separate gate |
+| HiPhi identity (#668) | Shared footer links “A HiPhi project” to hiphi.audio; accessible product name and README updated | Copy checks, strict Clippy, formatting; light/dark shared-footer preview and Settings navigation verified at `730c254e`; eight Cloud actions corrected to use the existing button styles and rebuilt at `c4db7b3e` |
 | License explanation (#738) | README and INSTALL explain noncommercial use and commercial deployments consistently | Governing LICENSE text unchanged; no new legal grant asserted |
 | Multi-firmware (#274–276) | Legacy OTA safety and immutable publication implemented; nine-family catalog prepared; new selectors and device UI await approved API additions | See firmware section; no physical flashing performed |
-| Reproducible CI (#340) | Pin a reviewed blocking Rust toolchain; preserve an advisory latest-stable signal | Local strict Clippy and 14 workflow contracts pass, including cache/filter mutation checks; Actions pending |
-| CodeRabbit | Owner requested disabling repo automation and removing blocking bot reviews | Blocking reviews dismissed; [PR #752](https://github.com/open-horizon-labs/unified-hifi-control/pull/752) contains disabled configuration and reviewed CI baseline; Actions pending; token cannot remove org-owned app installation |
+| Reproducible CI (#340) | Pin a reviewed blocking Rust toolchain; preserve an advisory latest-stable signal | Local strict Clippy and 14 workflow contracts pass, including cache/filter mutation checks. Hosted CI exposed missing isolated Cargo tools on PATH; a failing-then-passing behavioral regression and shared setup fix cover paths containing spaces. Updated Actions pending |
+| CodeRabbit | Owner requested disabling repo automation and removing blocking bot reviews | Blocking reviews dismissed; [PR #752](https://github.com/open-horizon-labs/unified-hifi-control/pull/752) contains disabled reviews/statuses/replies/issue automation and reviewed CI baseline; updated Actions pending; token cannot remove org-owned app installation |
 
 QNAP and Synology package contracts also passed locally. The Mac standalone Tailwind binary was killed on launch, so generated CSS was built with the same Tailwind 4.1.18 Node CLI using temporary npm-cache dependencies. The downloaded Dioxus 0.7.10 archive matched its published SHA-256. Local bundling required `DYLD_LIBRARY_PATH` pointing to the Rust toolchain lib directory so rust-objcopy could load libLLVM; no system library paths were modified.
+
+## CodeRabbit removal boundary
+
+The owner explicitly requested disabling CodeRabbit. The configuration disables automatic and incremental reviews, blocking change requests, commit/check/review status publishing, labels, unsolicited replies, issue enrichment and planning. The two blocking reviews on #745 were dismissed and that PR merged. [CodeRabbit documents that each feature branch supplies its own YAML](https://docs.coderabbit.ai/getting-started/yaml-configuration), so this is effective on the prepared branches; older branches can still carry their prior configuration. PR #752 must merge and be synchronized into those branches to inherit it. Complete app removal was attempted through GitHub and denied because it requires organization-owner permission. No alternate credential or permission bypass was attempted.
 
 ## Feature audit and release priority
 
@@ -50,6 +54,12 @@ QNAP and Synology package contracts also passed locally. The Mac standalone Tail
 | Home Assistant | Integration/add-on workflows exist | Ingress/discovery/installation/distribution issues span separate repos (#581/#605/#613/#614); validate exact release packages, not just Rust unit tests |
 | Premium updates/signing (#663/#561) | Documented future authority and packaging work | Signed manifests depend on Cloud work; signing/notarization and hardware update validation remain release gates, not hidden assumptions |
 | Historical adaptive/voice work | Multiple open v3 and stacked PRs | Re-plan against current v4 and approved protocol contracts; no wholesale merge of old branches |
+
+## Public hiphi.audio site audit
+
+A fresh read-only pass checked the home page, controllers, onboarding, MCP, Cloud sign-in and Stable/Beta/Alpha firmware centers. The local/Cloud boundary is consistent with UHC: Cloud is labeled Alpha and local playback authority remains on the Bridge. The nine-controller catalog distinguishes channel and hardware limitations. Sample Tough manifests bind ESP32 while Dial/Kizz bind ESP32-S3; sample merged-binary URLs returned HTTP 200. This verifies published metadata and availability, not physical flashing.
+
+Concrete site corrections: [the MCP page](https://hiphi.audio/mcp.html) still names v3 and exposes an unfinished screenshot placeholder; [getting started](https://hiphi.audio/getting-started.html) calls HA ingress planned despite the current beta add-on enabling it; [the firmware center](https://hiphi.audio/flash/) mentions Firefox while channel installers direct users to Chrome/Edge. Installation instructions also need an explicit stable/v4-beta choice because GitHub latest stable is v3.6.0 while the promoted streaming/Cloud line is v4.0.0-beta.1. The Docker `latest` tag must not be relabeled as v4 without verifying its published image. These findings concern a separate site repository and do not justify merging site history into UHC.
 
 ## Dependency security audit
 
@@ -81,9 +91,9 @@ Firmware-side limitations are real: Dial's `ota_update.c` does not send the devi
 | Guess a playback epoch from seek position | Retain backward seek tests and document unobservable identical entries | Accepted boundary: provider epoch absent; no heuristic added |
 | Serve another device's image or an app image at flash offset zero | Cross-target, missing image, traversal, legacy and app/merged route tests | Retired for existing legacy routes: behavioral red/green tests reject wrong/missing/empty/symlink/escaping artifacts and conflicting versions; unsafe clean-install manifest fails closed |
 | Quietly move stable firmware users to alpha | Channel-selection and independent per-target metadata tests | Approval/implementation pending |
-| New compiler makes unchanged code fail | Pinned strict gate plus separate visible latest-stable advisory | CI work in progress |
-| Brand polish changes product/API identity or license | Preserve UHC, IDs/routes, existing LICENSE; API contract | Source checks pass; integrated checks pending |
-| Claim a server-only build validates interactive UI | Build Dioxus WASM, then server with embedded current assets; fresh browser observation | Dioxus 0.7.10 WASM client build passed on Rust 1.98.1; native build/browser observation pending |
+| New compiler makes unchanged code fail | Pinned strict gate plus separate visible latest-stable advisory | Pinned checks passed on the previous CI head; tool-discovery correction is verified locally and awaits updated CI |
+| Brand polish changes product/API identity or license | Preserve UHC, IDs/routes, existing LICENSE; API contract | Source checks and final API contracts pass; shared footer observed in light and dark themes |
+| Claim a server-only build validates interactive UI | Build Dioxus WASM, then server with embedded current assets; fresh browser observation | Dioxus 0.7.10 WASM and native builds passed on Rust 1.98.1; immutable runtime SHA `730c254e`, shared branding and Settings navigation verified. Styling follow-up builds/runtime SHA `c4db7b3e` also passed |
 | Treat skipped live-provider tests as passed | Explicitly report ignored/host-gated tests and physical checks | Retired by evidence reporting; physical checks remain release gates |
 
 ## Delivered validation
@@ -91,15 +101,15 @@ Firmware-side limitations are real: Dial's `ota_update.c` does not send the devi
 - Relay baseline: 122 passed, one live-device test ignored. Follow-ups: 5 clock and 10 frame tests passed, with the new failures observed before fixes.
 - Firmware: 12 catalog/publication library tests, the comprehensive real-route safety scenario, and 2 public API contract tests passed. The wrong-device fallback, old-metadata/new-bytes race, invalid version, stale storage precedence, and version mismatch all failed before correction. Both logical changes passed strict Clippy and formatting and received independent review.
 - Dependency patch: 42 Cloud connector and 6 credential persistence tests passed.
-- CI: 14 workflow contracts pass; adverse toolchain, CSS, advisory, cache-key and path-filter mutations are rejected.
+- CI: 14 workflow contracts pass; adverse toolchain, CSS, advisory, cache-key and path-filter mutations are rejected. The actual shared setup shell blocks also pass a behavioral regression proving that tools in a Cargo path containing spaces are executable in the next workflow step. Hosted integration CI first exposed this defect as `dx: command not found` after a successful installation; it is corrected, with updated Actions pending.
 - Package contracts: QNAP and Synology passed locally.
-- A first native and WASM build passed. A shared-target executable was subsequently replaced by another worker before preview launch; its status SHA exposed the mix-up. That preview is not counted as integrated runtime evidence. Final verification must use a copied immutable executable and a matching status SHA.
+- Combined WASM and native builds passed at `730c254e`, followed by all 17 final firmware/API/workflow contract tests. A copied immutable executable reported the same SHA at `/status` and in a fresh browser. The shared footer rendered in light and HiPhi Dark themes, and client navigation reached Settings. A subsequent eight-button styling correction passed another combined WASM/native build and immutable runtime SHA check at `c4db7b3e`. A second fresh visual check of that last styling correction remains unverified because the browser automation reported an ambiguous tab binding. Earlier preview evidence from a shared-target executable overwritten by another worker was excluded.
 
 ## Review and completion gates
 
 The frame remains a readiness integration pass, not completion of every provider roadmap epic. The first implementation pass targets defects supported by current evidence. Expanding into new service providers, paid capability policy, or old adaptive protocol schemas would need a new bounded decision.
 
-Before release: final integrated tests and build, target QNAP installation and owner playback check, device-specific firmware and clean-install checks, desktop/mobile/theme/ingress visual checks, and the independent Cloud/Apple signing gates that apply to the selected release scope. A draft integration PR is a review artifact, not evidence these gates passed.
+Before release: green final-head CI, target QNAP installation and owner playback check, device-specific firmware and clean-install checks, remaining mobile/ingress and complete theme/state visual checks, and the independent Cloud/Apple signing gates that apply to the selected release scope. A draft integration PR is a review artifact, not evidence these gates passed.
 
 ## Open PR disposition at audit start
 
