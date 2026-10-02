@@ -36,7 +36,7 @@ jobs:
         run: make css
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
         with:
           components: clippy, rustfmt
 

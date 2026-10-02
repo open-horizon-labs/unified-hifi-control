@@ -201,3 +201,91 @@ fn parallel_fleet_workers_do_not_share_mutable_rust_toolchains() {
         ));
     }
 }
+
+#[test]
+fn blocking_rust_setups_share_one_reviewed_baseline() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let pin =
+        fs::read_to_string(root.join("rust-toolchain.toml")).expect("reviewed baseline is missing");
+    let channel = pin
+        .lines()
+        .find(|line| line.starts_with("channel = "))
+        .expect("pin needs a channel");
+    let release = channel.split('"').nth(1).unwrap();
+    let parts: Vec<_> = release.split('.').collect();
+    assert!(
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())),
+        "blocking baseline must name an exact release"
+    );
+    let action = fs::read_to_string(root.join(".github/actions/setup-rust/action.yml")).unwrap();
+    assert!(action.contains("rust-toolchain.toml"));
+    assert!(action.contains("RUSTUP_TOOLCHAIN="));
+    for entry in fs::read_dir(root.join(".github/workflows")).unwrap() {
+        let path = entry.unwrap().path();
+        let source = fs::read_to_string(&path).unwrap();
+        let baseline_source = if source.contains("\n  lint-latest-stable:") {
+            source.replace(&job(&source, "lint-latest-stable"), "")
+        } else {
+            source.clone()
+        };
+        assert!(
+            !baseline_source.contains("dtolnay/rust-toolchain@"),
+            "{} bypasses the reviewed setup action",
+            path.display()
+        );
+        assert!(
+            !source.contains("dtolnay/rust-toolchain@stable"),
+            "{} floats a blocking Rust setup",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn every_lint_path_builds_css_before_compilation() {
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    for entry in fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.display();
+        let source = fs::read_to_string(&path).unwrap();
+        for id in source
+            .lines()
+            .filter(|line| {
+                line.starts_with("  ") && !line.starts_with("    ") && line.ends_with(':')
+            })
+            .map(|line| line.trim().trim_end_matches(':'))
+        {
+            let body = job(&source, id);
+            if !body.contains("cargo clippy") && !body.contains("cargo +stable clippy") {
+                continue;
+            }
+            let compile = body
+                .find("cargo clippy")
+                .or_else(|| body.find("cargo +stable clippy"))
+                .unwrap();
+            assert!(
+                body[..compile].contains("make css"),
+                "{name} lint path lacks its embedded CSS prerequisite"
+            );
+            assert!(
+                body.contains("-- -D warnings"),
+                "{name} weakened lint enforcement"
+            );
+        }
+    }
+}
+
+#[test]
+fn latest_stable_lints_are_visible_and_advisory() {
+    let source = workflow("build.yml");
+    let advisory = job(&source, "lint-latest-stable");
+    assert!(advisory.contains("continue-on-error: true"));
+    assert!(advisory.contains("cargo +stable clippy -- -D warnings"));
+    assert!(advisory.contains("if: always()"));
+    assert!(advisory.contains("$GITHUB_STEP_SUMMARY"));
+    assert!(job(&source, "lint").contains("$GITHUB_STEP_SUMMARY"));
+    assert!(!job(&source, "lint").contains("continue-on-error: true"));
+}
