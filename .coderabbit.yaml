@@ -9,3 +9,14 @@ reviews:
   auto_review:
     enabled: false
     auto_incremental_review: false
+chat:
+  auto_reply: false
+issue_enrichment:
+  auto_enrich:
+    enabled: false
+  planning:
+    enabled: false
+    auto_planning:
+      enabled: false
+  labeling:
+    auto_apply_labels: false
