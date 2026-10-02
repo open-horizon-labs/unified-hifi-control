@@ -522,9 +522,9 @@ jobs:
           # Only inputs that can change the generated web assets belong here.
           # Server-only changes (adapters, logging, cloud runtime, packaging) do
           # not require rebuilding the client bundle or its static shell.
-          key: wasm-v4-tw4.1.18-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/lib.rs', 'src/app/**/*.rs', 'src/components/**/*.rs', 'src/adaptive/**/*.rs', 'assets/**', 'src/input.css', 'public/**') }}
+          key: wasm-v4-rust1.98.1-tw4.1.18-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/lib.rs', 'src/app/**/*.rs', 'src/components/**/*.rs', 'src/adaptive/**/*.rs', 'assets/**', 'src/input.css', 'public/**') }}
           restore-keys: |
-            wasm-v4-
+            wasm-v4-rust1.98.1-
 
       # Verify cache is an EXACT key match and content is valid.
       # restore-keys can load stale WASM from a previous build — file existence
@@ -546,15 +546,20 @@ jobs:
 
       - name: Setup Rust
         if: steps.check-cache.outputs.needs_build == 'true'
+        # LLVM 23 in Rust 1.99 breaks wasm-bindgen's adapter pass for this
+        # Dioxus build (upstream: https://github.com/DioxusLabs/dioxus/issues/5766).
+        # Keep native lint/build jobs on stable; isolate the workaround to WASM.
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.98.1
           targets: wasm32-unknown-unknown
+          components: llvm-tools-preview
 
       - name: Cache Rust dependencies
         if: steps.check-cache.outputs.needs_build == 'true' && runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "wasm-build"
+          shared-key: "wasm-build-rust1.98.1"
           cache-all-crates: true
           cache-on-failure: true
 
@@ -731,18 +736,20 @@ jobs:
           cargo clean -p unified-hifi-control 2>/dev/null || true
           cargo zigbuild --release --target x86_64-unknown-linux-musl \
             --features naa-proxy \
-            --bin unified-hifi-control --bin uhc-hiphi-pair
+            --bin unified-hifi-control --bin uhc-hiphi-pair --bin uhc-music-details
 
       - name: Rename binary
         run: |
           mkdir -p dist/bin
           cp target/x86_64-unknown-linux-musl/release/unified-hifi-control dist/bin/unified-hifi-linux-x64
           cp target/x86_64-unknown-linux-musl/release/uhc-hiphi-pair dist/bin/uhc-hiphi-pair-x64
+          cp target/x86_64-unknown-linux-musl/release/uhc-music-details dist/bin/uhc-music-details-x64
 
       - name: Verify ELF hardening
         run: |
           scripts/check-elf-hardening.sh dist/bin/unified-hifi-linux-x64
           scripts/check-elf-hardening.sh dist/bin/uhc-hiphi-pair-x64
+          scripts/check-elf-hardening.sh dist/bin/uhc-music-details-x64
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
@@ -1042,7 +1049,7 @@ jobs:
           cargo clean -p unified-hifi-control 2>/dev/null || true
           cargo zigbuild --release --target ${{ matrix.target }} \
             --features naa-proxy \
-            --bin unified-hifi-control --bin uhc-hiphi-pair
+            --bin unified-hifi-control --bin uhc-hiphi-pair --bin uhc-music-details
 
       - name: Smoke test armv7 binary
         if: matrix.target == 'armv7-unknown-linux-musleabihf'
@@ -1055,11 +1062,13 @@ jobs:
           mkdir -p dist/bin
           cp target/${{ matrix.target }}/release/unified-hifi-control dist/bin/${{ matrix.output }}
           cp target/${{ matrix.target }}/release/uhc-hiphi-pair dist/bin/uhc-hiphi-pair-${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/uhc-music-details dist/bin/uhc-music-details-${{ matrix.arch }}
 
       - name: Verify ELF hardening
         run: |
           scripts/check-elf-hardening.sh dist/bin/${{ matrix.output }}
           scripts/check-elf-hardening.sh dist/bin/uhc-hiphi-pair-${{ matrix.arch }}
+          scripts/check-elf-hardening.sh dist/bin/uhc-music-details-${{ matrix.arch }}
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
@@ -1124,6 +1133,7 @@ jobs:
           path: |
             target/x86_64-apple-darwin/release/unified-hifi-control
             target/x86_64-apple-darwin/release/uhc-hiphi-pair
+            target/x86_64-apple-darwin/release/uhc-music-details
           retention-days: 5
 
   build-macos-arm64:
@@ -1182,6 +1192,7 @@ jobs:
           path: |
             target/aarch64-apple-darwin/release/unified-hifi-control
             target/aarch64-apple-darwin/release/uhc-hiphi-pair
+            target/aarch64-apple-darwin/release/uhc-music-details
           retention-days: 5
 
   build-macos-universal:
@@ -1217,8 +1228,13 @@ jobs:
             x64/uhc-hiphi-pair \
             arm64/uhc-hiphi-pair \
             -output dist/bin/uhc-hiphi-pair-macos-universal
+          lipo -create \
+            x64/uhc-music-details \
+            arm64/uhc-music-details \
+            -output dist/bin/uhc-music-details-macos-universal
           file dist/bin/unified-hifi-macos-universal
           file dist/bin/uhc-hiphi-pair-macos-universal
+          file dist/bin/uhc-music-details-macos-universal
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
@@ -1404,6 +1420,7 @@ jobs:
           mkdir -p dist/bin
           cp target/release/unified-hifi-control.exe dist/bin/unified-hifi-win64.exe
           cp target/release/uhc-hiphi-pair.exe dist/bin/uhc-hiphi-pair-win64.exe
+          cp target/release/uhc-music-details.exe dist/bin/uhc-music-details-win64.exe
 
       # Windows Authenticode signing (issue #561): deferred until Windows
       # matters commercially. Prepared but inactive - gated on
@@ -1428,8 +1445,10 @@ jobs:
           fi
           "$SIGNTOOL" sign /f cert.pfx /p "$CERT_PASSWORD" /tr http://timestamp.digicert.com /td sha256 /fd sha256 dist/bin/unified-hifi-win64.exe
           "$SIGNTOOL" sign /f cert.pfx /p "$CERT_PASSWORD" /tr http://timestamp.digicert.com /td sha256 /fd sha256 dist/bin/uhc-hiphi-pair-win64.exe
+          "$SIGNTOOL" sign /f cert.pfx /p "$CERT_PASSWORD" /tr http://timestamp.digicert.com /td sha256 /fd sha256 dist/bin/uhc-music-details-win64.exe
           "$SIGNTOOL" verify /pa dist/bin/unified-hifi-win64.exe
           "$SIGNTOOL" verify /pa dist/bin/uhc-hiphi-pair-win64.exe
+          "$SIGNTOOL" verify /pa dist/bin/uhc-music-details-win64.exe
           rm -f cert.pfx
 
       - name: Note unsigned Windows binary
@@ -2057,6 +2076,7 @@ jobs:
             --after-install build/linux/postinst.sh \
             dist/bin/unified-hifi-linux-x64=/usr/bin/unified-hifi-control \
             dist/bin/uhc-hiphi-pair-x64=/usr/bin/uhc-hiphi-pair \
+            dist/bin/uhc-music-details-x64=/usr/bin/uhc-music-details \
             build/linux/unified-hifi-control.service=/etc/systemd/system/unified-hifi-control.service
 
       - name: Build rpm package (x64)
@@ -2071,6 +2091,7 @@ jobs:
             --after-install build/linux/postinst.sh \
             dist/bin/unified-hifi-linux-x64=/usr/bin/unified-hifi-control \
             dist/bin/uhc-hiphi-pair-x64=/usr/bin/uhc-hiphi-pair \
+            dist/bin/uhc-music-details-x64=/usr/bin/uhc-music-details \
             build/linux/unified-hifi-control.service=/etc/systemd/system/unified-hifi-control.service
 
       - name: Build deb package (arm64)
@@ -2086,6 +2107,7 @@ jobs:
             --after-install build/linux/postinst.sh \
             dist/bin/unified-hifi-linux-arm64=/usr/bin/unified-hifi-control \
             dist/bin/uhc-hiphi-pair-arm64=/usr/bin/uhc-hiphi-pair \
+            dist/bin/uhc-music-details-arm64=/usr/bin/uhc-music-details \
             build/linux/unified-hifi-control.service=/etc/systemd/system/unified-hifi-control.service
 
       - name: Build deb package (armv7/armhf)
@@ -2101,6 +2123,7 @@ jobs:
             --after-install build/linux/postinst.sh \
             dist/bin/unified-hifi-linux-armv7=/usr/bin/unified-hifi-control \
             dist/bin/uhc-hiphi-pair-armv7=/usr/bin/uhc-hiphi-pair \
+            dist/bin/uhc-music-details-armv7=/usr/bin/uhc-music-details \
             build/linux/unified-hifi-control.service=/etc/systemd/system/unified-hifi-control.service
 
       - name: Upload Linux packages
@@ -2158,6 +2181,7 @@ jobs:
           find artifacts -name "unified-hifi-*" -type f \
             ! -name "*.js" ! -name "*.wasm" \
             -exec cp {} release/ \;
+          find artifacts -name "uhc-music-details-*" -type f -exec cp {} release/ \;
           find artifacts -name "*.deb" -type f -exec cp {} release/ \;
           find artifacts -name "*.rpm" -type f -exec cp {} release/ \;
           find artifacts -name "*.zip" -type f -exec cp {} release/ \;

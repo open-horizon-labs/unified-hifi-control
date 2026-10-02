@@ -2,7 +2,7 @@
 
 The music-details client uses the installation key and owner-only pairing configuration already created by HiPhi pairing. It sends a dedicated signed metadata read to the production HiPhi authority. No provider token, owner cookie or Garmin grant is shared, and no subscription check is required. The cloud capability is independently deployable; old UHC builds continue listening normally when it is absent or disabled.
 
-Build this optional CLI with `cargo build --bin uhc-music-details --no-default-features --features server`. The existing release installer does not yet bundle it. For an explicit playing zone on this UHC host (default local HTTP port 8088):
+Build this optional CLI with `cargo build --bin uhc-music-details --no-default-features --features server`. Release builds publish standalone `uhc-music-details-*` binaries for Linux, macOS, and Windows; Linux deb/rpm packages install it as `/usr/bin/uhc-music-details`. Other package formats do not yet bundle the CLI. For an explicit playing zone on this UHC host (default local HTTP port 8088):
 
 ```sh
 uhc-music-details --zone 'roon:EXPLICIT_ZONE_ID' en
