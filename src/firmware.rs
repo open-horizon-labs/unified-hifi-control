@@ -2,6 +2,8 @@
 //!
 //! Polls GitHub releases for new knob firmware and downloads automatically.
 
+pub use crate::firmware_catalog as catalog;
+
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
