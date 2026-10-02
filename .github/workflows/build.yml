@@ -508,6 +508,7 @@ jobs:
         run: |
           echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
           echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
+          echo "${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo/bin" >> "$GITHUB_PATH"
 
       - name: Cache WASM build output
         id: cache-wasm
