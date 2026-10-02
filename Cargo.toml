@@ -89,7 +89,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Async utilities (shared)
 futures = "0.3"
-async-trait = "0.1"
+async-trait = "0.1.92"
 
 # Base64 (shared)
 base64 = "0.22.1"
@@ -190,6 +190,11 @@ required-features = ["server"]
 [[bin]]
 name = "uhc-hiphi-pair"
 path = "src/bin/uhc_hiphi_pair.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "uhc-music-details"
+path = "src/bin/uhc_music_details.rs"
 required-features = ["server"]
 
 [dev-dependencies]
