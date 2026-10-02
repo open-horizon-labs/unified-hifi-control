@@ -386,7 +386,7 @@ pub fn Knobs() -> Element {
                         }
                         a {
                             class: "link inline-flex min-h-11 items-center",
-                            href: "https://firmware.hiphi.audio/",
+                            href: crate::app::KNOB_FLASHER_URL,
                             target: "_blank",
                             rel: "noopener noreferrer",
                             "Firmware releases and installation"
