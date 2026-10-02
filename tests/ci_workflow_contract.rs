@@ -289,3 +289,34 @@ fn latest_stable_lints_are_visible_and_advisory() {
     assert!(job(&source, "lint").contains("$GITHUB_STEP_SUMMARY"));
     assert!(!job(&source, "lint").contains("continue-on-error: true"));
 }
+
+#[test]
+fn compiler_changes_invalidate_wasm_output_and_trigger_platform_validation() {
+    let source = workflow("build.yml");
+    let wasm = job(&source, "build-wasm");
+    let key = wasm
+        .lines()
+        .find(|line| line.trim_start().starts_with("key: wasm-"))
+        .expect("WASM cache key is missing");
+    for input in [
+        "rust-toolchain.toml",
+        ".github/actions/setup-rust/action.yml",
+    ] {
+        assert!(
+            key.contains(input),
+            "WASM cache does not include compiler input {input}"
+        );
+        for name in [
+            "streaming-alpha.yml",
+            "hiphi-cloud-connector.yml",
+            "windows-connector.yml",
+        ] {
+            let source = workflow(name);
+            let triggers = source.split("jobs:").next().unwrap();
+            assert!(
+                triggers.contains(input),
+                "{name} skips validation for compiler input {input}"
+            );
+        }
+    }
+}

@@ -4,6 +4,8 @@ on:
   pull_request:
     branches: [v4]
     paths:
+      - "rust-toolchain.toml"
+      - ".github/actions/setup-rust/action.yml"
       - '.github/workflows/hiphi-cloud-connector.yml'
       - 'Cargo.toml'
       - 'Cargo.lock'
