@@ -28,7 +28,7 @@ are replaced, including explicit clears, so native messages cannot reset the
 source's display or introduce a competing stream clock. With no injected source,
 native sections pass through unchanged.
 
-Track identity is sent on track changes. Position updates and two-second POS
+Track identity is sent when the source zone or its title, artist, or album changes. Consecutive queue entries with identical text on the same source cannot be distinguished by this metadata projection; UHC does not infer a new track from a backward seek. A genuine playback-item epoch would be required to distinguish those entries. Position updates and two-second POS
 heartbeats maintain the current track without repeating META, which downstream
 clients may interpret as a new track and clear their artwork and timing. Artwork
 updates likewise do not introduce a track boundary. While the bound source is
