@@ -1044,3 +1044,62 @@ fn explicit_listener_restart_rearms_a_route_after_failed_resume() {
     relay.stop_listener();
     naa.close();
 }
+
+/// The HiPhi client treats META as a track boundary (clears position and artwork).
+/// An artwork keepalive for the same track must therefore carry position, not a new META.
+#[test]
+fn relay_metadata_refresh_keeps_the_same_track_and_position() {
+    use unified_hifi_control::adapters::hqplayer::naa_relay::MetadataPayload;
+    let relay = relay(true, 0);
+    let naa = FakeNaa::start("metadata-stable", "hw:stable", 44100);
+    let (_, mut client) = forwarding_pair(&relay, &naa);
+    client.start(44100).unwrap();
+    relay.set_metadata(Some(MetadataPayload {
+        title: "Same track".into(),
+        artist: "Artist".into(),
+        album: "Album".into(),
+        picture: Some(b"http://127.0.0.1/art.jpg".to_vec()),
+        ..Default::default()
+    }));
+    client.send_audio(&[1, 2, 3, 4]).unwrap();
+    std::thread::sleep(Duration::from_millis(2100));
+    client.send_audio(&[5, 6, 7, 8]).unwrap();
+    let records = naa.audio_records();
+    assert!(!records[0].metadata.is_empty());
+    let refresh = records.last().unwrap();
+    assert!(
+        refresh.metadata.is_empty(),
+        "periodic refresh must not signal a new track"
+    );
+    assert!(
+        !refresh.position.is_empty(),
+        "same-track heartbeat belongs in POS"
+    );
+    relay.stop_listener();
+}
+
+#[test]
+fn frequent_source_positions_do_not_starve_artwork_refresh() {
+    use unified_hifi_control::adapters::hqplayer::naa_relay::MetadataPayload;
+    let relay = relay(true, 0);
+    let naa = FakeNaa::start("metadata-clock", "hw:clock", 44100);
+    let (_, mut client) = forwarding_pair(&relay, &naa);
+    client.start(44100).unwrap();
+    for step in 0..10 {
+        relay.set_metadata(Some(MetadataPayload {
+            title: "Same track".into(),
+            picture: Some(b"http://127.0.0.1/art.jpg".to_vec()),
+            position: Some(Duration::from_millis(step * 250)),
+            ..Default::default()
+        }));
+        client.send_audio(&[1, 2, 3, 4]).unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let records = naa.audio_records();
+    assert_eq!(records.iter().filter(|r| !r.metadata.is_empty()).count(), 1);
+    assert!(
+        records.iter().filter(|r| !r.picture.is_empty()).count() >= 2,
+        "source position updates must not postpone periodic artwork URL refresh"
+    );
+    relay.stop_listener();
+}

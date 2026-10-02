@@ -3,6 +3,9 @@
 //! The coordinator serves as a registry of all available adapters and manages their lifecycle.
 //! It tracks which adapters are enabled and handles starting/stopping them uniformly.
 
+#[cfg(feature = "naa-proxy")]
+mod relay_position;
+
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -1022,7 +1025,9 @@ pub async fn run_relay_metadata_with_listener(
         attempted: std::time::Instant,
     }
     let mut cache: HashMap<String, CachedArtwork> = HashMap::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    let mut clocks: HashMap<String, relay_position::RelayPosition> = HashMap::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = state.shutdown.cancelled() => break,
@@ -1030,6 +1035,7 @@ pub async fn run_relay_metadata_with_listener(
         }
         let instances = state.hqp_instances.list_instances().await;
         cache.retain(|name, _| instances.iter().any(|instance| &instance.name == name));
+        clocks.retain(|name, _| instances.iter().any(|instance| &instance.name == name));
         for instance in instances {
             let Some(adapter) = state.hqp_instances.get(&instance.name).await else {
                 continue;
@@ -1038,8 +1044,14 @@ pub async fn run_relay_metadata_with_listener(
             let Some((source, np)) = relay_metadata_source(&state, &instance.name).await else {
                 adapter.set_relay_metadata(None);
                 cache.remove(&instance.name);
+                clocks.remove(&instance.name);
                 continue;
             };
+            let position = clocks.entry(instance.name.clone()).or_default().project(
+                &source,
+                &np,
+                std::time::Instant::now(),
+            );
             let interface = adapter.output_projection().relay.discovery_interface;
             if let Some(url) = relay_artwork_url(
                 listener,
@@ -1048,10 +1060,15 @@ pub async fn run_relay_metadata_with_listener(
                 np.image_key.as_deref(),
             ) {
                 adapter.set_relay_metadata(Some(MetadataPayload {
+                    source_zone_id: Some(source.clone()),
                     title: np.title,
                     artist: np.artist,
                     album: np.album,
                     picture: Some(url.into_bytes()),
+                    position,
+                    duration: np
+                        .duration
+                        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok()),
                 }));
                 cache.remove(&instance.name);
                 continue;
@@ -1060,10 +1077,15 @@ pub async fn run_relay_metadata_with_listener(
                 .get(&instance.name)
                 .filter(|entry| entry.source == source && entry.key == np.image_key);
             let mut metadata = MetadataPayload {
+                source_zone_id: Some(source.clone()),
                 title: np.title.clone(),
                 artist: np.artist.clone(),
                 album: np.album.clone(),
                 picture: cached.and_then(|entry| entry.picture.clone()),
+                position,
+                duration: np
+                    .duration
+                    .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok()),
             };
             // Text arrives immediately, even while the image provider is slow or unavailable.
             adapter.set_relay_metadata(Some(metadata.clone()));
@@ -1097,7 +1119,19 @@ pub async fn run_relay_metadata_with_listener(
             }) {
                 adapter.set_relay_metadata(None);
                 cache.remove(&instance.name);
+                clocks.remove(&instance.name);
                 continue;
+            }
+            // A slow image fetch must not re-publish its old timing snapshot.
+            if let Some((source, current)) = current {
+                metadata.duration = current
+                    .duration
+                    .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok());
+                metadata.position = clocks.entry(instance.name.clone()).or_default().project(
+                    &source,
+                    &current,
+                    std::time::Instant::now(),
+                );
             }
             metadata.picture = picture.clone();
             adapter.set_relay_metadata(Some(metadata));

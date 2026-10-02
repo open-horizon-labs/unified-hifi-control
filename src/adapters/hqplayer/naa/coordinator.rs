@@ -417,6 +417,9 @@ impl HqpOutputCoordinator {
         let instance = self.instance_name();
         let settings = self.settings();
         let observation = self.relay().map(|r| r.observe());
+        let metadata_source_zone_id = observation
+            .as_ref()
+            .and_then(|o| o.metadata_source_zone_id.clone());
         let ledger = lock(&self.ledger);
         let (
             availability,
@@ -496,13 +499,16 @@ impl HqpOutputCoordinator {
             }
             (_, availability) => availability,
         };
-        let last_error = ledger.last_error.clone().or_else(|| {
-            relay_error.map(|message| HqpOutputError {
-                code: "RELAY".into(),
-                message,
-                at: now(),
-            })
-        });
+        // Only recent historical notices belong in the live projection. Availability continues
+        // to report persistent faults independently, and operation records retain their detail.
+        let observed_at = now();
+        let last_error = ledger
+            .last_error
+            .iter()
+            .chain(relay_error.iter())
+            .filter(|error| observed_at.saturating_sub(error.at) < 300)
+            .max_by_key(|error| error.at)
+            .cloned();
         HqpOutputProjection {
             zone_id: format!("hqplayer:{instance}"),
             instance,
@@ -516,6 +522,7 @@ impl HqpOutputCoordinator {
             selected_route_id: selected,
             desired_destination: desired,
             observed_forwarding_destination: observed,
+            metadata_source_zone_id,
             session,
             discovery,
             dac_observations: dacs,
@@ -2704,5 +2711,42 @@ mod automatic_interface_tests {
             super::automatic_discovery_interface("127.0.0.1:0").unwrap(),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod error_age_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_reads_do_not_make_a_relay_error_new_again() {
+        let settings = NaaRelaySettings::default();
+        let owner = HqpOutputCoordinator::new(settings.clone());
+        let relay = Arc::new(NaaRelay::new(settings, None).unwrap());
+        let generation = relay.observe().generation;
+        relay.disable_routing_after_failed_resume(generation, "endpoint refused connection".into());
+        *lock(&owner.relay) = Some(relay);
+        let first = owner.projection().last_error.unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        assert_eq!(owner.projection().last_error.unwrap().at, first.at);
+    }
+
+    #[test]
+    fn old_error_notice_expires_without_hiding_unavailable_status() {
+        let owner = HqpOutputCoordinator::new(NaaRelaySettings {
+            enabled: true,
+            ..Default::default()
+        });
+        lock(&owner.ledger).last_error = Some(HqpOutputError {
+            code: "RELAY".into(),
+            message: "old failure".into(),
+            at: now() - 301,
+        });
+        let p = owner.projection();
+        assert!(p.last_error.is_none());
+        assert!(matches!(
+            p.availability,
+            HqpOutputAvailability::Unavailable { .. }
+        ));
     }
 }

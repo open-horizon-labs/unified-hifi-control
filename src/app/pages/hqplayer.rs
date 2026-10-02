@@ -746,7 +746,7 @@ pub fn HqPlayer() -> Element {
                             details { class: "mt-3",
                                 summary { class: "cursor-pointer text-sm font-medium", "Paired source" }
                                 p { class: "text-sm text-muted my-2",
-                                    "Pair the playback zone that feeds this HQPlayer. Pairing provides controls and missing metadata; it does not reroute audio."
+                                    "Pair the playback zone that feeds this HQPlayer. Pairing connects playback controls and metadata; it does not reroute audio."
                                 }
                                 HqpInstancePairing {
                                     instance: instance.clone(),
@@ -2551,6 +2551,9 @@ fn ZoneLinkTable(
                 }
             }
 
+            p { class: "mb-5 max-w-3xl text-sm text-muted",
+                "When audio flows through UHC's relay, the paired playing zone supplies the endpoint's track info, artwork, elapsed time and duration. Pairing a Roon zone makes Roon authoritative for that display."
+            }
 
             if current_links.is_empty()
                 && matches!(
