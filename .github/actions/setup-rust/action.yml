@@ -18,6 +18,12 @@ runs:
         test -n "$channel"
         echo "channel=$channel" >> "$GITHUB_OUTPUT"
         echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+    - name: Expose Cargo-installed tools to subsequent steps
+      shell: bash
+      run: |
+        # GitHub applies GITHUB_PATH between steps; preserve spaces in fleet runner names.
+        cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+        printf '%s\n' "$cargo_bin" >> "$GITHUB_PATH"
     - uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ steps.baseline.outputs.channel }}
