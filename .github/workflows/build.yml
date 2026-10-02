@@ -427,6 +427,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      - name: Verify isolated Cargo tool discovery
+        run: python3 tests/ci_setup_rust_path.py
+
       - name: Run clippy
         run: cargo clippy -- -D warnings
 
