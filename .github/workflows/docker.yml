@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
         with:
           components: clippy, rustfmt
 
@@ -39,6 +39,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      - name: Build embedded CSS prerequisite
+        run: make css
+
       - name: Run clippy
         run: cargo clippy -- -D warnings
 
@@ -49,7 +52,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -57,6 +60,9 @@ jobs:
           shared-key: "native-build"
           cache-all-crates: true
           cache-on-failure: true
+
+      - name: Build embedded CSS prerequisite
+        run: make css
 
       - name: Run tests
         run: cargo test --workspace
