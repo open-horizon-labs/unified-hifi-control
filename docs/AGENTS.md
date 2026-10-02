@@ -106,14 +106,9 @@ if (Array.isArray(data)) {
 
 ### Automated Reviewers
 
-All PRs should be reviewed by both automated reviewers:
+CodeRabbit is disabled in `.coderabbit.yaml` by owner request. Do not request CodeRabbit reviews or treat its reviews or status as merge gates.
 
-1. **CodeRabbit** (`@coderabbitai`) - AI code review bot on GitHub
-   - Comment `@coderabbitai review` on the PR
-   - Provides line-by-line feedback, security checks, best practices
-   - Address feedback or explain why you're not
-
-2. **Superego** (`sg review pr`) - Local metacognitive review
+1. **Superego** (`sg review pr`) - Local metacognitive review
    - Run before creating PR or after significant changes
    - Evaluates proportionality, scope creep, architectural fit
    - Paste non-trivial feedback as PR comment for transparency
@@ -123,9 +118,6 @@ All PRs should be reviewed by both automated reviewers:
 ```bash
 # Before PR: run superego locally
 sg review pr
-
-# After PR created: request coderabbit
-gh pr comment <number> --body "@coderabbitai review"
 
 # If superego has substantive feedback, paste it to PR
 gh pr comment <number> --body "**Superego Review:**

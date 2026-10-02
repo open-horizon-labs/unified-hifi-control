@@ -21,7 +21,7 @@ Use GitHub for all task tracking:
 **Purpose:** Propose implementations for review
 - Link to the issue being addressed: `Fixes #123`
 - Describe what changed and how to test
-- CodeRabbit review is optional and advisory; it is never a merge gate.
+- CodeRabbit is disabled for this repository; do not request its reviews.
 
 ### Merging PRs
 **TEST BEFORE MERGING.** Do not merge PRs without testing.
@@ -47,12 +47,8 @@ Use GitHub for all task tracking:
 
 ## Code Review
 
-### coderabbit (Automated Code Review)
-**When to use:** Optional automated feedback when it is available.
-**Protocol:**
-- Reviews code style, potential bugs, and best practices
-- Evaluate actionable feedback, but do not wait on CodeRabbit or treat its status as required approval.
-- Use `@coderabbit` in PR comments to ask questions
+### CodeRabbit
+CodeRabbit automatic reviews, incremental reviews, approval workflow, and review status publishing are disabled in `.coderabbit.yaml` by owner request. Do not invoke CodeRabbit or treat its reviews or status as merge gates. Use `/review` and the repository's tests.
 
 ### Open Horizons skills
 **When to use:** Apply the skill that fits the decision or phase of work.

@@ -4,6 +4,8 @@ on:
   pull_request:
     branches: [v4]
     paths:
+      - "rust-toolchain.toml"
+      - ".github/actions/setup-rust/action.yml"
       - '.github/workflows/hiphi-cloud-connector.yml'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -28,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust
         with:
           components: clippy, rustfmt
 

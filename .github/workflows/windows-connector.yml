@@ -4,6 +4,8 @@ on:
   pull_request:
     branches: [v4]
     paths:
+      - "rust-toolchain.toml"
+      - ".github/actions/setup-rust/action.yml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "src/cloud_connector/**"
@@ -40,7 +42,7 @@ jobs:
           ./tailwindcss-windows-x64.exe -i src/input.css -o public/tailwind.css --content "src/app/**/*.rs"
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
