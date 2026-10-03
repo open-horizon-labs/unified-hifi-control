@@ -7240,6 +7240,10 @@ async fn music_details_is_explicit_read_only_open_world_and_returns_machine_refu
     assert_eq!(tool["annotations"]["readOnlyHint"], true);
     assert_eq!(tool["annotations"]["destructiveHint"], false);
     assert_eq!(tool["annotations"]["openWorldHint"], true);
+    let description = tool["description"].as_str().expect("tool description");
+    assert!(description.contains("first read can be slow"));
+    assert!(description.contains("ambiguous candidate facts as certain"));
+    assert!(description.contains("source facts with provenance and attribution"));
     let result = app
         .call_tool(
             "hifi_music_details",

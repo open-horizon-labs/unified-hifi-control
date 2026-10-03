@@ -16,7 +16,7 @@ printf '%s\n' '{"artist_mbid":"7944ed53-2a58-4035-9b93-140a71e41c34"}' | uhc-mus
 
 Rust callers can use `cloud_connector::music::MusicDetailsClient::from_runtime(config_dir)` and `read_now_playing(&aggregator, zone_id, language)`. The helper reads the aggregator before and after enrichment. Surfaces should request details on demand, preserve all source attribution and render source text as text. They must honor partial/ambiguous/unavailable status, and must never turn a source outage into a playback failure. Direct `read` callers own the opaque item token and must invalidate it on item, zone or session changes; the returned `applies_to` method is a final race check, not an automatic UI binding.
 
-This change provides the client and CLI. It does not add a details UI or a local HTTP endpoint. Those require the repository's separate public API review. Custom relay hosts/ports do not implicitly become metadata recipients; this client is restricted to the production `relay.hiphi.audio` pairing endpoint.
+The client, CLI, local HTTP endpoint, and MCP tool provide explicit on-demand reads. Custom relay hosts/ports do not implicitly become metadata recipients; this client is restricted to the production `relay.hiphi.audio` pairing endpoint.
 
 ## Cloud contract version 1
 
@@ -24,7 +24,7 @@ The signed JSON body contains exactly `purpose`, `version`, `installation_id`, `
 
 Identity may contain `artist`, `title`, `album`, `duration_ms`, `artist_mbid`, `recording_mbid`, `release_mbid`, and `wikidata_id`; text fields are bounded to 512 UTF-8 bytes and the whole request to 8 KiB. Metadata names are candidate evidence, not proof of a recording. A supplied Wikidata ID alone is explicitly unverified as a music match. Language is an explicit supported wiki language code.
 
-The response is bounded to 512 KiB and echoes `version: 1` and `item_token`, with `status` (`complete`, `partial`, `ambiguous`, or `unavailable`), `catalog`, `sources`, `entities`, `genres`, `unavailable`, `language` and `stale`. Current enrichment returns partial whenever content is available because source coverage is not assumed complete. Per-source facts include provenance, source revision, attribution and license; retained raw source responses are not sent to clients. Absence, outage, ambiguity and stale data must remain distinguishable in a consuming surface.
+The response is bounded to 512 KiB and echoes `version: 1` and `item_token`, with `status` (`complete`, `partial`, `ambiguous`, or `unavailable`), `catalog`, `sources`, `entities`, `genres`, `unavailable`, `language` and `stale`. Cloud reports complete, partial, ambiguous, or unavailable results based on its current source responses; source coverage is not assumed complete. Per-source facts include provenance, source revision, attribution and license; retained raw source responses are not sent to clients. Absence, outage, ambiguity and stale data must remain distinguishable in a consuming surface.
 
 Unknown/removed installations and invalid/expired signatures return 401; replay and rate limits return 429; disabled/unavailable service returns 503. Treat every such outcome as optional context unavailable, never as a playback or pairing failure.
 
@@ -49,3 +49,7 @@ HTTP returns `version`, `zone_id`, `identity`, `language` and `details`; MCP ret
 `details` retains the Cloud response's status, sources, attribution/license information, catalog, entities, genres, unavailable sections, language and stale flag. A catalog answer marked partial, ambiguous or unavailable is a successful read, distinct from failing to reach the service. Consumers must preserve these distinctions and render source text as text rather than executable markup.
 
 HTTP errors use `{ "error": "safe explanation", "code": "MACHINE_CODE" }`: `INVALID_REQUEST` (400), `ZONE_NOT_FOUND` (404), `NO_MUSIC` or `MUSIC_CHANGED` (409), and `CLOUD_NOT_PAIRED` or `MUSIC_DETAILS_UNAVAILABLE` (503). Existing controller-auth errors are unchanged. MCP carries the same music-context code in a structured refusal. Cloud failures never affect local playback. Requests have bounded concurrency, response size and deadlines; overload is reported as unavailable.
+
+## Agent guidance and response time
+
+The read-through implementation fetches source context on demand. The first request for a track can take longer while upstream sources respond. Agents should call this tool only when music context is useful, then treat `details.status` (`complete`, `partial`, `ambiguous`, or `unavailable`), `stale`, and each source's provenance/attribution as part of the answer. Do not combine facts from competing catalog candidates or present an ambiguous candidate as a confirmed match. Compare the returned `identity` with the user's current selection before describing it. Cloud or source delays affect this optional read only; playback remains local.
