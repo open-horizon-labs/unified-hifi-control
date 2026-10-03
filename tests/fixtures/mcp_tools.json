@@ -389,6 +389,31 @@
       "type": "object"
     }
   },
+  "hifi_music_details": {
+    "annotations": {
+      "destructiveHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "Read source-attributed HiPhi Cloud context for the music playing in an explicit zone and language. Returns identity, catalog candidates, genres, and available source facts with provenance and attribution. The first read can be slow while upstream sources are fetched. Treat partial, ambiguous, unavailable, or stale results accordingly; never present ambiguous candidate facts as certain. Compare returned identity with the current selection. Requires optional Cloud pairing; read-only and never changes playback.",
+    "inputSchema": {
+      "properties": {
+        "language": {
+          "description": "Supported wiki language code, for example en; required, with no default.",
+          "type": "string"
+        },
+        "zone_id": {
+          "description": "Explicit prefixed zone ID from hifi_zones; no default zone is selected.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "zone_id",
+        "language"
+      ],
+      "type": "object"
+    }
+  },
   "hifi_now_playing": {
     "annotations": {
       "readOnlyHint": true

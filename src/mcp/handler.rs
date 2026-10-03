@@ -97,6 +97,9 @@ impl ServerHandler for HifiMcpHandler {
             HifiTools::HifiNowPlayingTool(args) => {
                 tools::zones::handle_now_playing(state, args).await
             }
+            HifiTools::HifiMusicDetailsTool(args) => {
+                tools::music_details::handle_music_details(state, args).await
+            }
             HifiTools::HifiControlTool(args) => tools::transport::handle_control(state, args).await,
             HifiTools::HifiSearchTool(args) => tools::library::handle_search(state, args).await,
             HifiTools::HifiPlayTool(args) => tools::library::handle_play(state, args).await,
@@ -192,6 +195,12 @@ impl ServerHandler for HifiMcpHandler {
 /// So the parameter is reported when it can be identified against the tool's
 /// declared inputs and omitted when it cannot, rather than guessed at.
 fn invalid_arguments_envelope(tool: &'static str, error: &CallToolError) -> Envelope {
+    if tool == "hifi_music_details" {
+        return Envelope::read(tool, "parse_arguments").refuse(Refusal::MusicDetails {
+            code: "INVALID_REQUEST",
+            detail: "Invalid music details request; required zone_id and language only".into(),
+        });
+    }
     let message = error.to_string();
     let parameter = tools::static_param(tool, &message);
 

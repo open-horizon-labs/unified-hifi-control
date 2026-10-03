@@ -84,6 +84,10 @@ async fn create_test_app() -> Router {
     Router::new()
         // Health check
         .route("/status", get(api::status_handler))
+        .route(
+            "/zones/{zone_id}/music-details",
+            get(api::music_details::handler),
+        )
         // Roon routes
         .route("/roon/status", get(api::roon_status_handler))
         .route("/roon/zones", get(api::roon_zones_handler))
@@ -601,5 +605,73 @@ mod protocol_ui_separation {
             !body.starts_with("<!DOCTYPE"),
             "PROTOCOL VIOLATION: /config returned HTML!"
         );
+    }
+}
+
+#[tokio::test]
+async fn music_details_requires_explicit_language_and_rejects_unknown_query_fields() {
+    let app = create_test_app().await;
+    for path in [
+        "/zones/%FF/music-details?language=en",
+        "/zones/roon:missing/music-details",
+        "/zones/roon:missing/music-details?language=en&endpoint=https://evil.test",
+        "/zones/roon:missing/music-details?language=en&language=fr",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        assert_eq!(response.headers()["cache-control"], "private, no-store");
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"error":"Invalid music details request", "code":"INVALID_REQUEST"})
+        );
+    }
+}
+
+#[tokio::test]
+async fn music_details_invalid_selector_and_missing_zone_are_sanitized_json() {
+    let app = create_test_app().await;
+    for (path, expected_status, expected_code) in [
+        (
+            "/zones/roon:missing/music-details?language=EN",
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+        ),
+        (
+            "/zones/missing/music-details?language=en",
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+        ),
+        (
+            "/zones/roon:missing/music-details?language=en",
+            StatusCode::NOT_FOUND,
+            "ZONE_NOT_FOUND",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected_status, "{path}");
+        assert_eq!(response.headers()["cache-control"], "private, no-store");
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], expected_code);
+        assert_eq!(
+            body.as_object().unwrap().len(),
+            2,
+            "Only the existing error and code fields are exposed"
+        );
+        assert!(body["error"].is_string());
     }
 }

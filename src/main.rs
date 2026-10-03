@@ -894,6 +894,7 @@ mod server {
         let router = Router::new()
             // Health check
             .route("/status", get(api::status_handler))
+            .route("/zones/{zone_id}/music-details", get(api::music_details::handler))
             // Installation-bound controller bootstrap/session boundary
             .route("/api/controller/bootstrap", post(controller_bootstrap))
             .route("/api/controller/status", get(controller_status))

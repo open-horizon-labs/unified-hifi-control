@@ -68,6 +68,8 @@ pub mod mdns;
 // Optional MQTT publisher: exposes UHC zones to Home Assistant (#508).
 #[cfg(feature = "server")]
 pub mod mqtt;
+#[cfg(feature = "server")]
+pub mod music_context;
 // Adaptive producer publication: internal bus + aggregator-owned state (#324).
 // Server-only: it necessarily touches both `crate::bus` and `crate::adaptive`.
 #[cfg(feature = "server")]

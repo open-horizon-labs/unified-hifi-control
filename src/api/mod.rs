@@ -50,6 +50,7 @@ pub mod hqp_outputs_http;
 pub mod ingress;
 pub mod mqtt_bootstrap;
 pub mod mqtt_settings;
+pub mod music_details;
 pub mod provider_auth;
 pub mod spotify_callback_listener;
 pub mod spotify_tunnel;

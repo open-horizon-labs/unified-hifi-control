@@ -90,6 +90,7 @@ GET /upnp/zone/{zone_id}/now_playing
 GET /upnp/zones
 GET /webmcp-bridge.js
 GET /zones
+GET /zones/{zone_id}/music-details
 POST /admin/fetch-firmware
 POST /api/bridges/applemusic/claim
 POST /api/bridges/applemusic/commands/{command_id}

@@ -528,8 +528,8 @@ async fn tools_list_matches_fixture() {
 
     assert_eq!(
         tools.len(),
-        19,
-        "expected 19 tools with HQPlayer enabled, got {}: {:?}",
+        20,
+        "expected 20 tools with HQPlayer enabled, got {}: {:?}",
         tools.len(),
         tool_names(tools)
     );
@@ -599,6 +599,7 @@ async fn tools_list_order_is_pinned() {
             "hifi_zone_group",
             "hifi_hqplayer_outputs",
             "hifi_hqplayer_output_control",
+            "hifi_music_details",
         ],
         "tools/list order follows the tool_box! list in src/mcp/tools/mod.rs. \
          APPEND new tools rather than inserting, so this assertion grows by one \
@@ -646,6 +647,7 @@ async fn hqplayer_tools_filtered_when_adapter_disabled() {
             "hifi_apple_music",
             "hifi_collections",
             "hifi_zone_group",
+            "hifi_music_details",
         ],
         "HQPlayer disabled must yield exactly the non-HQPlayer tools, in order"
     );
@@ -783,6 +785,10 @@ async fn initialize_negotiates_down_for_older_clients() {
 const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
     ("hifi_zones", &[]),
     ("hifi_now_playing", &[("zone_id", true)]),
+    (
+        "hifi_music_details",
+        &[("zone_id", true), ("language", true)],
+    ),
     // #398. Optional: omitting it reports every zone and every provider.
     ("hifi_capabilities", &[("zone_id", false)]),
     (
@@ -1076,7 +1082,7 @@ async fn a_stale_session_id_is_transparently_recovered() {
         .unwrap_or_else(|| panic!("recovered request must return the tool list, got: {response}"));
     assert_eq!(
         tools.len(),
-        19,
+        20,
         "the recovered session must serve the same tool list as a fresh one"
     );
 }
@@ -3447,6 +3453,8 @@ use FieldRole::{Consumed, DisplayOnly};
 
 /// Today's truth, including its defects. `#394` freezes this; it fixes nothing.
 const FIELD_ROLES: &[(&str, FieldRole)] = &[
+    ("language", Consumed("hifi_music_details.language")),
+    ("code", DisplayOnly("machine-readable refusal classification; select recovery rather than submitting it as a tool argument")),
     // Zone identity closes the loop: every zone-scoped tool takes it.
     (
         "zone_id",
@@ -3886,6 +3894,11 @@ async fn no_tool_returns_an_unclassified_field() {
     // fields, every `params` key, and the write path's `observed`. Driven rather
     // than listed, so a renamed field is caught instead of quietly reclassified.
     for (tool, args) in [
+        // Explicit optional Cloud context refusal; its language and code are also data.
+        (
+            "hifi_music_details",
+            json!({"zone_id":"roon:absent-context", "language":"en"}),
+        ),
         // One call per Refusal variant.
         ("hifi_now_playing", json!({ "zone_id": "roon:nope" })), // unknown_target
         (
@@ -4724,11 +4737,24 @@ async fn every_refusal_reason_is_actually_produced() {
         }
     }
 
+    let context_refusal = app
+        .call_tool(
+            "hifi_music_details",
+            json!({"zone_id":UNKNOWN_ROON_ZONE,"language":"en"}),
+        )
+        .await;
+    seen.insert(
+        context_refusal["structuredContent"]["refusal"]["reason"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    );
     for reason in [
         "provider_limitation",
         "invalid_parameter",
         "unknown_target",
         "backend_error",
+        "music_details",
     ] {
         assert!(
             seen.contains(reason),
@@ -7198,4 +7224,446 @@ async fn hifi_zones_is_ordered_and_stable_across_calls() {
     }
 
     aggregator_task.abort();
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn music_details_is_explicit_read_only_open_world_and_returns_machine_refusals() {
+    let app = TestApp::new().await;
+    let listed = app.list_tools().await;
+    let tool = listed["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "hifi_music_details")
+        .expect("explicit music context read must be advertised");
+    assert_eq!(tool["annotations"]["readOnlyHint"], true);
+    assert_eq!(tool["annotations"]["destructiveHint"], false);
+    assert_eq!(tool["annotations"]["openWorldHint"], true);
+    let description = tool["description"].as_str().expect("tool description");
+    assert!(description.contains("first read can be slow"));
+    assert!(description.contains("ambiguous candidate facts as certain"));
+    assert!(description.contains("source facts with provenance and attribution"));
+    let result = app
+        .call_tool(
+            "hifi_music_details",
+            json!({"zone_id": UNKNOWN_ROON_ZONE, "language": "en"}),
+        )
+        .await;
+    assert_eq!(result["isError"], true);
+    assert_eq!(
+        result["structuredContent"]["refusal"]["code"],
+        "ZONE_NOT_FOUND"
+    );
+    assert_eq!(
+        result["structuredContent"]["params"]["zone_id"],
+        UNKNOWN_ROON_ZONE
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn music_details_invalid_requests_keep_contract_code() {
+    let app = TestApp::new().await;
+    for args in [
+        json!({"zone_id":"roon:test"}),
+        json!({"zone_id":"roon:test","language":"en","endpoint":"http://attacker"}),
+        json!({"zone_id":"roon:test","language":"not-a-wiki-language"}),
+    ] {
+        let result = app.call_tool("hifi_music_details", args).await;
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"]["refusal"]["code"],
+            "INVALID_REQUEST"
+        );
+        assert_eq!(result["structuredContent"]["outcome"], "invalid");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn music_details_consumer_preserves_cloud_attribution_and_uncertainty() {
+    use unified_hifi_control::{
+        cloud_connector::music::{MusicDetails, MusicError, MusicIdentity},
+        mcp::tools::music_details::{handle_music_details_with_service, HifiMusicDetailsTool},
+        music_context::{MusicContextService, MusicDetailsReader},
+    };
+    struct Reader {
+        status: &'static str,
+    }
+    impl MusicDetailsReader for Reader {
+        fn fetch<'a>(
+            &'a self,
+            _: &'a std::path::Path,
+            _: &'a MusicIdentity,
+            token: &'a str,
+            language: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<MusicDetails, MusicError>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                if self.status == "not_paired" {
+                    return Err(MusicError::NotPaired);
+                }
+                if self.status == "refused" {
+                    return Err(MusicError::Refused(401));
+                }
+                // Shape comes from hiphi-cloud edge/src/music/details.ts publicSource/packet,
+                // types.ts SourceDocument/SourceLicense and catalog.ts MusicCatalogResult.
+                // Values are bounded sample evidence, not a claim of deployed catalog coverage.
+                let mut packet = json!({"version":1,"item_token":token,"status":self.status,
+                    "catalog":[{"generationId":"sample-generation","snapshot":"20261001-000000","candidates":[{"kind":"artist","mbid":"11111111-1111-1111-1111-111111111111","name":"Example artist","wikidataIds":["Q123"],"facts":[]}],"ambiguous":false,"truncated":false,"source":"musicbrainz-snapshot","basis":"metadata-candidates"}],
+                    "sources":[{"status":"stale","document":{
+                        "source":"wikipedia","canonicalId":"en:123","sourceUrl":"https://en.wikipedia.org/wiki/Example","sourceRevision":"456","retrievedAt":"2026-10-01T00:00:00Z",
+                        "rawHash":{"algorithm":"sha256","scope":"http-response-body","value":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                        "mediaType":"application/json","rawText":"Sample attributed extract","entityScope":"artist","extractorVersion":"sample-extractor-v1","policyVersion":"sample-policy-v1",
+                        "license":{"id":"CC-BY-SA-4.0","url":"https://creativecommons.org/licenses/by-sa/4.0/","attribution":"Wikipedia contributors","historyUrl":"https://en.wikipedia.org/w/index.php?title=Example&action=history","modification":"extracted","modificationsShareAlike":{"id":"CC-BY-SA-4.0","url":"https://creativecommons.org/licenses/by-sa/4.0/"}},
+                        "facts":[{"field":"summary","value":"Sample attributed extract","scope":"artist"}],"presentationTruncated":false
+                    }}],
+                    "entities":[{"kind":"artist","mbid":"11111111-1111-1111-1111-111111111111","qid":"Q123","basis":"metadata-candidates"}],
+                    "genres":[{"id":"Q8341","label":"jazz","source":"https://www.wikidata.org/wiki/Q8341"}],
+                    "unavailable":["listenbrainz:outage"],"language":language,"stale":true,"presentationTruncated":false,
+                    "future_section":{"provenance":"retained"}});
+                if self.status == "ambiguous" {
+                    packet["catalog"].as_array_mut().unwrap().push(json!({
+                        "generationId":"sample-generation", "snapshot":"20261001-000000",
+                        "candidates":[
+                            {"kind":"recording","mbid":"22222222-2222-2222-2222-222222222222","name":"Example track","facts":[]},
+                            {"kind":"recording","mbid":"33333333-3333-3333-3333-333333333333","name":"Example track","facts":[]}
+                        ], "ambiguous":true,"truncated":false,"source":"musicbrainz-snapshot","basis":"metadata-candidates"
+                    }));
+                }
+                if self.status == "unavailable" {
+                    for section in ["catalog", "sources", "entities", "genres"] {
+                        packet[section] = json!([]);
+                    }
+                    packet["unavailable"] = json!(["musicbrainz-snapshot", "wikipedia:outage"]);
+                    packet["stale"] = json!(false);
+                }
+                Ok(serde_json::from_value(packet).unwrap())
+            })
+        }
+    }
+    let bus = create_bus();
+    let state = build_state_with_bus(bus.clone(), None, None).await;
+    let aggregator = state.aggregator.clone();
+    let task = tokio::spawn(async move { aggregator.run().await });
+    seed_zone(&bus, &state, "roon:context", "Context").await;
+    let mut zone = state.aggregator.get_zone("roon:context").await.unwrap();
+    zone.now_playing = Some(unified_hifi_control::bus::NowPlaying {
+        title: "Example track".into(),
+        artist: "Example artist".into(),
+        album: "Example album".into(),
+        image_key: None,
+        seek_position: None,
+        duration: Some(180.0),
+        metadata: None,
+        repeat_mode: None,
+        shuffle: None,
+    });
+    for _ in 0..100 {
+        bus.publish(unified_hifi_control::bus::BusEvent::ZoneDiscovered { zone: zone.clone() });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if state
+            .aggregator
+            .get_now_playing("roon:context")
+            .await
+            .is_some()
+        {
+            break;
+        }
+    }
+    assert!(state
+        .aggregator
+        .get_now_playing("roon:context")
+        .await
+        .is_some());
+    for status in ["partial", "ambiguous", "unavailable"] {
+        let service = MusicContextService::new(
+            Arc::new(Reader { status }),
+            1,
+            std::time::Duration::from_secs(1),
+        );
+        let result = handle_music_details_with_service(
+            &state,
+            HifiMusicDetailsTool {
+                zone_id: "roon:context".into(),
+                language: "en".into(),
+            },
+            &service,
+        )
+        .await
+        .unwrap();
+        let result = serde_json::to_value(result).unwrap();
+        assert_ne!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["outcome"], "ok");
+        let data = &result["structuredContent"]["data"];
+        // Context association fields are consumed by caller selection checks; the details
+        // subtree is the extensible upstream Cloud contract, displayed with its provenance.
+        assert_eq!(
+            data.as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["details", "identity", "language", "version", "zone_id"]
+        );
+        assert_eq!(data["zone_id"], "roon:context");
+        assert_eq!(data["language"], "en");
+        assert_eq!(data["identity"]["title"], "Example track");
+        assert_eq!(data["details"]["status"], status);
+        assert!(data["details"]["catalog"].is_array());
+        if status == "unavailable" {
+            assert_eq!(data["details"]["sources"], json!([]));
+        } else {
+            let source = &data["details"]["sources"][0];
+            assert_eq!(source["status"], "stale");
+            assert_eq!(source["document"]["sourceRevision"], "456");
+            assert_eq!(source["document"]["license"]["id"], "CC-BY-SA-4.0");
+            assert_eq!(
+                source["document"]["license"]["attribution"],
+                "Wikipedia contributors"
+            );
+            assert_eq!(source["document"]["license"]["modification"], "extracted");
+            assert_eq!(
+                source["document"]["license"]["modificationsShareAlike"]["id"],
+                "CC-BY-SA-4.0"
+            );
+            assert!(source["document"].get("raw").is_none());
+            assert_eq!(source["document"]["rawHash"]["scope"], "http-response-body");
+        }
+        assert_eq!(data["details"]["future_section"]["provenance"], "retained");
+        assert_eq!(data["details"]["stale"], status != "unavailable");
+        assert_eq!(
+            serde_json::from_str::<Value>(&result_text(&result)).unwrap(),
+            *data
+        );
+        let http = unified_hifi_control::api::music_details::response(
+            &service,
+            &state.aggregator,
+            &unified_hifi_control::config::get_config_dir(),
+            "roon:context",
+            Ok(axum::extract::Query(
+                serde_json::from_value(json!({"language":"en"})).unwrap(),
+            )),
+        )
+        .await;
+        assert_eq!(http.status(), axum::http::StatusCode::OK);
+        assert_eq!(http.headers()["cache-control"], "private, no-store");
+        let mut http_data: Value = serde_json::from_slice(
+            &axum::body::to_bytes(http.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let mut mcp_data = data.clone();
+        for payload in [&mut http_data, &mut mcp_data] {
+            let token = payload["details"]["item_token"].as_str().unwrap();
+            assert!(!token.is_empty() && token.len() <= 128);
+            assert!(token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'));
+            payload["details"]["item_token"] = json!("independent-request-token");
+        }
+        assert_eq!(
+            http_data, mcp_data,
+            "both transports preserve exactly the same attributed context"
+        );
+    }
+    for (status, code) in [
+        ("not_paired", "CLOUD_NOT_PAIRED"),
+        ("refused", "MUSIC_DETAILS_UNAVAILABLE"),
+    ] {
+        let service = MusicContextService::new(
+            Arc::new(Reader { status }),
+            1,
+            std::time::Duration::from_secs(1),
+        );
+        let result = serde_json::to_value(
+            handle_music_details_with_service(
+                &state,
+                HifiMusicDetailsTool {
+                    zone_id: "roon:context".into(),
+                    language: "en".into(),
+                },
+                &service,
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["refusal"]["code"], code);
+        let http = unified_hifi_control::api::music_details::response(
+            &service,
+            &state.aggregator,
+            &unified_hifi_control::config::get_config_dir(),
+            "roon:context",
+            Ok(axum::extract::Query(
+                serde_json::from_value(json!({"language":"en"})).unwrap(),
+            )),
+        )
+        .await;
+        assert_eq!(http.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(http.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["code"], code);
+        assert_eq!(
+            body["error"],
+            result["structuredContent"]["refusal"]["detail"]
+        );
+        assert!(
+            !result_text(&result).contains("401"),
+            "upstream authorization must not become local authorization"
+        );
+    }
+    task.abort();
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn music_details_both_transports_refuse_late_context_for_changed_music() {
+    use unified_hifi_control::{
+        cloud_connector::music::{MusicDetails, MusicError, MusicIdentity},
+        mcp::tools::music_details::{handle_music_details_with_service, HifiMusicDetailsTool},
+        music_context::{MusicContextService, MusicDetailsReader},
+    };
+    struct ChangingReader {
+        bus: unified_hifi_control::bus::SharedBus,
+        aggregator: Arc<ZoneAggregator>,
+    }
+    impl MusicDetailsReader for ChangingReader {
+        fn fetch<'a>(
+            &'a self,
+            _: &'a std::path::Path,
+            _: &'a MusicIdentity,
+            token: &'a str,
+            _: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<MusicDetails, MusicError>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                let mut zone = self
+                    .aggregator
+                    .get_zone("roon:changing-context")
+                    .await
+                    .unwrap();
+                zone.now_playing.as_mut().unwrap().title = "B".into();
+                self.bus
+                    .publish(unified_hifi_control::bus::BusEvent::ZoneDiscovered { zone });
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while self
+                        .aggregator
+                        .get_now_playing("roon:changing-context")
+                        .await
+                        .unwrap()
+                        .title
+                        != "B"
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                Ok(MusicDetails {
+                    version: 1,
+                    item_token: token.into(),
+                    status: "partial".into(),
+                    sections: Default::default(),
+                })
+            })
+        }
+    }
+    let bus = create_bus();
+    let state = build_state_with_bus(bus.clone(), None, None).await;
+    let aggregator = state.aggregator.clone();
+    let task = tokio::spawn(async move { aggregator.run().await });
+    seed_zone(&bus, &state, "roon:changing-context", "Changing").await;
+    let mut original = state
+        .aggregator
+        .get_zone("roon:changing-context")
+        .await
+        .unwrap();
+    original.now_playing = Some(unified_hifi_control::bus::NowPlaying {
+        title: "A".into(),
+        artist: "Artist".into(),
+        album: "Album".into(),
+        image_key: None,
+        seek_position: None,
+        duration: None,
+        metadata: None,
+        repeat_mode: None,
+        shuffle: None,
+    });
+    let service = MusicContextService::new(
+        Arc::new(ChangingReader {
+            bus: bus.clone(),
+            aggregator: state.aggregator.clone(),
+        }),
+        1,
+        std::time::Duration::from_secs(2),
+    );
+    for use_http in [false, true] {
+        bus.publish(unified_hifi_control::bus::BusEvent::ZoneDiscovered {
+            zone: original.clone(),
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !state
+                .aggregator
+                .get_now_playing("roon:changing-context")
+                .await
+                .is_some_and(|item| item.title == "A")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        if use_http {
+            let result = unified_hifi_control::api::music_details::response(
+                &service,
+                &state.aggregator,
+                &unified_hifi_control::config::get_config_dir(),
+                "roon:changing-context",
+                Ok(axum::extract::Query(
+                    serde_json::from_value(json!({"language":"en"})).unwrap(),
+                )),
+            )
+            .await;
+            assert_eq!(result.status(), axum::http::StatusCode::CONFLICT);
+            let body: Value = serde_json::from_slice(
+                &axum::body::to_bytes(result.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["code"], "MUSIC_CHANGED");
+            assert!(body.get("details").is_none());
+        } else {
+            let result = serde_json::to_value(
+                handle_music_details_with_service(
+                    &state,
+                    HifiMusicDetailsTool {
+                        zone_id: "roon:changing-context".into(),
+                        language: "en".into(),
+                    },
+                    &service,
+                )
+                .await
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(result["isError"], true);
+            assert_eq!(
+                result["structuredContent"]["refusal"]["code"],
+                "MUSIC_CHANGED"
+            );
+            assert!(result["structuredContent"].get("data").is_none());
+        }
+    }
+    task.abort();
 }

@@ -263,7 +263,14 @@ pub async fn middleware(
     }
     let headers = request.headers();
     let Some(session) = auth.session(headers).await else {
-        return unauthorized();
+        let mut response = unauthorized();
+        if is_music_details(path) {
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, no-store"),
+            );
+        }
+        return response;
     };
     if request.method() != axum::http::Method::GET
         && request.method() != axum::http::Method::HEAD
@@ -330,7 +337,16 @@ fn is_native_bridge(path: &str) -> bool {
         || path.starts_with("/api/bridges/applemusic/content/")
 }
 
+fn is_music_details(path: &str) -> bool {
+    path.strip_prefix("/zones/")
+        .and_then(|rest| rest.strip_suffix("/music-details"))
+        .is_some_and(|zone| !zone.is_empty() && !zone.contains('/'))
+}
+
 fn is_protected(path: &str, method: &axum::http::Method) -> bool {
+    if is_music_details(path) {
+        return true;
+    }
     if path.starts_with("/api/hiphi/pairing/") || path.starts_with("/api/hiphi/connection/") {
         return true;
     }
