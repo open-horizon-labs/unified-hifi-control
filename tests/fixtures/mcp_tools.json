@@ -395,7 +395,7 @@
       "openWorldHint": true,
       "readOnlyHint": true
     },
-    "description": "Read source-attributed HiPhi Cloud music context for an explicit zone and supported wiki language. Returns identity-level context, not a playback occurrence guarantee. Partial, ambiguous or unavailable catalog answers are successful reads; compare returned identity with your current selection. Makes an optional external Cloud request and never changes playback.",
+    "description": "Read source-attributed HiPhi Cloud context for the music playing in an explicit zone and language. Returns identity, catalog candidates, genres, and available source facts with provenance and attribution. The first read can be slow while upstream sources are fetched. Treat partial, ambiguous, unavailable, or stale results accordingly; never present ambiguous candidate facts as certain. Compare returned identity with the current selection. Requires optional Cloud pairing; read-only and never changes playback.",
     "inputSchema": {
       "properties": {
         "language": {
