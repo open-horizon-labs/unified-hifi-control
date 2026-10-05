@@ -46,7 +46,7 @@ try {
     $assets = [regex]::Matches($page.Content, '/assets/[^"\s<>]+\.js')
     if ($assets.Count -eq 0) { throw 'Embedded JavaScript asset link missing' }
     $asset = Invoke-WebRequest ("http://127.0.0.1:18088" + $assets[0].Value) -TimeoutSec 10
-    if ($asset.StatusCode -ne 200 -or $asset.RawContentLength -eq 0) { throw 'Embedded JavaScript asset missing' }
+    if ($asset.StatusCode -ne 200 -or $asset.RawContentLength -eq 0 -or $asset.Headers['Content-Type'] -notmatch 'javascript') { throw 'Embedded JavaScript asset missing' }
     Write-Host 'Native Windows loader, helper entrypoints, HTTP, version/SHA and embedded assets passed'
 } catch {
     if (Test-Path $stdout) { Get-Content $stdout -Tail 50 }
