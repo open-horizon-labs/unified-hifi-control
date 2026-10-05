@@ -32,6 +32,24 @@ class FleetCacheTests(unittest.TestCase):
                 self.assertNotEqual(first, cache.cache_key(root, "linux-x64"))
                 (root / name).write_text(original)
 
+    def test_windows_tool_recipe_changes_invalidate_only_windows_snapshots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".cargo").mkdir()
+            (root / "build/prepared-builders").mkdir(parents=True)
+            inputs = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml",
+                      "build/prepared-builders/windows-source.yml", "build/prepared-builders/windows-profile.json"]
+            for name in inputs:
+                (root / name).write_text(name)
+            windows = cache.cache_key(root, "windows-x86_64-pc-windows-msvc")
+            linux = cache.cache_key(root, "linux-x64")
+            for name in inputs[-2:]:
+                original = (root / name).read_text()
+                (root / name).write_text(original + " changed SDK/compiler")
+                self.assertNotEqual(windows, cache.cache_key(root, "windows-x86_64-pc-windows-msvc"))
+                self.assertEqual(linux, cache.cache_key(root, "linux-x64"))
+                (root / name).write_text(original)
+
     def test_unsafe_archive_cannot_overwrite_tools_or_escape_working_directory(self):
         for name in ["cargo/bin/cargo", "target/../../escaped", "cargo/credentials.toml"]:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:

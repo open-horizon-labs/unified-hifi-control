@@ -162,7 +162,7 @@ fn server_artifacts_include_the_naa_proxy() {
         "build-linux-arm",
         "build-macos-x64",
         "build-macos-arm64",
-        "build-windows",
+        "build-windows-cross",
     ] {
         let body = job(&source, name);
         assert!(
@@ -345,4 +345,31 @@ fn validation_uses_the_fast_profile_and_tagged_releases_keep_reviewed_optimizati
         assert!(body.contains("ln -s \"$cache\" target"));
         assert!(body.contains("if: runner.environment == 'github-hosted'"));
     }
+}
+
+#[test]
+fn windows_compiles_on_linux_and_is_verified_before_release_publication() {
+    let source = workflow("build.yml");
+    let cross = job(&source, "build-windows-cross");
+    assert!(cross.contains(
+        "cargo xwin build --locked --release --target x86_64-pc-windows-msvc --features naa-proxy"
+    ));
+    assert!(cross.contains("Download WASM assets"));
+    assert!(cross.contains("builder:"));
+    assert!(cross.contains("binary-windows-cross"));
+    for helper in [
+        "unified-hifi-control.exe",
+        "uhc-hiphi-pair.exe",
+        "uhc-music-details.exe",
+    ] {
+        assert!(cross.contains(helper), "missing Windows binary {helper}");
+    }
+    let native = job(&source, "build-windows");
+    assert!(native.contains("needs: [plan, build-windows-cross]"));
+    assert!(native.contains("runs-on: windows-latest"));
+    assert!(native.contains("./scripts/check-windows-runtime.ps1"));
+    assert!(native.contains("signtool") || native.contains("SIGNTOOL"));
+    assert!(native.contains("name: binary-windows"));
+    assert!(!native.contains("cargo build"));
+    assert!(!native.contains("continue-on-error"));
 }
