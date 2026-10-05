@@ -1320,7 +1320,7 @@ jobs:
       if: runner.environment == 'github-hosted'
       uses: Swatinem/rust-cache@v2
       with:
-        shared-key: windows-cross-msvc
+        shared-key: windows-cross-msvc-${{ hashFiles('build/prepared-builders/windows-*') }}
     - name: Download WASM assets
       uses: actions/download-artifact@v8
       with:

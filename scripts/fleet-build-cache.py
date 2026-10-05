@@ -22,7 +22,10 @@ def cache_key(workspace, flavor):
     for name in ["CARGO_PROFILE_RELEASE_LTO", "CARGO_PROFILE_RELEASE_CODEGEN_UNITS"]:
         digest.update(name.encode())
         digest.update(os.environ.get(name, "").encode())
-    for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"]:
+    inputs = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"]
+    if flavor.startswith("windows-"):
+        inputs += ["build/prepared-builders/windows-source.yml", "build/prepared-builders/windows-profile.json"]
+    for name in inputs:
         digest.update(name.encode())
         digest.update((workspace / name).read_bytes())
     return "uhc-build-state/v1/" + quote(flavor, safe="") + "/" + digest.hexdigest() + ".tar.gz"
