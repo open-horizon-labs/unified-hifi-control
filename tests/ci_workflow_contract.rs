@@ -351,11 +351,17 @@ fn validation_uses_the_fast_profile_and_tagged_releases_keep_reviewed_optimizati
 fn windows_compiles_on_linux_and_is_verified_before_release_publication() {
     let source = workflow("build.yml");
     let cross = job(&source, "build-windows-cross");
-    assert!(cross.contains("cargo xwin build --locked --release --target x86_64-pc-windows-msvc --features naa-proxy"));
+    assert!(cross.contains(
+        "cargo xwin build --locked --release --target x86_64-pc-windows-msvc --features naa-proxy"
+    ));
     assert!(cross.contains("Download WASM assets"));
     assert!(cross.contains("builder:"));
     assert!(cross.contains("binary-windows-cross"));
-    for helper in ["unified-hifi-control.exe", "uhc-hiphi-pair.exe", "uhc-music-details.exe"] {
+    for helper in [
+        "unified-hifi-control.exe",
+        "uhc-hiphi-pair.exe",
+        "uhc-music-details.exe",
+    ] {
         assert!(cross.contains(helper), "missing Windows binary {helper}");
     }
     let native = job(&source, "build-windows");
