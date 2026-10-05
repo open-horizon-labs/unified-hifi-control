@@ -275,11 +275,9 @@ fn latest_stable_lints_are_visible_and_advisory() {
     assert!(advisory.contains("$GITHUB_STEP_SUMMARY"));
     assert!(job(&source, "lint").contains("$GITHUB_STEP_SUMMARY"));
     let blocking = job(&source, "lint");
-    assert!(
-        !blocking
-            .lines()
-            .any(|line| line.starts_with("    continue-on-error:"))
-    );
+    assert!(!blocking
+        .lines()
+        .any(|line| line.starts_with("    continue-on-error:")));
     let clippy = blocking
         .split("- name: Run clippy")
         .nth(1)
