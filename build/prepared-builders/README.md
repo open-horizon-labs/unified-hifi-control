@@ -39,3 +39,7 @@ python runner/builder/convert.py /path/to/uhc/.github/workflows/build.yml \
 
 The Mac jobs continue using their existing persistent Tart guest and Actions
 compiler cache. They are not Linux containers.
+
+The main Build workflow owns formatting, workspace clippy, and workspace tests
+(including the HTTP API contract). The former streaming-alpha workflow repeated
+those same checks on v4 PRs and has been consolidated into Build.

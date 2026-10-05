@@ -430,7 +430,7 @@ jobs:
         python3 tests/ci_setup_rust_path.py
         python3 tests/fleet_build_cache.py
     - name: Run clippy
-      run: cargo clippy -- -D warnings
+      run: cargo clippy --workspace -- -D warnings
     - name: Explain blocking lint result
       if: always()
       run: echo 'Blocking lint uses the reviewed rust-toolchain.toml baseline and rejects every warning. Latest-stable findings
