@@ -397,8 +397,8 @@ jobs:
     - uses: actions/checkout@v6
     - name: Isolate mutable tool state
       run: |
-        echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
-        echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
+        echo "CARGO_HOME=${HOME}/.cargo" >> "$GITHUB_ENV"
+        echo "RUSTUP_HOME=${HOME}/.rustup" >> "$GITHUB_ENV"
     - name: Cache generated CSS
       id: cache-css
       uses: actions/cache@v5
@@ -473,8 +473,8 @@ jobs:
     - uses: actions/checkout@v6
     - name: Isolate mutable tool state
       run: |
-        echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
-        echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
+        echo "CARGO_HOME=${HOME}/.cargo" >> "$GITHUB_ENV"
+        echo "RUSTUP_HOME=${HOME}/.rustup" >> "$GITHUB_ENV"
     - name: Cache generated CSS
       id: cache-css
       uses: actions/cache@v5
