@@ -1,5 +1,8 @@
 import importlib.util
 import io
+import json
+import os
+from unittest import mock
 from pathlib import Path
 import tarfile
 import tempfile
@@ -45,6 +48,26 @@ class FleetCacheTests(unittest.TestCase):
                     cache.extract(archive, workspace, root / "cargo")
                 self.assertFalse((workspace / "target/dependency.rlib").exists())
                 self.assertFalse((root / "escaped").exists())
+
+    def test_repeat_commit_skips_upload_but_new_commit_does_not(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".cargo").mkdir()
+            (root / "target").mkdir()
+            (root / "target/dependency.rlib").write_bytes(b"compiled")
+            for name in ["Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"]:
+                (root / name).write_text(name)
+            key = cache.cache_key(root, "linux")
+            state = root / ("nas-cargo-state-" + cache.hashlib.sha256(key.encode()).hexdigest() + ".json")
+            state.write_text(json.dumps({"key": key, "source_sha": "same-commit"}))
+            environment = {"GITHUB_WORKSPACE": str(root), "CARGO_HOME": str(root / "cargo"), "RUNNER_TEMP": str(root), "GITHUB_SHA": "same-commit"}
+            with mock.patch.dict(os.environ, environment), mock.patch("sys.argv", ["cache", "save", "--flavor", "linux"]), mock.patch.object(cache, "request", side_effect=AssertionError("upload attempted")) as transfer:
+                cache.main()
+                transfer.assert_not_called()
+                os.environ["GITHUB_SHA"] = "new-commit"
+                with self.assertRaisesRegex(AssertionError, "upload attempted"):
+                    cache.main()
+                transfer.assert_called_once()
 
     def test_restore_preserves_existing_wasm_assets_and_other_tool_files(self):
         with tempfile.TemporaryDirectory() as directory:

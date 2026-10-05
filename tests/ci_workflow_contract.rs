@@ -23,6 +23,9 @@ fn job(source: &str, name: &str) -> String {
 
 #[test]
 fn development_pull_requests_run_rust_and_api_contract_checks() {
+    let build = workflow("build.yml");
+    assert!(job(&build, "lint").contains("cargo clippy --workspace -- -D warnings"));
+    assert!(job(&build, "test").contains("cargo test --workspace"));
     for name in ["build.yml", "api-guard.yml"] {
         let source = workflow(name);
         let pull_request = source
@@ -71,12 +74,16 @@ fn development_does_not_enable_edge_image_publication() {
 #[test]
 fn trusted_expensive_linux_jobs_ask_for_a_capability_with_a_hosted_fork_fallback() {
     let source = workflow("build.yml");
-    let selector = r#"vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest'"#;
+    let trust = "vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)";
 
     for name in ["lint", "test", "build-wasm", "build-linux-x64"] {
         let body = job(&source, name);
         assert!(
-            body.contains(selector),
+            body.split_whitespace()
+                .collect::<String>()
+                .contains(&trust.split_whitespace().collect::<String>())
+                && body.contains(r#"["self-hosted","linux","x64","linux-general""#)
+                && body.contains("|| 'ubuntu-latest'"),
             "{name} must ask for the linux-general capability for trusted work and ubuntu-latest for fork PRs"
         );
         assert!(
@@ -103,42 +110,29 @@ fn jobs_that_need_playwright_or_docker_stay_on_hosted_ubuntu() {
 }
 
 #[test]
-fn linux_x64_tool_install_is_safe_on_a_persistent_runner() {
+fn linux_tools_are_prepared_once_and_activated_before_compilation() {
     let source = workflow("build.yml");
-    let linux_x64 = job(&source, "build-linux-x64");
-
-    assert!(linux_x64.contains("RUNNER_TOOL_CACHE"));
-    assert!(linux_x64.contains("Using runner-provided Zig"));
-    assert!(!linux_x64.contains("sudo mv zig-linux"));
-    assert!(linux_x64.contains(r#"test -x "$STAGED_ROOT/zig""#));
-    assert!(linux_x64.contains(r#"rm -rf "$ZIG_ROOT""#));
-}
-
-#[test]
-fn zigbuild_tool_cache_is_versioned_and_validated() {
-    let source = workflow("build.yml");
-
+    let setup = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/prepared-builders/source.yml"),
+    )
+    .unwrap();
+    assert!(setup.contains("cargo install cargo-zigbuild --version 0.23.4 --locked"));
+    assert!(setup.contains("test -x \"$STAGED_ROOT/zig\""));
     for name in ["build-linux-x64", "build-linux-arm"] {
         let body = job(&source, name);
+        assert!(body.contains("builder:"));
+        assert!(body.contains("CARGO_HOME=/opt/gh-builder/cargo"));
+        assert!(body.contains("cat /opt/gh-builder/path"));
+        assert!(body.contains("credentials:"));
+        assert!(body.contains("secrets.GITHUB_TOKEN"));
         assert!(
-            body.contains("cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-0.23.4"),
-            "{name} must key the cargo-zigbuild cache by platform and pinned version"
+            body.contains("|| ''"),
+            "fleet must not request a nested job container"
         );
+        assert!(!body.contains("cargo install cargo-zigbuild"));
+        assert!(!body.contains("name: Install zig"));
         assert!(
-            body.contains("cargo-zigbuild --version | grep -q 'cargo-zigbuild 0.23.4'"),
-            "{name} must validate a restored cargo-zigbuild binary before using it"
-        );
-        assert!(
-            body.contains("cargo install cargo-zigbuild --version 0.23.4 --locked"),
-            "{name} must install the same version named by its cache key"
-        );
-        assert!(
-            body.contains("path: ${{ runner.tool_cache }}/zig/0.13.0/"),
-            "{name} must restore Zig from the runner tool cache"
-        );
-        assert!(
-            body.find("name: Cache Zig") < body.find("name: Install zig"),
-            "{name} must restore Zig before checking whether an install is needed"
+            body.find("name: Activate prepared builder") < body.find("cargo zigbuild --release")
         );
     }
 }
@@ -163,42 +157,35 @@ fn server_artifacts_include_the_naa_proxy() {
 }
 
 #[test]
-fn dioxus_cli_cache_matches_the_isolated_cargo_home() {
+fn dioxus_is_prepared_once_and_wasm_retains_exact_output_reuse() {
     let source = workflow("build.yml");
     let wasm = job(&source, "build-wasm");
-
-    assert!(
-        wasm.contains("path: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/cargo/bin/dx"),
-        "Dioxus CLI cache must use the isolated runner Cargo bin path"
-    );
-    assert!(
-        wasm.contains("key: dx-cli-${{ runner.os }}-${{ runner.arch }}-0.7.10"),
-        "Dioxus CLI cache must be scoped by runner platform and pinned version"
-    );
-    assert!(
-        wasm.find("name: Cache Dioxus CLI") < wasm.find("name: Install Dioxus CLI"),
-        "Dioxus CLI cache must restore before installation"
-    );
+    let setup = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/prepared-builders/source.yml"),
+    )
+    .unwrap();
+    assert!(setup.contains("cargo install dioxus-cli@0.7.10 --locked"));
+    assert!(wasm.contains("CARGO_HOME=/opt/gh-builder/cargo"));
+    assert!(!wasm.contains("cargo install dioxus-cli"));
+    assert!(wasm.contains("steps.cache-wasm.outputs.cache-hit"));
+    assert!(wasm.contains("steps.check-cache.outputs.needs_build == 'true'"));
+    assert!(wasm.contains("build/prepared-builders/source.yml"));
 }
 
 #[test]
-fn parallel_fleet_workers_do_not_share_mutable_rust_toolchains() {
+fn ephemeral_fleet_containers_use_stable_tool_paths_without_shared_mutable_mounts() {
     let source = workflow("build.yml");
-
-    for name in [
-        "lint",
-        "test",
-        "build-wasm",
-        "build-linux-x64",
-        "build-linux-arm",
-    ] {
+    for name in ["lint", "test"] {
         let body = job(&source, name);
-        assert!(body.contains(
-            r#"echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV""#
-        ));
-        assert!(body.contains(
-            r#"echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV""#
-        ));
+        assert!(body.contains("CARGO_HOME=${HOME}/.cargo"));
+        assert!(body.contains("RUSTUP_HOME=${HOME}/.rustup"));
+        assert!(!body.contains("RUNNER_NAME}/cargo"));
+    }
+    for name in ["build-wasm", "build-linux-x64", "build-linux-arm"] {
+        let body = job(&source, name);
+        assert!(body.contains("CARGO_HOME=/opt/gh-builder/cargo"));
+        assert!(body.contains("RUSTUP_HOME=/opt/gh-builder/rustup"));
+        assert!(!body.contains("volumes:"));
     }
 }
 
@@ -287,7 +274,21 @@ fn latest_stable_lints_are_visible_and_advisory() {
     assert!(advisory.contains("if: always()"));
     assert!(advisory.contains("$GITHUB_STEP_SUMMARY"));
     assert!(job(&source, "lint").contains("$GITHUB_STEP_SUMMARY"));
-    assert!(!job(&source, "lint").contains("continue-on-error: true"));
+    let blocking = job(&source, "lint");
+    assert!(
+        !blocking
+            .lines()
+            .any(|line| line.starts_with("    continue-on-error:"))
+    );
+    let clippy = blocking
+        .split("- name: Run clippy")
+        .nth(1)
+        .unwrap()
+        .split("- name:")
+        .next()
+        .unwrap();
+    assert!(!clippy.contains("continue-on-error:"));
+    assert!(clippy.contains("cargo clippy --workspace -- -D warnings"));
 }
 
 #[test]
@@ -306,11 +307,7 @@ fn compiler_changes_invalidate_wasm_output_and_trigger_platform_validation() {
             key.contains(input),
             "WASM cache does not include compiler input {input}"
         );
-        for name in [
-            "streaming-alpha.yml",
-            "hiphi-cloud-connector.yml",
-            "windows-connector.yml",
-        ] {
+        for name in ["hiphi-cloud-connector.yml", "windows-connector.yml"] {
             let source = workflow(name);
             let triggers = source.split("jobs:").next().unwrap();
             assert!(

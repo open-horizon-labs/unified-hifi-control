@@ -23,8 +23,8 @@ Fleet Linux jobs restore/save Cargo target state and registry sources directly
 from NAS MinIO using `scripts/fleet-build-cache.py`. The key covers the job/target,
 Cargo.lock, pinned toolchain, and target flags. Ephemeral Linux containers use stable Cargo/Rustup paths so restored dependency
 fingerprints remain reusable. Jobs keep independent working directories; S3 publishes snapshots atomically. This avoids uploading large target
-archives through GitHub. Hosted jobs retain Swatinem's cache. NAS failures are
-visible but do not block builds. Source changes reuse dependency state; Cargo
+archives through GitHub. Hosted jobs retain Swatinem's cache. Snapshots record the source commit; repeat builds of that commit skip an
+unnecessary snapshot upload. NAS failures are visible but do not block builds. Source changes reuse dependency state; Cargo
 fingerprints and the existing main-crate clean still force application rebuilds.
 Linux compile timings and sccache statistics are uploaded/reported in each run.
 

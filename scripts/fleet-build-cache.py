@@ -2,9 +2,11 @@
 """Transfer isolated Cargo state to the fleet's NAS S3 service (no dependencies)."""
 import argparse
 import datetime
+import errno
 import hashlib
 import hmac
 import http.client
+import json
 import os
 from pathlib import Path
 import shutil
@@ -23,7 +25,7 @@ def cache_key(workspace, flavor):
     return "uhc-build-state/v1/" + quote(flavor, safe="") + "/" + digest.hexdigest() + ".tar.gz"
 
 
-def request(method, key, body=None):
+def request(method, key, body=None, metadata=None):
     endpoint = urlsplit(os.environ["SCCACHE_ENDPOINT"])
     if endpoint.scheme not in {"http", "https"} or endpoint.path not in {"", "/"}:
         raise ValueError("expected an HTTP(S) S3 endpoint without a path")
@@ -38,6 +40,7 @@ def request(method, key, body=None):
     headers = {"host": endpoint.netloc, "x-amz-content-sha256": payload_hash.hexdigest(), "x-amz-date": stamp}
     if os.environ.get("AWS_SESSION_TOKEN"):
         headers["x-amz-security-token"] = os.environ["AWS_SESSION_TOKEN"]
+    headers.update(metadata or {})
     names = ";".join(sorted(headers))
     path = "/" + quote(os.environ["SCCACHE_BUCKET"], safe="") + "/" + key
     canonical = "\n".join([method, path, "", "".join(k + ":" + headers[k] + "\n" for k in sorted(headers)), names, payload_hash.hexdigest()])
@@ -73,6 +76,14 @@ def extract(archive, workspace, cargo):
             bundle.extractall(root, filter="data")
         for source, destination in [(root / "target", workspace / "target"), (root / "cargo/registry", cargo / "registry"), (root / "cargo/git", cargo / "git")]:
             if source.exists():
+                if not destination.exists():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        source.rename(destination)
+                        continue
+                    except OSError as error:
+                        if error.errno != errno.EXDEV:
+                            raise
                 shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=True)
 
 
@@ -84,6 +95,13 @@ def main():
     workspace = Path(os.environ["GITHUB_WORKSPACE"])
     cargo = Path(os.environ.get("CARGO_HOME", str(Path.home() / ".cargo")))
     key = cache_key(workspace, args.flavor)
+    source_sha = os.environ.get("GITHUB_SHA", "")
+    state = Path(os.environ["RUNNER_TEMP"]) / ("nas-cargo-state-" + hashlib.sha256(key.encode()).hexdigest() + ".json")
+    if args.mode == "save" and source_sha and state.exists():
+        restored = json.loads(state.read_text())
+        if restored == {"key": key, "source_sha": source_sha}:
+            print("NAS Cargo state already current for this commit; skipped snapshot upload")
+            return
     started = time.monotonic()
     with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP")) as temporary:
         archive = Path(temporary) / "state.tar.gz"
@@ -95,11 +113,13 @@ def main():
                     return
                 if response.status != 200:
                     raise RuntimeError("NAS cache GET returned HTTP " + str(response.status))
+                restored_sha = response.getheader("x-amz-meta-source-sha", "")
                 with archive.open("wb") as stream:
                     shutil.copyfileobj(response, stream, 8 * 1024 * 1024)
             finally:
                 connection.close()
             extract(archive, workspace, cargo)
+            state.write_text(json.dumps({"key": key, "source_sha": restored_sha}))
         else:
             # Each job owns its working directories. S3 PUT publishes a complete
             # immutable snapshot atomically; jobs never share mutable target/.
@@ -118,7 +138,7 @@ def main():
                 producer.stdout.close()
                 if producer.wait() or compressor.returncode:
                     raise RuntimeError("cache archive creation failed")
-            connection, response = request("PUT", key, archive)
+            connection, response = request("PUT", key, archive, {"x-amz-meta-source-sha": source_sha} if source_sha else None)
             try:
                 response.read()
                 if response.status not in {200, 201, 204}:
