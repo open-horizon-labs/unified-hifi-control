@@ -1,0 +1,61 @@
+name: Prepare build environments
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check out the reviewed converter
+        uses: actions/checkout@v6
+        with:
+          repository: open-horizon-labs/homelab-infra
+          ref: ba5fb06713dfc83d3753851b41374f8c5d6875d3
+          ssh-key: ${{ secrets.BUILDER_INFRA_SSH_KEY }}
+          persist-credentials: false
+          path: .builder-infra
+          sparse-checkout: runner/builder
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r .builder-infra/runner/builder/requirements.txt
+      - name: Generate the environment from canonical Actions setup
+        run: |
+          python .builder-infra/runner/builder/convert.py .github/workflows/build.yml \
+            --setup-source build/prepared-builders/source.yml \
+            --config build/prepared-builders/profile.json \
+            --output "$RUNNER_TEMP/prepared-builder"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish hosted tools once
+        run: |
+          image=$(python -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"] + "/prepared-builder/manifest.json"))["image"])')
+          if ! docker pull "$image"; then
+            docker build --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+              --tag "$image" "$RUNNER_TEMP/prepared-builder"
+            docker push "$image"
+          fi
+      - name: Export tools for the private fleet publisher
+        run: |
+          image=$(python -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"] + "/prepared-builder/manifest.json"))["image"])')
+          docker save "$image" | gzip -1 > "$RUNNER_TEMP/prepared-tools.tar.gz"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: prepared-tools
+          path: ${{ runner.temp }}/prepared-tools.tar.gz
+          compression-level: 0
+          retention-days: 3
+      - uses: actions/upload-artifact@v7
+        with:
+          name: prepared-builder
+          path: ${{ runner.temp }}/prepared-builder/
+          retention-days: 30

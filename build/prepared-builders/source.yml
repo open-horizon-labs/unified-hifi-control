@@ -1,0 +1,160 @@
+# Canonical Actions setup for explicit builder conversion. Not an executable workflow.
+name: Prepared build environment source
+jobs:
+  build-wasm:
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name
+      == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
+    steps:
+    - name: Isolate mutable tool state
+      run: |
+        echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+        echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
+    - name: Setup Rust
+      uses: ./.github/actions/setup-rust
+      with:
+        targets: wasm32-unknown-unknown
+        components: llvm-tools-preview
+    - name: Cache Dioxus CLI
+      id: cache-dx
+      uses: actions/cache@v5
+      with:
+        path: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/cargo/bin/dx
+        key: dx-cli-${{ runner.os }}-${{ runner.arch }}-0.7.10
+        restore-keys: |
+          dx-cli-${{ runner.os }}-${{ runner.arch }}-
+    - name: Install Dioxus CLI
+      run: cargo install dioxus-cli@0.7.10 --locked
+  build-linux-x64:
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name
+      == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
+    steps:
+    - name: Isolate mutable tool state
+      run: |
+        echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+        echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
+    - name: Setup Rust
+      uses: ./.github/actions/setup-rust
+      with:
+        targets: x86_64-unknown-linux-musl
+    - name: Cache Zig
+      uses: actions/cache@v5
+      with:
+        path: ${{ runner.tool_cache }}/zig/0.13.0/x64
+        key: zig-${{ runner.os }}-${{ runner.arch }}-0.13.0
+    - name: Install zig
+      run: |
+        set -euo pipefail
+        ZIG_VERSION="0.13.0"
+
+        # The fleet image may already carry the exact compiler. Reuse it;
+        # the host being x86_64 does not remove the musl linker requirement.
+        if command -v zig >/dev/null 2>&1 && [ "$(zig version)" = "$ZIG_VERSION" ]; then
+          echo "Using runner-provided Zig $(zig version)"
+          exit 0
+        fi
+
+        ZIG_ROOT="${RUNNER_TOOL_CACHE:-$HOME/.cache/uhc-tools}/zig/$ZIG_VERSION/x64"
+        if [ ! -x "$ZIG_ROOT/zig" ]; then
+          ZIG_PARENT=$(dirname "$ZIG_ROOT")
+          mkdir -p "$ZIG_PARENT"
+          TEMP_DIR=$(mktemp -d "$ZIG_PARENT/.zig-install.XXXXXX")
+          trap 'rm -rf "$TEMP_DIR"' EXIT
+          curl --fail --show-error --location \
+            "https://ziglang.org/download/$ZIG_VERSION/zig-linux-x86_64-$ZIG_VERSION.tar.xz" | \
+            tar -xJ -C "$TEMP_DIR"
+          STAGED_ROOT="$TEMP_DIR/zig-linux-x86_64-$ZIG_VERSION"
+          test -x "$STAGED_ROOT/zig"
+          rm -rf "$ZIG_ROOT"
+          mv "$STAGED_ROOT" "$ZIG_ROOT"
+          rm -rf "$TEMP_DIR"
+          trap - EXIT
+        fi
+        test -x "$ZIG_ROOT/zig"
+        echo "$ZIG_ROOT" >> "$GITHUB_PATH"
+    - name: Cache cargo-zigbuild
+      id: cache-zigbuild
+      uses: actions/cache@v5
+      with:
+        path: ${{ env.CARGO_HOME }}/bin/cargo-zigbuild
+        key: cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-0.23.4
+        restore-keys: |
+          cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-
+    - name: Ensure cargo-zigbuild
+      run: |
+        set -euo pipefail
+        if command -v cargo-zigbuild >/dev/null 2>&1 && \
+           cargo-zigbuild --version | grep -q 'cargo-zigbuild 0.23.4'; then
+          echo "Using cached cargo-zigbuild $(cargo-zigbuild --version)"
+        else
+          cargo install cargo-zigbuild --version 0.23.4 --locked
+        fi
+  build-linux-arm:
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name
+      == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
+    strategy:
+      matrix:
+        include:
+        - target: aarch64-unknown-linux-musl
+          output: unified-hifi-linux-arm64
+          arch: arm64
+        - target: armv7-unknown-linux-musleabihf
+          output: unified-hifi-linux-armv7
+          arch: armv7
+    steps:
+    - name: Isolate mutable tool state
+      run: |
+        echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+        echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
+    - name: Setup Rust
+      uses: ./.github/actions/setup-rust
+      with:
+        targets: ${{ matrix.target }}
+    - name: Cache Zig
+      uses: actions/cache@v5
+      with:
+        path: ${{ runner.tool_cache }}/zig/0.13.0/${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
+        key: zig-${{ runner.os }}-${{ runner.arch }}-0.13.0
+    - name: Install zig
+      run: |
+        set -euo pipefail
+        ZIG_VERSION="0.13.0"
+        ZIG_ARCH="$(uname -m)"
+        if command -v zig >/dev/null 2>&1 && [ "$(zig version)" = "$ZIG_VERSION" ]; then
+          echo "Using runner-provided Zig $(zig version)"
+        else
+          ZIG_ROOT="${RUNNER_TOOL_CACHE:-$HOME/.cache/uhc-tools}/zig/$ZIG_VERSION/$ZIG_ARCH"
+          if [ ! -x "$ZIG_ROOT/zig" ]; then
+            ZIG_PARENT=$(dirname "$ZIG_ROOT")
+            mkdir -p "$ZIG_PARENT"
+            TEMP_DIR=$(mktemp -d "$ZIG_PARENT/.zig-install.XXXXXX")
+            trap 'rm -rf "$TEMP_DIR"' EXIT
+            curl --fail --show-error --location \
+              "https://ziglang.org/download/$ZIG_VERSION/zig-linux-${ZIG_ARCH}-$ZIG_VERSION.tar.xz" | \
+              tar -xJ -C "$TEMP_DIR"
+            STAGED_ROOT="$TEMP_DIR/zig-linux-${ZIG_ARCH}-$ZIG_VERSION"
+            test -x "$STAGED_ROOT/zig"
+            rm -rf "$ZIG_ROOT"
+            mv "$STAGED_ROOT" "$ZIG_ROOT"
+            rm -rf "$TEMP_DIR"
+            trap - EXIT
+          fi
+          test -x "$ZIG_ROOT/zig"
+          echo "$ZIG_ROOT" >> "$GITHUB_PATH"
+        fi
+    - name: Cache cargo-zigbuild
+      id: cache-zigbuild
+      uses: actions/cache@v5
+      with:
+        path: ${{ env.CARGO_HOME }}/bin/cargo-zigbuild
+        key: cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-0.23.4
+        restore-keys: |
+          cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-
+    - name: Ensure cargo-zigbuild
+      run: |
+        set -euo pipefail
+        if command -v cargo-zigbuild >/dev/null 2>&1 && \
+           cargo-zigbuild --version | grep -q 'cargo-zigbuild 0.23.4'; then
+          echo "Using cached cargo-zigbuild $(cargo-zigbuild --version)"
+        else
+          cargo install cargo-zigbuild --version 0.23.4 --locked
+        fi
