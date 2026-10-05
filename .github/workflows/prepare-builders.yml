@@ -21,7 +21,7 @@ jobs:
           persist-credentials: false
           path: .builder-infra
           sparse-checkout: runner/builder
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - run: python -m pip install -r .builder-infra/runner/builder/requirements.txt
