@@ -1,5 +1,9 @@
 name: Build
 
+permissions:
+  contents: read
+  packages: read
+
 on:
   pull_request:
     branches: [master, v3, v4]
@@ -387,55 +391,57 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name
+      == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Isolate mutable tool state
-        run: |
-          echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
-
-      - name: Cache generated CSS
-        id: cache-css
-        uses: actions/cache@v5
-        with:
-          path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
-
-      - name: Build Tailwind CSS
-        if: steps.cache-css.outputs.cache-hit != 'true'
-        run: make css
-
-      - name: Setup Rust
-        uses: ./.github/actions/setup-rust
-        with:
-          components: clippy, rustfmt
-
-      # GitHub-hosted only. Self-hosted fleet runners are ephemeral containers
-      # with a persistent sccache mounted by the fleet's placement policy, so a
-      # target/ upload to GitHub's cache costs minutes of egress per job and
-      # buys nothing on the next one.
-      - name: Cache cargo
-        if: runner.environment == 'github-hosted'
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "native-build"
-          cache-all-crates: true
-          cache-on-failure: true
-
-      - name: Check formatting
-        run: cargo fmt --check
-
-      - name: Verify isolated Cargo tool discovery
-        run: python3 tests/ci_setup_rust_path.py
-
-      - name: Run clippy
-        run: cargo clippy -- -D warnings
-
-      - name: Explain blocking lint result
-        if: always()
-        run: echo 'Blocking lint uses the reviewed rust-toolchain.toml baseline and rejects every warning. Latest-stable findings are advisory.' >> "$GITHUB_STEP_SUMMARY"
+    - uses: actions/checkout@v6
+    - name: Isolate mutable tool state
+      run: |
+        echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+        echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
+    - name: Cache generated CSS
+      id: cache-css
+      uses: actions/cache@v5
+      with:
+        path: public/tailwind.css
+        key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
+    - name: Build Tailwind CSS
+      if: steps.cache-css.outputs.cache-hit != 'true'
+      run: make css
+    - name: Setup Rust
+      uses: ./.github/actions/setup-rust
+      with:
+        components: clippy, rustfmt
+    - name: Restore Cargo state from NAS
+      if: runner.environment == 'self-hosted'
+      continue-on-error: true
+      run: python3 scripts/fleet-build-cache.py restore --flavor '${{ github.job }}'
+    - name: Cache cargo
+      if: runner.environment == 'github-hosted'
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: native-build
+        cache-all-crates: true
+        cache-on-failure: true
+    - name: Check formatting
+      run: cargo fmt --check
+    - name: Verify isolated Cargo tool discovery
+      run: |
+        python3 tests/ci_setup_rust_path.py
+        python3 tests/fleet_build_cache.py
+    - name: Run clippy
+      run: cargo clippy -- -D warnings
+    - name: Explain blocking lint result
+      if: always()
+      run: echo 'Blocking lint uses the reviewed rust-toolchain.toml baseline and rejects every warning. Latest-stable findings
+        are advisory.' >> "$GITHUB_STEP_SUMMARY"
+    - name: Save Cargo state to NAS
+      if: always() && !cancelled() && runner.environment == 'self-hosted'
+      continue-on-error: true
+      run: python3 scripts/fleet-build-cache.py save --flavor '${{ github.job }}'
+    - name: Report compiler cache
+      if: always()
+      run: if command -v sccache >/dev/null; then sccache --show-stats; fi
 
   lint-latest-stable:
     name: Latest stable lint (advisory)
@@ -461,47 +467,50 @@ jobs:
 
   test:
     name: Test
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name
+      == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Isolate mutable tool state
-        run: |
-          echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
-
-      - name: Cache generated CSS
-        id: cache-css
-        uses: actions/cache@v5
-        with:
-          path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
-
-      - name: Build Tailwind CSS
-        if: steps.cache-css.outputs.cache-hit != 'true'
-        run: make css
-
-      - name: Setup Rust
-        uses: ./.github/actions/setup-rust
-
-      # On self-hosted fleet runners sccache is already in the image and
-      # RUSTC_WRAPPER/SCCACHE_DIR point at a persistent local cache; the GHA
-      # backend would override that and ship objects to GitHub instead.
-      - name: Setup sccache
-        if: runner.environment == 'github-hosted'
-        uses: mozilla-actions/sccache-action@v0.0.11
-
-      - name: Cache Rust
-        if: runner.environment == 'github-hosted'
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "test-build"
-
-      - name: Run tests
-        env:
-          SCCACHE_GHA_ENABLED: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
-          RUSTC_WRAPPER: "sccache"
-        run: cargo test --workspace
+    - uses: actions/checkout@v6
+    - name: Isolate mutable tool state
+      run: |
+        echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+        echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
+    - name: Cache generated CSS
+      id: cache-css
+      uses: actions/cache@v5
+      with:
+        path: public/tailwind.css
+        key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
+    - name: Build Tailwind CSS
+      if: steps.cache-css.outputs.cache-hit != 'true'
+      run: make css
+    - name: Setup Rust
+      uses: ./.github/actions/setup-rust
+    - name: Setup sccache
+      if: runner.environment == 'github-hosted'
+      uses: mozilla-actions/sccache-action@v0.0.11
+    - name: Restore Cargo state from NAS
+      if: runner.environment == 'self-hosted'
+      continue-on-error: true
+      run: python3 scripts/fleet-build-cache.py restore --flavor '${{ github.job }}'
+    - name: Cache Rust
+      if: runner.environment == 'github-hosted'
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: test-build
+        cache-on-failure: true
+    - name: Run tests
+      env:
+        SCCACHE_GHA_ENABLED: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
+        RUSTC_WRAPPER: sccache
+      run: cargo test --workspace
+    - name: Save Cargo state to NAS
+      if: always() && !cancelled() && runner.environment == 'self-hosted'
+      continue-on-error: true
+      run: python3 scripts/fleet-build-cache.py save --flavor '${{ github.job }}'
+    - name: Report compiler cache
+      if: always()
+      run: if command -v sccache >/dev/null; then sccache --show-stats; fi
 
   synology-package-test:
     name: Synology Package Contract
@@ -529,263 +538,197 @@ jobs:
   # Uses content-based caching to skip build when source unchanged
   build-wasm:
     name: Build WASM Assets
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name
+      == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general","builder:149e632fddb26ba06228"]') || 'ubuntu-latest'
+      }}
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Isolate mutable tool state
-        run: |
-          echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
-
-      - name: Cache WASM build output
-        id: cache-wasm
-        uses: actions/cache@v5
-        with:
-          path: |
-            target/dx/
-            target/wasm32-unknown-unknown/
-          # Version is baked in at compile time, but we accept stale version display
-          # for PRs in exchange for cache efficiency. Releases change Cargo.toml anyway.
-          # Note: Tailwind version pinned in Makefile - update cache key when upgrading
-          # Only inputs that can change the generated web assets belong here.
-          # Server-only changes (adapters, logging, cloud runtime, packaging) do
-          # not require rebuilding the client bundle or its static shell.
-          key: wasm-v4-tw4.1.18-${{ hashFiles('rust-toolchain.toml', '.github/actions/setup-rust/action.yml', '**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/lib.rs', 'src/app/**/*.rs', 'src/components/**/*.rs', 'src/adaptive/**/*.rs', 'assets/**', 'src/input.css', 'public/**') }}
-          restore-keys: |
-            wasm-v4-
-
-      # Verify cache is an EXACT key match and content is valid.
-      # restore-keys can load stale WASM from a previous build — file existence
-      # alone is not sufficient. Require cache-hit == true (exact key match).
-      - name: Verify cache and determine if build needed
-        id: check-cache
-        run: |
-          if [ "${{ steps.cache-wasm.outputs.cache-hit }}" == "true" ] && \
-             [ -d "target/dx/unified-hifi-control/release/web/public" ] && \
-             [ -f "target/dx/unified-hifi-control/release/web/public/index.html" ]; then
-            echo "WASM cache valid (exact key match)"
-            echo "needs_build=false" >> $GITHUB_OUTPUT
-          else
-            echo "WASM cache miss or partial restore — will rebuild"
-            echo "needs_build=true" >> $GITHUB_OUTPUT
-            # Clear stale dx output but keep Rust deps (wasm32-unknown-unknown)
-            rm -rf target/dx/
-          fi
-
-      - name: Setup Rust
-        if: steps.check-cache.outputs.needs_build == 'true'
-        # The reviewed baseline avoids the LLVM 23 wasm-bindgen regression:
-        # https://github.com/DioxusLabs/dioxus/issues/5766
-        uses: ./.github/actions/setup-rust
-        with:
-          targets: wasm32-unknown-unknown
-          components: llvm-tools-preview
-
-      - name: Cache Rust dependencies
-        if: steps.check-cache.outputs.needs_build == 'true' && runner.environment == 'github-hosted'
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "wasm-build"
-          cache-all-crates: true
-          cache-on-failure: true
-
-      - name: Cache Dioxus CLI
-        if: steps.check-cache.outputs.needs_build == 'true'
-        id: cache-dx
-        uses: actions/cache@v5
-        with:
-          # Isolate this from other runner jobs just like the installer isolates
-          # CARGO_HOME, otherwise a shared fleet cache can restore the wrong tool.
-          path: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/cargo/bin/dx
-          key: dx-cli-${{ runner.os }}-${{ runner.arch }}-0.7.10
-          restore-keys: |
-            dx-cli-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Install Dioxus CLI
-        if: steps.check-cache.outputs.needs_build == 'true' && steps.cache-dx.outputs.cache-hit != 'true'
-        run: cargo install dioxus-cli@0.7.10 --locked
-
-      - name: Cache generated CSS
-        if: steps.check-cache.outputs.needs_build == 'true'
-        id: cache-css
-        uses: actions/cache@v5
-        with:
-          path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
-
-      - name: Build Tailwind CSS
-        if: steps.check-cache.outputs.needs_build == 'true'
-        run: make css
-
-      - name: Build WASM assets (ADR 002)
-        if: steps.check-cache.outputs.needs_build == 'true'
-        # Asset generation does not produce a shipped server binary. Avoid the
-        # project's production LTO/link profile here; native packaging jobs below
-        # retain the optimized release profile when they build the actual binary.
-        env:
-          CARGO_PROFILE_RELEASE_LTO: "false"
-          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
-        run: |
-          # Version is fetched from server at runtime, no need to bake into WASM
-          dx build --fullstack=false --release @client --no-default-features --features web
-          echo "Generated assets:"
-          find target/dx -name "*.wasm" -o -name "*.js" | head -10
-
-      - name: Report cache status
-        run: |
-          if [ "${{ steps.check-cache.outputs.needs_build }}" == "false" ]; then
-            echo "::notice::WASM cache valid - skipped build"
-          else
-            echo "::notice::WASM cache invalid/partial - built from source (Rust deps cached)"
-          fi
-
-      - name: Verify WASM assets exist
-        run: |
-          if [ ! -d "target/dx/unified-hifi-control" ]; then
-            echo "::error::WASM assets not found in target/dx/ - build failed"
-            exit 1
-          fi
-          echo "WASM assets found:"
-          find target/dx -name "*.wasm" -o -name "*.js" | head -5
-
-      - name: Upload WASM assets
-        uses: actions/upload-artifact@v7
-        with:
-          name: wasm-assets
-          # Only upload release web assets, not entire target/dx/ (avoids 30MB+ bloat)
-          path: target/dx/unified-hifi-control/release/web/
-          if-no-files-found: error
-          retention-days: 1
+    - name: Activate prepared builder
+      shell: bash
+      run: |
+        echo 'CARGO_HOME=/opt/gh-builder/cargo' >> "$GITHUB_ENV"
+        echo 'RUSTUP_HOME=/opt/gh-builder/rustup' >> "$GITHUB_ENV"
+        cat /opt/gh-builder/path >> "$GITHUB_PATH"
+        cat /opt/gh-builder/env >> "$GITHUB_ENV"
+    - uses: actions/checkout@v6
+    - name: Cache WASM build output
+      id: cache-wasm
+      uses: actions/cache@v5
+      with:
+        path: |
+          target/dx/
+          target/wasm32-unknown-unknown/
+        key: wasm-v4-tw4.1.18-${{ hashFiles('rust-toolchain.toml', '.github/actions/setup-rust/action.yml', 'build/prepared-builders/source.yml',
+          '**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/lib.rs', 'src/app/**/*.rs', 'src/components/**/*.rs', 'src/adaptive/**/*.rs',
+          'assets/**', 'src/input.css', 'public/**') }}
+        restore-keys: |
+          wasm-v4-
+    - name: Verify cache and determine if build needed
+      id: check-cache
+      run: "if [ \"${{ steps.cache-wasm.outputs.cache-hit }}\" == \"true\" ] && \\\n   [ -d \"target/dx/unified-hifi-control/release/web/public\"\
+        \ ] && \\\n   [ -f \"target/dx/unified-hifi-control/release/web/public/index.html\" ]; then\n  echo \"WASM cache valid\
+        \ (exact key match)\"\n  echo \"needs_build=false\" >> $GITHUB_OUTPUT\nelse\n  echo \"WASM cache miss or partial restore\
+        \ \u2014 will rebuild\"\n  echo \"needs_build=true\" >> $GITHUB_OUTPUT\n  # Clear stale dx output but keep Rust deps\
+        \ (wasm32-unknown-unknown)\n  rm -rf target/dx/\nfi\n"
+    - name: Restore Cargo state from NAS
+      if: runner.environment == 'self-hosted' && steps.check-cache.outputs.needs_build == 'true'
+      continue-on-error: true
+      run: python3 scripts/fleet-build-cache.py restore --flavor '${{ github.job }}'
+    - name: Cache Rust dependencies
+      if: runner.environment == 'github-hosted' && (steps.check-cache.outputs.needs_build == 'true')
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: wasm-build
+        cache-all-crates: true
+        cache-on-failure: true
+    - name: Cache generated CSS
+      if: steps.check-cache.outputs.needs_build == 'true'
+      id: cache-css
+      uses: actions/cache@v5
+      with:
+        path: public/tailwind.css
+        key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
+    - name: Build Tailwind CSS
+      if: steps.check-cache.outputs.needs_build == 'true'
+      run: make css
+    - name: Build WASM assets (ADR 002)
+      if: steps.check-cache.outputs.needs_build == 'true'
+      env:
+        CARGO_PROFILE_RELEASE_LTO: 'false'
+        CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+      run: |
+        # Version is fetched from server at runtime, no need to bake into WASM
+        dx build --fullstack=false --release @client --no-default-features --features web
+        echo "Generated assets:"
+        find target/dx -name "*.wasm" -o -name "*.js" | head -10
+    - name: Report cache status
+      run: |
+        if [ "${{ steps.check-cache.outputs.needs_build }}" == "false" ]; then
+          echo "::notice::WASM cache valid - skipped build"
+        else
+          echo "::notice::WASM cache invalid/partial - built from source (Rust deps cached)"
+        fi
+    - name: Verify WASM assets exist
+      run: |
+        if [ ! -d "target/dx/unified-hifi-control" ]; then
+          echo "::error::WASM assets not found in target/dx/ - build failed"
+          exit 1
+        fi
+        echo "WASM assets found:"
+        find target/dx -name "*.wasm" -o -name "*.js" | head -5
+    - name: Upload WASM assets
+      uses: actions/upload-artifact@v7
+      with:
+        name: wasm-assets
+        path: target/dx/unified-hifi-control/release/web/
+        if-no-files-found: error
+        retention-days: 1
+    - name: Save Cargo state to NAS
+      if: always() && !cancelled() && runner.environment == 'self-hosted' && steps.check-cache.outputs.needs_build == 'true'
+      continue-on-error: true
+      run: python3 scripts/fleet-build-cache.py save --flavor '${{ github.job }}'
+    defaults:
+      run:
+        shell: bash
+    container:
+      image: ${{ !(vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name
+        == github.repository)) && 'ghcr.io/open-horizon-labs/unified-hifi-control:builder-76505ee69a4f7f747109' || '' }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
   build-linux-x64:
     name: Build Linux x64
-    needs: [plan, build-wasm]
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
+    needs:
+    - plan
+    - build-wasm
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name
+      == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general","builder:149e632fddb26ba06228"]') || 'ubuntu-latest'
+      }}
     steps:
-      - uses: actions/checkout@v6
+    - name: Activate prepared builder
+      shell: bash
+      run: |
+        echo 'CARGO_HOME=/opt/gh-builder/cargo' >> "$GITHUB_ENV"
+        echo 'RUSTUP_HOME=/opt/gh-builder/rustup' >> "$GITHUB_ENV"
+        cat /opt/gh-builder/path >> "$GITHUB_PATH"
+        cat /opt/gh-builder/env >> "$GITHUB_ENV"
+    - uses: actions/checkout@v6
+    - name: Restore Cargo state from NAS
+      if: runner.environment == 'self-hosted'
+      continue-on-error: true
+      run: python3 scripts/fleet-build-cache.py restore --flavor '${{ github.job }}'
+    - name: Cache Rust
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: zigbuild-x86_64-unknown-linux-musl
+        cache-on-failure: true
+      if: runner.environment == 'github-hosted'
+    - name: Download WASM assets
+      uses: actions/download-artifact@v8
+      with:
+        name: wasm-assets
+        path: target/dx/unified-hifi-control/release/web/
+    - name: Cache generated CSS
+      id: cache-css
+      uses: actions/cache@v5
+      with:
+        path: public/tailwind.css
+        key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
+    - name: Build Tailwind CSS
+      if: steps.cache-css.outputs.cache-hit != 'true'
+      run: make css
+    - name: Build with zigbuild (embeds WASM)
+      env:
+        UHC_VERSION: ${{ needs.plan.outputs.version }}
+        UHC_GIT_SHA: ${{ needs.plan.outputs.git_sha }}
+      run: |
+        # Force rebuild of main crate to pick up version env vars and embedded assets
+        cargo clean -p unified-hifi-control 2>/dev/null || true
+        cargo zigbuild --release --timings --target x86_64-unknown-linux-musl \
+          --features naa-proxy \
+          --bin unified-hifi-control --bin uhc-hiphi-pair --bin uhc-music-details
+    - name: Rename binary
+      run: |
+        mkdir -p dist/bin
+        cp target/x86_64-unknown-linux-musl/release/unified-hifi-control dist/bin/unified-hifi-linux-x64
+        cp target/x86_64-unknown-linux-musl/release/uhc-hiphi-pair dist/bin/uhc-hiphi-pair-x64
+        cp target/x86_64-unknown-linux-musl/release/uhc-music-details dist/bin/uhc-music-details-x64
+    - name: Verify ELF hardening
+      run: |
+        scripts/check-elf-hardening.sh dist/bin/unified-hifi-linux-x64
+        scripts/check-elf-hardening.sh dist/bin/uhc-hiphi-pair-x64
+        scripts/check-elf-hardening.sh dist/bin/uhc-music-details-x64
+    - name: Upload binary
+      uses: actions/upload-artifact@v7
+      with:
+        name: binary-x86_64-unknown-linux-musl
+        path: dist/bin/
+        retention-days: 5
+    - name: Report compiler cache statistics
+      if: always()
+      run: if command -v sccache >/dev/null 2>&1; then sccache --show-stats; fi
+    - name: Upload compilation timings
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: compile-timings-linux-x64
+        path: target/cargo-timings/
+        if-no-files-found: ignore
+        retention-days: 7
+    - name: Save Cargo state to NAS
+      if: always() && !cancelled() && runner.environment == 'self-hosted'
+      continue-on-error: true
+      run: python3 scripts/fleet-build-cache.py save --flavor '${{ github.job }}'
+    defaults:
+      run:
+        shell: bash
+    container:
+      image: ${{ !(vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name
+        == github.repository)) && 'ghcr.io/open-horizon-labs/unified-hifi-control:builder-76505ee69a4f7f747109' || '' }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Isolate mutable tool state
-        run: |
-          echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
-
-      - name: Setup Rust
-        uses: ./.github/actions/setup-rust
-        with:
-          targets: x86_64-unknown-linux-musl
-
-      - name: Cache Rust
-        if: runner.environment == 'github-hosted'
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: zigbuild-x86_64-unknown-linux-musl
-
-      - name: Cache Zig
-        uses: actions/cache@v5
-        with:
-          path: ${{ runner.tool_cache }}/zig/0.13.0/x64
-          key: zig-${{ runner.os }}-${{ runner.arch }}-0.13.0
-
-      - name: Install zig
-        run: |
-          set -euo pipefail
-          ZIG_VERSION="0.13.0"
-
-          # The fleet image may already carry the exact compiler. Reuse it;
-          # the host being x86_64 does not remove the musl linker requirement.
-          if command -v zig >/dev/null 2>&1 && [ "$(zig version)" = "$ZIG_VERSION" ]; then
-            echo "Using runner-provided Zig $(zig version)"
-            exit 0
-          fi
-
-          ZIG_ROOT="${RUNNER_TOOL_CACHE:-$HOME/.cache/uhc-tools}/zig/$ZIG_VERSION/x64"
-          if [ ! -x "$ZIG_ROOT/zig" ]; then
-            ZIG_PARENT=$(dirname "$ZIG_ROOT")
-            mkdir -p "$ZIG_PARENT"
-            TEMP_DIR=$(mktemp -d "$ZIG_PARENT/.zig-install.XXXXXX")
-            trap 'rm -rf "$TEMP_DIR"' EXIT
-            curl --fail --show-error --location \
-              "https://ziglang.org/download/$ZIG_VERSION/zig-linux-x86_64-$ZIG_VERSION.tar.xz" | \
-              tar -xJ -C "$TEMP_DIR"
-            STAGED_ROOT="$TEMP_DIR/zig-linux-x86_64-$ZIG_VERSION"
-            test -x "$STAGED_ROOT/zig"
-            rm -rf "$ZIG_ROOT"
-            mv "$STAGED_ROOT" "$ZIG_ROOT"
-            rm -rf "$TEMP_DIR"
-            trap - EXIT
-          fi
-          test -x "$ZIG_ROOT/zig"
-          echo "$ZIG_ROOT" >> "$GITHUB_PATH"
-
-      - name: Cache cargo-zigbuild
-        id: cache-zigbuild
-        uses: actions/cache@v5
-        with:
-          path: ${{ env.CARGO_HOME }}/bin/cargo-zigbuild
-          key: cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-0.23.4
-          restore-keys: |
-            cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Ensure cargo-zigbuild
-        run: |
-          set -euo pipefail
-          if command -v cargo-zigbuild >/dev/null 2>&1 && \
-             cargo-zigbuild --version | grep -q 'cargo-zigbuild 0.23.4'; then
-            echo "Using cached cargo-zigbuild $(cargo-zigbuild --version)"
-          else
-            cargo install cargo-zigbuild --version 0.23.4 --locked
-          fi
-
-      - name: Download WASM assets
-        uses: actions/download-artifact@v8
-        with:
-          name: wasm-assets
-          path: target/dx/unified-hifi-control/release/web/
-
-      - name: Cache generated CSS
-        id: cache-css
-        uses: actions/cache@v5
-        with:
-          path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
-
-      - name: Build Tailwind CSS
-        if: steps.cache-css.outputs.cache-hit != 'true'
-        run: make css
-
-      - name: Build with zigbuild (embeds WASM)
-        env:
-          UHC_VERSION: ${{ needs.plan.outputs.version }}
-          UHC_GIT_SHA: ${{ needs.plan.outputs.git_sha }}
-        run: |
-          # Force rebuild of main crate to pick up version env vars and embedded assets
-          cargo clean -p unified-hifi-control 2>/dev/null || true
-          cargo zigbuild --release --target x86_64-unknown-linux-musl \
-            --features naa-proxy \
-            --bin unified-hifi-control --bin uhc-hiphi-pair --bin uhc-music-details
-
-      - name: Rename binary
-        run: |
-          mkdir -p dist/bin
-          cp target/x86_64-unknown-linux-musl/release/unified-hifi-control dist/bin/unified-hifi-linux-x64
-          cp target/x86_64-unknown-linux-musl/release/uhc-hiphi-pair dist/bin/uhc-hiphi-pair-x64
-          cp target/x86_64-unknown-linux-musl/release/uhc-music-details dist/bin/uhc-music-details-x64
-
-      - name: Verify ELF hardening
-        run: |
-          scripts/check-elf-hardening.sh dist/bin/unified-hifi-linux-x64
-          scripts/check-elf-hardening.sh dist/bin/uhc-hiphi-pair-x64
-          scripts/check-elf-hardening.sh dist/bin/uhc-music-details-x64
-
-      - name: Upload binary
-        uses: actions/upload-artifact@v7
-        with:
-          name: binary-x86_64-unknown-linux-musl
-          path: dist/bin/
-          retention-days: 5
-
-  # Smoke test: verify the musl binary actually works with embedded assets
   smoke-test:
     name: Smoke Test Binary
     needs: [plan, build-linux-x64]
@@ -966,143 +909,111 @@ jobs:
 
   build-linux-arm:
     name: Build Linux ARM (${{ matrix.arch }})
-    needs: [plan, build-wasm]
+    needs:
+    - plan
+    - build-wasm
     if: needs.plan.outputs.build_linux_arm == 'true'
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name
+      == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general","builder:149e632fddb26ba06228"]') || 'ubuntu-latest'
+      }}
     strategy:
       matrix:
         include:
-          - target: aarch64-unknown-linux-musl
-            output: unified-hifi-linux-arm64
-            arch: arm64
-          - target: armv7-unknown-linux-musleabihf
-            output: unified-hifi-linux-armv7
-            arch: armv7
+        - target: aarch64-unknown-linux-musl
+          output: unified-hifi-linux-arm64
+          arch: arm64
+        - target: armv7-unknown-linux-musleabihf
+          output: unified-hifi-linux-armv7
+          arch: armv7
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Isolate mutable tool state
-        run: |
-          echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
-
-      - name: Setup Rust
-        uses: ./.github/actions/setup-rust
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Cache Rust
-        if: runner.environment == 'github-hosted'
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: zigbuild-${{ matrix.target }}
-
-      - name: Cache Zig
-        uses: actions/cache@v5
-        with:
-          path: ${{ runner.tool_cache }}/zig/0.13.0/${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
-          key: zig-${{ runner.os }}-${{ runner.arch }}-0.13.0
-
-      - name: Install zig
-        run: |
-          set -euo pipefail
-          ZIG_VERSION="0.13.0"
-          ZIG_ARCH="$(uname -m)"
-          if command -v zig >/dev/null 2>&1 && [ "$(zig version)" = "$ZIG_VERSION" ]; then
-            echo "Using runner-provided Zig $(zig version)"
-          else
-            ZIG_ROOT="${RUNNER_TOOL_CACHE:-$HOME/.cache/uhc-tools}/zig/$ZIG_VERSION/$ZIG_ARCH"
-            if [ ! -x "$ZIG_ROOT/zig" ]; then
-              ZIG_PARENT=$(dirname "$ZIG_ROOT")
-              mkdir -p "$ZIG_PARENT"
-              TEMP_DIR=$(mktemp -d "$ZIG_PARENT/.zig-install.XXXXXX")
-              trap 'rm -rf "$TEMP_DIR"' EXIT
-              curl --fail --show-error --location \
-                "https://ziglang.org/download/$ZIG_VERSION/zig-linux-${ZIG_ARCH}-$ZIG_VERSION.tar.xz" | \
-                tar -xJ -C "$TEMP_DIR"
-              STAGED_ROOT="$TEMP_DIR/zig-linux-${ZIG_ARCH}-$ZIG_VERSION"
-              test -x "$STAGED_ROOT/zig"
-              rm -rf "$ZIG_ROOT"
-              mv "$STAGED_ROOT" "$ZIG_ROOT"
-              rm -rf "$TEMP_DIR"
-              trap - EXIT
-            fi
-            test -x "$ZIG_ROOT/zig"
-            echo "$ZIG_ROOT" >> "$GITHUB_PATH"
-          fi
-
-      - name: Cache cargo-zigbuild
-        id: cache-zigbuild
-        uses: actions/cache@v5
-        with:
-          path: ${{ env.CARGO_HOME }}/bin/cargo-zigbuild
-          key: cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-0.23.4
-          restore-keys: |
-            cargo-zigbuild-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Ensure cargo-zigbuild
-        run: |
-          set -euo pipefail
-          if command -v cargo-zigbuild >/dev/null 2>&1 && \
-             cargo-zigbuild --version | grep -q 'cargo-zigbuild 0.23.4'; then
-            echo "Using cached cargo-zigbuild $(cargo-zigbuild --version)"
-          else
-            cargo install cargo-zigbuild --version 0.23.4 --locked
-          fi
-
-      - name: Download WASM assets
-        uses: actions/download-artifact@v8
-        with:
-          name: wasm-assets
-          path: target/dx/unified-hifi-control/release/web/
-
-      - name: Cache generated CSS
-        id: cache-css
-        uses: actions/cache@v5
-        with:
-          path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
-
-      - name: Build Tailwind CSS
-        if: steps.cache-css.outputs.cache-hit != 'true'
-        run: make css
-
-      - name: Build with zigbuild (embeds WASM)
-        env:
-          UHC_VERSION: ${{ needs.plan.outputs.version }}
-          UHC_GIT_SHA: ${{ needs.plan.outputs.git_sha }}
-        run: |
-          # Force rebuild of main crate to pick up version env vars and embedded assets
-          cargo clean -p unified-hifi-control 2>/dev/null || true
-          cargo zigbuild --release --target ${{ matrix.target }} \
-            --features naa-proxy \
-            --bin unified-hifi-control --bin uhc-hiphi-pair --bin uhc-music-details
-
-      - name: Smoke test armv7 binary
-        if: matrix.target == 'armv7-unknown-linux-musleabihf'
-        run: |
-          sudo apt-get update && sudo apt-get install -y qemu-user-static
-          qemu-arm-static ./target/${{ matrix.target }}/release/unified-hifi-control --version
-
-      - name: Rename binary
-        run: |
-          mkdir -p dist/bin
-          cp target/${{ matrix.target }}/release/unified-hifi-control dist/bin/${{ matrix.output }}
-          cp target/${{ matrix.target }}/release/uhc-hiphi-pair dist/bin/uhc-hiphi-pair-${{ matrix.arch }}
-          cp target/${{ matrix.target }}/release/uhc-music-details dist/bin/uhc-music-details-${{ matrix.arch }}
-
-      - name: Verify ELF hardening
-        run: |
-          scripts/check-elf-hardening.sh dist/bin/${{ matrix.output }}
-          scripts/check-elf-hardening.sh dist/bin/uhc-hiphi-pair-${{ matrix.arch }}
-          scripts/check-elf-hardening.sh dist/bin/uhc-music-details-${{ matrix.arch }}
-
-      - name: Upload binary
-        uses: actions/upload-artifact@v7
-        with:
-          name: binary-${{ matrix.target }}
-          path: dist/bin/
-          retention-days: 5
+    - name: Activate prepared builder
+      shell: bash
+      run: |
+        echo 'CARGO_HOME=/opt/gh-builder/cargo' >> "$GITHUB_ENV"
+        echo 'RUSTUP_HOME=/opt/gh-builder/rustup' >> "$GITHUB_ENV"
+        cat /opt/gh-builder/path >> "$GITHUB_PATH"
+        cat /opt/gh-builder/env >> "$GITHUB_ENV"
+    - uses: actions/checkout@v6
+    - name: Restore Cargo state from NAS
+      if: runner.environment == 'self-hosted'
+      continue-on-error: true
+      run: python3 scripts/fleet-build-cache.py restore --flavor '${{ github.job }}-${{ matrix.target }}'
+    - name: Cache Rust
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: zigbuild-${{ matrix.target }}
+        cache-on-failure: true
+      if: runner.environment == 'github-hosted'
+    - name: Download WASM assets
+      uses: actions/download-artifact@v8
+      with:
+        name: wasm-assets
+        path: target/dx/unified-hifi-control/release/web/
+    - name: Cache generated CSS
+      id: cache-css
+      uses: actions/cache@v5
+      with:
+        path: public/tailwind.css
+        key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
+    - name: Build Tailwind CSS
+      if: steps.cache-css.outputs.cache-hit != 'true'
+      run: make css
+    - name: Build with zigbuild (embeds WASM)
+      env:
+        UHC_VERSION: ${{ needs.plan.outputs.version }}
+        UHC_GIT_SHA: ${{ needs.plan.outputs.git_sha }}
+      run: |
+        # Force rebuild of main crate to pick up version env vars and embedded assets
+        cargo clean -p unified-hifi-control 2>/dev/null || true
+        cargo zigbuild --release --timings --target ${{ matrix.target }} \
+          --features naa-proxy \
+          --bin unified-hifi-control --bin uhc-hiphi-pair --bin uhc-music-details
+    - name: Smoke test armv7 binary
+      if: matrix.target == 'armv7-unknown-linux-musleabihf'
+      run: |
+        sudo apt-get update && sudo apt-get install -y qemu-user-static
+        qemu-arm-static ./target/${{ matrix.target }}/release/unified-hifi-control --version
+    - name: Rename binary
+      run: |
+        mkdir -p dist/bin
+        cp target/${{ matrix.target }}/release/unified-hifi-control dist/bin/${{ matrix.output }}
+        cp target/${{ matrix.target }}/release/uhc-hiphi-pair dist/bin/uhc-hiphi-pair-${{ matrix.arch }}
+        cp target/${{ matrix.target }}/release/uhc-music-details dist/bin/uhc-music-details-${{ matrix.arch }}
+    - name: Verify ELF hardening
+      run: |
+        scripts/check-elf-hardening.sh dist/bin/${{ matrix.output }}
+        scripts/check-elf-hardening.sh dist/bin/uhc-hiphi-pair-${{ matrix.arch }}
+        scripts/check-elf-hardening.sh dist/bin/uhc-music-details-${{ matrix.arch }}
+    - name: Upload binary
+      uses: actions/upload-artifact@v7
+      with:
+        name: binary-${{ matrix.target }}
+        path: dist/bin/
+        retention-days: 5
+    - name: Report compiler cache statistics
+      if: always()
+      run: if command -v sccache >/dev/null 2>&1; then sccache --show-stats; fi
+    - name: Upload compilation timings
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: compile-timings-${{ matrix.arch }}
+        path: target/cargo-timings/
+        if-no-files-found: ignore
+        retention-days: 7
+    - name: Save Cargo state to NAS
+      if: always() && !cancelled() && runner.environment == 'self-hosted'
+      continue-on-error: true
+      run: python3 scripts/fleet-build-cache.py save --flavor '${{ github.job }}-${{ matrix.target }}'
+    defaults:
+      run:
+        shell: bash
+    container:
+      image: ${{ !(vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name
+        == github.repository)) && 'ghcr.io/open-horizon-labs/unified-hifi-control:builder-76505ee69a4f7f747109' || '' }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
   build-macos-x64:
     name: Build macOS (x86_64)
@@ -1431,7 +1342,7 @@ jobs:
 
       - name: Build (embeds WASM)
         env:
-          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_ENABLED: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
           RUSTC_WRAPPER: "sccache"
           UHC_VERSION: ${{ needs.plan.outputs.version }}
           UHC_GIT_SHA: ${{ needs.plan.outputs.git_sha }}

@@ -16,7 +16,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: open-horizon-labs/homelab-infra
-          ref: 2421555a924065fbc7447ef729411e477b828108
+          ref: 11b94e8eaaa1204abb1c47f610551e1c7862a65f
           ssh-key: ${{ secrets.BUILDER_INFRA_SSH_KEY }}
           persist-credentials: false
           path: .builder-infra
@@ -39,9 +39,11 @@ jobs:
       - name: Build and publish hosted tools once
         run: |
           image=$(python -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"] + "/prepared-builder/manifest.json"))["image"])')
-          docker build --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
-            --tag "$image" "$RUNNER_TEMP/prepared-builder"
-          docker push "$image"
+          if ! docker pull "$image"; then
+            docker build --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+              --tag "$image" "$RUNNER_TEMP/prepared-builder"
+            docker push "$image"
+          fi
       - name: Export tools for the private fleet publisher
         run: |
           image=$(python -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"] + "/prepared-builder/manifest.json"))["image"])')
