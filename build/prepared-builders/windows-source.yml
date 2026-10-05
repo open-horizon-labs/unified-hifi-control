@@ -1,0 +1,48 @@
+# Canonical Linux-hosted Windows MSVC tool setup for explicit conversion.
+name: Windows cross-build setup
+jobs:
+  build-windows-cross:
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]')
+      || 'ubuntu-latest' }}
+    steps:
+    - name: Setup Rust
+      uses: ./.github/actions/setup-rust
+      with:
+        targets: x86_64-pc-windows-msvc
+        components: llvm-tools-preview
+    - name: Install Windows cross-toolchain
+      run: 'set -euo pipefail
+
+        archive=cargo-xwin-v0.23.1.x86_64-unknown-linux-musl.tar.gz
+
+        curl --fail --show-error --location "https://github.com/rust-cross/cargo-xwin/releases/download/v0.23.1/$archive"
+        -o "/tmp/$archive"
+
+        echo "c492c6dfb7e5ac0eee586b796e0fc950ba13077e7f0bbb046f445d71790d5360  /tmp/$archive"
+        | sha256sum -c -
+
+        tar -xzf "/tmp/$archive" -C "$CARGO_HOME/bin" cargo-xwin
+
+        rm "/tmp/$archive"
+
+        export XWIN_CACHE_DIR=/opt/gh-builder/tools/xwin
+
+        export XWIN_ARCH=x86_64
+
+        export XWIN_VARIANT=desktop
+
+        export XWIN_VERSION=17
+
+        mkdir -p "$XWIN_CACHE_DIR"
+
+        cargo xwin cache xwin
+
+        printf ''%s\n'' "XWIN_CACHE_DIR=$XWIN_CACHE_DIR" "XWIN_ARCH=$XWIN_ARCH" "XWIN_VARIANT=$XWIN_VARIANT"
+        "XWIN_VERSION=$XWIN_VERSION" >> "$GITHUB_ENV"
+
+        cargo xwin --version
+
+        clang --version
+
+        '

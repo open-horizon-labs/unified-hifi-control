@@ -1,0 +1,22 @@
+{
+  "job": [
+    "build-windows-cross"
+  ],
+  "bake_step": [
+    "Setup Rust",
+    "Install Windows cross-toolchain"
+  ],
+  "remove_step": [],
+  "image_repository": "ghcr.io/open-horizon-labs/unified-hifi-control",
+  "runner_base_image": "fleet-runner:2.337.0",
+  "fleet_repository": "open-horizon-labs/unified-hifi-control",
+  "runner_image_repository": "192.168.1.36:5443/fleet/uhc-windows",
+  "ghcr_auth": true,
+  "system_packages": [
+    "clang",
+    "lld",
+    "llvm",
+    "cmake",
+    "ninja-build"
+  ]
+}

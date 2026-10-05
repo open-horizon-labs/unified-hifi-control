@@ -62,3 +62,31 @@ separate dependency snapshots. WASM keeps its existing LTO-disabled profile.
 The Test job uses the fleet S3 compiler cache without full target snapshots:
 its measured 2.2 GB archive cost more to transfer than the compilation it saved.
 Only successful lint/WASM/native builds publish new dependency snapshots.
+
+## Windows MSVC cross-builder
+
+The explicit Prepare build environments workflow also prepares the Windows tools
+image from windows-source.yml and windows-profile.json. It includes Rust's actual
+project baseline, the Windows MSVC target, cargo-xwin 0.23.1 (checksum verified),
+Clang/LLD/LLVM, CMake/Ninja and pre-cached Microsoft SDK/CRT. The SDK is part of
+immutable image contents, separate from per-job NAS Cargo state. Microsoft SDK
+use is subject to its license (linked in cargo-xwin upstream documentation).
+
+The Linux cross job produces all three executables with the existing version,
+assets, NAA features and tag-dependent optimization profile. A blocking native
+Windows job verifies executable loading, helper entrypoints, HTTP/version/SHA and
+embedded assets, then applies the existing optional signing and publishes the
+unchanged binary-windows artifact. Signing/publishing never bypass native checks.
+
+Generate a reviewable image and runner recipe with the homelab converter:
+
+```sh
+python3 ../homelab-infra/runner/builder/convert.py .github/workflows/build.yml \
+  --setup-source build/prepared-builders/windows-source.yml \
+  --config build/prepared-builders/windows-profile.json --output /tmp/windows-builder
+```
+
+Build/publish tools once, promote the generated runner digest to the repository-
+scoped broker policy and pull it on both fleet hosts before enabling the workflow.
+The hosted Ubuntu fallback uses the GHCR tools image and job-token authentication.
+No compiler or SDK download is required in the per-build job.

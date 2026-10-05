@@ -10,13 +10,22 @@ permissions:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: linux
+            setup: build/prepared-builders/source.yml
+            profile: build/prepared-builders/profile.json
+          - name: windows
+            setup: build/prepared-builders/windows-source.yml
+            profile: build/prepared-builders/windows-profile.json
     steps:
       - uses: actions/checkout@v6
       - name: Check out the reviewed converter
         uses: actions/checkout@v6
         with:
           repository: open-horizon-labs/homelab-infra
-          ref: ba5fb06713dfc83d3753851b41374f8c5d6875d3
+          ref: 8580a722f15d3c5e7be60afdd013755f45b628ae
           ssh-key: ${{ secrets.BUILDER_INFRA_SSH_KEY }}
           persist-credentials: false
           path: .builder-infra
@@ -28,8 +37,8 @@ jobs:
       - name: Generate the environment from canonical Actions setup
         run: |
           python .builder-infra/runner/builder/convert.py .github/workflows/build.yml \
-            --setup-source build/prepared-builders/source.yml \
-            --config build/prepared-builders/profile.json \
+            --setup-source "${{ matrix.setup }}" \
+            --config "${{ matrix.profile }}" \
             --output "$RUNNER_TEMP/prepared-builder"
       - uses: docker/login-action@v3
         with:
@@ -50,12 +59,12 @@ jobs:
           docker save "$image" | gzip -1 > "$RUNNER_TEMP/prepared-tools.tar.gz"
       - uses: actions/upload-artifact@v7
         with:
-          name: prepared-tools
+          name: prepared-tools${{ matrix.name == 'windows' && '-windows' || '' }}
           path: ${{ runner.temp }}/prepared-tools.tar.gz
           compression-level: 0
           retention-days: 3
       - uses: actions/upload-artifact@v7
         with:
-          name: prepared-builder
+          name: prepared-builder${{ matrix.name == 'windows' && '-windows' || '' }}
           path: ${{ runner.temp }}/prepared-builder/
           retention-days: 30
