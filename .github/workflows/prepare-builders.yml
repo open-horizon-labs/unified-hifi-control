@@ -23,7 +23,9 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: open-horizon-labs/homelab-infra
-          ref: 7d44b9e
+          ref: 7d44b9e1e8656d9e4a32f42e0334c71ac91ae6e4
+          ssh-key: ${{ secrets.BUILDER_INFRA_SSH_KEY }}
+          persist-credentials: false
           path: .builder-infra
           sparse-checkout: runner/builder
       - uses: actions/setup-python@v6
