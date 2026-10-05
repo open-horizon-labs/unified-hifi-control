@@ -76,16 +76,32 @@ fn trusted_expensive_linux_jobs_ask_for_a_capability_with_a_hosted_fork_fallback
     let source = workflow("build.yml");
     let trust = "vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)";
 
-    for name in ["lint", "test", "build-wasm", "build-linux-x64"] {
+    for name in [
+        "lint",
+        "test",
+        "build-wasm",
+        "build-linux-x64",
+        "build-linux-arm",
+    ] {
         let body = job(&source, name);
         assert!(
             body.split_whitespace()
                 .collect::<String>()
                 .contains(&trust.split_whitespace().collect::<String>())
-                && body.contains(r#"["self-hosted","linux","x64","linux-general""#)
+                && body.contains(r#"["self-hosted","linux","x64""#)
                 && body.contains("|| 'ubuntu-latest'"),
-            "{name} must ask for the linux-general capability for trusted work and ubuntu-latest for fork PRs"
+            "{name} must ask for an approved capability/builder for trusted work and ubuntu-latest for fork PRs"
         );
+        let header = body.split("steps:").next().unwrap();
+        if name.starts_with("build-") {
+            assert!(header.contains("builder:"));
+            assert!(
+                !header.contains("linux-general"),
+                "prepared runners must not match the generic pool"
+            );
+        } else {
+            assert!(header.contains("linux-general"));
+        }
         assert!(
             !body.contains("nuc14"),
             "{name} still names a host rather than a capability"
@@ -313,5 +329,20 @@ fn compiler_changes_invalidate_wasm_output_and_trigger_platform_validation() {
                 "{name} skips validation for compiler input {input}"
             );
         }
+    }
+}
+
+#[test]
+fn validation_uses_the_fast_profile_and_tagged_releases_keep_reviewed_optimization() {
+    let source = workflow("build.yml");
+    assert!(source.contains("startsWith(github.ref, 'refs/tags/') && 'true' || 'thin'"));
+    assert!(source.contains("startsWith(github.ref, 'refs/tags/') && '1' || '16'"));
+    let wasm = job(&source, "build-wasm");
+    assert!(wasm.contains("CARGO_PROFILE_RELEASE_LTO: 'false'"));
+    for name in ["build-macos-x64", "build-macos-arm64"] {
+        let body = job(&source, name);
+        assert!(body.contains("Library/Caches/uhc-build/"));
+        assert!(body.contains("ln -s \"$cache\" target"));
+        assert!(body.contains("if: runner.environment == 'github-hosted'"));
     }
 }

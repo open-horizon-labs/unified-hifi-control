@@ -19,14 +19,18 @@ artifact locally before building the generated runner derivative. Verify the man
 image digests and run the full Build workflow afterward. The preparation workflow
 uses `--setup-source` so it can regenerate already converted jobs.
 
-Fleet Linux jobs restore/save Cargo target state and registry sources directly
-from NAS MinIO using `scripts/fleet-build-cache.py`. The key covers the job/target,
-Cargo.lock, pinned toolchain, and target flags. Ephemeral Linux containers use stable Cargo/Rustup paths so restored dependency
-fingerprints remain reusable. Jobs keep independent working directories; S3 publishes snapshots atomically. This avoids uploading large target
-archives through GitHub. Hosted jobs retain Swatinem's cache. Snapshots record the source commit; repeat builds of that commit skip an
-unnecessary snapshot upload. NAS failures are visible but do not block builds. Source changes reuse dependency state; Cargo
-fingerprints and the existing main-crate clean still force application rebuilds.
-Linux compile timings and sccache statistics are uploaded/reported in each run.
+Fleet lint, WASM, and native Linux jobs restore Cargo target state and registry
+sources directly from NAS MinIO using `scripts/fleet-build-cache.py`. The key
+covers job/target, Cargo.toml/Cargo.lock, pinned toolchain, target flags, and
+compiler profile. Ephemeral containers use stable Cargo/Rustup paths so restored
+dependency fingerprints remain reusable. Each job keeps independent working
+state; S3 publishes complete snapshots atomically.
+
+Snapshots are written once per dependency key and reused across source changes.
+This avoids repeated large uploads. Hosted jobs retain Swatinem's cache. NAS
+failures are visible but do not block builds. Cargo fingerprints and the existing
+main-crate clean still force application rebuilds. Linux jobs report compiler
+cache statistics and upload compilation timing reports.
 
 Regenerate with the maintained converter, not by editing Dockerfiles:
 
@@ -37,9 +41,24 @@ python runner/builder/convert.py /path/to/uhc/.github/workflows/build.yml \
   --output /tmp/uhc-builder
 ```
 
-The Mac jobs continue using their existing persistent Tart guest and Actions
-compiler cache. They are not Linux containers.
+The Mac jobs use their existing persistent Tart guest, with one admitted job
+at a time. Each architecture's target state lives outside the checkout under
+`~/Library/Caches/uhc-build/`, linked into the job as `target/`. Checkout cleans
+the symlink without deleting the cache. Hosted Macs retain Swatinem's cache;
+fleet Macs avoid target archive downloads/uploads. They are not Linux containers.
 
 The main Build workflow owns formatting, workspace clippy, and workspace tests
 (including the HTTP API contract). The former streaming-alpha workflow repeated
 those same checks on v4 PRs and has been consolidated into Build.
+
+Untagged validation builds use ThinLTO and 16 codegen units. Tagged releases
+retain the Cargo.toml fat-LTO / one-codegen-unit profile. A same-runner x64
+comparison measured 230s versus 111s, with the server binary increasing from
+29.8 MB to 37.0 MB; hardening and server identity checks passed. The experiment
+is [run 37250408869](https://github.com/open-horizon-labs/unified-hifi-control/actions/runs/37250408869).
+NAS state keys include the profile overrides, so the two configurations keep
+separate dependency snapshots. WASM keeps its existing LTO-disabled profile.
+
+The Test job uses the fleet S3 compiler cache without full target snapshots:
+its measured 2.2 GB archive cost more to transfer than the compilation it saved.
+Only successful lint/WASM/native builds publish new dependency snapshots.

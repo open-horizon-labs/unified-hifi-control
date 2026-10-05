@@ -18,13 +18,15 @@ class FleetCacheTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / ".cargo").mkdir()
-            for name in ["Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"]:
+            for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"]:
                 (root / name).write_text(name)
             first = cache.cache_key(root, "linux-x64")
             (root / "main.rs").write_text("changed application source")
             self.assertEqual(first, cache.cache_key(root, "linux-x64"))
             self.assertNotEqual(first, cache.cache_key(root, "linux-arm64"))
-            for name in ["Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"]:
+            with mock.patch.dict(os.environ, {"CARGO_PROFILE_RELEASE_LTO": "false" if os.environ.get("CARGO_PROFILE_RELEASE_LTO") != "false" else "thin", "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "4"}):
+                self.assertNotEqual(first, cache.cache_key(root, "linux-x64"))
+            for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"]:
                 original = (root / name).read_text()
                 (root / name).write_text(original + " changed")
                 self.assertNotEqual(first, cache.cache_key(root, "linux-x64"))
@@ -49,13 +51,13 @@ class FleetCacheTests(unittest.TestCase):
                 self.assertFalse((workspace / "target/dependency.rlib").exists())
                 self.assertFalse((root / "escaped").exists())
 
-    def test_repeat_commit_skips_upload_but_new_commit_does_not(self):
+    def test_source_changes_skip_upload_but_dependency_changes_publish_new_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / ".cargo").mkdir()
             (root / "target").mkdir()
             (root / "target/dependency.rlib").write_bytes(b"compiled")
-            for name in ["Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"]:
+            for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"]:
                 (root / name).write_text(name)
             key = cache.cache_key(root, "linux")
             state = root / ("nas-cargo-state-" + cache.hashlib.sha256(key.encode()).hexdigest() + ".json")
@@ -65,6 +67,9 @@ class FleetCacheTests(unittest.TestCase):
                 cache.main()
                 transfer.assert_not_called()
                 os.environ["GITHUB_SHA"] = "new-commit"
+                cache.main()
+                transfer.assert_not_called()
+                (root / "Cargo.lock").write_text("new dependencies")
                 with self.assertRaisesRegex(AssertionError, "upload attempted"):
                     cache.main()
                 transfer.assert_called_once()

@@ -19,7 +19,10 @@ from urllib.parse import quote, urlsplit
 
 def cache_key(workspace, flavor):
     digest = hashlib.sha256(flavor.encode())
-    for name in ["Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"]:
+    for name in ["CARGO_PROFILE_RELEASE_LTO", "CARGO_PROFILE_RELEASE_CODEGEN_UNITS"]:
+        digest.update(name.encode())
+        digest.update(os.environ.get(name, "").encode())
+    for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"]:
         digest.update(name.encode())
         digest.update((workspace / name).read_bytes())
     return "uhc-build-state/v1/" + quote(flavor, safe="") + "/" + digest.hexdigest() + ".tar.gz"
@@ -97,10 +100,10 @@ def main():
     key = cache_key(workspace, args.flavor)
     source_sha = os.environ.get("GITHUB_SHA", "")
     state = Path(os.environ["RUNNER_TEMP"]) / ("nas-cargo-state-" + hashlib.sha256(key.encode()).hexdigest() + ".json")
-    if args.mode == "save" and source_sha and state.exists():
+    if args.mode == "save" and state.exists():
         restored = json.loads(state.read_text())
-        if restored == {"key": key, "source_sha": source_sha}:
-            print("NAS Cargo state already current for this commit; skipped snapshot upload")
+        if restored.get("key") == key:
+            print("NAS dependency snapshot already exists; skipped snapshot upload")
             return
     started = time.monotonic()
     with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP")) as temporary:
