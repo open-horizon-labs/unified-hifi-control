@@ -1,0 +1,79 @@
+name: Build profile benchmark
+on:
+  push:
+    branches: [codex/issue-760-build-bench]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  compare:
+    runs-on: [self-hosted, linux, x64, linux-general, 'builder:149e632fddb26ba06228']
+    env:
+      CARGO_HOME: /opt/gh-builder/cargo
+      RUSTUP_HOME: /opt/gh-builder/rustup
+      UHC_VERSION: 0.0.0-benchmark
+      UHC_GIT_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Activate tools and record hardware
+        run: |
+          cat /opt/gh-builder/path >> "$GITHUB_PATH"
+          rustc --version
+          lscpu | head -20
+          cat /sys/fs/cgroup/cpu.max
+          mkdir -p profile-results
+      - name: Restore existing native dependency state
+        run: python3 scripts/fleet-build-cache.py restore --flavor build-linux-x64
+      - uses: actions/download-artifact@v8
+        with:
+          name: wasm-assets
+          run-id: 37249222488
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: target/dx/unified-hifi-control/release/web/
+      - run: make css
+      - name: Current fat LTO baseline
+        run: |
+          cargo clean -p unified-hifi-control
+          start=$SECONDS
+          cargo zigbuild --release --timings --target x86_64-unknown-linux-musl --features naa-proxy \
+            --bin unified-hifi-control --bin uhc-hiphi-pair --bin uhc-music-details
+          echo "fat_seconds=$((SECONDS-start))" | tee profile-results/fat-time.txt
+          cp target/cargo-timings/cargo-timing.html profile-results/fat.html
+          stat -c '%n %s' target/x86_64-unknown-linux-musl/release/unified-hifi-control > profile-results/fat-size.txt
+      - name: Thin LTO and parallel code generation
+        env:
+          CARGO_PROFILE_RELEASE_LTO: thin
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+        run: |
+          cargo clean -p unified-hifi-control
+          start=$SECONDS
+          cargo zigbuild --release --timings --target x86_64-unknown-linux-musl --features naa-proxy \
+            --bin unified-hifi-control --bin uhc-hiphi-pair --bin uhc-music-details
+          echo "thin_seconds=$((SECONDS-start))" | tee profile-results/thin-time.txt
+          cp target/cargo-timings/cargo-timing.html profile-results/thin.html
+          stat -c '%n %s' target/x86_64-unknown-linux-musl/release/unified-hifi-control > profile-results/thin-size.txt
+      - name: Verify all ThinLTO artifacts and server identity
+        run: |
+          for binary in unified-hifi-control uhc-hiphi-pair uhc-music-details; do
+            scripts/check-elf-hardening.sh "target/x86_64-unknown-linux-musl/release/$binary"
+          done
+          target/x86_64-unknown-linux-musl/release/unified-hifi-control > profile-results/server.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for attempt in {1..30}; do
+            if curl --fail --silent http://localhost:8088/ > /dev/null; then break; fi
+            kill -0 "$pid"
+            sleep 1
+          done
+          python3 - <<'CHECK'
+          import json,os,urllib.request
+          status=json.load(urllib.request.urlopen('http://localhost:8088/status'))
+          assert status['version']==os.environ['UHC_VERSION'],status
+          assert status['git_sha']==os.environ['UHC_GIT_SHA'],status
+          print('ThinLTO server returned HTTP 200 and the expected version/SHA')
+          CHECK
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: build-profile-comparison
+          path: profile-results/
