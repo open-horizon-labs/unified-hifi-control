@@ -40,7 +40,7 @@ jobs:
             --setup-source "${{ matrix.setup }}" \
             --config "${{ matrix.profile }}" \
             --output "$RUNNER_TEMP/prepared-builder"
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
