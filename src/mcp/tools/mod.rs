@@ -22,6 +22,7 @@ pub mod apple_music;
 pub mod capabilities;
 pub mod collections;
 pub mod groups;
+pub mod home_assistant;
 pub mod hqplayer;
 pub mod library;
 pub mod queue;
@@ -37,6 +38,7 @@ pub use apple_music::HifiAppleMusicTool;
 pub use capabilities::HifiCapabilitiesTool;
 pub use collections::HifiCollectionsTool;
 pub use groups::HifiZoneGroupTool;
+pub use home_assistant::{HASSControlEntityTool, HASSReadStatesTool};
 pub use hqplayer::{
     HifiHqplayerLoadProfileTool, HifiHqplayerProfilesTool, HifiHqplayerSetPipelineTool,
     HifiHqplayerStatusTool,
@@ -77,7 +79,9 @@ tool_box!(
         HifiSpotifyTool,
         HifiAppleMusicTool,
         HifiCollectionsTool,
-        HifiZoneGroupTool
+        HifiZoneGroupTool,
+        HASSReadStatesTool,
+        HASSControlEntityTool
     ]
 );
 
@@ -109,6 +113,8 @@ pub fn static_name(name: &str) -> Option<&'static str> {
         "hifi_apple_music" => "hifi_apple_music",
         "hifi_collections" => "hifi_collections",
         "hifi_zone_group" => "hifi_zone_group",
+        "ha_read_states" => "ha_read_states",
+        "ha_control_entity" => "ha_control_entity",
         _ => return None,
     })
 }
@@ -149,6 +155,8 @@ pub fn declared_params(tool: &str) -> &'static [&'static str] {
             "member_zone_ids",
             "confirm",
         ],
+        "ha_read_states" => &["entity_id", "entity_ids", "domain", "name", "limit"],
+        "ha_control_entity" => &["entity_id", "action"],
         "hifi_spotify" => &[
             "action",
             "playlist_id",
@@ -222,8 +230,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn advertises_seventeen_tools_when_hqplayer_is_enabled() {
-        assert_eq!(list_tools(true).len(), 17);
+    fn advertises_nineteen_tools_when_hqplayer_is_enabled() {
+        assert_eq!(list_tools(true).len(), 19);
     }
 
     /// The filter must remove exactly the four HQPlayer tools and nothing else.
@@ -232,7 +240,7 @@ mod tests {
         let enabled: Vec<String> = list_tools(true).into_iter().map(|t| t.name).collect();
         let disabled: Vec<String> = list_tools(false).into_iter().map(|t| t.name).collect();
 
-        assert_eq!(disabled.len(), 13);
+        assert_eq!(disabled.len(), 15);
         assert!(disabled.iter().all(|n| !n.starts_with("hifi_hqplayer")));
 
         let removed: Vec<&String> = enabled.iter().filter(|n| !disabled.contains(n)).collect();

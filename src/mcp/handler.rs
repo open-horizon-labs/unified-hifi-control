@@ -128,6 +128,12 @@ impl ServerHandler for HifiMcpHandler {
             HifiTools::HifiZoneGroupTool(args) => {
                 tools::groups::handle_zone_group(state, args).await
             }
+            HifiTools::HASSReadStatesTool(args) => {
+                tools::home_assistant::handle_read_states(args).await
+            }
+            HifiTools::HASSControlEntityTool(args) => {
+                tools::home_assistant::handle_control_entity(args).await
+            }
         }
     }
 

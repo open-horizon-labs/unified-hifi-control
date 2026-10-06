@@ -528,8 +528,8 @@ async fn tools_list_matches_fixture() {
 
     assert_eq!(
         tools.len(),
-        17,
-        "expected 17 tools with HQPlayer enabled, got {}: {:?}",
+        19,
+        "expected 19 tools with HQPlayer enabled, got {}: {:?}",
         tools.len(),
         tool_names(tools)
     );
@@ -597,6 +597,8 @@ async fn tools_list_order_is_pinned() {
             "hifi_apple_music",
             "hifi_collections",
             "hifi_zone_group",
+            "ha_read_states",
+            "ha_control_entity",
         ],
         "tools/list order follows the tool_box! list in src/mcp/tools/mod.rs. \
          APPEND new tools rather than inserting, so this assertion grows by one \
@@ -644,6 +646,8 @@ async fn hqplayer_tools_filtered_when_adapter_disabled() {
             "hifi_apple_music",
             "hifi_collections",
             "hifi_zone_group",
+            "ha_read_states",
+            "ha_control_entity",
         ],
         "HQPlayer disabled must yield exactly the non-HQPlayer tools, in order"
     );
@@ -885,6 +889,20 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
             ("confirm", false),
         ],
     ),
+    (
+        "ha_read_states",
+        &[
+            ("entity_id", false),
+            ("entity_ids", false),
+            ("domain", false),
+            ("name", false),
+            ("limit", false),
+        ],
+    ),
+    (
+        "ha_control_entity",
+        &[("entity_id", true), ("action", true)],
+    ),
 ];
 
 #[tokio::test]
@@ -1047,7 +1065,7 @@ async fn a_stale_session_id_is_transparently_recovered() {
         .unwrap_or_else(|| panic!("recovered request must return the tool list, got: {response}"));
     assert_eq!(
         tools.len(),
-        17,
+        19,
         "the recovered session must serve the same tool list as a fresh one"
     );
 }

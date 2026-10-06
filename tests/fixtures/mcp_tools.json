@@ -1,4 +1,77 @@
 {
+  "ha_control_entity": {
+    "annotations": {
+      "destructiveHint": true
+    },
+    "description": "Turn one exact Home Assistant light or switch entity on or off. Use an entity_id previously returned by ha_read_states. The only actions are turn_on and turn_off; no other domains, services, targets, scripts, or URLs are accepted. A successful service response is reported as accepted, and a separate state readback reports whether the requested state was observed.",
+    "inputSchema": {
+      "properties": {
+        "action": {
+          "description": "Only turn_on or turn_off.",
+          "oneOf": [
+            {
+              "enum": [
+                "TurnOn"
+              ]
+            },
+            {
+              "enum": [
+                "TurnOff"
+              ]
+            }
+          ]
+        },
+        "entity_id": {
+          "description": "Exact Home Assistant entity ID from ha_read_states (light.* or switch.* only).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entity_id",
+        "action"
+      ],
+      "type": "object"
+    }
+  },
+  "ha_read_states": {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Read current Home Assistant entity states through the Supervisor API. Available when UHC runs as a Home Assistant add-on with core API access. Query by exact entity ID(s), domain, or name; at least one filter is required. Returns stable entity IDs, friendly names, state, selected safe attributes, and source timestamps. Results are capped and report truncation. This is read-only and does not call services.",
+    "inputSchema": {
+      "properties": {
+        "domain": {
+          "description": "Match one entity domain.",
+          "nullable": true,
+          "type": "string"
+        },
+        "entity_id": {
+          "description": "One exact Home Assistant entity ID.",
+          "nullable": true,
+          "type": "string"
+        },
+        "entity_ids": {
+          "description": "Exact entity IDs (maximum 64).",
+          "items": {
+            "type": "string"
+          },
+          "nullable": true,
+          "type": "array"
+        },
+        "limit": {
+          "description": "Maximum matching states returned (1–100; defaults to 50).",
+          "nullable": true,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Case-insensitive substring of the friendly name or entity ID.",
+          "nullable": true,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
   "hifi_apple_music": {
     "description": "Apple Music catalog, library, playlist, feedback, and bounded adaptation context through a paired native companion. Actions include catalog_search, library, playlists, playlist_tracks, recent, recommendations, favorites, queue_plan, queue_append, play_next, context, clear_feedback, playlist_create, playlist_update, playlist_add, playlist_remove, favorite_add/remove, and feedback. Feedback accepts explicit user signals only; skips and manual changes are not inferred as dislike. Apple authorization stays on the companion; operations are limited to documented MusicKit capabilities and may be refused when the companion or account cannot perform them. Use hifi_search/hifi_play for exact content selection and playback.",
     "inputSchema": {
