@@ -101,11 +101,11 @@ sub start {
     local $ENV{PORT} = $port;
     local $ENV{CONFIG_DIR} = $configDir;
     local $ENV{UHC_CONFIG_DIR} = $configDir;
-    local $ENV{LMS_HOST} = '127.0.0.1';
+    local $ENV{LMS_HOST} = $ENV{LMS_HOST} || '127.0.0.1';
     local $ENV{LMS_PORT} = $lmsPort;
     local $ENV{LMS_UNIFIEDHIFI_STARTED} = 'true';
 
-    $log->debug("Running: $binary (with env: PORT=$port CONFIG_DIR=$configDir LMS_HOST=127.0.0.1 LMS_PORT=$lmsPort)");
+    $log->debug("Running: $binary (with env: PORT=$port CONFIG_DIR=$configDir LMS_HOST=$ENV{LMS_HOST} LMS_PORT=$lmsPort)");
     # Platform-specific process spawning
     if (main::ISWINDOWS) {
         # Windows: run binary directly, Proc::Background handles it
