@@ -9,6 +9,19 @@ use std::collections::HashMap;
 pub const ROON_KNOB_SERVICE_TYPE: &str = "_roonknob._tcp.local.";
 pub const UHC_SERVICE_TYPE: &str = "_uhc._tcp.local.";
 
+/// Whether this process should suppress mDNS advertisements.
+///
+/// Isolated test instances can share a LAN with a production UHC service and
+/// must not present themselves as another discoverable knob endpoint.
+pub fn disabled_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
+}
+
 /// Advertise the service via mDNS
 pub fn advertise(port: u16, name: &str, base_url: &str) -> anyhow::Result<ServiceDaemon> {
     let mdns = ServiceDaemon::new()?;
@@ -67,5 +80,15 @@ mod tests {
     fn publishes_distinct_companion_service_type() {
         assert_ne!(UHC_SERVICE_TYPE, ROON_KNOB_SERVICE_TYPE);
         assert_eq!(UHC_SERVICE_TYPE, "_uhc._tcp.local.");
+    }
+
+    #[test]
+    fn mdns_disable_setting_accepts_common_true_values() {
+        for value in [Some("1"), Some("true"), Some("YES"), Some(" true ")] {
+            assert!(disabled_from_env(value));
+        }
+        for value in [None, Some(""), Some("0"), Some("false")] {
+            assert!(!disabled_from_env(value));
+        }
     }
 }

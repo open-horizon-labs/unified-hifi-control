@@ -1192,15 +1192,21 @@ mod server {
         // Start server with graceful shutdown
         tracing::info!("Listening on http://{}", addr);
 
-        // Advertise via mDNS for knob discovery
-        let _mdns = match mdns::advertise(config.port, "Unified Hi-Fi Control", &base_url) {
-            Ok(daemon) => {
-                tracing::info!("mDNS advertising started");
-                Some(daemon)
-            }
-            Err(e) => {
-                tracing::warn!("Failed to start mDNS advertising: {}", e);
-                None
+        // Advertise via mDNS for knob discovery unless this is an isolated
+        // candidate that shares the LAN with another UHC instance.
+        let _mdns = if mdns::disabled_from_env(std::env::var("UHC_MDNS_DISABLE").ok().as_deref()) {
+            tracing::info!("mDNS advertising disabled by UHC_MDNS_DISABLE");
+            None
+        } else {
+            match mdns::advertise(config.port, "Unified Hi-Fi Control", &base_url) {
+                Ok(daemon) => {
+                    tracing::info!("mDNS advertising started");
+                    Some(daemon)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to start mDNS advertising: {}", e);
+                    None
+                }
             }
         };
 
