@@ -107,10 +107,10 @@ pub struct HifiCollectionsTool {
     pub zone_id: String,
     /// browse, playlists, or favorites.
     pub action: String,
-    /// Short-lived collection continuation returned by a preceding browse call.
+    /// Short-lived continuation returned by a preceding browse call. Supply this or location, never both; path is for the current MCP session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// Durable provider-neutral collection location returned by a preceding browse call.
+    /// Durable provider-neutral location returned by a preceding browse call. Supply this or path, never both; location is preferred for canonical navigation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
     /// Media type when listing favorites (tracks by default).
@@ -1087,6 +1087,21 @@ fn refuse_unknown_location(env: Envelope) -> Result<CallToolResult, CallToolErro
 #[cfg(test)]
 mod tab_gating_tests {
     use super::*;
+
+    #[test]
+    fn cursor_schema_spells_out_mutual_exclusion() {
+        let properties = HifiCollectionsTool::tool()
+            .input_schema
+            .properties
+            .expect("collection tool properties");
+        for field in ["path", "location"] {
+            let description = properties[field]["description"]
+                .as_str()
+                .expect("cursor field description");
+            assert!(description.contains("never both"), "{field}: {description}");
+            assert!(description.contains("or location") || description.contains("or path"));
+        }
+    }
 
     /// #573 defect 6: Roon serves Browse and Playlists only -- Favorites
     /// and Radio (both the `favorites` capability) are not wired, so the

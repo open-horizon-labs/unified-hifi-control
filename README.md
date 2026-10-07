@@ -133,6 +133,8 @@ docker compose up -d
 | `RUST_LOG` | Log filter (e.g., `info`, `debug`, `unified_hifi_control=debug`) | `info` |
 | `UHC_LOG_DIR` | Write daily rotating UHC logs here; unset uses stdout | — |
 | `UHC_LOG_RETENTION_DAYS` | Completed daily log files to retain (`1`–`365`) | `7` |
+| `UHC_HA_API_URL` | Home Assistant root/API URL for a standalone install (for example `http://home-assistant:8123/api/config`) | — |
+| `UHC_HA_API_TOKEN` | Home Assistant API token for a standalone install; keep it in the deployment's secret store | — |
 | `LMS_HOST` | Auto-configure LMS backend (used by LMS plugin) | — |
 | `LMS_PORT` | LMS server port | `9000` |
 
@@ -280,6 +282,10 @@ Control your hi-fi with natural language. The bridge includes an MCP server so C
 | `hifi_hqplayer_profiles` | List saved HQPlayer profiles |
 | `hifi_hqplayer_load_profile` | Switch HQPlayer profile |
 | `hifi_hqplayer_set_pipeline` | Change filter, shaper, dither settings |
+| `ha_read_states` | Read bounded, filtered Home Assistant states and safe attributes |
+| `ha_control_entity` | Turn one previously read exact `light.*` or `switch.*` entity on or off |
+
+Home Assistant MCP tools use the Supervisor API in the Home Assistant add-on. In standalone deployments, set `UHC_HA_API_URL` and `UHC_HA_API_TOKEN` through the deployment's protected environment/secret mechanism. The QNAP package reads the pair from the mode-0600 data-only file `config/home-assistant.env` under its package config directory; the service validates the two allowed keys and never executes the file as shell. The URL may be the Home Assistant origin, `/api`, or `/api/config`; UHC derives `/api/states` and service URLs itself. Tool callers cannot provide an endpoint. Reads are limited to exact IDs, one domain, or a name substring, with bounded results and a safe attribute allowlist. Control accepts only one exact light or switch entity returned by a read and only `turn_on`/`turn_off`; acceptance and state readback are reported separately.
 
 *Spotify is a controller for existing Spotify Connect devices, not a receiver. Spotify search, exact play/queue-add, queue read, playlists, liked tracks, repeat, and shuffle require the corresponding OAuth scopes. New Development Mode applications cannot use the removed categories, featured-playlists, or new-releases browse endpoints; UHC defaults to that mode. Existing Extended Quota applications can explicitly retain those legacy browse calls with `UHC_SPOTIFY_QUOTA_MODE=extended`. Spotify exposes no active-queue jump/reorder/remove/clear/transfer operations, and Transfer Playback selects one device rather than synchronizing a multiroom group. Transport controls work with all enabled adapters.*
 

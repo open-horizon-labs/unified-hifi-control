@@ -1,0 +1,9 @@
+# Home Assistant MCP candidate on QNAP
+
+This records the local candidate build and the current deployment boundary for PR 767. It is not evidence of a live Home Assistant MCP read on QNAP.
+
+The candidate was built on 2026-10-06 from base commit `d3d22b313e5745c29bc6c5c1cb0236b7bbba37a5` plus the eight-file working-tree patch whose `git diff --binary | shasum -a 256` was `a012c2f647acdd1538609d8d5fc61044b8a62ee7560d236a914e2e9d6eaecb4c`. The candidate service binary is a static x86_64-musl ELF; SHA-256 `93c8df7f87c4a6361097cd94754b82479886524a1d31f3ba5584ad5e83856e5a`. Its version output in the local amd64 QDK container was `unified-hifi-control 4.0.1-ha (d3d22b31)`. The embedded Dioxus web assets and Tailwind stylesheet were built before the final service binary; the stylesheet is 73,103 bytes.
+
+The QDK 2.5.3 x86_64 candidate package was generated locally and has SHA-256 `e0bb0fd77b609fa7efe063e4ef17d78b624aec4f15205c703c00bdc7f2934d53`. The package contract script passed, as did the seven Home Assistant unit tests, `cargo fmt --check`, and `git diff --check`.
+
+The QNAP still runs its existing signed QPKG version 4.0.0-beta, build 20261003. QNAP's package verifier rejected the unsigned candidate package, so no package install or metadata change occurred. A manual candidate binary/launcher swap with a protected rollback snapshot had been authorized as the fallback, but it has not been performed for this rebuilt artifact. The QNAP service remains on the old binary; no live Home Assistant MCP call or control effect has been made with this candidate. Live verification is pending renewed QNAP login credentials after an SSH prompt-handling mistake exposed the Fleet password in tool output. The credential was not written to the repository, candidate package, or a local log file; the captured output existed in the command/tool result. Do not use the prior credential again.

@@ -1,8 +1,8 @@
-//! Narrow, add-on-scoped Home Assistant entity reads and light/switch control.
+//! Narrow Home Assistant entity reads and light/switch control.
 //!
-//! The Supervisor token is injected by Home Assistant and is never accepted as
-//! an MCP argument, persisted, or returned. The API origin is fixed to the
-//! Supervisor proxy. Reads return an allowlist of ordinary state attributes so
+//! Add-on credentials are injected by Home Assistant and are never accepted as
+//! an MCP argument, persisted, or returned. Standalone credentials come from
+//! runtime configuration. Reads return an allowlist of ordinary state attributes so
 //! entity metadata cannot accidentally expose integration credentials.
 
 use crate::mcp::envelope::{Envelope, Refusal};
@@ -15,7 +15,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::time::Duration;
 
-const STATES_URL: &str = "http://supervisor/core/api/states";
+const SUPERVISOR_STATES_URL: &str = "http://supervisor/core/api/states";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_LIMIT: usize = 50;
@@ -211,7 +211,7 @@ struct HaUnavailableResult {
 
 #[mcp_tool(
     name = "ha_read_states",
-    description = "Read current Home Assistant entity states through the Supervisor API. Available when UHC runs as a Home Assistant add-on with core API access. Query by exact entity ID(s), domain, or name; at least one filter is required. Returns stable entity IDs, friendly names, state, selected safe attributes, and source timestamps. Results are capped and report truncation. This is read-only and does not call services.",
+    description = "Read current Home Assistant entity states through the Supervisor API when running as an add-on, or through explicitly configured UHC_HA_API_URL and UHC_HA_API_TOKEN when standalone. Query by exact entity ID(s), domain, or name; at least one filter is required. Returns stable entity IDs, friendly names, state, selected safe attributes, and source timestamps. Results are capped and report truncation. This is read-only and does not call services.",
     read_only_hint = true
 )]
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
@@ -235,7 +235,7 @@ pub struct HASSReadStatesTool {
 
 #[mcp_tool(
     name = "ha_control_entity",
-    description = "Turn one exact Home Assistant light or switch entity on or off. Use an entity_id previously returned by ha_read_states. The only actions are turn_on and turn_off; no other domains, services, targets, scripts, or URLs are accepted. A successful service response is reported as accepted, and a separate state readback reports whether the requested state was observed.",
+    description = "Turn one exact Home Assistant light or switch entity on or off, using the Supervisor API when running as an add-on or explicitly configured UHC_HA_API_URL and UHC_HA_API_TOKEN when standalone. Use an entity_id previously returned by ha_read_states. The only actions are turn_on and turn_off; no other domains, services, targets, scripts, or URLs are accepted. A successful service response is reported as accepted, and a separate state readback reports whether the requested state was observed.",
     destructive_hint = true
 )]
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -246,13 +246,51 @@ pub struct HASSControlEntityTool {
     pub action: HaEntityAction,
 }
 
-fn supervisor_token() -> Option<String> {
-    if std::env::var("UHC_ADDON").ok().as_deref() != Some("1") {
+/// Resolve the state endpoint and credential from runtime configuration.
+/// Add-ons use the Supervisor proxy; standalone installs require both
+/// UHC_HA_API_URL and UHC_HA_API_TOKEN. The URL is never an MCP argument.
+fn ha_api_credentials() -> Option<(String, String)> {
+    use crate::mqtt::consumer::{CORE_TOKEN_ENV, CORE_URL_ENV, SUPERVISOR_TOKEN_ENV};
+    credentials_for(
+        std::env::var("UHC_ADDON").ok().as_deref() == Some("1"),
+        std::env::var(SUPERVISOR_TOKEN_ENV).ok(),
+        std::env::var(CORE_URL_ENV).ok(),
+        std::env::var(CORE_TOKEN_ENV).ok(),
+    )
+}
+
+fn credentials_for(
+    is_addon: bool,
+    supervisor_token: Option<String>,
+    configured_url: Option<String>,
+    configured_token: Option<String>,
+) -> Option<(String, String)> {
+    if is_addon {
+        let token = supervisor_token.filter(|token| !token.trim().is_empty())?;
+        return Some((SUPERVISOR_STATES_URL.to_string(), token));
+    }
+    let url = states_endpoint(configured_url.as_deref()?)?;
+    let token = configured_token.filter(|token| !token.trim().is_empty())?;
+    Some((url, token))
+}
+
+fn states_endpoint(configured_url: &str) -> Option<String> {
+    let mut url = url::Url::parse(configured_url).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
         return None;
     }
-    std::env::var(crate::mqtt::consumer::SUPERVISOR_TOKEN_ENV)
-        .ok()
-        .filter(|token| !token.trim().is_empty())
+    let path = url.path().trim_end_matches('/');
+    if !matches!(path, "" | "/api" | "/api/config") {
+        return None;
+    }
+    url.set_path("/api/states");
+    Some(url.to_string().trim_end_matches('/').to_string())
 }
 
 fn validate_read(args: &HASSReadStatesTool) -> Result<usize, (&'static str, String)> {
@@ -370,7 +408,8 @@ async fn fetch_rows_at(
         || response.status() == reqwest::StatusCode::FORBIDDEN
     {
         return Err(
-            "Home Assistant refused the add-on token; check homeassistant_api permission".into(),
+            "Home Assistant refused the configured API credential; check its access and endpoint"
+                .into(),
         );
     }
     if !response.status().is_success() {
@@ -538,8 +577,8 @@ pub async fn handle_read_states(args: HASSReadStatesTool) -> Result<CallToolResu
             );
         }
     };
-    let Some(token) = supervisor_token() else {
-        let detail = "Home Assistant state reads require UHC to run as an add-on with homeassistant_api enabled.";
+    let Some((states_url, token)) = ha_api_credentials() else {
+        let detail = "Home Assistant state reads require the add-on homeassistant_api permission or standalone UHC_HA_API_URL and UHC_HA_API_TOKEN configuration.";
         return env
             .data(&HaUnavailableResult {
                 status: "unavailable",
@@ -552,7 +591,7 @@ pub async fn handle_read_states(args: HASSReadStatesTool) -> Result<CallToolResu
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(CallToolError::new)?;
-    match read_states_at(&client, &token, STATES_URL, &args, limit).await {
+    match read_states_at(&client, &token, &states_url, &args, limit).await {
         Ok(result) => Ok(env.json_result(&result)),
         Err(detail) => env.failed(detail),
     }
@@ -578,7 +617,8 @@ async fn fetch_one_at(
         || response.status() == reqwest::StatusCode::FORBIDDEN
     {
         return Err(
-            "Home Assistant refused the add-on token; check homeassistant_api permission".into(),
+            "Home Assistant refused the configured API credential; check its access and endpoint"
+                .into(),
         );
     }
     if !response.status().is_success() {
@@ -693,8 +733,8 @@ pub async fn handle_control_entity(
             },
         );
     }
-    let Some(token) = supervisor_token() else {
-        let detail = "Home Assistant control requires UHC to run as an add-on with homeassistant_api enabled.";
+    let Some((states_url, token)) = ha_api_credentials() else {
+        let detail = "Home Assistant control requires the add-on homeassistant_api permission or standalone UHC_HA_API_URL and UHC_HA_API_TOKEN configuration.";
         return env
             .data(&HaUnavailableResult {
                 status: "unavailable",
@@ -707,7 +747,7 @@ pub async fn handle_control_entity(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(CallToolError::new)?;
-    match control_entity_at(&client, &token, STATES_URL, &args).await {
+    match control_entity_at(&client, &token, &states_url, &args).await {
         Ok(result) => Ok(env.json_result(&result)),
         Err(failure @ HaControlFailure::NotFound(_)) => env.refused(
             failure.detail(),
@@ -731,6 +771,45 @@ mod tests {
     use serde_json::json;
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn runtime_credentials_use_supervisor_or_explicit_standalone_configuration() {
+        assert_eq!(
+            credentials_for(true, Some("supervisor".into()), None, None),
+            Some((SUPERVISOR_STATES_URL.into(), "supervisor".into()))
+        );
+        assert_eq!(
+            credentials_for(
+                false,
+                Some("must-not-win".into()),
+                Some("http://ha.local:8123/api/config".into()),
+                Some("standalone".into())
+            ),
+            Some((
+                "http://ha.local:8123/api/states".into(),
+                "standalone".into()
+            ))
+        );
+        assert!(credentials_for(false, Some("supervisor".into()), None, None).is_none());
+        assert!(credentials_for(false, None, Some("http://ha.local:8123".into()), None).is_none());
+    }
+
+    #[test]
+    fn standalone_endpoint_rejects_ambiguous_or_unsafe_url_forms() {
+        for url in [
+            "file:///etc/passwd",
+            "http://user:pass@ha.local:8123/api/config",
+            "http://ha.local:8123/api/config?token=x",
+            "http://ha.local:8123/api/config#fragment",
+            "http://ha.local:8123/proxy/api/config",
+        ] {
+            assert!(states_endpoint(url).is_none(), "accepted {url}");
+        }
+        assert_eq!(
+            states_endpoint("https://ha.example/api/"),
+            Some("https://ha.example/api/states".into())
+        );
+    }
 
     #[derive(Clone)]
     struct Stub {

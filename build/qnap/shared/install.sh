@@ -48,6 +48,19 @@ elif [ ! -f "${QPKG_ROOT}/config/hiphi.env" ]; then
 fi
 chmod 600 "${QPKG_ROOT}/config/hiphi.env"
 
+# Optional standalone Home Assistant MCP credentials use a data-only file.
+# Preserve an existing file across upgrades and keep it private to the package.
+if [ -L "${QPKG_ROOT}/config/home-assistant.env" ]; then
+    echo "Refusing symlinked Home Assistant configuration" >&2
+    exit 1
+elif [ ! -e "${QPKG_ROOT}/config/home-assistant.env" ]; then
+    touch "${QPKG_ROOT}/config/home-assistant.env"
+elif [ ! -f "${QPKG_ROOT}/config/home-assistant.env" ]; then
+    echo "Refusing non-file Home Assistant configuration" >&2
+    exit 1
+fi
+chmod 600 "${QPKG_ROOT}/config/home-assistant.env"
+
 # Restart service if it was running before upgrade
 if [ "$WAS_RUNNING" = true ]; then
     echo "Restarting service after upgrade..."

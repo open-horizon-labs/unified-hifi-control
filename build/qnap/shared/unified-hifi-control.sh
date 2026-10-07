@@ -17,6 +17,7 @@ export HOME=$QPKG_ROOT
 export UHC_CONFIG_DIR=${UHC_CONFIG_DIR:-${QPKG_ROOT}/config}
 export PATH=$QPKG_ROOT:$PATH
 HIPHI_ENV_FILE=${UHC_CONFIG_DIR}/hiphi.env
+HOME_ASSISTANT_ENV_FILE=${UHC_CONFIG_DIR}/home-assistant.env
 
 export PIDF=${QPKG_ROOT}/unified-hifi-control.pid
 export UHC_LOG_DIR=${UHC_LOG_DIR:-${QPKG_ROOT}/logs}
@@ -80,6 +81,52 @@ load_hiphi_config() {
     done < "$HIPHI_ENV_FILE"
 }
 
+# Home Assistant's standalone MCP connection is kept separately from the
+# pairing-owned HiPhi settings.  Parse data only; never source this file as
+# shell code.  A missing or empty file leaves the optional integration off.
+load_home_assistant_config() {
+    if [ -L "$HOME_ASSISTANT_ENV_FILE" ]; then
+        echo "Refusing unsafe Home Assistant configuration: $HOME_ASSISTANT_ENV_FILE"
+        return 1
+    fi
+    [ -e "$HOME_ASSISTANT_ENV_FILE" ] || return 0
+    if [ ! -f "$HOME_ASSISTANT_ENV_FILE" ]; then
+        echo "Refusing unsafe Home Assistant configuration: $HOME_ASSISTANT_ENV_FILE"
+        return 1
+    fi
+
+    SEEN_HA_URL=false
+    SEEN_HA_TOKEN=false
+    while IFS= read -r HA_LINE || [ -n "$HA_LINE" ]; do
+        case "$HA_LINE" in
+            ''|'#'*) continue ;;
+            *=*) ;;
+            *) echo "Invalid Home Assistant configuration line"; return 1 ;;
+        esac
+        HA_NAME=${HA_LINE%%=*}
+        HA_VALUE=${HA_LINE#*=}
+        [ -n "$HA_VALUE" ] || { echo "Empty Home Assistant setting: $HA_NAME"; return 1; }
+        case "$HA_NAME" in
+            UHC_HA_API_URL)
+                [ "$SEEN_HA_URL" = false ] || return 1
+                SEEN_HA_URL=true
+                export UHC_HA_API_URL="$HA_VALUE"
+                ;;
+            UHC_HA_API_TOKEN)
+                [ "$SEEN_HA_TOKEN" = false ] || return 1
+                SEEN_HA_TOKEN=true
+                export UHC_HA_API_TOKEN="$HA_VALUE"
+                ;;
+            *) echo "Unknown Home Assistant setting: $HA_NAME"; return 1 ;;
+        esac
+    done < "$HOME_ASSISTANT_ENV_FILE"
+
+    if [ "$SEEN_HA_URL" != "$SEEN_HA_TOKEN" ]; then
+        echo "Home Assistant configuration requires both URL and token"
+        return 1
+    fi
+}
+
 # A PID file is only a hint: after a crash or reboot its numeric PID can be reused by an
 # unrelated process. Refuse to signal unless /proc still identifies the package binary.
 is_our_pid() {
@@ -105,6 +152,7 @@ case "$1" in
     cd "$QPKG_ROOT" || { echo "Failed to cd to $QPKG_ROOT"; exit 1; }
 
     load_hiphi_config || { echo "Failed to load HiPhi connector configuration"; exit 1; }
+    load_home_assistant_config || { echo "Failed to load Home Assistant configuration"; exit 1; }
 
     # UHC owns daily rotation inside UHC_LOG_DIR. This small launcher file is
     # truncated on each start and captures only failures before logging starts.

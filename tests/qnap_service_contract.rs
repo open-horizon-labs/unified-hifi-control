@@ -135,6 +135,22 @@ fn qnap_package_persists_and_loads_the_complete_hiphi_connector_configuration() 
 }
 
 #[test]
+fn qnap_package_loads_standalone_home_assistant_credentials_as_private_data() {
+    assert!(INSTALL.contains("touch \"${QPKG_ROOT}/config/home-assistant.env\""));
+    assert!(INSTALL.contains("chmod 600 \"${QPKG_ROOT}/config/home-assistant.env\""));
+    assert!(INSTALL.contains("[ -L \"${QPKG_ROOT}/config/home-assistant.env\" ]"));
+    assert!(SERVICE.contains("HOME_ASSISTANT_ENV_FILE=${UHC_CONFIG_DIR}/home-assistant.env"));
+    assert!(SERVICE.contains("UHC_HA_API_URL"));
+    assert!(SERVICE.contains("UHC_HA_API_TOKEN"));
+    assert!(SERVICE.contains("load_home_assistant_config ||"));
+    assert!(
+        !SERVICE.contains(". \"$HOME_ASSISTANT_ENV_FILE\"")
+            && !SERVICE.contains("source \"$HOME_ASSISTANT_ENV_FILE\"")
+            && !SERVICE.contains("eval \"$(cat \"$HOME_ASSISTANT_ENV_FILE\")\"")
+    );
+}
+
+#[test]
 fn qnap_artifact_contains_the_pairing_helper_for_each_packaged_architecture() {
     let x64_job = BUILD_WORKFLOW
         .split("build-qnap-x64:")

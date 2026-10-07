@@ -3,7 +3,7 @@
     "annotations": {
       "destructiveHint": true
     },
-    "description": "Turn one exact Home Assistant light or switch entity on or off. Use an entity_id previously returned by ha_read_states. The only actions are turn_on and turn_off; no other domains, services, targets, scripts, or URLs are accepted. A successful service response is reported as accepted, and a separate state readback reports whether the requested state was observed.",
+    "description": "Turn one exact Home Assistant light or switch entity on or off, using the Supervisor API when running as an add-on or explicitly configured UHC_HA_API_URL and UHC_HA_API_TOKEN when standalone. Use an entity_id previously returned by ha_read_states. The only actions are turn_on and turn_off; no other domains, services, targets, scripts, or URLs are accepted. A successful service response is reported as accepted, and a separate state readback reports whether the requested state was observed.",
     "inputSchema": {
       "properties": {
         "action": {
@@ -37,7 +37,7 @@
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "Read current Home Assistant entity states through the Supervisor API. Available when UHC runs as a Home Assistant add-on with core API access. Query by exact entity ID(s), domain, or name; at least one filter is required. Returns stable entity IDs, friendly names, state, selected safe attributes, and source timestamps. Results are capped and report truncation. This is read-only and does not call services.",
+    "description": "Read current Home Assistant entity states through the Supervisor API when running as an add-on, or through explicitly configured UHC_HA_API_URL and UHC_HA_API_TOKEN when standalone. Query by exact entity ID(s), domain, or name; at least one filter is required. Returns stable entity IDs, friendly names, state, selected safe attributes, and source timestamps. Results are capped and report truncation. This is read-only and does not call services.",
     "inputSchema": {
       "properties": {
         "domain": {
@@ -200,7 +200,7 @@
           "type": "integer"
         },
         "location": {
-          "description": "Durable provider-neutral collection location returned by a preceding browse call.",
+          "description": "Durable provider-neutral location returned by a preceding browse call. Supply this or path, never both; location is preferred for canonical navigation.",
           "nullable": true,
           "type": "string"
         },
@@ -215,7 +215,7 @@
           "type": "integer"
         },
         "path": {
-          "description": "Short-lived collection continuation returned by a preceding browse call.",
+          "description": "Short-lived continuation returned by a preceding browse call. Supply this or location, never both; path is for the current MCP session.",
           "nullable": true,
           "type": "string"
         },
