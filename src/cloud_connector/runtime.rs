@@ -211,13 +211,31 @@ impl ConnectorSupervisor {
             "Cloud connector is already running."
         );
         anyhow::ensure!(!state.shutdown.is_cancelled(), "UHC is shutting down.");
+        let config_dir = config_dir.into();
+        let config = CloudConnectorConfig::for_recovery(config_dir.clone())?
+            .ok_or_else(|| anyhow::anyhow!("This installation is not paired."))?;
+        let permissions_changed = super::permissions::changed(&config)?;
+        if permissions_changed {
+            super::permissions::repair(&config)?;
+        }
+        // Reload strictly after repair; the inspection-only binding cannot
+        // authorize a connection. Never replace identity or reset replay state.
         let config = CloudConnectorConfig::from_runtime(config_dir)?
             .ok_or_else(|| anyhow::anyhow!("This installation is not paired."))?;
-        // Validate identity and replay protection before changing containment.
         let identity =
             InstallationIdentity::load(&config.key_path, config.installation_id.clone())?;
         SessionEpochGuard::load(&config.epoch_path)?;
-        super::safety::resume(&config.epoch_path, now_ms() as u64)?;
+        if permissions_changed {
+            // Repair must not also silently release an unrelated cost stop.
+            anyhow::ensure!(super::safety::pause_reason(&config.epoch_path).is_none(),
+                "File access is restored. Cloud is still paused by its usage limit; review the updated connection status.");
+            tracing::info!(
+                event = "cloud_permissions_repaired",
+                "Cloud connection file access restored by local recovery"
+            );
+        } else {
+            super::safety::resume(&config.epoch_path, now_ms() as u64)?;
+        }
         self.start_config(state, config, identity).await
     }
 
@@ -254,7 +272,7 @@ impl ConnectorSupervisor {
         &self,
         config_dir: impl Into<std::path::PathBuf>,
     ) -> anyhow::Result<ConnectorStatus> {
-        let Some(config) = CloudConnectorConfig::from_runtime(config_dir)? else {
+        let Some(config) = CloudConnectorConfig::for_recovery(config_dir.into())? else {
             return Ok(ConnectorStatus {
                 configured: false,
                 installation_id: None,
@@ -274,20 +292,27 @@ impl ConnectorSupervisor {
         };
         let mut pause_reason = if active {
             None
-        } else if phase == ConnectorPhase::SafetyError {
-            Some("safety_state_unavailable")
         } else {
-            super::safety::pause_reason(&config.epoch_path)
+            // Current persisted containment takes precedence over an old run's
+            // storage failure, especially after the owner repairs file access.
+            super::safety::pause_reason(&config.epoch_path).or_else(|| {
+                (phase == ConnectorPhase::SafetyError).then_some("safety_state_unavailable")
+            })
         };
-        if !active && SessionEpochGuard::load(&config.epoch_path).is_err() {
-            pause_reason = Some("safety_state_unavailable");
+        if !active {
+            match super::permissions::changed(&config) {
+                Ok(true) => pause_reason = Some("permissions_changed"),
+                Err(_) => pause_reason = Some("safety_state_unavailable"),
+                Ok(false) => {}
+            }
         }
         if pause_reason.is_some() {
             phase = ConnectorPhase::Paused;
         }
         let can_resume = !active
-            && pause_reason == Some("cost_limit")
-            && super::safety::can_resume(&config.epoch_path, now_ms() as u64);
+            && (pause_reason == Some("permissions_changed")
+                || (pause_reason == Some("cost_limit")
+                    && super::safety::can_resume(&config.epoch_path, now_ms() as u64)));
         Ok(ConnectorStatus {
             configured: true,
             installation_id: Some(config.installation_id),
@@ -1565,7 +1590,8 @@ mod tests {
             status.installation_id.as_deref(),
             Some(installation_id.as_str())
         );
-        assert_eq!(status.phase, super::ConnectorPhase::Offline);
+        assert_eq!(status.phase, super::ConnectorPhase::Paused);
+        assert_eq!(status.pause_reason, Some("safety_state_unavailable"));
 
         let state = empty_app_state().await;
         assert!(
@@ -1651,6 +1677,200 @@ mod tests {
             !supervisor.inner.lock().await.active,
             "shutdown must not wait an hour"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permission_recovery_explains_changed_access_and_preserves_pairing_and_replay() {
+        use std::os::unix::fs::PermissionsExt;
+        // Each file can independently strand a listener, including hiphi.env
+        // on packages that do not inject connector settings into the process.
+        for changed in ["hiphi-installation.key", "hiphi-relay-epoch", "hiphi.env"] {
+            let (directory, installation_id) = paired_directory();
+            let key = directory.path().join("hiphi-installation.key");
+            InstallationIdentity::generate(installation_id.clone())
+                .unwrap()
+                .save(&key)
+                .unwrap();
+            let epoch = directory.path().join("hiphi-relay-epoch");
+            let now = super::now_ms() as u64;
+            super::SessionEpochGuard::load(&epoch)
+                .unwrap()
+                .accept_at(now, now)
+                .unwrap();
+            let key_before = std::fs::read(&key).unwrap();
+            let epoch_before = std::fs::read(&epoch).unwrap();
+            std::fs::set_permissions(
+                directory.path().join(changed),
+                std::fs::Permissions::from_mode(0o770),
+            )
+            .unwrap();
+            let supervisor = ConnectorSupervisor::default();
+            let status = supervisor
+                .status_from_runtime(directory.path())
+                .await
+                .unwrap();
+            assert_eq!(
+                status.pause_reason,
+                Some("permissions_changed"),
+                "{changed}"
+            );
+            assert!(
+                status.can_resume,
+                "the listener needs a usable reconnect action"
+            );
+            assert_eq!(
+                status.installation_id.as_deref(),
+                Some(installation_id.as_str())
+            );
+            assert_eq!(
+                std::fs::metadata(directory.path().join(changed))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o770,
+                "reading status must not silently change access"
+            );
+            let state = empty_app_state().await;
+            let (first, second) = tokio::join!(
+                supervisor.resume_from_runtime(state.clone(), directory.path()),
+                supervisor.resume_from_runtime(state.clone(), directory.path()),
+            );
+            assert_ne!(
+                first.is_ok(),
+                second.is_ok(),
+                "start one connector without restarting local UHC"
+            );
+            assert_eq!(supervisor.inner.lock().await.generation, 1);
+            assert!(!state.shutdown.is_cancelled());
+            assert_eq!(std::fs::read(&key).unwrap(), key_before);
+            assert_eq!(std::fs::read(&epoch).unwrap(), epoch_before);
+            assert_eq!(
+                std::fs::metadata(directory.path().join(changed))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert!(super::SessionEpochGuard::load(&epoch)
+                .unwrap()
+                .accept_at(now, now)
+                .is_err());
+            state.shutdown.cancel();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permission_recovery_does_not_disguise_damage_or_follow_links() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        for defect in [
+            "damaged_epoch",
+            "missing_key",
+            "symlink",
+            "hardlink",
+            "damaged_retry",
+        ] {
+            let (directory, installation_id) = paired_directory();
+            let key = directory.path().join("hiphi-installation.key");
+            InstallationIdentity::generate(installation_id)
+                .unwrap()
+                .save(&key)
+                .unwrap();
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o770)).unwrap();
+            let epoch = directory.path().join("hiphi-relay-epoch");
+            match defect {
+                "damaged_epoch" => std::fs::write(&epoch, "broken").unwrap(),
+                "missing_key" => std::fs::remove_file(&key).unwrap(),
+                "damaged_retry" => std::fs::write(epoch.with_extension("retry"), "broken").unwrap(),
+                "symlink" | "hardlink" => {
+                    let other = directory.path().join("unrelated");
+                    std::fs::rename(&key, &other).unwrap();
+                    if defect == "symlink" {
+                        symlink(other, &key).unwrap();
+                    } else {
+                        std::fs::hard_link(other, &key).unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let supervisor = ConnectorSupervisor::default();
+            let status = supervisor
+                .status_from_runtime(directory.path())
+                .await
+                .unwrap();
+            assert_eq!(
+                status.pause_reason,
+                Some("safety_state_unavailable"),
+                "{defect}"
+            );
+            assert!(!status.can_resume, "{defect}");
+            let state = empty_app_state().await;
+            assert!(
+                supervisor
+                    .resume_from_runtime(state.clone(), directory.path())
+                    .await
+                    .is_err(),
+                "{defect}"
+            );
+            assert!(!supervisor.inner.lock().await.active);
+            if defect == "symlink" || defect == "hardlink" {
+                assert_eq!(
+                    std::fs::metadata(directory.path().join("unrelated"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o770
+                );
+            }
+            state.shutdown.cancel();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permission_recovery_preserves_an_independent_cost_stop_and_retry_budget() {
+        use std::os::unix::fs::PermissionsExt;
+        let (directory, installation_id) = paired_directory();
+        let key = directory.path().join("hiphi-installation.key");
+        InstallationIdentity::generate(installation_id.clone())
+            .unwrap()
+            .save(&key)
+            .unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let epoch = directory.path().join("hiphi-relay-epoch");
+        super::super::safety::quarantine(&epoch).unwrap();
+        let attempts = epoch.with_extension("attempts");
+        let retry = epoch.with_extension("retry");
+        std::fs::write(&attempts, "[1000,32]").unwrap();
+        std::fs::write(&retry, r#"{"last_ms":1000,"next_ms":901000,"step":3}"#).unwrap();
+        let supervisor = ConnectorSupervisor::default();
+        {
+            let mut inner = supervisor.inner.lock().await;
+            inner.installation_id = Some(installation_id);
+            inner.phase = Some(super::ConnectorPhase::SafetyError);
+        }
+        let state = empty_app_state().await;
+        assert!(supervisor
+            .resume_from_runtime(state.clone(), directory.path())
+            .await
+            .is_err());
+        assert!(epoch.with_extension("quarantine").exists());
+        assert_eq!(std::fs::read_to_string(attempts).unwrap(), "[1000,32]");
+        assert_eq!(
+            std::fs::read_to_string(retry).unwrap(),
+            r#"{"last_ms":1000,"next_ms":901000,"step":3}"#
+        );
+        assert!(!supervisor.inner.lock().await.active);
+        let status = supervisor
+            .status_from_runtime(directory.path())
+            .await
+            .unwrap();
+        assert_eq!(status.pause_reason, Some("cost_limit"));
+        state.shutdown.cancel();
     }
 
     #[cfg(unix)]

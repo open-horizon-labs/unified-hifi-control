@@ -38,6 +38,7 @@ server = [
     "dep:rumqttc",
     "dep:ed25519-dalek",
     "dep:uuid",
+    "dep:rustix",
 ]
 # UHC-owned NAA relay for HQPlayer output routing. Server builds include it by default; use
 # `--no-default-features --features server` when a relay-free server is specifically required.
@@ -191,6 +192,10 @@ required-features = ["server"]
 name = "uhc-hiphi-pair"
 path = "src/bin/uhc_hiphi_pair.rs"
 required-features = ["server"]
+
+[target.'cfg(unix)'.dependencies]
+# Open the exact connection files without following links during owner recovery.
+rustix = { version = "1", features = ["fs", "process"], optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

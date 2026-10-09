@@ -8,6 +8,7 @@ pub mod commands;
 pub mod config;
 pub mod identity;
 pub mod pairing;
+mod permissions;
 pub mod protocol;
 mod retry;
 pub mod runtime;
