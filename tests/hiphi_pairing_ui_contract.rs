@@ -6,6 +6,7 @@
 
 const MAIN: &str = include_str!("../src/main.rs");
 const API: &str = include_str!("../src/api/hiphi_pairing.rs");
+const CONNECTION: &str = include_str!("../src/app/cloud_connection.rs");
 const SETTINGS: &str = include_str!("../src/app/pages/settings.rs");
 
 #[test]
@@ -17,7 +18,10 @@ fn settings_exposes_the_complete_local_pairing_ceremony() {
         "/api/hiphi/pairing/complete",
     ] {
         assert!(MAIN.contains(route), "server must mount {route}");
-        assert!(SETTINGS.contains(route), "Settings must call {route}");
+        assert!(
+            SETTINGS.contains(route) || CONNECTION.contains(route),
+            "Settings must call {route}"
+        );
     }
 
     for copy in [
@@ -47,8 +51,8 @@ fn settings_exposes_the_complete_local_pairing_ceremony() {
 #[test]
 fn paired_status_keeps_refreshing_after_the_page_loads() {
     assert!(
-        SETTINGS.contains("dioxus_sdk_time::sleep(HIPHI_STATUS_POLL_INTERVAL)")
-            && SETTINGS.contains("pairing_status.restart()"),
+        CONNECTION.contains("dioxus_sdk_time::sleep(HIPHI_STATUS_POLL_INTERVAL)")
+            && SETTINGS.contains("use_cloud_connection().status"),
         "Settings must refresh connector state so online, reconnecting, and revoked do not go stale"
     );
 }
@@ -85,8 +89,10 @@ fn browser_handoff_explicitly_clears_inherited_group_and_other_permissions() {
 fn recovery_is_reachable_and_uses_the_controller_gate() {
     let route = "/api/hiphi/connection/resume";
     assert!(MAIN.contains(route));
-    assert!(SETTINGS.contains(route));
-    assert!(SETTINGS.contains("Resume Cloud connection"));
+    assert!(CONNECTION.contains(route));
+    assert!(CONNECTION.contains("Resume Cloud connection"));
+    assert!(SETTINGS.contains("CloudConnectionNotice"));
+    assert!(include_str!("../src/app/components/layout.rs").contains("CloudConnectionNotice"));
     let auth = include_str!("../src/api/controller_auth.rs");
     assert!(auth.contains("path.starts_with(\"/api/hiphi/connection/\")"));
 }

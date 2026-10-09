@@ -6,20 +6,18 @@ use dioxus::prelude::*;
 
 use crate::app::api::{
     source_label, AppSettings, AppleBridgeStatus, HiphiCompleteRequest, HiphiCompleteResponse,
-    HiphiEnrollmentHandoff, HiphiInitiateRequest, HiphiInitiateResponse, HiphiPairingStatus,
-    HiphiPrepareResponse, HqpStatus, LmsConfig, ManagedZone, ManagedZonesResponse, MoveDirection,
-    MqttConfigureRequest, MqttStatusResponse, MusicAssistantConfigureRequest,
-    MusicAssistantStatusResponse, ProviderAuthResponse, ProviderOAuthStart, RoonStatus,
-    SpotifyAccountResponse, SpotifyConfigureRequest, SpotifyConfigureResponse, SpotifyTunnelStatus,
-    ZoneNameRequest, ZoneOrderRequest, ZoneVisibilityRequest, ZonesResponse,
+    HiphiEnrollmentHandoff, HiphiInitiateRequest, HiphiInitiateResponse, HiphiPrepareResponse,
+    HqpStatus, LmsConfig, ManagedZone, ManagedZonesResponse, MoveDirection, MqttConfigureRequest,
+    MqttStatusResponse, MusicAssistantConfigureRequest, MusicAssistantStatusResponse,
+    ProviderAuthResponse, ProviderOAuthStart, RoonStatus, SpotifyAccountResponse,
+    SpotifyConfigureRequest, SpotifyConfigureResponse, SpotifyTunnelStatus, ZoneNameRequest,
+    ZoneOrderRequest, ZoneVisibilityRequest, ZonesResponse,
 };
 use crate::app::components::{ErrorAlert, Layout};
 use crate::app::settings_context::{initial_app_settings, use_settings};
 use crate::app::sse::use_sse;
 use crate::app::theme::{use_theme, Theme};
 use crate::app::{McpEndpoint, Route};
-
-const HIPHI_STATUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// OpenHome status response
 #[derive(Clone, Debug, Default, serde::Deserialize, PartialEq)]
@@ -120,22 +118,7 @@ fn HiphiCloudPairing() -> Element {
     let public_key_copy = use_signal(CopyState::default);
     let pairing_id_copy = use_signal(CopyState::default);
     let pairing_secret_copy = use_signal(CopyState::default);
-    let mut pairing_status = use_resource(|| async {
-        crate::app::api::fetch_json::<HiphiPairingStatus>("/api/hiphi/pairing/status").await
-    });
-
-    // Pairing is durable, but relay presence changes independently of page
-    // navigation. Refresh only this small status resource so a page opened
-    // while online cannot keep claiming connectivity after a disconnect (or
-    // stay on "connecting" after recovery).
-    use_effect(move || {
-        spawn(async move {
-            loop {
-                dioxus_sdk_time::sleep(HIPHI_STATUS_POLL_INTERVAL).await;
-                pairing_status.restart();
-            }
-        });
-    });
+    let mut pairing_status = crate::app::cloud_connection::use_cloud_connection().status;
 
     let prepare = move |_| {
         action.set(ProviderActionState::Loading);
@@ -225,31 +208,9 @@ fn HiphiCloudPairing() -> Element {
         });
     };
 
-    let resume_cloud = move |_| {
-        if matches!(action(), ProviderActionState::Loading) {
-            return;
-        }
-        action.set(ProviderActionState::Loading);
-        error.set(None);
-        spawn(async move {
-            match crate::app::api::post_json::<serde_json::Value, HiphiPairingStatus>(
-                "/api/hiphi/connection/resume",
-                &serde_json::json!({}),
-            )
-            .await
-            {
-                Ok(_) => action.set(ProviderActionState::Success),
-                Err(message) => {
-                    action.set(ProviderActionState::Failed);
-                    error.set(crate::app::api::suppress_controller_unauthorized(message));
-                }
-            }
-            pairing_status.restart();
-        });
-    };
-
     let status_snapshot = pairing_status.read().as_ref().cloned();
     let status_pending = status_snapshot.is_none();
+    let status_failed = matches!(status_snapshot, Some(Err(_)));
     let paired_status = status_snapshot
         .and_then(Result::ok)
         .filter(|status| status.paired);
@@ -266,27 +227,18 @@ fn HiphiCloudPairing() -> Element {
             div { class: "card p-5 sm:p-6 space-y-6",
                 if status_pending {
                     p { class: "text-sm text-secondary", "Checking this installation’s HiPhi Cloud connection…" }
+                } else if status_failed {
+                    p { role: "alert", "UHC couldn’t check its Cloud connection. Try again shortly; you don’t need to start pairing again." }
                 } else if let Some(status) = paired_status {
                     div { class: if status.connector_state == "online" { "status-ok" } else { "text-secondary" }, role: "status",
                         p { class: "font-medium", "This UHC installation is paired." }
-                        p { class: "mt-1", "{status.display_state()}" }
+                        if status.pause_reason.is_none() {
+                            p { class: "mt-1", "{status.display_state()}" }
+                        }
                         if status.connector_state == "offline" && status.pause_reason.is_none() {
                             p { class: "mt-2 text-sm", "UHC retries automatically. During an outage, retries slow to about once every 15 minutes to limit Cloud usage." }
                         }
-                        if status.pause_reason.as_deref() == Some("cost_limit") {
-                            p { class: "mt-2 text-sm", "Cloud traffic or repeated connection attempts reached a safety limit. Local playback is unaffected. Resume after the Cloud issue is resolved; cost protection stays enabled." }
-                            button {
-                                r#type: "button", class: "btn btn-primary mt-3",
-                                disabled: !status.can_resume || matches!(action(), ProviderActionState::Loading),
-                                onclick: resume_cloud,
-                                "Resume Cloud connection"
-                            }
-                            if !status.can_resume {
-                                p { class: "mt-2 text-sm", "Recovery attempts are limited to once every 15 minutes. If this persists, the saved recovery state needs attention." }
-                            }
-                        } else if status.pause_reason.is_some() {
-                            p { class: "mt-2 text-sm", "Cloud safety or replay state could not be read or saved. Check the UHC logs and configuration storage before resuming. Pairing and local playback are preserved." }
-                        }
+                        crate::app::cloud_connection::CloudConnectionNotice {}
                         if let Some(installation_id) = status.installation_id {
                             p { class: "mt-2 text-xs text-muted break-all", "Installation ID: {installation_id}" }
                         }

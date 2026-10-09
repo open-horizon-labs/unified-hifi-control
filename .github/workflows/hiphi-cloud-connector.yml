@@ -2,7 +2,7 @@ name: HiPhi Cloud connector
 
 on:
   pull_request:
-    branches: [v4]
+    branches: [v4, 'integration/v4-hiphi-readiness-2026-10-02']
     paths:
       - "rust-toolchain.toml"
       - ".github/actions/setup-rust/action.yml"
@@ -10,6 +10,10 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'src/cloud_connector/**'
+      - 'src/app/**'
+      - 'src/api/hiphi_pairing.rs'
+      - 'tests/hiphi_recovery.rs'
+      - 'tests/hiphi_pairing_ui_contract.rs'
       - 'src/lib.rs'
       - 'src/main.rs'
       - 'tests/cloud_connector.rs'
@@ -46,7 +50,12 @@ jobs:
         run: cargo test --features server --test cloud_connector
 
       - name: Test the production connector runtime
-        run: cargo test --features server --lib cloud_connector::runtime
+        run: cargo test --features server --lib cloud_connector
+
+      - name: Test connection recovery presentation
+        run: |
+          cargo test --features server --lib cloud_connection
+          cargo test --features server --test hiphi_recovery --test hiphi_pairing_ui_contract
 
       - name: Preserve the public HTTP API contract
         run: cargo test --features server --test api_contract
