@@ -162,6 +162,9 @@ impl HiphiPairingStatus {
             "online" => "Connected to HiPhi Cloud",
             "connecting" => "Paired · connecting",
             "offline" => "Paired · offline",
+            "paused" if self.pause_reason.as_deref() == Some("permissions_changed") => {
+                "Remote control is disconnected"
+            }
             "paused" if self.pause_reason.as_deref() == Some("cost_limit") => {
                 "Cloud paused · cost protection"
             }
