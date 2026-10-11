@@ -2,6 +2,56 @@ use std::{fs, path::PathBuf};
 
 const DEVELOPMENT_BRANCH: &str = "v4";
 
+#[test]
+fn integration_v4_pull_requests_run_build_and_api_checks() {
+    for name in ["build.yml", "api-guard.yml"] {
+        let source = workflow(name);
+        let trigger = source
+            .split("pull_request:")
+            .nth(1)
+            .unwrap()
+            .split("types:")
+            .next()
+            .unwrap();
+        assert!(
+            trigger.contains("'integration/v4-*'"),
+            "{name} must validate v4 integration PRs"
+        );
+    }
+}
+
+#[test]
+fn artwork_attention_runtime_is_shipped_and_exercised_in_workspace_ci() {
+    for name in ["build.yml", "docker.yml", "streaming-alpha.yml"] {
+        let source = workflow(name);
+        assert!(
+            source.contains("install -y libvips-tools"),
+            "{name} must exercise actual attention cropping"
+        );
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for name in ["Dockerfile.release", "Dockerfile.ci"] {
+        let source = fs::read_to_string(root.join(name)).unwrap();
+        assert!(
+            source.contains("apk add --no-cache ca-certificates openssh-client vips-tools"),
+            "{name} needs vips at runtime"
+        );
+    }
+    assert!(fs::read_to_string(root.join("Dockerfile"))
+        .unwrap()
+        .contains("libvips-tools"));
+    let build = workflow("build.yml");
+    assert_eq!(
+        build.matches("--depends libvips-tools").count(),
+        3,
+        "every deb architecture must install the native runtime"
+    );
+    assert!(build.contains("--depends vips-tools"));
+    assert!(fs::read_to_string(root.join("build/arch/PKGBUILD"))
+        .unwrap()
+        .contains("depends=('libvips')"));
+}
+
 fn workflow(name: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join(".github/workflows")
@@ -163,21 +213,25 @@ fn server_artifacts_include_the_naa_proxy() {
 }
 
 #[test]
-fn dioxus_cli_cache_matches_the_isolated_cargo_home() {
-    let source = workflow("build.yml");
-    let wasm = job(&source, "build-wasm");
-
+fn dioxus_cli_cache_is_portable_between_isolated_runners() {
+    let wasm = job(&workflow("build.yml"), "build-wasm");
     assert!(
-        wasm.contains("path: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/cargo/bin/dx"),
-        "Dioxus CLI cache must use the isolated runner Cargo bin path"
+        wasm.contains("path: .ci-tools/dioxus/bin/dx"),
+        "cache input path must stay identical when the fleet runner name changes"
     );
+    assert!(wasm.contains("key: dx-cli-v2-${{ runner.os }}-${{ runner.arch }}-0.7.10"));
+    assert!(wasm.contains("run: bash .github/scripts/ensure-dioxus-cli.sh"));
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let result = std::process::Command::new("bash")
+        .arg(root.join("tests/dioxus_cli_cache.sh"))
+        .current_dir(root)
+        .output()
+        .unwrap();
     assert!(
-        wasm.contains("key: dx-cli-${{ runner.os }}-${{ runner.arch }}-0.7.10"),
-        "Dioxus CLI cache must be scoped by runner platform and pinned version"
-    );
-    assert!(
-        wasm.find("name: Cache Dioxus CLI") < wasm.find("name: Install Dioxus CLI"),
-        "Dioxus CLI cache must restore before installation"
+        result.status.success(),
+        "cross-runner CLI cache behavior failed:\n{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
     );
 }
 

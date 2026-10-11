@@ -37,3 +37,6 @@ __pycache__/
 /.build/
 companion/**/.build/
 companion/**/.swiftpm/
+
+# Workspace staging for portable CI tool caches
+.ci-tools/

@@ -57,4 +57,8 @@ jobs:
         run: cargo test --test api_contract
 
       - name: Run workspace tests
-        run: cargo test --workspace
+        # The native attention test must exercise libvips rather than fallback.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvips-tools
+          cargo test --workspace
