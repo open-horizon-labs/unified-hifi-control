@@ -1,13 +1,13 @@
 # QNAP beta.4 acceptance: artwork fill and HiPhi Cloud reconnect
 
-This candidate combines #771 (artwork fill, including portrait viewports) and #769 (a readable Cloud access failure with owner-initiated reconnect). It retains the current v4 prepared builders. Download the x86_64 QPKG from the release PR's Build artifact `qnap-x86_64`, or the beta.4 release asset when published. Install through QNAP App Center → Install Manually, replacing the existing UHC package. Keep the existing configuration and pairing; do not uninstall first. The QPKG remains unsigned and may display QNAP's signature warning.
+This candidate combines #771 (artwork fill, including portrait viewports), #772 (Zensally subject-aware composition), and #769 (a readable Cloud access failure with owner-initiated reconnect). It retains the current v4 prepared builders. Download the x86_64 QPKG from the release PR's Build artifact `qnap-x86_64`, or the beta.4 release asset when published. Install through QNAP App Center → Install Manually, replacing the existing UHC package. Keep the existing configuration and pairing; do not uninstall first. The QPKG remains unsigned and may display QNAP's signature warning.
 
 Before updating, retain the previous QPKG for rollback and make an owner-only backup of the package's `config` directory. The installation preserves that directory. Verify the downloaded package against the SHA256 supplied with the build. Open UHC at `http://<NAS>:8088`; Settings should show the installed version and commit. Reload the browser after the upgrade so the embedded UI is current.
 
 ## Healthy baseline
 
 1. Open Settings → HiPhi Cloud and confirm the same installation is paired and comes online. Send a real Garmin/HiPhi Cloud playback or volume command and verify that the intended zone responds.
-2. Check the Frame still fills its artwork area above the tiny strip. No Frame firmware update is needed. If `vips` is absent from the NAS service PATH, UHC uses centered fill; attention cropping needs the native executable.
+2. Check the Frame still fills its artwork area above the tiny strip. No Frame firmware update is needed. Zensally is embedded and supplies the default subject-aware crop even when `vips` is absent from the NAS service PATH. Libvips attention is a fallback; centered fill is used if both composition paths fail.
 3. Keep UHC open on Zones as well as Settings. The shared Cloud status is refreshed about every ten seconds; there should be no persistent access-error notice during a healthy connection.
 
 ## Simulate changed file access, then reconnect
