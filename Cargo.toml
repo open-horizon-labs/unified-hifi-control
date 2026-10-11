@@ -25,6 +25,9 @@ server = [
     "dep:config",
     "dep:image",
     "dep:tempfile",
+    "dep:zensally",
+    "dep:zensally-tract",
+    "dep:zenlayout",
     "dep:resvg",
     "dep:tokio-stream",
     "dep:tokio-util",
@@ -240,3 +243,21 @@ panic = "abort"
 # Build with: cargo build --release --target x86_64-unknown-linux-musl
 # Or use cross: cross build --release --target x86_64-unknown-linux-musl
 # Available targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, armv7-unknown-linux-musleabihf
+
+# Server-only embedded face/saliency models; pinned to the offline evaluation.
+[dependencies.zensally]
+git = "https://github.com/imazen/zensally"
+rev = "a8888d08c6d4bd1fe0969cdce40da6c01b8032be"
+features = ["zenlayout"]
+optional = true
+[dependencies.zensally-tract]
+git = "https://github.com/imazen/zensally"
+rev = "a8888d08c6d4bd1fe0969cdce40da6c01b8032be"
+default-features = false
+features = ["analyzer"]
+optional = true
+[dependencies.zenlayout]
+version = "=0.2.2"
+default-features = false
+features = ["smart-crop", "alloc"]
+optional = true

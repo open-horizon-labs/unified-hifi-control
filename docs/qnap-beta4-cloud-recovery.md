@@ -54,3 +54,9 @@ Collect the visible message and UHC logs under the package's `logs` directory, w
 ## Pass criteria
 
 The package installs over the existing version; Frame artwork still works; a changed-access notice appears outside Settings; Reconnect repairs 0600 access without changing the pairing key or resetting replay protection; the actual Cloud state is shown; a real remote command works again; and the repaired state survives restart. Automated tests cover concurrent reconnects, missing/damaged/linked/unrelated files, retained usage limits, and preserved retry history. A real NAS/Cloud/Garmin test is deployment acceptance and is not replaced by CI.
+
+## Artwork crop acceptance
+
+The default proportional artwork fill now uses Zensally UltraFace + MicroSalNet and zenlayout's Minimal crop solver. Both models are embedded in the server; the NAS does not download models or require an ONNX Runtime installation. Analysis is shared by decoded artwork content across zones, display sizes, and orientations. A bounded 32-entry process cache retains faces and saliency maps; eviction or a server restart can cause another analysis. Inference is serialized to bound working memory, and image conversion remains in the existing bounded blocking workers. Explicit fit preserves the complete cover with its existing mat.
+
+Check the Crown cover that previously lost the woman's face on Frame. Confirm the new 800×450 fill keeps her face visible. Check another cover without a face, and check an Android display in portrait as well as landscape. Expect cropping to remove some of a square cover when filling a rectangular screen; multiple widely separated faces cannot always fit. If model initialization or crop geometry fails, UHC tries libvips attention and then centered fill. Pi 3 latency and memory remain hardware acceptance checks; the offline Mac measurements are not a Pi benchmark.

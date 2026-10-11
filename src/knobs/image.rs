@@ -83,7 +83,7 @@ impl EinkArtworkCache {
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum Rgb565ResizePolicy {
-    /// Proportionate fill with libvips attention selecting the crop placement.
+    /// Proportionate fill using cached face/saliency analysis, with libvips fallback.
     #[default]
     AttentionCover,
     /// Legacy behavior for clients that explicitly need every output pixel filled.
@@ -372,7 +372,10 @@ fn resize_with_policy(
             img,
             target_w,
             target_h,
-            attention_cover(img, target_w, target_h),
+            super::artwork_analysis::compose(img, target_w, target_h).or_else(|error| {
+                tracing::warn!("Zensally artwork crop unavailable; trying libvips: {error}");
+                attention_cover(img, target_w, target_h)
+            }),
         ),
         Rgb565ResizePolicy::Exact => img.resize_exact(target_w, target_h, FilterType::Triangle),
         Rgb565ResizePolicy::Fit => fit_on_gallery_mat(img, target_w, target_h),
@@ -656,6 +659,52 @@ mod tests {
     use super::*;
     use image::ImageEncoder;
 
+    #[test]
+    fn default_landscape_crop_preserves_upper_face() {
+        let source =
+            image::load_from_memory(include_bytes!("../../tests/fixtures/artwork/crown.png"))
+                .unwrap();
+        let actual = resize_with_policy(&source, 800, 450, Rgb565ResizePolicy::default());
+        let expected = source
+            .crop_imm(0, 0, 240, 135)
+            .resize_exact(800, 450, FilterType::Triangle);
+        assert!(
+            actual.to_rgb8() == expected.to_rgb8(),
+            "landscape cover must retain the face at the top of this artwork"
+        );
+        let bytes = include_bytes!("../../tests/fixtures/artwork/crown.png");
+        let packed =
+            jpeg_to_rgb565_with_policy(bytes, 800, 450, Rgb565ResizePolicy::default()).unwrap();
+        assert!(
+            packed.data == rgba_to_rgb565(&expected),
+            "Frame/LCD packing must use the face-preserving composition"
+        );
+        let browser =
+            image_to_display_with_policy(bytes, 800, 450, Rgb565ResizePolicy::default(), true)
+                .unwrap();
+        assert!(
+            image::load_from_memory(&browser).unwrap().to_rgb8() == expected.to_rgb8(),
+            "browser images must retain the same face-preserving crop"
+        );
+        let mut expected_png = Cursor::new(Vec::new());
+        expected
+            .write_to(&mut expected_png, ImageFormat::Png)
+            .unwrap();
+        let frame = image_to_eink_acep6_with_policy(bytes, 800, 450, Rgb565ResizePolicy::default())
+            .unwrap();
+        let expected_frame = image_to_eink_acep6_with_policy(
+            expected_png.get_ref(),
+            800,
+            450,
+            Rgb565ResizePolicy::Exact,
+        )
+        .unwrap();
+        assert!(
+            frame.data == expected_frame.data,
+            "Frame eInk palette packing must use the face-preserving crop"
+        );
+    }
+
     fn encode_solid_png(width: u32, height: u32, color: image::Rgba<u8>) -> Vec<u8> {
         let img = image::RgbaImage::from_pixel(width, height, color);
         let mut png_data = Vec::new();
@@ -719,34 +768,6 @@ mod tests {
             attention_cover(&source, 100, 100).unwrap().to_rgb8(),
             attention,
             "crop placement is deterministic"
-        );
-        assert_eq!(
-            resize_with_policy(&source, 100, 100, Rgb565ResizePolicy::default()).to_rgb8(),
-            attention,
-            "the default must use attention, not merely fill"
-        );
-        let mut png = Cursor::new(Vec::new());
-        source.write_to(&mut png, ImageFormat::Png).unwrap();
-        let rgb565 =
-            jpeg_to_rgb565_with_policy(png.get_ref(), 100, 100, Rgb565ResizePolicy::default())
-                .unwrap();
-        assert_eq!(
-            rgb565.data,
-            rgba_to_rgb565(&DynamicImage::ImageRgb8(attention.clone())),
-            "packed art must use the same attention placement"
-        );
-        let browser = image_to_display_with_policy(
-            png.get_ref(),
-            100,
-            100,
-            Rgb565ResizePolicy::default(),
-            true,
-        )
-        .unwrap();
-        assert_eq!(
-            image::load_from_memory(&browser).unwrap().to_rgb8(),
-            attention,
-            "browser art must share the attention crop"
         );
     }
 

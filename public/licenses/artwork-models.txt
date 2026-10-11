@@ -1,0 +1,14 @@
+Artwork composition dependencies
+
+Zensally (including the Imazen MicroSalNet model), zensally-tract, and zenlayout:
+Copyright Imazen LLC. Used under the Imazen Commercial License.
+https://github.com/imazen/zensally/blob/main/LICENSE-COMMERCIAL
+https://www.imazen.io/legal/subscription/site
+
+UltraFace RFB-320 model:
+Copyright (c) 2019 linzai. MIT License.
+The full permission notice accompanies this file as ultraface-mit.txt.
+https://github.com/Linzaer/Ultra-Light-Fast-Generic-Face-Detector-1MB
+
+Inference: tract (Sonos), MIT OR Apache-2.0.
+https://github.com/sonos/tract

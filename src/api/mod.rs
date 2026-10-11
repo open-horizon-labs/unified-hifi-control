@@ -527,7 +527,7 @@ impl AppState {
             width: dimensions.0,
             height: dimensions.1,
             resize_policy,
-            converter_version: 2,
+            converter_version: 3,
         });
         if let Some(key) = eink_cache_key.as_ref() {
             if let Some(data) = self.eink_artwork_cache.get(key) {
