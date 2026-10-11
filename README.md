@@ -21,7 +21,7 @@ Once the bridge is running, control your system from:
 
 ## Installation
 
-Artwork requested for a display viewport uses libvips attention cropping by default. Container images and Linux packages include the runtime dependency. Standalone macOS builds need `brew install vips`; other standalone installations need the `vips` executable on the service's PATH. Without it, UHC uses centered fill. Use `scale=fit` to preserve a complete cover. See [artwork composition](docs/artwork-smartcrop.md) for behavior, limits, and deployment details.
+Artwork requested for a display viewport uses embedded Zensally face/saliency analysis and zenlayout composition by default. Analysis is cached across zones, sizes and orientations; no model download or external inference runtime is needed. If analysis or crop placement is unavailable, UHC tries libvips attention, then centered fill. Containers and Linux packages include libvips; standalone installs can provide `vips` on the service PATH for that fallback. Use `scale=fit` to preserve a complete cover. See [artwork composition](docs/artwork-smartcrop.md) for behavior, limits, and deployment details.
 
 See [INSTALL.md](INSTALL.md) for every supported installation and companion path.
 

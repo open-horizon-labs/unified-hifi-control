@@ -1,6 +1,18 @@
-# Artwork composition (#770)
+# Artwork composition (#770, #772)
 
-## Execute: selected approach and checks
+## Current behavior
+
+Viewport artwork defaults to embedded Zensally UltraFace face detection plus MicroSalNet saliency, composed by zenlayout in Minimal mode. Both landscape and portrait use the same cached content analysis. Models load lazily once; inference is serialized and analyses are kept in a 32-entry LRU across zones, sizes and orientations. The RGBA analysis probe is capped at 640 pixels per side, and existing decode/output budgets and two blocking-worker permits remain in force. Eviction and process restarts may repeat inference. The crop is taken before resizing, avoiding an oversized intermediate on extreme aspect ratios.
+
+Existing `/now_playing/image` and `/knob/now_playing/image` routes, including browser PNG/JPEG, RGB565 and Frame ACeP6, share this default. `scale=smart` uses it, `scale=fit` retains the complete artwork with the existing mat, and original provider-byte requests remain unchanged. No route or payload fields change. Failed model initialization or crop geometry tries libvips attention and then bounded centered fill. QNAP and other standalone binaries embed the models and do not need an external model runtime. Native libvips is now a fallback dependency, not a requirement for the default subject-aware result.
+
+[Integration evidence and commercial licensing](zensally-artwork-integration.md) and [QNAP acceptance steps](qnap-beta4-cloud-recovery.md) cover the new pipeline. Crop quality and Pi 3 latency require real hardware/user acceptance; the small embedded models and Mac timing do not establish Pi performance. Minimal mode prefers detected subjects but cannot guarantee retaining all text or widely separated faces in a rectangular crop.
+
+## Historical #770 implementation record
+
+The following records the original libvips implementation and its verification. Its default crop mechanism is superseded by #772 above; its native fallback, bounds, original-image behavior and client compatibility remain relevant.
+
+### Execute: selected approach and checks
 
 The aim is to fill Frame and Android artwork viewports with proportionate artwork, using libvips attention to choose the crop placement. Scope is the existing UHC image surface and its runtime packaging. Android UI changes, firmware releases, new endpoints, and merging this PR are outside this change. Success means matching browser and packed-image defaults, an explicit complete-cover option, actual attention cropping, bounded failures, preserved original-image access, and a PR against `integration/v4-hiphi-readiness-2026-10-02`.
 
