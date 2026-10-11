@@ -465,6 +465,7 @@ pub struct ImageQuery {
     pub height: Option<u32>,
     pub format: Option<String>,
     pub scale: Option<String>,
+    /// Accepted for older firmware; attention fill no longer uses an area budget.
     pub crop_limit: Option<u8>,
 }
 
@@ -483,25 +484,20 @@ pub async fn knob_image_handler(
     let format = params.format.as_deref();
     let rgb565_requested = matches!(format, Some("rgb565" | "rgb565-smart"));
     let eink_requested = format == Some("eink_acep6");
-    if eink_requested
-        && (target_width == 0
-            || target_height == 0
-            || u64::from(target_width) * u64::from(target_height) > 1_536_000)
-    {
+    if !crate::knobs::image::valid_artwork_dimensions(
+        target_width,
+        target_height,
+        if eink_requested { 1_536_000 } else { 8_388_608 },
+    ) {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
-            .body(Body::from("invalid e-ink artwork dimensions"))
+            .body(Body::from("invalid artwork dimensions"))
             .unwrap();
     }
-    let resize_policy = match (format, params.scale.as_deref()) {
-        (Some("rgb565-smart" | "eink_acep6"), _) | (_, Some("smart")) => {
-            Some(crate::knobs::image::Rgb565ResizePolicy::SmartCover {
-                max_crop_percent: params.crop_limit.unwrap_or(10).min(25),
-            })
-        }
-        (_, Some("fit")) => Some(crate::knobs::image::Rgb565ResizePolicy::Fit),
-        _ => None,
-    };
+    let resize_policy = Some(match params.scale.as_deref() {
+        Some("fit") => crate::knobs::image::Rgb565ResizePolicy::Fit,
+        _ => crate::knobs::image::Rgb565ResizePolicy::AttentionCover,
+    });
 
     // Helper to return placeholder image in appropriate format
     let placeholder_response = || -> Response {

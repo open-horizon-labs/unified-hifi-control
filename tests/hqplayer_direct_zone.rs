@@ -668,6 +668,186 @@ async fn hqplayer_current_cover_reaches_the_unified_image_interface() {
 
 /// Frame requests for the same artwork identity must not refetch or redither
 /// the provider image. A dimension or composition change remains a cache miss.
+async fn artwork_rig() -> (Rig, tokio::task::JoinHandle<()>) {
+    let image = image::RgbaImage::from_pixel(100, 100, image::Rgba([255, 0, 0, 255]));
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(&image, 100, 100, image::ExtendedColorType::Rgba8)
+        .expect("encode square artwork");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let app = Router::new().route(
+            "/cover/current",
+            get(move || {
+                let png = png.clone();
+                async move { ([("content-type", "image/png")], png) }
+            }),
+        );
+        axum::serve(listener, app).await.unwrap();
+    });
+    let rig = Rig::new().await;
+    rig.manager
+        .add_instance(
+            "art".into(),
+            "127.0.0.1".into(),
+            Some(9),
+            Some(port),
+            None,
+            None,
+        )
+        .await;
+    rig.bus.publish(BusEvent::ZoneDiscovered {
+        zone: Zone {
+            zone_id: "hqplayer:art".into(),
+            zone_name: "Art".into(),
+            state: PlaybackState::Playing,
+            volume_control: None,
+            now_playing: Some(unified_hifi_control::bus::NowPlaying {
+                title: "Cover".into(),
+                artist: String::new(),
+                album: String::new(),
+                image_key: Some("artwork-default".into()),
+                seek_position: None,
+                duration: None,
+                metadata: None,
+                repeat_mode: None,
+                shuffle: None,
+            }),
+            source: "hqplayer".into(),
+            is_controllable: true,
+            is_seekable: false,
+            last_updated: 0,
+            is_play_allowed: false,
+            is_pause_allowed: true,
+            is_next_allowed: true,
+            is_previous_allowed: true,
+        },
+    });
+    for _ in 0..100 {
+        if rig.aggregator.get_zone("hqplayer:art").await.is_some() {
+            return (rig, server);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("artwork zone was not published");
+}
+
+/// An Android display requesting landscape art gets the composed viewport,
+/// rather than a square source that its renderer might stretch or letterbox.
+#[tokio::test]
+async fn artwork_default_browser_image_fills_requested_viewport() {
+    let (rig, server) = artwork_rig().await;
+    let response = rig
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/now_playing/image?zone_id=hqplayer:art&width=160&height=90")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    let image = image::load_from_memory(&bytes).unwrap().to_rgb8();
+    assert_eq!(image.dimensions(), (160, 90));
+    assert!(
+        image.pixels().all(|p| p[0] > 240 && p[1] < 10 && p[2] < 10),
+        "default adds no mat"
+    );
+    rig.shutdown().await;
+    server.abort();
+}
+
+/// Existing Frame queries still fill the art region even with the old budget
+/// parameter. Both packed formats must agree with the normal image default.
+#[tokio::test]
+async fn artwork_default_packed_images_fill_existing_frame_query() {
+    let (rig, server) = artwork_rig().await;
+    for format in ["eink_acep6", "rgb565-smart", "rgb565"] {
+        let response = rig.app.clone().oneshot(Request::builder()
+            .uri(format!("/now_playing/image?zone_id=hqplayer:art&width=160&height=90&format={format}&scale=smart&crop_limit=10"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/octet-stream"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        if format == "eink_acep6" {
+            assert_eq!(bytes.len(), 160 * 90 / 2);
+            assert!(
+                bytes.iter().all(|b| *b == 0x33),
+                "Frame default must not add white margins"
+            );
+        } else {
+            assert_eq!(bytes.len(), 160 * 90 * 2);
+            assert!(
+                bytes.chunks_exact(2).all(|p| p == [0, 0xf8]),
+                "RGB565 default must not add margins"
+            );
+        }
+    }
+    rig.shutdown().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn artwork_explicit_fit_preserves_complete_cover_for_packed_formats() {
+    let (rig, server) = artwork_rig().await;
+    for format in ["eink_acep6", "rgb565-smart"] {
+        let response = rig.app.clone().oneshot(Request::builder()
+            .uri(format!("/now_playing/image?zone_id=hqplayer:art&width=100&height=90&format={format}&scale=fit&crop_limit=25"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        assert_eq!(bytes[0], if format == "eink_acep6" { 0x11 } else { 0xdf });
+    }
+    rig.shutdown().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn artwork_portrait_viewports_preserve_requested_geometry_in_all_formats() {
+    let (rig, server) = artwork_rig().await;
+    for format in ["", "rgb565", "eink_acep6"] {
+        let response = rig.app.clone().oneshot(Request::builder()
+            .uri(format!("/now_playing/image?zone_id=hqplayer:art&width=90&height=160&format={format}"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        if !format.is_empty() {
+            assert_eq!(response.headers()["X-Image-Width"], "90");
+            assert_eq!(response.headers()["X-Image-Height"], "160");
+        }
+        let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        match format {
+            "eink_acep6" => {
+                assert_eq!(bytes.len(), 90 * 160 / 2);
+                assert!(bytes.iter().all(|b| *b == 0x33));
+            }
+            "rgb565" => {
+                assert_eq!(bytes.len(), 90 * 160 * 2);
+                assert!(bytes.chunks_exact(2).all(|p| p == [0, 0xf8]));
+            }
+            _ => {
+                let image = image::load_from_memory(&bytes).unwrap().to_rgb8();
+                assert_eq!(image.dimensions(), (90, 160));
+                assert!(image.pixels().all(|p| p[0] > 240 && p[1] < 10));
+            }
+        }
+    }
+    rig.shutdown().await;
+    server.abort();
+}
+
 #[tokio::test]
 async fn packed_frame_cover_is_cached_by_artwork_identity_and_policy() {
     let image = image::RgbaImage::from_pixel(20, 20, image::Rgba([255, 0, 0, 255]));

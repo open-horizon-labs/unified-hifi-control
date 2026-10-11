@@ -65,6 +65,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     openssh-client \
+    libvips-tools \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binary with embedded web assets (ADR 002 - no public/ directory)

@@ -13,6 +13,7 @@ arch=('x86_64' 'aarch64' 'armv7h')
 url="https://github.com/open-horizon-labs/unified-hifi-control"
 license=('PolyForm-Noncommercial-1.0.0')
 options=('!debug' '!strip')
+depends=('libvips')
 provides=("${_pkgname}")
 conflicts=("${_pkgname}")
 install="${_pkgname}.install"

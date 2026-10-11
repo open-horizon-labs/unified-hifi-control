@@ -2,6 +2,56 @@ use std::{fs, path::PathBuf};
 
 const DEVELOPMENT_BRANCH: &str = "v4";
 
+#[test]
+fn integration_v4_pull_requests_run_build_and_api_checks() {
+    for name in ["build.yml", "api-guard.yml"] {
+        let source = workflow(name);
+        let trigger = source
+            .split("pull_request:")
+            .nth(1)
+            .unwrap()
+            .split("types:")
+            .next()
+            .unwrap();
+        assert!(
+            trigger.contains("'integration/v4-*'"),
+            "{name} must validate v4 integration PRs"
+        );
+    }
+}
+
+#[test]
+fn artwork_attention_runtime_is_shipped_and_exercised_in_workspace_ci() {
+    for name in ["build.yml", "docker.yml", "streaming-alpha.yml"] {
+        let source = workflow(name);
+        assert!(
+            source.contains("install -y libvips-tools"),
+            "{name} must exercise actual attention cropping"
+        );
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for name in ["Dockerfile.release", "Dockerfile.ci"] {
+        let source = fs::read_to_string(root.join(name)).unwrap();
+        assert!(
+            source.contains("apk add --no-cache ca-certificates openssh-client vips-tools"),
+            "{name} needs vips at runtime"
+        );
+    }
+    assert!(fs::read_to_string(root.join("Dockerfile"))
+        .unwrap()
+        .contains("libvips-tools"));
+    let build = workflow("build.yml");
+    assert_eq!(
+        build.matches("--depends libvips-tools").count(),
+        3,
+        "every deb architecture must install the native runtime"
+    );
+    assert!(build.contains("--depends vips-tools"));
+    assert!(fs::read_to_string(root.join("build/arch/PKGBUILD"))
+        .unwrap()
+        .contains("depends=('libvips')"));
+}
+
 fn workflow(name: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join(".github/workflows")
