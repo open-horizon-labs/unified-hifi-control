@@ -18,3 +18,13 @@ fn quarantined_connector_explains_pause() {
     .unwrap();
     assert_eq!(status.display_state(), "Cloud paused · cost protection");
 }
+
+#[test]
+fn changed_file_access_has_a_readable_explanation() {
+    let status: HiphiPairingStatus = serde_json::from_value(serde_json::json!({
+        "paired": true, "installation_id": "test", "connector_state": "paused",
+        "pause_reason": "permissions_changed", "can_resume": true
+    }))
+    .unwrap();
+    assert_eq!(status.display_state(), "Remote control is disconnected");
+}

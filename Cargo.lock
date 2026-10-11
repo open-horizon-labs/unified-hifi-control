@@ -5491,6 +5491,7 @@ dependencies = [
  "rumqttd",
  "rust-embed",
  "rust-mcp-sdk",
+ "rustix",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",

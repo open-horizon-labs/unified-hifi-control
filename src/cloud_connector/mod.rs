@@ -9,6 +9,7 @@ pub mod config;
 pub mod identity;
 pub mod music;
 pub mod pairing;
+mod permissions;
 pub mod protocol;
 mod retry;
 pub mod runtime;

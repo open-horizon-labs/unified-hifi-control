@@ -139,8 +139,23 @@ impl CloudConnectorConfig {
         }
     }
 
+    // Inspection may read the public binding despite changed access, but must
+    // never start a connector from it. Recovery revalidates with from_runtime.
+    pub(super) fn for_recovery(config_dir: PathBuf) -> Result<Option<Self>, ConfigError> {
+        match Self::from_env(config_dir.clone())? {
+            Some(config) => Ok(Some(config)),
+            None => Self::read_persisted(config_dir, false),
+        }
+    }
+
     pub fn from_persisted(config_dir: impl Into<PathBuf>) -> Result<Option<Self>, ConfigError> {
-        let config_dir = config_dir.into();
+        Self::read_persisted(config_dir.into(), true)
+    }
+
+    fn read_persisted(
+        config_dir: PathBuf,
+        require_private: bool,
+    ) -> Result<Option<Self>, ConfigError> {
         let path = config_dir.join("hiphi.env");
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -153,10 +168,12 @@ impl CloudConnectorConfig {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            if metadata.permissions().mode() & 0o077 != 0 {
+            if require_private && metadata.permissions().mode() & 0o077 != 0 {
                 return Err(ConfigError::InvalidPersisted);
             }
         }
+        #[cfg(not(unix))]
+        let _ = require_private;
         let contents = std::fs::read_to_string(&path)?;
         if contents.trim().is_empty() {
             return Ok(None);
