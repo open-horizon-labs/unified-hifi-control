@@ -24,6 +24,7 @@ server = [
     "dep:tracing-appender",
     "dep:config",
     "dep:image",
+    "dep:tempfile",
     "dep:resvg",
     "dep:tokio-stream",
     "dep:tokio-util",
@@ -130,6 +131,7 @@ config = { version = "0.15", optional = true }
 
 # Image processing (server only)
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"], optional = true }
+tempfile = { version = "3", optional = true }
 
 # Tokio stream utilities (server only)
 tokio-stream = { version = "0.1", features = ["sync"], optional = true }

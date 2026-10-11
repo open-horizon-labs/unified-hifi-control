@@ -495,8 +495,8 @@ impl AppState {
     ) -> anyhow::Result<crate::bus::ImageData> {
         use crate::bus::ImageData;
         use crate::knobs::image::{
-            image_to_eink_acep6_with_policy, jpeg_to_rgb565_with_policy, EinkCacheKey,
-            Rgb565ResizePolicy,
+            image_to_display_with_policy, image_to_eink_acep6_with_policy,
+            jpeg_to_rgb565_with_policy, EinkCacheKey, Rgb565ResizePolicy,
         };
 
         let dimensions = match (width, height) {
@@ -506,14 +506,28 @@ impl AppState {
             (None, None) if format == Some("eink_acep6") => (800, 450),
             (None, None) => (240, 240),
         };
-        let resize_policy = resize_policy.unwrap_or(Rgb565ResizePolicy::Exact);
+        let compose_raster = width.is_some() || height.is_some() || resize_policy.is_some();
+        if (compose_raster || format.is_some())
+            && !crate::knobs::image::valid_artwork_dimensions(
+                dimensions.0,
+                dimensions.1,
+                if format == Some("eink_acep6") {
+                    1_536_000
+                } else {
+                    8_388_608
+                },
+            )
+        {
+            anyhow::bail!("invalid artwork dimensions");
+        }
+        let resize_policy = resize_policy.unwrap_or_default();
         let eink_cache_key = (format == Some("eink_acep6")).then(|| EinkCacheKey {
             zone_id: zone_id.to_string(),
             image_key: image_key.to_string(),
             width: dimensions.0,
             height: dimensions.1,
             resize_policy,
-            converter_version: 1,
+            converter_version: 2,
         });
         if let Some(key) = eink_cache_key.as_ref() {
             if let Some(data) = self.eink_artwork_cache.get(key) {
@@ -603,51 +617,83 @@ impl AppState {
             anyhow::bail!("remote artwork is too large");
         }
 
-        // Convert to RGB565 if requested (for ESP32 LCD/e-ink displays).
-        // The smart variant is a capability handshake: older servers return
-        // the source image, allowing firmware to detect and use its fallback.
-        if matches!(format, Some("rgb565" | "rgb565-smart")) {
-            // Use square dimensions when only one side specified (matches adapter behavior)
-            let (target_w, target_h) = dimensions;
-
-            match jpeg_to_rgb565_with_policy(&raw_image.data, target_w, target_h, resize_policy) {
-                Ok(rgb565) => Ok(ImageData {
-                    content_type: "application/octet-stream".to_string(),
-                    data: rgb565.data,
-                }),
-                Err(_) => {
-                    // Fall back to original on conversion error
-                    Ok(raw_image)
-                }
-            }
-        } else if format == Some("eink_acep6") {
-            let (target_w, target_h) = dimensions;
-            match image_to_eink_acep6_with_policy(
-                &raw_image.data,
-                target_w,
-                target_h,
-                resize_policy,
-            ) {
-                Ok(eink) => {
-                    let Some(cache_key) = eink_cache_key else {
-                        return Ok(raw_image);
-                    };
-                    let data = self.eink_artwork_cache.insert(cache_key, eink.data);
-                    Ok(ImageData {
-                        content_type: "application/octet-stream".to_string(),
-                        data: data.as_ref().clone(),
-                    })
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "Frame artwork conversion failed for {zone_id} at {target_w}x{target_h}: {error}"
-                    );
-                    Ok(raw_image)
-                }
-            }
-        } else {
-            Ok(raw_image)
+        // Bound expensive raster/native work and keep it off the async reactor.
+        // Move the permit into the closure so cancellation cannot free a slot
+        // while the blocking worker/native child is still running.
+        if !compose_raster && !matches!(format, Some("rgb565" | "rgb565-smart" | "eink_acep6")) {
+            return Ok(raw_image);
         }
+        static WORKERS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
+        let permit = Arc::clone(&WORKERS).acquire_owned().await?;
+        let format = format.map(str::to_owned);
+        let cache = self.eink_artwork_cache.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            // Convert to RGB565 if requested (for ESP32 LCD/e-ink displays).
+            // The smart variant is a capability handshake: older servers return
+            // the source image, allowing firmware to detect and use its fallback.
+            if matches!(format.as_deref(), Some("rgb565" | "rgb565-smart")) {
+                // Use square dimensions when only one side specified (matches adapter behavior)
+                let (target_w, target_h) = dimensions;
+
+                match jpeg_to_rgb565_with_policy(&raw_image.data, target_w, target_h, resize_policy)
+                {
+                    Ok(rgb565) => Ok(ImageData {
+                        content_type: "application/octet-stream".to_string(),
+                        data: rgb565.data,
+                    }),
+                    Err(_) => {
+                        // Fall back to original on conversion error
+                        Ok(raw_image)
+                    }
+                }
+            } else if format.as_deref() == Some("eink_acep6") {
+                let (target_w, target_h) = dimensions;
+                match image_to_eink_acep6_with_policy(
+                    &raw_image.data,
+                    target_w,
+                    target_h,
+                    resize_policy,
+                ) {
+                    Ok(eink) => {
+                        let Some(cache_key) = eink_cache_key else {
+                            return Ok(raw_image);
+                        };
+                        let data = cache.insert(cache_key, eink.data);
+                        Ok(ImageData {
+                            content_type: "application/octet-stream".to_string(),
+                            data: data.as_ref().clone(),
+                        })
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "Frame artwork conversion failed at {target_w}x{target_h}: {error}"
+                        );
+                        Ok(raw_image)
+                    }
+                }
+            } else {
+                let png = raw_image.content_type == "image/png";
+                match image_to_display_with_policy(
+                    &raw_image.data,
+                    dimensions.0,
+                    dimensions.1,
+                    resize_policy,
+                    png,
+                ) {
+                    Ok(data) => Ok(ImageData {
+                        content_type: if png { "image/png" } else { "image/jpeg" }.to_string(),
+                        data,
+                    }),
+                    Err(error) => {
+                        tracing::warn!("Raster artwork composition failed: {error}");
+                        Ok(raw_image)
+                    }
+                }
+            }
+        })
+        .await?
     }
 }
 

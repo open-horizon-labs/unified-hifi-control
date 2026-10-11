@@ -14,7 +14,9 @@ use image::{
 };
 use std::collections::VecDeque;
 use std::io::Cursor;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// RGB565 image data for LCD display
 pub struct Rgb565Image {
@@ -79,8 +81,11 @@ impl EinkArtworkCache {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum Rgb565ResizePolicy {
+    /// Proportionate fill with libvips attention selecting the crop placement.
+    #[default]
+    AttentionCover,
     /// Legacy behavior for clients that explicitly need every output pixel filled.
     Exact,
     /// Preserve the complete source and compose unused space as a gallery mat.
@@ -172,6 +177,146 @@ fn floyd_steinberg_acep6(rgb: &mut [u8], width: usize, height: usize) -> Vec<u8>
 const GALLERY_MAT: Rgba<u8> = Rgba([248, 250, 251, 255]);
 const GALLERY_KEYLINE: Rgba<u8> = Rgba([23, 37, 54, 255]);
 
+/// Bound composed outputs, including direct callers outside the HTTP handler.
+pub fn valid_artwork_dimensions(width: u32, height: u32, max_pixels: u64) -> bool {
+    width > 0
+        && height > 0
+        && width <= 8192
+        && height <= 8192
+        && u64::from(width) * u64::from(height) <= max_pixels
+}
+
+fn dimension_error() -> image::ImageError {
+    image::ImageError::Limits(image::error::LimitError::from_kind(
+        image::error::LimitErrorKind::DimensionError,
+    ))
+}
+
+/// Decode bounded raster data and honor EXIF before normalizing for libvips.
+/// The native process receives our PNG, never a provider path or SVG loader.
+fn decode_artwork(data: &[u8]) -> Result<DynamicImage, image::ImageError> {
+    use image::ImageDecoder;
+    let mut reader = image::ImageReader::new(Cursor::new(data)).with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let mut decoder = reader.into_decoder()?;
+    let (width, height) = decoder.dimensions();
+    if !valid_artwork_dimensions(width, height, 16_777_216) {
+        return Err(dimension_error());
+    }
+    let orientation = decoder.orientation()?;
+    let mut image = DynamicImage::from_decoder(decoder)?;
+    image.apply_orientation(orientation);
+    Ok(image)
+}
+
+const VIPS_DEADLINE: Duration = Duration::from_secs(3);
+
+fn run_vips_thumbnail(
+    executable: &std::ffi::OsStr,
+    input: &std::path::Path,
+    output: &std::path::Path,
+    width: u32,
+    height: u32,
+    deadline: Duration,
+) -> anyhow::Result<()> {
+    let mut child = Command::new(executable)
+        .arg("thumbnail")
+        .arg(input)
+        .arg(output)
+        .arg(width.to_string())
+        .arg(format!("--height={height}"))
+        .arg("--crop=attention")
+        .arg("--size=both")
+        .env("VIPS_CONCURRENCY", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                anyhow::ensure!(status.success(), "vips thumbnail exited with {status}");
+                return Ok(());
+            }
+            Ok(None) if start.elapsed() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => {
+                // Reap even on a polling error; dropping Child does not kill it.
+                let _ = child.kill();
+                let _ = child.wait();
+                match result {
+                    Err(error) => return Err(error.into()),
+                    _ => anyhow::bail!("vips thumbnail exceeded its deadline"),
+                }
+            }
+        }
+    }
+}
+
+fn attention_cover(img: &DynamicImage, width: u32, height: u32) -> anyhow::Result<DynamicImage> {
+    attention_cover_using(
+        img,
+        width,
+        height,
+        std::ffi::OsStr::new("vips"),
+        VIPS_DEADLINE,
+    )
+}
+
+fn attention_cover_using(
+    img: &DynamicImage,
+    width: u32,
+    height: u32,
+    executable: &std::ffi::OsStr,
+    deadline: Duration,
+) -> anyhow::Result<DynamicImage> {
+    let scale = (f64::from(width) / f64::from(img.width()))
+        .max(f64::from(height) / f64::from(img.height()));
+    anyhow::ensure!(
+        f64::from(img.width()) * f64::from(img.height()) * scale * scale <= 67_108_864.0,
+        "attention composition exceeds intermediate pixel budget"
+    );
+    let temp = tempfile::tempdir()?;
+    let input = temp.path().join("source.png");
+    let output = temp.path().join("cover.png");
+    img.save_with_format(&input, ImageFormat::Png)?;
+    run_vips_thumbnail(executable, &input, &output, width, height, deadline)?;
+    let composed = decode_artwork(&std::fs::read(output)?)?;
+    anyhow::ensure!(
+        composed.width() == width && composed.height() == height,
+        "vips returned incorrect dimensions"
+    );
+    Ok(composed)
+}
+
+/// Normal image clients use the same composition as packed displays. PNG keeps
+/// its lossless/alpha representation; other raster formats become JPEG.
+pub fn image_to_display_with_policy(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    policy: Rgb565ResizePolicy,
+    png: bool,
+) -> Result<Vec<u8>, image::ImageError> {
+    if !valid_artwork_dimensions(width, height, 8_388_608) {
+        return Err(dimension_error());
+    }
+    let image = decode_artwork(data)?;
+    let composed = resize_with_policy(&image, width, height, policy);
+    let mut output = Cursor::new(Vec::new());
+    if png {
+        composed.write_to(&mut output, ImageFormat::Png)?;
+    } else {
+        DynamicImage::ImageRgb8(composed.to_rgb8())
+            .write_with_encoder(JpegEncoder::new_with_quality(&mut output, 90))?;
+    }
+    Ok(output.into_inner())
+}
+
 fn cover_crop_percent(source_w: u32, source_h: u32, target_w: u32, target_h: u32) -> f64 {
     let source_ratio = source_w as f64 / source_h as f64;
     let target_ratio = target_w as f64 / target_h as f64;
@@ -223,6 +368,12 @@ fn resize_with_policy(
     }
 
     match policy {
+        Rgb565ResizePolicy::AttentionCover => attention_or_center(
+            img,
+            target_w,
+            target_h,
+            attention_cover(img, target_w, target_h),
+        ),
         Rgb565ResizePolicy::Exact => img.resize_exact(target_w, target_h, FilterType::Triangle),
         Rgb565ResizePolicy::Fit => fit_on_gallery_mat(img, target_w, target_h),
         Rgb565ResizePolicy::SmartCover { max_crop_percent }
@@ -235,13 +386,57 @@ fn resize_with_policy(
     }
 }
 
+fn attention_or_center(
+    img: &DynamicImage,
+    width: u32,
+    height: u32,
+    result: anyhow::Result<DynamicImage>,
+) -> DynamicImage {
+    match result {
+        Ok(composed) => composed,
+        Err(error) => {
+            tracing::warn!("Attention artwork crop unavailable; using centered fill: {error}");
+            centered_cover(img, width, height)
+        }
+    }
+}
+
+/// Crop the source before resizing so a very wide source and tall viewport
+/// cannot allocate an enormous full-size intermediate in the fallback.
+fn centered_cover(img: &DynamicImage, width: u32, height: u32) -> DynamicImage {
+    let source_w = img.width();
+    let source_h = img.height();
+    let (crop_w, crop_h) =
+        if u64::from(source_w) * u64::from(height) > u64::from(source_h) * u64::from(width) {
+            (
+                ((u64::from(source_h) * u64::from(width) / u64::from(height)) as u32).max(1),
+                source_h,
+            )
+        } else {
+            (
+                source_w,
+                ((u64::from(source_w) * u64::from(height) / u64::from(width)) as u32).max(1),
+            )
+        };
+    img.crop_imm(
+        (source_w - crop_w) / 2,
+        (source_h - crop_h) / 2,
+        crop_w,
+        crop_h,
+    )
+    .resize_exact(width, height, FilterType::Triangle)
+}
+
 pub fn image_to_eink_acep6_with_policy(
     image_data: &[u8],
     target_width: u32,
     target_height: u32,
     policy: Rgb565ResizePolicy,
 ) -> Result<EinkAcep6Image, image::ImageError> {
-    let image = image::load_from_memory(image_data)?;
+    if !valid_artwork_dimensions(target_width, target_height, 1_536_000) {
+        return Err(dimension_error());
+    }
+    let image = decode_artwork(image_data)?;
     let resized = resize_with_policy(&image, target_width, target_height, policy);
     let mut rgb = resized.to_rgb8().into_raw();
     let data = floyd_steinberg_acep6(&mut rgb, target_width as usize, target_height as usize);
@@ -275,6 +470,9 @@ pub fn jpeg_to_rgb565_with_policy(
     target_height: u32,
     policy: Rgb565ResizePolicy,
 ) -> Result<Rgb565Image, image::ImageError> {
+    if !valid_artwork_dimensions(target_width, target_height, 8_388_608) {
+        return Err(dimension_error());
+    }
     // Check if it's SVG (starts with '<' after optional whitespace/BOM)
     let trimmed = image_data
         .iter()
@@ -289,7 +487,7 @@ pub fn jpeg_to_rgb565_with_policy(
     }
 
     // Auto-detect format and decode (works with JPEG, PNG, GIF, BMP, etc.)
-    let img = image::load_from_memory(image_data)?;
+    let img = decode_artwork(image_data)?;
 
     // Resize if needed
     let img = resize_with_policy(&img, target_width, target_height, policy);
@@ -470,6 +668,280 @@ mod tests {
     fn rgb565_at(image: &Rgb565Image, x: u32, y: u32) -> u16 {
         let offset = ((y * image.width + x) * 2) as usize;
         u16::from_le_bytes([image.data[offset], image.data[offset + 1]])
+    }
+
+    fn off_center_subject() -> DynamicImage {
+        DynamicImage::ImageRgba8(RgbaImage::from_fn(400, 200, |x, y| {
+            let dx = i64::from(x) - 350;
+            let dy = i64::from(y) - 100;
+            if dx * dx + dy * dy <= 30 * 30 {
+                Rgba([255, 120, 30, 255])
+            } else {
+                Rgba([10, 10, 10, 255])
+            }
+        }))
+    }
+
+    #[test]
+    fn attention_selects_off_center_subject_without_stretching() {
+        let source = off_center_subject();
+        let attention = attention_cover(&source, 100, 100)
+            .expect("install vips to exercise actual attention")
+            .to_rgb8();
+        let center = source
+            .resize_to_fill(100, 100, FilterType::Triangle)
+            .to_rgb8();
+        let is_subject = |p: &image::Rgb<u8>| p[0] > 200 && p[1] > 80 && p[2] < 60;
+        assert_eq!(
+            center.pixels().filter(|p| is_subject(p)).count(),
+            0,
+            "center crop misses the subject"
+        );
+        let points: Vec<_> = attention
+            .enumerate_pixels()
+            .filter(|(_, _, p)| is_subject(p))
+            .collect();
+        assert!(
+            points.len() > 600,
+            "attention must preserve the off-center circle"
+        );
+        let width = points.iter().map(|(x, _, _)| *x).max().unwrap()
+            - points.iter().map(|(x, _, _)| *x).min().unwrap()
+            + 1;
+        let height = points.iter().map(|(_, y, _)| *y).max().unwrap()
+            - points.iter().map(|(_, y, _)| *y).min().unwrap()
+            + 1;
+        assert!(
+            width.abs_diff(height) <= 2,
+            "the circle must stay round: {width}x{height}"
+        );
+        assert_eq!(
+            attention_cover(&source, 100, 100).unwrap().to_rgb8(),
+            attention,
+            "crop placement is deterministic"
+        );
+        assert_eq!(
+            resize_with_policy(&source, 100, 100, Rgb565ResizePolicy::default()).to_rgb8(),
+            attention,
+            "the default must use attention, not merely fill"
+        );
+        let mut png = Cursor::new(Vec::new());
+        source.write_to(&mut png, ImageFormat::Png).unwrap();
+        let rgb565 =
+            jpeg_to_rgb565_with_policy(png.get_ref(), 100, 100, Rgb565ResizePolicy::default())
+                .unwrap();
+        assert_eq!(
+            rgb565.data,
+            rgba_to_rgb565(&DynamicImage::ImageRgb8(attention.clone())),
+            "packed art must use the same attention placement"
+        );
+        let browser = image_to_display_with_policy(
+            png.get_ref(),
+            100,
+            100,
+            Rgb565ResizePolicy::default(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            image::load_from_memory(&browser).unwrap().to_rgb8(),
+            attention,
+            "browser art must share the attention crop"
+        );
+    }
+
+    #[test]
+    fn attention_upscales_small_covers_and_regular_image_fit_is_explicit() {
+        let data = encode_solid_png(20, 20, Rgba([255, 0, 0, 255]));
+        for png in [false, true] {
+            let filled =
+                image_to_display_with_policy(&data, 160, 90, Rgb565ResizePolicy::default(), png)
+                    .unwrap();
+            let filled = image::load_from_memory(&filled).unwrap().to_rgb8();
+            assert_eq!(filled.dimensions(), (160, 90));
+            assert!(
+                filled.pixels().all(|p| p[0] > 240 && p[1] < 10),
+                "upscaling must still fill"
+            );
+            let fitted =
+                image_to_display_with_policy(&data, 160, 90, Rgb565ResizePolicy::Fit, png).unwrap();
+            assert!(
+                image::load_from_memory(&fitted)
+                    .unwrap()
+                    .to_rgb8()
+                    .get_pixel(0, 0)[1]
+                    > 240
+            );
+        }
+    }
+
+    #[test]
+    fn attention_supports_tall_viewports_and_portrait_sources_without_stretching() {
+        for source in [off_center_subject(), off_center_subject().rotate90()] {
+            let composed = attention_cover(&source, 90, 160)
+                .expect("actual portrait attention crop")
+                .to_rgb8();
+            assert_eq!(composed.dimensions(), (90, 160));
+            let points: Vec<_> = composed
+                .enumerate_pixels()
+                .filter(|(_, _, p)| p[0] > 200 && p[1] > 80 && p[2] < 60)
+                .collect();
+            assert!(points.len() > 400, "portrait crops retain the subject");
+            let width = points.iter().map(|(x, _, _)| *x).max().unwrap()
+                - points.iter().map(|(x, _, _)| *x).min().unwrap()
+                + 1;
+            let height = points.iter().map(|(_, y, _)| *y).max().unwrap()
+                - points.iter().map(|(_, y, _)| *y).min().unwrap()
+                + 1;
+            assert!(
+                width.abs_diff(height) <= 2,
+                "portrait must preserve subject proportions: {width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_failure_does_not_change_centered_fallback_geometry() {
+        let source = off_center_subject();
+        let result = attention_cover_using(
+            &source,
+            100,
+            100,
+            std::ffi::OsStr::new("uhc-nonexistent-vips-770"),
+            Duration::from_millis(50),
+        );
+        assert!(result.is_err(), "missing executable must be observable");
+        let fallback = attention_or_center(&source, 100, 100, result);
+        assert_eq!((fallback.width(), fallback.height()), (100, 100));
+        assert_eq!(
+            fallback.to_rgba8(),
+            source
+                .resize_to_fill(100, 100, FilterType::Triangle)
+                .to_rgba8()
+        );
+    }
+
+    #[test]
+    fn extreme_aspect_ratio_uses_bounded_crop_before_resize() {
+        let source =
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(8192, 1, Rgba([255, 0, 0, 255])));
+        let result = attention_cover(&source, 1, 8192);
+        assert!(result
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("intermediate pixel budget"));
+        let composed = attention_or_center(&source, 1, 8192, result).to_rgb8();
+        assert_eq!(composed.dimensions(), (1, 8192));
+        assert!(composed.pixels().all(|p| *p == image::Rgb([255, 0, 0])));
+    }
+
+    #[test]
+    fn raster_decode_honors_exif_orientation_before_cropping() {
+        let mut jpeg = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image::RgbImage::from_pixel(40, 20, image::Rgb([255, 0, 0])))
+            .write_with_encoder(JpegEncoder::new_with_quality(&mut jpeg, 90))
+            .unwrap();
+        let jpeg = jpeg.into_inner();
+        // Little-endian TIFF orientation=6 (90 degrees clockwise).
+        let exif = b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0";
+        let mut oriented = vec![0xff, 0xd8, 0xff, 0xe1];
+        oriented.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+        oriented.extend_from_slice(exif);
+        oriented.extend_from_slice(&jpeg[2..]);
+        let decoded = decode_artwork(&oriented).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (20, 40));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_deadline_kills_and_reaps_stalled_child_and_removes_temporary_art() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("stall");
+        let observed = dir.path().join("observed");
+        // Record the private image directory and PID; exec avoids a descendant
+        // shell that could survive killing the native process under test.
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" \"$2\" > '{}'\nexec sleep 30\n",
+                observed.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let start = Instant::now();
+        let result = attention_cover_using(
+            &off_center_subject(),
+            100,
+            100,
+            executable.as_os_str(),
+            Duration::from_millis(150),
+        );
+        assert!(result.unwrap_err().to_string().contains("deadline"));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let record = std::fs::read_to_string(observed).unwrap();
+        let mut lines = record.lines();
+        let pid = lines.next().unwrap();
+        let input = std::path::Path::new(lines.next().unwrap());
+        assert!(
+            !input.parent().unwrap().exists(),
+            "temporary art directory must be removed"
+        );
+        let status = Command::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "timed-out child must be gone and reaped");
+    }
+
+    #[test]
+    fn composed_images_reject_zero_oversized_and_malicious_source_dimensions() {
+        let data = encode_solid_png(10, 10, Rgba([255, 0, 0, 255]));
+        for (width, height) in [
+            (0, 100),
+            (100, 0),
+            (u32::MAX, u32::MAX),
+            (8_388_608, 1),
+            (1, 8_388_608),
+        ] {
+            assert!(image_to_display_with_policy(
+                &data,
+                width,
+                height,
+                Rgb565ResizePolicy::default(),
+                true
+            )
+            .is_err());
+            assert!(jpeg_to_rgb565_with_policy(
+                &data,
+                width,
+                height,
+                Rgb565ResizePolicy::default()
+            )
+            .is_err());
+            assert!(image_to_eink_acep6_with_policy(
+                &data,
+                width,
+                height,
+                Rgb565ResizePolicy::default()
+            )
+            .is_err());
+        }
+        let mut bmp = [0u8; 54];
+        bmp[..2].copy_from_slice(b"BM");
+        bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+        bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+        bmp[18..22].copy_from_slice(&100_000i32.to_le_bytes());
+        bmp[22..26].copy_from_slice(&100_000i32.to_le_bytes());
+        bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+        bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
+        assert!(
+            decode_artwork(&bmp).is_err(),
+            "reject huge source before allocating pixels"
+        );
     }
 
     #[test]
