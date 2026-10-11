@@ -598,16 +598,14 @@ jobs:
         id: cache-dx
         uses: actions/cache@v5
         with:
-          # Isolate this from other runner jobs just like the installer isolates
-          # CARGO_HOME, otherwise a shared fleet cache can restore the wrong tool.
-          path: ${{ runner.tool_cache }}/uhc/${{ runner.name }}/cargo/bin/dx
-          key: dx-cli-${{ runner.os }}-${{ runner.arch }}-0.7.10
-          restore-keys: |
-            dx-cli-${{ runner.os }}-${{ runner.arch }}-
+          # A stable relative path shares cache versions across ephemeral runners.
+          # Activation below copies the binary into the isolated CARGO_HOME.
+          path: .ci-tools/dioxus/bin/dx
+          key: dx-cli-v2-${{ runner.os }}-${{ runner.arch }}-0.7.10
 
-      - name: Install Dioxus CLI
-        if: steps.check-cache.outputs.needs_build == 'true' && steps.cache-dx.outputs.cache-hit != 'true'
-        run: cargo install dioxus-cli@0.7.10 --locked
+      - name: Ensure Dioxus CLI
+        if: steps.check-cache.outputs.needs_build == 'true'
+        run: bash .github/scripts/ensure-dioxus-cli.sh
 
       - name: Cache generated CSS
         if: steps.check-cache.outputs.needs_build == 'true'
