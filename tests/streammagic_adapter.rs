@@ -367,6 +367,10 @@ async fn unit_is_observed_with_identity_and_percentage_scale() {
     let h = harness().await;
     let mock = MockStreamMagic::start(MockState::evo("0AABBCCDDEE0", "Living Room")).await;
     let device_id = h.attach("0AABBCCDDEE0", &mock).await;
+    // The limit arrives in its own /zone/audio message, possibly after inputs and power.
+    h.wait_for(|device| device.volume.hardware_max == Some(80.0))
+        .await_device(&h, &device_id)
+        .await;
 
     let device = h.device(&device_id).await;
     assert_eq!(device_id.as_str(), "cambridge:0AABBCCDDEE0");
