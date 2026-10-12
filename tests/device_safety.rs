@@ -35,7 +35,7 @@ use unified_hifi_control::bus::{
 };
 use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::devices::links::DeviceLinkStore;
-use unified_hifi_control::devices::service::DeviceService;
+use unified_hifi_control::devices::service::{DeviceRequest, DeviceService, DeviceTarget};
 use unified_hifi_control::devices::{DeviceId, DevicePower};
 use unified_hifi_control::knobs::routes::{knob_control_handler, KnobControlRequest};
 use unified_hifi_control::knobs::KnobStore;
@@ -131,7 +131,9 @@ impl Harness {
                 description(serial, name),
             )
             .await;
-        // Ready means the push session reported a level *and* the unit's maximum.
+        // Ready means a level is known and, when the unit speaks Telnet, its own MVMAX (until
+        // then the protocol's +18 dB full scale stands in).
+        let telnet = mock.snapshot().await.telnet;
         self.wait_for(|state| {
             let serial = serial.to_string();
             async move {
@@ -139,7 +141,10 @@ impl Harness {
                     .aggregator
                     .get_device(&id(&serial))
                     .await
-                    .is_some_and(|device| device.volume_control().is_some())
+                    .is_some_and(|device| {
+                        device.volume_control().is_some()
+                            && (!telnet || device.volume.hardware_max != Some(18.0))
+                    })
             }
         })
         .await;
@@ -281,6 +286,35 @@ async fn linked_zone_publishes_device_volume_and_survives_a_provider_resnapshot(
     h.state.devices.unlink("roon:living").await.unwrap();
     let zone = h.state.aggregator.get_zone("roon:living").await.unwrap();
     assert!(zone.volume_control.is_none());
+}
+
+/// A unit reachable over HTTP only (the captured bedroom SR6008) never reports MVMAX. Volume must
+/// still work without the user setting a ceiling: the protocol's +18 dB full scale bounds the
+/// request, and the receiver enforces its own limit. Fails the "refuse until a ceiling" gate.
+#[tokio::test]
+async fn http_only_unit_takes_volume_without_a_ceiling() {
+    let h = harness().await;
+    let bedroom = MockMarantz::start_with(MockMarantzState {
+        telnet: false,
+        ..MockMarantzState::default()
+    })
+    .await;
+    h.attach(BEDROOM, "bedroom", &bedroom).await;
+
+    let device = h.state.aggregator.get_device(&id(BEDROOM)).await.unwrap();
+    assert_eq!(device.volume.hardware_max, Some(18.0));
+    assert!(device.capabilities.volume.supported);
+
+    h.state
+        .devices
+        .control(
+            DeviceTarget::Device(id(BEDROOM)),
+            DeviceRequest::VolumeAbsolute(-30.0),
+        )
+        .await
+        .expect("volume over HTTP, no ceiling required");
+    assert_eq!(bedroom.snapshot().await.level_db(), -30.0);
+    assert!(bedroom.snapshot().await.telnet_received.is_empty());
 }
 
 #[tokio::test]

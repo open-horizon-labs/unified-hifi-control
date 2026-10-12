@@ -44,11 +44,11 @@ fn family_rows() -> Vec<(String, unified_hifi_control::devices::DeviceCapabiliti
     use unified_hifi_control::adapters::*;
     let mut rows = Vec::new();
     for (model, _) in READ_VERIFIED_MODELS {
-        rows.push((format!("Marantz {model}"), capabilities_for(model, true)));
+        rows.push((format!("Marantz {model}"), capabilities_for(model)));
     }
     rows.push((
         "Other Denon / Marantz".to_string(),
-        capabilities_for("(other)", true),
+        capabilities_for("(other)"),
     ));
     for (model, _) in wiim::READ_VERIFIED_MODELS {
         rows.push(((*model).to_string(), wiim::capabilities_for(model)));
@@ -190,7 +190,7 @@ fn write_claims_are_not_hardware_verified_without_a_write_capture() {
         if WRITE_VERIFIED_MODELS.iter().any(|(m, _)| m == model) {
             continue;
         }
-        let claims = capabilities_for(model, true);
+        let claims = capabilities_for(model);
         for claim in [
             &claims.volume,
             &claims.mute,
@@ -207,10 +207,10 @@ fn write_claims_are_not_hardware_verified_without_a_write_capture() {
     }
 }
 
-/// A unit reached without its range must not advertise volume.
+/// A unit reached over HTTP only (no MVMAX) still has volume: the protocol's full scale bounds it.
 #[test]
-fn volume_is_not_advertised_without_a_known_range() {
-    assert!(!capabilities_for("SR6008", false).volume.supported);
+fn volume_is_advertised_without_mvmax() {
+    assert!(capabilities_for("SR6008").volume.supported);
 }
 
 #[test]

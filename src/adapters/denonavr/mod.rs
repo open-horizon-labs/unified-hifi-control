@@ -63,10 +63,7 @@ pub const READ_VERIFIED_MODELS: &[(&str, &str)] =
 pub const WRITE_VERIFIED_MODELS: &[(&str, &str)] = &[];
 
 /// Capability claims for one model. Pure, so the AGENTS.md device table is generated from it.
-///
-/// `volume_range_known`: the push session is up and has reported `MVMAX`. Without it, volume
-/// writes are refused, and the claim says so rather than advertising a path that will refuse.
-pub fn capabilities_for(model: &str, volume_range_known: bool) -> DeviceCapabilities {
+pub fn capabilities_for(model: &str) -> DeviceCapabilities {
     let read_verified = READ_VERIFIED_MODELS.iter().any(|(m, _)| *m == model);
     let write_verified = WRITE_VERIFIED_MODELS.iter().any(|(m, _)| *m == model);
     let write_evidence = if write_verified {
@@ -102,14 +99,11 @@ pub fn capabilities_for(model: &str, volume_range_known: bool) -> DeviceCapabili
             },
         },
         volume: write(
-            volume_range_known,
-            if volume_range_known {
-                format!("MV over Telnet, clamped to the unit's MVMAX and the user ceiling{pending}")
-            } else {
-                "refused until the unit reports its maximum (MVMAX), which it sends only over \
-                 Telnet"
-                    .to_string()
-            },
+            true,
+            format!(
+                "MV over Telnet, or formiPhoneAppVolume over HTTP; bounded by the unit's MVMAX \
+                 (Telnet) or the protocol's +18 dB full scale, and by any user ceiling{pending}"
+            ),
         ),
         mute: write(
             true,
@@ -829,10 +823,7 @@ impl Unit {
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
-        capabilities_for(
-            &self.model,
-            self.state.channel == ControlChannel::Push && self.state.max_db.is_some(),
-        )
+        capabilities_for(&self.model)
     }
 
     fn publish(&self) {
@@ -855,7 +846,8 @@ impl Unit {
                 scale: crate::bus::VolumeScale::Decibel,
                 value: self.state.volume_db,
                 min: protocol::MIN_DB,
-                hardware_max: self.state.max_db,
+                // MVMAX arrives only over Telnet; over HTTP the protocol's full scale bounds it.
+                hardware_max: Some(self.state.max_db.unwrap_or(protocol::MAX_DB)),
                 ceiling: None,
                 step: 0.5,
                 is_muted: self.state.muted,

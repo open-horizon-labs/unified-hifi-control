@@ -7,9 +7,8 @@
 //!
 //! Safety rules that stay (they are hazards, not device limits):
 //!
-//! - Volume is Home Assistant's 0–1 `volume_level`, with no native scale (its denonavr integration
-//!   maps 1.0 to +20 dB). It is published as `Linear` with no hardware maximum, so the device
-//!   service refuses every level until the user sets a ceiling for the device.
+//! - Volume is Home Assistant's 0–1 `volume_level`, published as `Linear` with 1.0 as its
+//!   maximum. Any user ceiling lowers that further.
 //! - Self-exclusion fails closed: if the entity registry cannot be read, nothing is offered.
 //!
 //! Users avoid linking one amplifier both natively and through Home Assistant (decision #790);
@@ -266,8 +265,8 @@ fn device(device_id: DeviceId, entity: &EntityState, host: &str) -> Device {
             scale: VolumeScale::Linear,
             value: entity.volume,
             min: 0.0,
-            // No native maximum: the user's ceiling is what bounds a level (refused until set).
-            hardware_max: None,
+            // Home Assistant's volume_level is 0–1 by definition.
+            hardware_max: Some(1.0),
             ceiling: None,
             step: 0.01,
             is_muted: entity.muted,

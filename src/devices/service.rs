@@ -940,9 +940,9 @@ mod tests {
         }
     }
 
-    /// CRITICAL: no level may be sent to a device whose maximum is unknown. The SR6008 reports
-    /// `MVMAX` only over Telnet, so a unit reached over HTTP alone never gets a range — and must
-    /// therefore never get a level, absolute or relative.
+    /// CRITICAL: no level may be sent to a device whose adapter publishes no scale at all (for
+    /// example a unit that has not yet reported state). Adapters with a known protocol scale
+    /// publish it as the maximum, so this does not gate them.
     #[test]
     fn critical_vol_abs_refused_until_range_read() {
         let unknown_max = device(Some(-40.0), None);

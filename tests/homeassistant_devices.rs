@@ -18,9 +18,7 @@ use unified_hifi_control::adapters::homeassistant_devices::HomeAssistantDevices;
 use unified_hifi_control::aggregator::ZoneAggregator;
 use unified_hifi_control::bus::create_bus;
 use unified_hifi_control::devices::links::DeviceLinkStore;
-use unified_hifi_control::devices::service::{
-    DeviceError, DeviceRequest, DeviceService, DeviceTarget,
-};
+use unified_hifi_control::devices::service::{DeviceRequest, DeviceService, DeviceTarget};
 use unified_hifi_control::devices::{DeviceId, DevicePower};
 
 #[derive(Default)]
@@ -183,14 +181,14 @@ async fn wait_for_device(aggregator: &ZoneAggregator) {
 }
 
 #[tokio::test]
-async fn media_players_are_offered_with_a_linear_scale_and_no_hardware_maximum() {
+async fn media_players_are_offered_with_a_linear_zero_to_one_scale() {
     let (h, _) = harness(true).await;
     wait_for_device(&h.aggregator).await;
     let device = h.aggregator.get_device(&amp_id()).await.unwrap();
     assert_eq!(device.maturity, "alpha");
     assert_eq!(device.power, DevicePower::On);
     assert_eq!(device.volume.value, Some(0.4));
-    assert_eq!(device.volume.hardware_max, None);
+    assert_eq!(device.volume.hardware_max, Some(1.0));
     assert_eq!(device.input.as_deref(), Some("TV Audio"));
     // Only the real amplifier: UHC's own export and non-media_player entities are absent.
     assert_eq!(h.aggregator.get_devices().await.len(), 1);
@@ -205,25 +203,22 @@ async fn critical_unreadable_registry_offers_no_devices() {
     assert!(h.aggregator.get_devices().await.is_empty());
 }
 
-/// CRITICAL: Home Assistant's 0–1 scale has no native meaning (1.0 is +20 dB on a Denon). No
-/// level is sent until the user sets a ceiling; then the ceiling bounds it.
+/// Volume works without a ceiling (bounded by 0–1); an optional ceiling lowers the bound.
 #[tokio::test]
-async fn critical_volume_refused_until_a_ceiling_then_bounded_by_it() {
+async fn critical_volume_works_without_a_ceiling_and_a_ceiling_bounds_it() {
     let (h, shared) = harness(true).await;
     wait_for_device(&h.aggregator).await;
 
-    let refused = h
+    let report = h
         .service
         .control(
             DeviceTarget::Device(amp_id()),
-            DeviceRequest::VolumeAbsolute(0.9),
+            DeviceRequest::VolumeAbsolute(0.6),
         )
-        .await;
-    assert!(
-        matches!(refused, Err(DeviceError::RangeUnknown { .. })),
-        "{refused:?}"
-    );
-    assert!(shared.lock().await.calls.is_empty());
+        .await
+        .expect("no ceiling needed");
+    assert_eq!(report.sent_volume, Some(0.6));
+    shared.lock().await.calls.clear();
 
     h.service
         .set_ceiling(amp_id().as_str(), Some(0.5))

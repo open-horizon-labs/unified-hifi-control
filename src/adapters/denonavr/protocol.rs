@@ -16,6 +16,10 @@ pub const STATE_QUERIES: &[&str] = &["PW?", "ZM?", "MV?", "MU?", "SI?"];
 /// Lowest level the protocol can express, in dB (`MV00`).
 pub const MIN_DB: f32 = -80.0;
 
+/// Highest level the protocol can express, in dB (`MV98`). The scale used when the unit has not
+/// reported `MVMAX` (it sends that only over Telnet); the receiver still enforces its own limit.
+pub const MAX_DB: f32 = 18.0;
+
 /// Offset between the Telnet `MV` value and dB: `MV405` is 40.5 absolute, -39.5 dB (captured).
 const MV_OFFSET_DB: f32 = 80.0;
 

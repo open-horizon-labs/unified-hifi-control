@@ -31,6 +31,9 @@ pub struct MockMarantzState {
     pub echo_noop_writes: bool,
     /// When false the unit accepts writes but never answers them — not even queries.
     pub answers: bool,
+    /// When false Telnet connections are closed at once, like the captured bedroom SR6008:
+    /// the unit is reachable over HTTP only and never reports `MVMAX`.
+    pub telnet: bool,
     /// Every line received over Telnet, in order, including queries.
     pub telnet_received: Vec<String>,
     /// Every HTTP path requested, in order.
@@ -47,6 +50,7 @@ impl Default for MockMarantzState {
             input: "MPLAY".to_string(),
             echo_noop_writes: true,
             answers: true,
+            telnet: true,
             telnet_received: Vec::new(),
             http_requests: Vec::new(),
         }
@@ -144,6 +148,10 @@ impl MockMarantz {
                         _ = shutdown.cancelled() => break,
                         accepted = telnet.accept() => {
                             let Ok((stream, _)) = accepted else { continue };
+                            if !state.lock().await.telnet {
+                                drop(stream);
+                                continue;
+                            }
                             let state = state.clone();
                             let shutdown = shutdown.clone();
                             let pushed = push.subscribe();
@@ -348,6 +356,14 @@ async fn serve_http(mut stream: TcpStream, state: Arc<Mutex<MockMarantzState>>) 
             Some(String::new())
         } else if path.starts_with("/goform/formiPhoneAppPower.xml?1+PowerStandby") {
             state.zone_on = false;
+            Some(String::new())
+        } else if let Some(db) = path
+            .strip_prefix("/goform/formiPhoneAppVolume.xml?1+")
+            .and_then(|db| db.parse::<f32>().ok())
+        {
+            // The unit enforces its own MVMAX whatever it is sent.
+            let halves = ((db + 80.0) * 2.0).round().max(0.0) as u32;
+            state.level_halves = halves.min(state.max_absolute * 2);
             Some(String::new())
         } else {
             None

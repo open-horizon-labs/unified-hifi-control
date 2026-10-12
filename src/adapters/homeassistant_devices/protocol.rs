@@ -165,8 +165,8 @@ pub fn capabilities(features: u64) -> DeviceCapabilities {
         },
         volume: DeviceCapability {
             detail: if features & FEATURE_VOLUME_SET != 0 {
-                "media_player.volume_set (0–1, no native scale): absolute levels are refused \
-                 until a ceiling is set for this device"
+                "media_player.volume_set (0–1), bounded by any user ceiling; confirmed by state \
+                 readback"
                     .to_string()
             } else {
                 "the entity does not advertise volume_set".to_string()
