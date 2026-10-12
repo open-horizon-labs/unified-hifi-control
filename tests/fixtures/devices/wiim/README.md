@@ -23,3 +23,9 @@ Facts established:
 Live write path (`tests/wiim_live.rs`, through `DeviceService`) on the WiiM Ultra: volume set
 confirmed in 0.18 s; no-op write confirmed (1.7 s, no hang); restore 2.1 s; mute on/off 1.9 s each;
 power refused (no LinkPlay power command). Unit restored to its starting state.
+
+Input path (`live_wiim_input_path`): Network → Bluetooth confirmed in 0.2 s, back to Network in
+1.9 s. A physical input with nothing connected (Line In, Phono on the Deck) is acknowledged `OK`
+by the device but never reported — HTTP `mode` stays `-1` and UPnP `PlayMedium` stays `NONE` — so
+UHC reports it unconfirmed, never success. Mode codes and per-model inputs follow the vendor SDK
+(`Linkplay2020/wiim` `consts.py`): optical 43, HDMI 49, phono 54.

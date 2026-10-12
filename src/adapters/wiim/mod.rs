@@ -70,8 +70,9 @@ pub const READ_VERIFIED_MODELS: &[(&str, &str)] = &[
     ("WiiM Pro Plus", "tests/fixtures/devices/wiim"),
 ];
 
-/// Models whose volume and mute writes were exercised on a real unit through `DeviceService`
-/// (`tests/wiim_live.rs`): set, no-op, restore, mute on/off, each confirmed by readback.
+/// Models whose writes were exercised on a real unit through `DeviceService` (`tests/wiim_live.rs`):
+/// volume set/no-op/restore, mute on/off, and input Network → Bluetooth → Network, each confirmed by
+/// readback.
 pub const WRITE_VERIFIED_MODELS: &[(&str, &str)] = &[("WiiM Ultra", "tests/fixtures/devices/wiim")];
 
 pub fn capabilities_for(model: &str) -> DeviceCapabilities {
@@ -127,13 +128,16 @@ pub fn capabilities_for(model: &str) -> DeviceCapabilities {
              reported as standby"
                 .to_string(),
         ),
-        input_select: claim(
+        input_select: DeviceCapability {
+            evidence: evidence(write_verified),
+            ..claim(
             true,
-            "setPlayerCmd:switchmode:<input>. The input catalog is the documented switchmode set; \
-             which inputs a model physically has is not reported by the device, which refuses the \
-             rest"
+            "setPlayerCmd:switchmode:<input>. The input catalog is per model (vendor SDK); a \
+             physical input with nothing connected may not report as selected, so it stays \
+             unconfirmed rather than succeeding"
                 .to_string(),
-        ),
+            )
+        },
     }
 }
 
@@ -640,7 +644,7 @@ impl Unit {
             // No power model on LinkPlay: never inferred from playback state.
             power: DevicePower::Unknown,
             input: player.input,
-            inputs: protocol::input_catalog(),
+            inputs: protocol::input_catalog_for(&self.model),
             volume: DeviceVolume {
                 scale: VolumeScale::Percentage,
                 value: player.volume,

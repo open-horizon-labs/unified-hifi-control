@@ -44,7 +44,62 @@ pub const INPUTS: &[(&str, &str)] = &[
     ("co-axial", "Coaxial"),
     ("RCA", "RCA"),
     ("HDMI", "HDMI"),
+    ("phono", "Phono"),
 ];
+
+/// Inputs each model physically has, from the vendor SDK's `SUPPORTED_INPUT_MODES_BY_MODEL`
+/// (Linkplay2020/wiim `consts.py`, MIT; fetched 2026-10-12). Matched by longest model prefix so
+/// "WiiM Pro Plus" is not read as "WiiM Pro". Unlisted models get the full documented set and
+/// the device refuses what it lacks.
+const INPUTS_BY_MODEL: &[(&str, &[&str])] = &[
+    (
+        "WiiM Pro Plus",
+        &["wifi", "bluetooth", "line-in", "optical"],
+    ),
+    ("WiiM Pro", &["wifi", "bluetooth", "line-in", "optical"]),
+    (
+        "WiiM Ultra",
+        &["wifi", "bluetooth", "line-in", "optical", "HDMI", "phono"],
+    ),
+    (
+        "WiiM Amp Ultra",
+        &["wifi", "bluetooth", "line-in", "optical", "HDMI"],
+    ),
+    (
+        "WiiM Amp Pro",
+        &["wifi", "bluetooth", "line-in", "optical", "HDMI"],
+    ),
+    (
+        "WiiM Amp",
+        &["wifi", "bluetooth", "line-in", "optical", "HDMI"],
+    ),
+    (
+        "WiiM CI MOD A80",
+        &["wifi", "bluetooth", "line-in", "optical", "HDMI"],
+    ),
+    (
+        "WiiM CI MOD S",
+        &["wifi", "bluetooth", "line-in", "optical"],
+    ),
+];
+
+/// The input catalog for one model.
+pub fn input_catalog_for(model: &str) -> Vec<DeviceInput> {
+    let supported = INPUTS_BY_MODEL
+        .iter()
+        .filter(|(prefix, _)| model.starts_with(prefix))
+        .max_by_key(|(prefix, _)| prefix.len())
+        .map(|(_, inputs)| *inputs);
+    INPUTS
+        .iter()
+        .filter(|(id, _)| supported.is_none_or(|list| list.contains(id)))
+        .map(|(id, name)| DeviceInput {
+            id: (*id).to_string(),
+            name: (*name).to_string(),
+            available: true,
+        })
+        .collect()
+}
 
 /// The input catalog as [`DeviceInput`]s.
 pub fn input_catalog() -> Vec<DeviceInput> {
@@ -161,11 +216,14 @@ pub fn parse_player_status(body: &str) -> Option<PlayerStatus> {
 pub fn input_for_mode(mode: u32) -> Option<String> {
     let id = match mode {
         1 | 2 | 10 | 20 | 30..=39 => "wifi",
+        // Vendor SDK `PlayingMode`: 10 network, 40 line-in, 41 bluetooth, 43 optical, 49 HDMI,
+        // 54 phono. 46 (line-in 2) and 44 (coaxial) are from the arylic HTTP API notes.
         40 | 46 => "line-in",
         41 => "bluetooth",
-        42 => "optical",
-        43 => "RCA",
+        43 => "optical",
         44 => "co-axial",
+        49 => "HDMI",
+        54 => "phono",
         _ => return None,
     };
     Some(id.to_string())
@@ -266,9 +324,11 @@ mod tests {
         assert_eq!(input_for_mode(1).as_deref(), Some("wifi"));
         assert_eq!(input_for_mode(32).as_deref(), Some("wifi"));
         assert_eq!(input_for_mode(41).as_deref(), Some("bluetooth"));
-        assert_eq!(input_for_mode(42).as_deref(), Some("optical"));
-        assert_eq!(input_for_mode(43).as_deref(), Some("RCA"));
-        assert_eq!(input_for_mode(44).as_deref(), Some("co-axial"));
+        // Vendor SDK PlayingMode values.
+        assert_eq!(input_for_mode(43).as_deref(), Some("optical"));
+        assert_eq!(input_for_mode(49).as_deref(), Some("HDMI"));
+        assert_eq!(input_for_mode(54).as_deref(), Some("phono"));
+        assert_eq!(input_for_mode(42), None);
         assert_eq!(input_for_mode(0), None);
         assert_eq!(input_for_mode(99), None);
     }
@@ -344,5 +404,29 @@ mod tests {
             assert_eq!(status.max_volume, Some(100.0), "{file}");
             assert!(status.hardware_id().is_some(), "{file}");
         }
+    }
+
+    #[test]
+    fn input_catalog_follows_the_model() {
+        let ids = |model: &str| -> Vec<String> {
+            input_catalog_for(model).into_iter().map(|i| i.id).collect()
+        };
+        assert_eq!(
+            ids("WiiM Ultra"),
+            ["wifi", "line-in", "bluetooth", "optical", "HDMI", "phono"]
+        );
+        assert_eq!(
+            ids("WiiM Pro Plus"),
+            ["wifi", "line-in", "bluetooth", "optical"]
+        );
+        assert_eq!(
+            ids("WiiM Pro with gc4a"),
+            ["wifi", "line-in", "bluetooth", "optical"]
+        );
+        assert_eq!(
+            ids("WiiM Amp Pro"),
+            ["wifi", "line-in", "bluetooth", "optical", "HDMI"]
+        );
+        assert_eq!(ids("Some LinkPlay").len(), INPUTS.len());
     }
 }

@@ -183,3 +183,49 @@ async fn live_wiim_write_path() {
     assert_eq!(end.volume.value, Some(original));
     assert_eq!(end.volume.is_muted, Some(false));
 }
+
+#[tokio::test]
+#[ignore = "switches a real WiiM's input to Bluetooth and back to Network; set UHC_LIVE_WIIM=1"]
+async fn live_wiim_input_path() {
+    if std::env::var("UHC_LIVE_WIIM").is_err() {
+        return;
+    }
+    let (service, aggregator, devices, _dir) = discover().await;
+    let target = devices
+        .iter()
+        .find(|d| d.model == "WiiM Ultra")
+        .expect("the WiiM Ultra")
+        .clone();
+    let id = target.device_id.clone();
+    println!(
+        "input test on {} ({:?}), starting input {:?}",
+        id, target.name, target.input
+    );
+
+    for input in ["bluetooth", "wifi"] {
+        let started = Instant::now();
+        let report = service
+            .control(
+                DeviceTarget::Device(id.clone()),
+                DeviceRequest::SelectInput(input.to_string()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("select {input}: {e}"));
+        println!("  select {input}: confirmed in {:?}", started.elapsed());
+        assert_eq!(report.observed.input.as_deref(), Some(input));
+    }
+    let end = aggregator.get_device(&id).await.unwrap();
+    assert_eq!(end.input.as_deref(), Some("wifi"));
+
+    let refused = service
+        .control(
+            DeviceTarget::Device(id.clone()),
+            DeviceRequest::SelectInput("co-axial".to_string()),
+        )
+        .await;
+    println!(
+        "  select co-axial (not on the Ultra; expected refused): {:?}",
+        refused.as_ref().err()
+    );
+    assert!(refused.is_err());
+}

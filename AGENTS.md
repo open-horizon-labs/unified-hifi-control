@@ -419,7 +419,7 @@ in `docs/device-control-weave.md`; the SR6008 captures behind the claims below a
 | Other Denon / Marantz | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
 | WiiM Pro with gc4a | ✅ hardware-verified | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | 🚧 implemented, #788 |
 | WiiM Pro No MFI | ✅ hardware-verified | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | 🚧 implemented, #788 |
-| WiiM Ultra | ✅ hardware-verified | ✅ hardware-verified | ✅ hardware-verified | ⛔ | 🚧 implemented, #788 |
+| WiiM Ultra | ✅ hardware-verified | ✅ hardware-verified | ✅ hardware-verified | ⛔ | ✅ hardware-verified |
 | WiiM Amp Pro | ✅ hardware-verified | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | 🚧 implemented, #788 |
 | WiiM Pro Plus | ✅ hardware-verified | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | 🚧 implemented, #788 |
 | Other WiiM / LinkPlay | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | 🚧 implemented, #788 |

@@ -50,7 +50,7 @@ fn mode_for(input: &str) -> Option<u32> {
         "wifi" => 31,
         "line-in" => 40,
         "bluetooth" => 41,
-        "optical" => 42,
+        "optical" => 43,
         "RCA" => 43,
         "co-axial" => 44,
         _ => return None,
@@ -387,7 +387,7 @@ async fn unknown_input_is_refused_without_sending() {
     let mock = MockWiim::start(KITCHEN, 20).await;
     let device_id = h.attach(KITCHEN, &mock).await;
     assert!(h
-        .control(&device_id, DeviceRequest::SelectInput("phono".into()))
+        .control(&device_id, DeviceRequest::SelectInput("tape".into()))
         .await
         .is_err());
     let error = h
