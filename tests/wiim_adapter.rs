@@ -140,6 +140,7 @@ impl MockWiim {
             mac: None,
             name: format!("WiiM Mini-{}", &s.uuid[s.uuid.len() - 4..]),
             project: "Muzo_Mini".to_string(),
+            max_volume: None,
         }
     }
 }

@@ -50,7 +50,13 @@ fn family_rows() -> Vec<(String, unified_hifi_control::devices::DeviceCapabiliti
         "Other Denon / Marantz".to_string(),
         capabilities_for("(other)", true),
     ));
-    rows.push(("WiiM".to_string(), wiim::capabilities_for("WiiM")));
+    for (model, _) in wiim::READ_VERIFIED_MODELS {
+        rows.push(((*model).to_string(), wiim::capabilities_for(model)));
+    }
+    rows.push((
+        "Other WiiM / LinkPlay".to_string(),
+        wiim::capabilities_for("WiiM"),
+    ));
     rows.push(("Sonos".to_string(), sonos::capabilities_for("Sonos", false)));
     rows.push((
         "Yamaha MusicCast".to_string(),
@@ -122,7 +128,11 @@ fn render() -> String {
 #[test]
 fn only_captured_models_claim_hardware_verification() {
     for (label, claims) in family_rows() {
-        if label.starts_with("Marantz SR6008") {
+        let captured = label.starts_with("Marantz SR6008")
+            || unified_hifi_control::adapters::wiim::READ_VERIFIED_MODELS
+                .iter()
+                .any(|(model, _)| *model == label);
+        if captured {
             continue;
         }
         for claim in [
@@ -146,7 +156,13 @@ fn only_captured_models_claim_hardware_verification() {
 #[test]
 fn hardware_verified_claims_point_at_existing_captures() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for (model, directory) in READ_VERIFIED_MODELS.iter().chain(WRITE_VERIFIED_MODELS) {
+    use unified_hifi_control::adapters::wiim;
+    for (model, directory) in READ_VERIFIED_MODELS
+        .iter()
+        .chain(WRITE_VERIFIED_MODELS)
+        .chain(wiim::READ_VERIFIED_MODELS)
+        .chain(wiim::WRITE_VERIFIED_MODELS)
+    {
         let directory = root.join(directory);
         assert!(
             directory.join("README.md").is_file(),
@@ -156,9 +172,9 @@ fn hardware_verified_claims_point_at_existing_captures() {
         let captures = std::fs::read_dir(&directory)
             .unwrap()
             .filter_map(Result::ok)
-            .filter(|entry| entry.path().is_dir())
+            .filter(|entry| entry.file_name() != "README.md")
             .count();
-        assert!(captures > 0, "{model}: no per-unit capture directories");
+        assert!(captures > 0, "{model}: no captures beside the README");
     }
 }
 

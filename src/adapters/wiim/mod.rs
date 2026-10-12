@@ -60,11 +60,34 @@ const READBACK_SCHEDULE: &[Duration] = &[
 ];
 
 /// Capability claims. All implementation-derived: no WiiM hardware has been exercised.
+/// Models whose read path (identity, level, mute, `max_volume`) was exercised on real units,
+/// with captures in the named fixture directory (`tests/device_claims.rs` checks it exists).
+pub const READ_VERIFIED_MODELS: &[(&str, &str)] = &[
+    ("WiiM Pro with gc4a", "tests/fixtures/devices/wiim"),
+    ("WiiM Pro No MFI", "tests/fixtures/devices/wiim"),
+    ("WiiM Ultra", "tests/fixtures/devices/wiim"),
+    ("WiiM Amp Pro", "tests/fixtures/devices/wiim"),
+    ("WiiM Pro Plus", "tests/fixtures/devices/wiim"),
+];
+
+/// Models whose volume and mute writes were exercised on a real unit through `DeviceService`
+/// (`tests/wiim_live.rs`): set, no-op, restore, mute on/off, each confirmed by readback.
+pub const WRITE_VERIFIED_MODELS: &[(&str, &str)] = &[("WiiM Ultra", "tests/fixtures/devices/wiim")];
+
 pub fn capabilities_for(model: &str) -> DeviceCapabilities {
+    let read_verified = READ_VERIFIED_MODELS.iter().any(|(m, _)| *m == model);
+    let write_verified = WRITE_VERIFIED_MODELS.iter().any(|(m, _)| *m == model);
     let model_note = if model.is_empty() {
         String::new()
     } else {
         format!(" ({model})")
+    };
+    let evidence = |verified: bool| {
+        if verified {
+            CapabilityEvidence::HardwareVerified
+        } else {
+            CapabilityEvidence::ImplementationDerived
+        }
     };
     let claim = |supported: bool, detail: String| DeviceCapability {
         supported,
@@ -72,19 +95,32 @@ pub fn capabilities_for(model: &str) -> DeviceCapabilities {
         detail,
     };
     DeviceCapabilities {
-        observe: claim(
+        observe: DeviceCapability {
+            evidence: evidence(read_verified),
+            ..claim(
+                true,
+                format!(
+                    "LinkPlay HTTP API getStatusEx/getPlayerStatus polled every 3 s{model_note}; {}",
+                    if read_verified {
+                        "captured on this model (tests/fixtures/devices/wiim)"
+                    } else {
+                        "not exercised on this model"
+                    }
+                ),
+            )
+        },
+        volume: DeviceCapability {
+            evidence: evidence(write_verified),
+            ..claim(
             true,
-            format!(
-                "LinkPlay HTTP API getPlayerStatus (vol, mute, mode) polled every 3 s{model_note}; \
-                 not exercised on hardware"
-            ),
-        ),
-        volume: claim(
-            true,
-            "setPlayerCmd:vol:N, N in 0-100 (percentage). The protocol full scale (100) is the maximum; a user ceiling lowers it; fixed-output mode is not detectable over this API"
+            "setPlayerCmd:vol:N, N in 0-100 (percentage). The device's max_volume setting (else 100) is the maximum; a user ceiling lowers it; fixed-output mode is not detectable over this API"
                 .to_string(),
-        ),
-        mute: claim(true, "setPlayerCmd:mute:1|0".to_string()),
+            )
+        },
+        mute: DeviceCapability {
+            evidence: evidence(write_verified),
+            ..claim(true, "setPlayerCmd:mute:1|0".to_string())
+        },
         power: claim(
             false,
             "WiiM/LinkPlay has no power command; pause is transport, not power, and is never \
@@ -380,6 +416,7 @@ impl WiimAdapter {
             active,
             device_id: device_id.clone(),
             model: status.model(),
+            max_volume: status.max_volume,
             name: status.name,
             discovery: discovery.to_string(),
             player: None,
@@ -462,6 +499,8 @@ struct Unit {
     active: String,
     device_id: DeviceId,
     model: String,
+    /// The device's own maximum-volume setting, when it reports one.
+    max_volume: Option<f32>,
     name: String,
     discovery: String,
     player: Option<PlayerStatus>,
@@ -606,8 +645,9 @@ impl Unit {
                 scale: VolumeScale::Percentage,
                 value: player.volume,
                 min: protocol::MIN_VOLUME,
-                // 0–100 is the protocol's full scale: the device maximum. A user ceiling lowers it.
-                hardware_max: Some(100.0),
+                // The device's own `max_volume` setting, else the protocol's full scale (100).
+                // A user ceiling lowers it further.
+                hardware_max: Some(self.max_volume.unwrap_or(100.0)),
                 ceiling: None,
                 step: 1.0,
                 is_muted: player.muted,

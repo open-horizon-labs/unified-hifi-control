@@ -59,7 +59,7 @@ pub fn input_catalog() -> Vec<DeviceInput> {
 }
 
 /// Identity and labels from `getStatusEx`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StatusEx {
     pub uuid: Option<String>,
     pub mac: Option<String>,
@@ -67,6 +67,9 @@ pub struct StatusEx {
     pub name: String,
     /// `project`, e.g. `Muzo_Mini`, `WiiM_Pro_with_gc4a`.
     pub project: String,
+    /// The user's maximum-volume setting on the device (`max_volume`, 1–100), when reported.
+    /// Captured on five models (`tests/fixtures/devices/wiim/`).
+    pub max_volume: Option<f32>,
 }
 
 impl StatusEx {
@@ -107,6 +110,9 @@ pub fn parse_status_ex(body: &str) -> Option<StatusEx> {
         mac: text(&value, "MAC").filter(|v| !v.is_empty()),
         name: text(&value, "DeviceName").unwrap_or_default(),
         project: text(&value, "project").unwrap_or_default(),
+        max_volume: text(&value, "max_volume")
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| (1.0..=100.0).contains(v)),
     };
     status.hardware_id()?;
     Some(status)
@@ -318,5 +324,25 @@ mod tests {
         assert!(command_accepted("OK\n"));
         assert!(!command_accepted("Failed"));
         assert!(!command_accepted("unknown command"));
+    }
+
+    #[test]
+    fn captured_status_ex_gives_identity_model_and_max_volume() {
+        for (file, model) in [
+            ("pro", "WiiM Pro with gc4a"),
+            ("pro-nomfi", "WiiM Pro No MFI"),
+            ("ultra", "WiiM Ultra"),
+            ("amp-pro", "WiiM Amp Pro"),
+            ("pro-plus", "WiiM Pro Plus"),
+        ] {
+            let path = format!(
+                "{}/tests/fixtures/devices/wiim/{file}-getStatusEx.json",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let status = parse_status_ex(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(status.model(), model);
+            assert_eq!(status.max_volume, Some(100.0), "{file}");
+            assert!(status.hardware_id().is_some(), "{file}");
+        }
     }
 }

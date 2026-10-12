@@ -417,7 +417,12 @@ in `docs/device-control-weave.md`; the SR6008 captures behind the claims below a
 |---|---|---|---|---|---|
 | Marantz SR6008 | ✅ hardware-verified | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
 | Other Denon / Marantz | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
-| WiiM | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | 🚧 implemented, #788 |
+| WiiM Pro with gc4a | ✅ hardware-verified | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | 🚧 implemented, #788 |
+| WiiM Pro No MFI | ✅ hardware-verified | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | 🚧 implemented, #788 |
+| WiiM Ultra | ✅ hardware-verified | ✅ hardware-verified | ✅ hardware-verified | ⛔ | 🚧 implemented, #788 |
+| WiiM Amp Pro | ✅ hardware-verified | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | 🚧 implemented, #788 |
+| WiiM Pro Plus | ✅ hardware-verified | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | 🚧 implemented, #788 |
+| Other WiiM / LinkPlay | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | 🚧 implemented, #788 |
 | Sonos | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | ⛔ |
 | Yamaha MusicCast | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
 | BluOS | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | 🚧 implemented, #788 |
@@ -434,7 +439,12 @@ in `docs/device-control-weave.md`; the SR6008 captures behind the claims below a
 
 - **Marantz SR6008** — volume: MV over Telnet, clamped to the unit's MVMAX and the user ceiling; pending on-device verification (#788); power: ZMON/ZMOFF over Telnet, or formiPhoneAppPower over HTTP (the SR6008 refuses Telnet in standby); pending on-device verification (#788)
 - **Other Denon / Marantz** — volume: MV over Telnet, clamped to the unit's MVMAX and the user ceiling; pending on-device verification (#788); power: ZMON/ZMOFF over Telnet, or formiPhoneAppPower over HTTP (the SR6008 refuses Telnet in standby); pending on-device verification (#788)
-- **WiiM** — volume: setPlayerCmd:vol:N, N in 0-100 (percentage). The protocol full scale (100) is the maximum; a user ceiling lowers it; fixed-output mode is not detectable over this API; power: WiiM/LinkPlay has no power command; pause is transport, not power, and is never reported as standby
+- **WiiM Pro with gc4a** — volume: setPlayerCmd:vol:N, N in 0-100 (percentage). The device's max_volume setting (else 100) is the maximum; a user ceiling lowers it; fixed-output mode is not detectable over this API; power: WiiM/LinkPlay has no power command; pause is transport, not power, and is never reported as standby
+- **WiiM Pro No MFI** — volume: setPlayerCmd:vol:N, N in 0-100 (percentage). The device's max_volume setting (else 100) is the maximum; a user ceiling lowers it; fixed-output mode is not detectable over this API; power: WiiM/LinkPlay has no power command; pause is transport, not power, and is never reported as standby
+- **WiiM Ultra** — volume: setPlayerCmd:vol:N, N in 0-100 (percentage). The device's max_volume setting (else 100) is the maximum; a user ceiling lowers it; fixed-output mode is not detectable over this API; power: WiiM/LinkPlay has no power command; pause is transport, not power, and is never reported as standby
+- **WiiM Amp Pro** — volume: setPlayerCmd:vol:N, N in 0-100 (percentage). The device's max_volume setting (else 100) is the maximum; a user ceiling lowers it; fixed-output mode is not detectable over this API; power: WiiM/LinkPlay has no power command; pause is transport, not power, and is never reported as standby
+- **WiiM Pro Plus** — volume: setPlayerCmd:vol:N, N in 0-100 (percentage). The device's max_volume setting (else 100) is the maximum; a user ceiling lowers it; fixed-output mode is not detectable over this API; power: WiiM/LinkPlay has no power command; pause is transport, not power, and is never reported as standby
+- **Other WiiM / LinkPlay** — volume: setPlayerCmd:vol:N, N in 0-100 (percentage). The device's max_volume setting (else 100) is the maximum; a user ceiling lowers it; fixed-output mode is not detectable over this API; power: WiiM/LinkPlay has no power command; pause is transport, not power, and is never reported as standby
 - **Sonos** — volume: RenderingControl SetVolume, Channel Master, 0-100 (percentage), per player not per group. 100 is the maximum; a user ceiling lowers it; power: Sonos has no generic power on/off; players sleep and wake by themselves
 - **Yamaha MusicCast** — volume: main/setVolume, native units 0..161 step 1 (not a percentage and not dB; the model's own scale), limited by the unit's max_volume; implemented from the YXC specification and aiomusiccast; no MusicCast hardware exercised yet; power: main/setPower on|standby over HTTP. Waking a unit in standby needs network standby enabled on the device; otherwise it does not answer; implemented from the YXC specification and aiomusiccast; no MusicCast hardware exercised yet
 - **BluOS** — volume: /Volume?level= (0-100 percent); implemented from pyblu and the BluOS API; no BluOS hardware exercised yet; power: the BluOS API has no universal power command (a streaming module has no amplifier to switch, and power is a host-device matter); refused with an error; implemented from pyblu and the BluOS API; no BluOS hardware exercised yet
