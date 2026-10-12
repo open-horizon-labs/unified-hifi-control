@@ -512,6 +512,7 @@ fn FeatureToggle(label: &'static str, enabled: bool, onclick: EventHandler<Mouse
                 "Enable HQPlayer" => "adapters.hqplayer",
                 "Enable Spotify" => "adapters.spotify",
                 "Enable Apple Music" => "adapters.applemusic",
+                "Enable receiver and amplifier control" => "adapters.devices",
                 "Enable MQTT/Home Assistant" => "adapters.mqtt",
                 "Show Controllers page" => "hide_knobs_page",
                 _ => "",
@@ -2139,7 +2140,8 @@ pub fn Settings() -> Element {
                                 td { class: "py-2 px-3",
                                     if devices_enabled() {
                                         span { class: "text-muted",
-                                            "Power, volume and input for linked zones. Link zones with hifi_devices (MCP) or POST /devices/link."
+                                            "Power, volume and input for linked zones. "
+                                            Link { class: "link", to: Route::Devices {}, "Open Devices →" }
                                         }
                                     } else {
                                         span { class: "text-muted", "-" }

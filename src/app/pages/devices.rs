@@ -1,8 +1,13 @@
-//! Playback devices page (#774, **alpha**): receivers and amplifiers, plus the
-//! opt-in, local-only device-mismatch report.
+//! Playback devices page (#774, **alpha**): receivers and amplifiers, the zones that feed them,
+//! and the opt-in, local-only device-mismatch report.
 //!
 //! The page talks only to the frozen `/devices` HTTP surface. Nothing it does sends data off the
 //! server: a report is previewed here, and the user submits it on GitHub themselves.
+//!
+//! Two promises the copy here has to keep. Linking a zone hands its volume to the device (knob,
+//! Watch, Home Assistant and MCP all follow), and a user ceiling is optional and can only lower
+//! the device's own maximum. A link may record the input a zone arrives on, but UHC only shows
+//! when the device is elsewhere: it never switches inputs by itself.
 //!
 //! Hydration note: every conditional that depends on fetched data sits behind a `use_resource`
 //! that starts as `None` on both SSR and the first client render, so both render the same
@@ -10,7 +15,10 @@
 
 use dioxus::prelude::*;
 
-use crate::app::api::{self, DeviceInfo, DeviceInventory, MismatchPreview, ReportSectionInfo};
+use crate::app::api::{
+    self, DeviceCommandResult, DeviceInfo, DeviceInventory, DeviceLinkInfo, LinkStoreInfo,
+    MismatchPreview, ReportSectionInfo, Zone, ZonesResponse,
+};
 use crate::app::base_path;
 use crate::app::components::Layout;
 use crate::app::Route;
@@ -37,6 +45,13 @@ pub fn Devices() -> Element {
             .await
             .map_err(|error| error.to_string())
     });
+    // Zones are fetched once per page and handed to every card's link form.
+    let mut zones = use_resource(|| async {
+        api::fetch_json::<ZonesResponse>("/zones")
+            .await
+            .map(|response| response.zones)
+            .map_err(|error| error.to_string())
+    });
 
     // The device whose report preview is open: (device_id, display name).
     let mut reporting = use_signal(|| None::<(String, String)>);
@@ -50,6 +65,11 @@ pub fn Devices() -> Element {
         .and_then(|result| result.as_ref().err().cloned());
     let recording = loaded.is_some_and(|inv| inv.mismatch_recording);
     let recording_aria = if recording { "true" } else { "false" };
+    let zone_list: Vec<Zone> = zones
+        .read()
+        .as_ref()
+        .and_then(|result| result.as_ref().ok().cloned())
+        .unwrap_or_default();
 
     let set_recording = move |_| {
         if toggle_busy() {
@@ -88,7 +108,7 @@ pub fn Devices() -> Element {
                 span { class: "badge badge-secondary", "Alpha" }
             }
             p { class: "text-muted text-sm mb-6",
-                "The hardware your zones play into: power, volume and input as the device reports them. "
+                "Link a zone to the amplifier it plays through; the zone's volume then drives the amplifier. "
                 "Alpha: support varies by model, and mismatch reports help us fix that."
             }
 
@@ -128,7 +148,10 @@ pub fn Devices() -> Element {
                     button {
                         r#type: "button",
                         class: "btn btn-outline btn-sm",
-                        onclick: move |_| inventory.restart(),
+                        onclick: move |_| {
+                            inventory.restart();
+                            zones.restart();
+                        },
                         "Refresh"
                     }
                 }
@@ -140,12 +163,19 @@ pub fn Devices() -> Element {
                     if inv.devices.is_empty() {
                         div { class: "card p-6",
                             p { class: "font-medium mb-1", "No devices found" }
-                            p { class: "text-muted text-sm",
+                            p { class: "text-muted text-sm mb-2",
                                 "Receiver and amplifier control is off by default. Turn on "
                                 em { "Enable receiver and amplifier control" }
                                 " in "
                                 Link { class: "link", to: Route::Settings {}, "Settings" }
                                 ", then give discovery a minute to find your hardware."
+                            }
+                            p { class: "text-muted text-sm",
+                                "Discovery listens for Denon/Marantz, Sonos, Yamaha, Arcam, Hegel and Lyngdorf over SSDP and WiiM, BluOS and Cambridge over mDNS; "
+                                "Home Assistant media players appear when its API is configured. "
+                                "Anthem, Trinnov and Eversolo need their address in "
+                                code { class: "font-mono text-xs", "manual_devices" }
+                                " in device-links.json. Use Refresh above to look again."
                             }
                         }
                     } else {
@@ -154,31 +184,26 @@ pub fn Devices() -> Element {
                                 "Mismatch recording is off, so nothing is being captured. Turn it on above to collect evidence you can report."
                             }
                         }
-                        div { class: "card overflow-x-auto",
-                            table { class: "w-full text-sm",
-                                thead {
-                                    tr { class: "border-b border-default text-left",
-                                        th { class: "py-2 px-3 font-medium", "Name" }
-                                        th { class: "py-2 px-3 font-medium", "Vendor / model" }
-                                        th { class: "py-2 px-3 font-medium", "Power" }
-                                        th { class: "py-2 px-3 font-medium", "Input" }
-                                        th { class: "py-2 px-3 font-medium", "Volume" }
-                                        th { class: "py-2 px-3 font-medium", "Linked zones" }
-                                        th { class: "py-2 px-3 font-medium", "Mismatches" }
-                                        th { class: "py-2 px-3 font-medium", span { class: "sr-only", "Actions" } }
-                                    }
-                                }
-                                tbody {
-                                    for device in inv.devices.iter() {
-                                        DeviceRow {
-                                            key: "{device.device_id}",
-                                            device: device.clone(),
-                                            zone_names: linked_zone_names(inv, device),
-                                            mismatch_count: inv.mismatch_counts.get(&device.device_id).copied().unwrap_or(0),
-                                            recording: inv.mismatch_recording,
-                                            on_report: move |(id, name): (String, String)| reporting.set(Some((id, name))),
-                                        }
-                                    }
+                        div { class: "space-y-4",
+                            for device in inv.devices.iter() {
+                                DeviceCard {
+                                    key: "{device.device_id}",
+                                    device: device.clone(),
+                                    links: inv
+                                        .links
+                                        .iter()
+                                        .filter(|link| link.device_id == device.device_id)
+                                        .cloned()
+                                        .collect::<Vec<_>>(),
+                                    linked_zone_ids: inv.links.iter().map(|link| link.zone_id.clone()).collect::<Vec<_>>(),
+                                    zones: zone_list.clone(),
+                                    link_store: inv.link_store.clone(),
+                                    mismatch_count: inv.mismatch_counts.get(&device.device_id).copied().unwrap_or(0),
+                                    on_report: move |(id, name): (String, String)| reporting.set(Some((id, name))),
+                                    on_changed: move |_| {
+                                        inventory.restart();
+                                        zones.restart();
+                                    },
                                 }
                             }
                         }
@@ -204,104 +229,617 @@ pub fn Devices() -> Element {
     }
 }
 
-/// Zone names for a device's links, falling back to the zone id when the zone is not present.
-fn linked_zone_names(inventory: &DeviceInventory, device: &DeviceInfo) -> Vec<String> {
-    device
-        .linked_zone_ids
-        .iter()
-        .map(|zone_id| {
-            inventory
-                .links
-                .iter()
-                .find(|link| link.zone_id == *zone_id && link.device_id == device.device_id)
-                .and_then(|link| link.zone_name.clone())
-                .unwrap_or_else(|| zone_id.clone())
-        })
-        .collect()
+/// One-line outcome of a device command, from what the server read back afterwards.
+fn describe_result(result: &DeviceCommandResult) -> String {
+    let volume = &result.observed.volume;
+    if result.confirmation == "confirmed_different" {
+        let now = volume
+            .value
+            .map(|value| volume.format(value))
+            .unwrap_or_else(|| "—".to_string());
+        format!("The device applied its own limit: now {now}.")
+    } else if result.clamped {
+        let sent = result
+            .sent_volume
+            .map(|value| volume.format(value))
+            .unwrap_or_else(|| "—".to_string());
+        format!("Lowered to the maximum ({sent}).")
+    } else {
+        "Confirmed.".to_string()
+    }
 }
 
-/// One table row. "Report mismatch" is always enabled, deliberately: the detector only catches
+/// Why a typed ceiling cannot be sent, or the value to send. A limit above the device's own
+/// maximum would change nothing, so it is refused here rather than saved as a no-op.
+fn validate_ceiling(text: &str, device: &DeviceInfo) -> Result<f32, String> {
+    let volume = &device.volume;
+    let value: f32 = text
+        .trim()
+        .parse()
+        .ok()
+        .filter(|value: &f32| value.is_finite())
+        .ok_or_else(|| "Enter a number, or use Clear limit to remove the limit.".to_string())?;
+    if let Some(max) = volume.hardware_max {
+        if value > max {
+            return Err(format!(
+                "{} is above the device's own maximum ({}), so it would change nothing. Enter a lower value.",
+                volume.format(value),
+                volume.format(max)
+            ));
+        }
+    }
+    if value < volume.min {
+        return Err(format!(
+            "{} is below the device's minimum ({}).",
+            volume.format(value),
+            volume.format(volume.min)
+        ));
+    }
+    Ok(value)
+}
+
+/// One device: header, live controls, optional max volume, and the zones it feeds.
+/// "Report mismatch" is always enabled, deliberately: the detector only catches
 /// what it knows to look for, and a user who sees a wrong value (volume off, input mislabelled)
 /// can still send the device facts. The preview says when nothing has been recorded.
 #[component]
-fn DeviceRow(
+fn DeviceCard(
     device: DeviceInfo,
-    zone_names: Vec<String>,
+    links: Vec<DeviceLinkInfo>,
+    linked_zone_ids: Vec<String>,
+    zones: Vec<Zone>,
+    link_store: LinkStoreInfo,
     mismatch_count: usize,
-    recording: bool,
     on_report: EventHandler<(String, String)>,
+    on_changed: EventHandler<()>,
 ) -> Element {
     let display_name = if device.name.is_empty() {
         device.device_id.clone()
     } else {
         device.name.clone()
     };
-    // Model names often carry the vendor already ("WiiM Ultra"); don't print it twice.
-    let model = if device
-        .model
-        .to_lowercase()
-        .starts_with(&device.vendor.to_lowercase())
-    {
-        device.model.clone()
-    } else {
-        format!("{} {}", device.vendor, device.model)
-    };
     let (power_class, power_text) = match device.power.as_str() {
         "on" => ("badge badge-success", "On"),
         "standby" => ("badge badge-secondary", "Standby"),
         _ => ("badge badge-secondary", "Unknown"),
     };
-    let input = device.input_label();
-    let volume = device.volume_label();
-    let zones = zone_names.join(", ");
+    let connection = match device.connection.control_channel.as_str() {
+        "push" => "push updates",
+        "polling" => "polling",
+        _ => "no control channel",
+    };
     let id = device.device_id.clone();
     let name_for_report = display_name.clone();
 
+    // Controls. `busy` disables the whole row while a command is in flight.
+    let mut busy = use_signal(|| false);
+    let mut message = use_signal(|| None::<String>);
+    let mut error = use_signal(|| None::<String>);
+    let command_id = device.device_id.clone();
+    let run = use_callback(
+        move |(action, value): (String, Option<serde_json::Value>)| {
+            if busy() {
+                return;
+            }
+            busy.set(true);
+            message.set(None);
+            error.set(None);
+            let id = command_id.clone();
+            spawn(async move {
+                match api::control_device(&id, &action, value).await {
+                    Ok(result) => message.set(Some(describe_result(&result))),
+                    Err(failure) => error.set(Some(failure)),
+                }
+                // Re-read either way: the select must show what the device is actually on.
+                on_changed.call(());
+                busy.set(false);
+            });
+        },
+    );
+
+    let caps = &device.capabilities;
+    let power_on = device.power == "on";
+    let power_label = if power_on { "Standby" } else { "Turn on" };
+    let power_action = if power_on { "power_off" } else { "power_on" };
+    let power_title = (!caps.power.supported).then(|| caps.power.detail.clone());
+    let input_blocked = !caps.input_select.supported || device.inputs.is_empty();
+    let input_title = input_blocked.then(|| caps.input_select.detail.clone());
+    let volume_title = (!caps.volume.supported).then(|| caps.volume.detail.clone());
+    let muted = device.volume.is_muted == Some(true);
+    let mute_title = (!caps.mute.supported).then(|| caps.mute.detail.clone());
+    let mute_label = if muted { "Unmute" } else { "Mute" };
+    let mute_action = if muted { "unmute" } else { "mute" };
+    let volume_text = device.volume_label().unwrap_or_else(|| "—".to_string());
+    let has_current_input = device.input.is_some();
+    let card_id = format!("device-{}", device.device_id);
+
     rsx! {
-        tr { class: "border-b border-default",
-            td { class: "py-2 px-3",
-                div { class: "font-medium", "{display_name}" }
-                div { class: "text-xs text-muted", "{device.host}" }
-            }
-            td { class: "py-2 px-3", "{model}" }
-            td { class: "py-2 px-3", span { class: "{power_class}", "{power_text}" } }
-            td { class: "py-2 px-3",
-                if let Some(ref input) = input {
-                    "{input}"
-                } else {
-                    span { class: "text-muted", "-" }
+        div { id: "{card_id}", class: "card p-4",
+            // Header
+            div { class: "flex flex-wrap items-start justify-between gap-3 mb-3",
+                div {
+                    div { class: "flex flex-wrap items-center gap-2",
+                        h3 { class: "font-semibold text-lg", "{display_name}" }
+                        span { class: "{power_class}", "{power_text}" }
+                        span { class: "text-xs text-muted", "{connection}" }
+                    }
+                    div { class: "text-xs text-muted", "{device.vendor_model()} · {device.host}" }
+                }
+                div { class: "flex items-center gap-2",
+                    if mismatch_count > 0 {
+                        span { class: "badge badge-primary", "{mismatch_count} mismatches" }
+                    }
+                    button {
+                        r#type: "button",
+                        class: "btn btn-outline btn-sm",
+                        onclick: move |_| on_report.call((id.clone(), name_for_report.clone())),
+                        "Report mismatch"
+                    }
                 }
             }
-            td { class: "py-2 px-3",
-                if let Some(ref volume) = volume {
-                    "{volume}"
-                } else {
-                    span { class: "text-muted", "-" }
-                }
-            }
-            td { class: "py-2 px-3",
-                if zones.is_empty() {
-                    span { class: "text-muted", "none linked" }
-                } else {
-                    "{zones}"
-                }
-            }
-            td { class: "py-2 px-3",
-                if mismatch_count > 0 {
-                    span { class: "badge badge-primary", "{mismatch_count}" }
-                } else if recording {
-                    span { class: "text-muted", "0" }
-                } else {
-                    span { class: "text-muted", "-" }
-                }
-            }
-            td { class: "py-2 px-3 text-right",
+
+            // Controls
+            div { class: "flex flex-wrap items-center gap-3 mb-1",
                 button {
                     r#type: "button",
                     class: "btn btn-outline btn-sm",
-                    onclick: move |_| on_report.call((id.clone(), name_for_report.clone())),
-                    "Report mismatch"
+                    disabled: busy() || !caps.power.supported,
+                    title: power_title,
+                    onclick: move |_| run.call((power_action.to_string(), None)),
+                    "{power_label}"
                 }
+                select {
+                    class: "input w-auto min-w-48",
+                    aria_label: "Input",
+                    disabled: busy() || input_blocked,
+                    title: input_title,
+                    onchange: move |event| {
+                        let input = event.value();
+                        if !input.is_empty() {
+                            run.call(("select_input".to_string(), Some(serde_json::Value::String(input))));
+                        }
+                    },
+                    if !has_current_input {
+                        option { value: "", disabled: true, selected: true, "Input unknown" }
+                    }
+                    for input in device.inputs.iter() {
+                        option {
+                            key: "{input.id}",
+                            value: "{input.id}",
+                            selected: device.input.as_deref() == Some(input.id.as_str()),
+                            if input.available {
+                                "{input.label()}"
+                            } else {
+                                "{input.label()} (nothing connected)"
+                            }
+                        }
+                    }
+                }
+                div { class: "flex items-center gap-2",
+                    button {
+                        r#type: "button",
+                        class: "btn btn-outline btn-sm",
+                        aria_label: "Volume down",
+                        disabled: busy() || !caps.volume.supported,
+                        title: volume_title.clone(),
+                        onclick: move |_| run.call(("volume_down".to_string(), None)),
+                        "−"
+                    }
+                    span { class: "text-sm min-w-16 text-center", "{volume_text}" }
+                    button {
+                        r#type: "button",
+                        class: "btn btn-outline btn-sm",
+                        aria_label: "Volume up",
+                        disabled: busy() || !caps.volume.supported,
+                        title: volume_title,
+                        onclick: move |_| run.call(("volume_up".to_string(), None)),
+                        "+"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "btn btn-ghost btn-sm",
+                        disabled: busy() || !caps.mute.supported,
+                        title: mute_title,
+                        onclick: move |_| run.call((mute_action.to_string(), None)),
+                        "{mute_label}"
+                    }
+                }
+            }
+            if let Some(ref text) = message() {
+                p { class: "text-sm text-muted mt-1", role: "status", "{text}" }
+            }
+            if let Some(ref text) = error() {
+                p { class: "status-err text-sm mt-1", role: "alert", "{text}" }
+            }
+
+            if caps.volume.supported {
+                CeilingSection {
+                    device: device.clone(),
+                    on_changed: move |_| on_changed.call(()),
+                }
+            }
+
+            ZoneLinks {
+                device: device.clone(),
+                links,
+                linked_zone_ids,
+                zones,
+                link_store,
+                on_changed: move |_| on_changed.call(()),
+            }
+        }
+    }
+}
+
+/// The zone's provider as the user knows it, for the takeover line.
+fn takeover_source(zone: &Zone) -> String {
+    zone.source
+        .as_deref()
+        .map(|source| api::source_label(source).to_string())
+        .unwrap_or_else(|| "its music provider".to_string())
+}
+
+/// The optional user maximum. It only ever lowers the device's own maximum.
+#[component]
+fn CeilingSection(device: DeviceInfo, on_changed: EventHandler<()>) -> Element {
+    let volume = device.volume.clone();
+    let mut text = use_signal(|| {
+        volume
+            .ceiling
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    });
+    let mut busy = use_signal(|| false);
+    let mut message = use_signal(|| None::<String>);
+    let mut error = use_signal(|| None::<String>);
+
+    let hardware = volume
+        .hardware_max
+        .map(|value| volume.format(value))
+        .unwrap_or_else(|| "not reported".to_string());
+    let limit = volume
+        .ceiling
+        .map(|value| volume.format(value))
+        .unwrap_or_else(|| "none".to_string());
+    let effective = volume
+        .effective_max()
+        .map(|value| volume.format(value))
+        .unwrap_or_else(|| "the device's own range".to_string());
+    let trigger = match (volume.hardware_max, volume.ceiling) {
+        (Some(max), Some(ceiling)) => format!(
+            "Max volume · limit {} (device max {})",
+            volume.format(ceiling),
+            volume.format(max)
+        ),
+        (Some(max), None) => format!("Max volume · device max {}", volume.format(max)),
+        _ => "Max volume".to_string(),
+    };
+    let step = if volume.step > 0.0 { volume.step } else { 0.5 };
+    let unit = volume.unit();
+
+    let save = use_callback({
+        let device = device.clone();
+        move |clear: bool| {
+            if busy() {
+                return;
+            }
+            message.set(None);
+            error.set(None);
+            let ceiling = if clear {
+                None
+            } else {
+                match validate_ceiling(&text(), &device) {
+                    Ok(value) => Some(value),
+                    Err(reason) => {
+                        error.set(Some(reason));
+                        return;
+                    }
+                }
+            };
+            busy.set(true);
+            let id = device.device_id.clone();
+            spawn(async move {
+                match api::set_device_ceiling(&id, ceiling).await {
+                    Ok(()) => {
+                        if ceiling.is_none() {
+                            text.set(String::new());
+                            message.set(Some("Limit cleared.".to_string()));
+                        } else {
+                            message.set(Some("Limit saved.".to_string()));
+                        }
+                        on_changed.call(());
+                    }
+                    Err(failure) => error.set(Some(failure)),
+                }
+                busy.set(false);
+            });
+        }
+    });
+
+    rsx! {
+        div { class: "mt-3",
+            Collapsible { default_open: false,
+                CollapsibleTrigger { "{trigger}" }
+                CollapsibleContent {
+                    div { class: "pt-2",
+                        p { class: "text-sm",
+                            "Device maximum: {hardware} · Your limit: {limit} → levels are clamped to {effective}"
+                        }
+                        div { class: "flex flex-wrap items-center gap-2 mt-2",
+                            input {
+                                class: "input w-28",
+                                r#type: "number",
+                                step: "{step}",
+                                aria_label: "Volume limit",
+                                value: "{text}",
+                                disabled: busy(),
+                                oninput: move |event| text.set(event.value()),
+                            }
+                            if !unit.is_empty() {
+                                span { class: "text-sm text-muted", "{unit.trim()}" }
+                            }
+                            button {
+                                r#type: "button",
+                                class: "btn btn-outline btn-sm",
+                                disabled: busy(),
+                                onclick: move |_| save.call(false),
+                                "Set limit"
+                            }
+                            button {
+                                r#type: "button",
+                                class: "btn btn-ghost btn-sm",
+                                disabled: busy() || volume.ceiling.is_none(),
+                                onclick: move |_| save.call(true),
+                                "Clear limit"
+                            }
+                        }
+                        p { class: "text-xs text-muted mt-1",
+                            "Optional. A limit only lowers the device's own maximum; volume works without one."
+                        }
+                        if let Some(ref text) = message() {
+                            p { class: "text-sm text-muted mt-1", role: "status", "{text}" }
+                        }
+                        if let Some(ref text) = error() {
+                            p { class: "status-err text-sm mt-1", role: "alert", "{text}" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The zones this device feeds, and the form that links another. Always visible: this is the
+/// onboarding.
+#[component]
+fn ZoneLinks(
+    device: DeviceInfo,
+    links: Vec<DeviceLinkInfo>,
+    linked_zone_ids: Vec<String>,
+    zones: Vec<Zone>,
+    link_store: LinkStoreInfo,
+    on_changed: EventHandler<()>,
+) -> Element {
+    let mut chosen_zone = use_signal(String::new);
+    let mut chosen_input = use_signal(String::new);
+    let mut form_open = use_signal(|| false);
+    let mut busy = use_signal(|| false);
+    let mut message = use_signal(|| None::<String>);
+    let mut error = use_signal(|| None::<String>);
+
+    let device_name = if device.name.is_empty() {
+        device.device_id.clone()
+    } else {
+        device.name.clone()
+    };
+    let writable = link_store.writable;
+    let store_detail = link_store
+        .detail
+        .clone()
+        .unwrap_or_else(|| "Links cannot be saved right now.".to_string());
+
+    // Only zones no device feeds yet: a zone has one volume owner.
+    let candidates: Vec<Zone> = zones
+        .iter()
+        .filter(|zone| zone.device.is_none() && !linked_zone_ids.contains(&zone.zone_id))
+        .cloned()
+        .collect();
+    let picked = candidates
+        .iter()
+        .find(|zone| zone.zone_id == chosen_zone())
+        .cloned();
+
+    let remove_device_name = device_name.clone();
+    let remove = use_callback(move |(zone_id, label): (String, String)| {
+        if busy() {
+            return;
+        }
+        busy.set(true);
+        message.set(None);
+        error.set(None);
+        let device_name = remove_device_name.clone();
+        spawn(async move {
+            match api::unlink_device(&zone_id).await {
+                Ok(()) => {
+                    message.set(Some(format!(
+                        "Link removed. {label} is back on its own volume; nothing on {device_name} changed."
+                    )));
+                    on_changed.call(());
+                }
+                Err(failure) => error.set(Some(failure)),
+            }
+            busy.set(false);
+        });
+    });
+
+    let link_id = device.device_id.clone();
+    let link_name = device_name.clone();
+    let link_candidates = candidates.clone();
+    let link = move |_| {
+        if busy() {
+            return;
+        }
+        let zone_id = chosen_zone();
+        let Some(zone) = link_candidates.iter().find(|zone| zone.zone_id == zone_id) else {
+            error.set(Some("Choose a zone to link.".to_string()));
+            return;
+        };
+        let zone_name = zone.zone_name.clone();
+        let source = chosen_input();
+        busy.set(true);
+        message.set(None);
+        error.set(None);
+        let device_id = link_id.clone();
+        let device_name = link_name.clone();
+        spawn(async move {
+            let source_id = (!source.is_empty()).then_some(source.as_str());
+            match api::link_device(&zone_id, &device_id, source_id).await {
+                Ok(()) => {
+                    message.set(Some(format!(
+                        "Linked. {zone_name}'s volume now controls {device_name}."
+                    )));
+                    chosen_zone.set(String::new());
+                    chosen_input.set(String::new());
+                    form_open.set(false);
+                    on_changed.call(());
+                }
+                Err(failure) => error.set(Some(failure)),
+            }
+            busy.set(false);
+        });
+    };
+
+    rsx! {
+        div { class: "mt-4 pt-3 border-t border-default",
+            h4 { class: "font-medium mb-2", "Feeds these zones" }
+            if !links.is_empty() {
+                ul { class: "mb-2 space-y-1",
+                    for link in links.iter() {
+                        {
+                            let zone_label = link.zone_name.clone().unwrap_or_else(|| link.zone_id.clone());
+                            let arrives_on = link.source_id.as_deref().map(|source| {
+                                device
+                                    .inputs
+                                    .iter()
+                                    .find(|input| input.id == source)
+                                    .map(|input| input.label().to_string())
+                                    .unwrap_or_else(|| source.to_string())
+                            });
+                            let zone_id = link.zone_id.clone();
+                            let label_for_remove = zone_label.clone();
+                            rsx! {
+                                li { key: "{link.zone_id}", class: "flex flex-wrap items-center gap-2 text-sm",
+                                    span { class: "font-medium", "{zone_label}" }
+                                    if let Some(ref input) = arrives_on {
+                                        span { class: "text-muted", "arrives on {input}" }
+                                    }
+                                    if !link.zone_present {
+                                        span { class: "text-muted", "(zone offline)" }
+                                    }
+                                    button {
+                                        r#type: "button",
+                                        class: "btn btn-ghost btn-sm",
+                                        disabled: busy() || !writable,
+                                        onclick: move |_| remove.call((zone_id.clone(), label_for_remove.clone())),
+                                        "Remove"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Link form: folded until asked for, so the list above stays the page's focus.
+            if !form_open() {
+                div { class: "flex flex-wrap items-center gap-2",
+                    if links.is_empty() {
+                        p { class: "text-sm text-muted",
+                            "No zones yet. Link a zone so its volume controls this device."
+                        }
+                    }
+                    button {
+                        r#type: "button",
+                        class: "btn btn-outline btn-sm",
+                        onclick: move |_| form_open.set(true),
+                        "Link a zone"
+                    }
+                }
+            } else {
+                div { class: "space-y-2",
+                    if !writable {
+                        p { class: "status-err text-sm", role: "alert", "{store_detail}" }
+                    }
+                    div { class: "grid gap-3 sm:grid-cols-2",
+                        label { class: "block text-sm",
+                            "Zone"
+                            select {
+                                class: "input w-full",
+                                disabled: busy() || !writable,
+                                onchange: move |event| chosen_zone.set(event.value()),
+                                option { value: "", selected: chosen_zone().is_empty(), "Choose a zone" }
+                                for zone in candidates.iter() {
+                                    option {
+                                        key: "{zone.zone_id}",
+                                        value: "{zone.zone_id}",
+                                        selected: chosen_zone() == zone.zone_id,
+                                        if let Some(ref source) = zone.source {
+                                            "{zone.zone_name} ({api::source_label(source)})"
+                                        } else {
+                                            "{zone.zone_name}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        label { class: "block text-sm",
+                            "Arrives on input (optional)"
+                            select {
+                                class: "input w-full",
+                                disabled: busy() || !writable,
+                                onchange: move |event| chosen_input.set(event.value()),
+                                option { value: "", selected: chosen_input().is_empty(), "Not specified" }
+                                for input in device.inputs.iter() {
+                                    option {
+                                        key: "{input.id}",
+                                        value: "{input.id}",
+                                        selected: chosen_input() == input.id,
+                                        "{input.label()}"
+                                    }
+                                }
+                            }
+                            span { class: "block text-xs text-muted mt-1",
+                                "The input this zone arrives on. UHC records it and shows when the device is on another input. It never switches inputs for you."
+                            }
+                        }
+                    }
+                    if let Some(zone) = picked {
+                        p { class: "text-sm",
+                            "After linking, volume on {zone.zone_name} controls {device_name} (knob, Watch, Home Assistant, MCP) instead of {takeover_source(&zone)}."
+                        }
+                    }
+                    div { class: "flex items-center gap-2",
+                        button {
+                            r#type: "button",
+                            class: "btn btn-primary btn-sm",
+                            disabled: busy() || !writable || chosen_zone().is_empty(),
+                            onclick: link,
+                            "Link zone"
+                        }
+                        button {
+                            r#type: "button",
+                            class: "btn btn-ghost btn-sm",
+                            onclick: move |_| form_open.set(false),
+                            "Cancel"
+                        }
+                    }
+                }
+            }
+            if let Some(ref text) = message() {
+                p { class: "text-sm text-muted mt-2", role: "status", "{text}" }
+            }
+            if let Some(ref text) = error() {
+                p { class: "status-err text-sm mt-2", role: "alert", "{text}" }
             }
         }
     }

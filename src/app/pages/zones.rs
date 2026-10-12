@@ -2,7 +2,9 @@
 //!
 //! Shows all available zones using Dioxus resources.
 
-use crate::app::api::{HqpMatrixProfilesResponse, HqpProfile, NowPlaying, Zone, ZonesResponse};
+use crate::app::api::{
+    HqpMatrixProfilesResponse, HqpProfile, LinkedDeviceInfo, NowPlaying, Zone, ZonesResponse,
+};
 use crate::app::components::{ErrorAlert, HqpControlsCompact, Layout, VolumeControlsCompact};
 use crate::app::sse::{use_sse, SseEvent};
 use crate::app::Route;
@@ -243,6 +245,28 @@ pub fn Zones() -> Element {
         });
     };
 
+    // Linked-device commands (#774): power and input. Volume is not here -- a linked zone's
+    // volume buttons already drive the device through `/control`. `device_busy` disables every
+    // device strip while one command is in flight.
+    let mut device_error = use_signal(|| None::<String>);
+    let mut device_busy = use_signal(|| false);
+    let device_command = move |(device_id, action, value): (String, String, Option<String>)| {
+        if device_busy() {
+            return;
+        }
+        device_error.set(None);
+        device_busy.set(true);
+        spawn(async move {
+            let value = value.map(serde_json::Value::String);
+            match crate::app::api::control_device(&device_id, &action, value).await {
+                // Re-read /zones so the strip shows the device's readback, not our guess.
+                Ok(_) => zones.restart(),
+                Err(e) => device_error.set(Some(format!("Device: {e}"))),
+            }
+            device_busy.set(false);
+        });
+    };
+
     let is_loading = zones.read().is_none();
     let zones_list = zones
         .read()
@@ -302,6 +326,8 @@ pub fn Zones() -> Element {
                                 on_control: control,
                                 on_load_profile: load_profile,
                                 on_set_matrix: set_matrix,
+                                on_device: device_command,
+                                device_busy: device_busy(),
                             }
                         }
                     }
@@ -325,6 +351,14 @@ pub fn Zones() -> Element {
                 }
             }
 
+            // Linked-device error display
+            if let Some(error) = device_error() {
+                ErrorAlert {
+                    message: error,
+                    on_dismiss: move |_| device_error.set(None),
+                }
+            }
+
             section { id: "zones",
                 {content}
             }
@@ -342,6 +376,9 @@ fn ZoneCard(
     on_control: EventHandler<(String, String)>,
     on_load_profile: EventHandler<String>,
     on_set_matrix: EventHandler<String>,
+    // (device_id, action, input id for `select_input`)
+    on_device: EventHandler<(String, String, Option<String>)>,
+    device_busy: bool,
 ) -> Element {
     let zone_id = zone.zone_id.clone();
     let zone_id_prev = zone_id.clone();
@@ -498,6 +535,10 @@ fn ZoneCard(
                 }
             }
 
+            if let Some(device) = zone.device.clone() {
+                DeviceStrip { device, busy: device_busy, on_device }
+            }
+
             // Library browse moved off the zone card and onto the Library
             // home page (#550) -- one browse surface instead of one per
             // zone. This is just a deep link that arms this zone as the
@@ -519,6 +560,112 @@ fn ZoneCard(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Linked-device strip under a zone's volume controls (#774, alpha).
+///
+/// Power and input only: the zone's own -/+ buttons already drive the device's volume. Input is
+/// never switched automatically (D2) -- when the device is on another input than the one this zone
+/// arrives on we say so and offer a button; the user clicks it or nothing happens.
+#[component]
+fn DeviceStrip(
+    device: LinkedDeviceInfo,
+    busy: bool,
+    on_device: EventHandler<(String, String, Option<String>)>,
+) -> Element {
+    let disabled = busy || !device.present;
+    let is_on = device.power == "on";
+    let (badge_class, badge_text) = if !device.present {
+        ("badge badge-secondary", "Offline")
+    } else {
+        match device.power.as_str() {
+            "on" => ("badge badge-success", "On"),
+            "standby" => ("badge badge-secondary", "Standby"),
+            _ => ("badge badge-secondary", "?"),
+        }
+    };
+    let power_label = if is_on { "Standby" } else { "Turn on" };
+    let power_action = if is_on { "power_off" } else { "power_on" };
+
+    // D2 notice: only when the link names an input and the device is known to be elsewhere.
+    let mismatch = match (device.source_label(), device.on_linked_input) {
+        (Some(source), Some(false)) => {
+            let current = device
+                .input_name
+                .clone()
+                .or_else(|| device.input.clone())
+                .unwrap_or_else(|| "another input".to_string());
+            Some((source, current))
+        }
+        _ => None,
+    };
+
+    let device_id = device.device_id.clone();
+    let id_power = device_id.clone();
+    let id_input = device_id.clone();
+    let id_switch = device_id.clone();
+    let source_id = device.source_id.clone();
+    let current_input = device.input.clone();
+    let settings_href = crate::app::base_path::href(&format!("/ui/devices#device-{device_id}"));
+
+    rsx! {
+        div { class: "mt-3 border-t border-subtle pt-3 text-xs",
+            div { class: "flex flex-wrap items-center gap-2",
+                span { class: "{badge_class}", "{badge_text}" }
+                span { class: "font-medium truncate", "{device.name}" }
+                button {
+                    class: "btn btn-outline btn-sm",
+                    disabled: disabled,
+                    onclick: move |_| on_device.call((id_power.clone(), power_action.to_string(), None)),
+                    "{power_label}"
+                }
+                if !device.inputs.is_empty() {
+                    select {
+                        class: "input",
+                        "aria-label": "Device input",
+                        disabled: disabled,
+                        onchange: move |evt| {
+                            let input = evt.value();
+                            if !input.is_empty() {
+                                on_device.call((id_input.clone(), "select_input".to_string(), Some(input)));
+                            }
+                        },
+                        // Device is on an input we cannot name: leave the select blank rather
+                        // than implying the first entry is selected.
+                        if current_input.is_none() {
+                            option { value: "", selected: true, disabled: true, "Input…" }
+                        }
+                        for input in device.inputs.iter() {
+                            option {
+                                key: "{input.id}",
+                                value: "{input.id}",
+                                selected: current_input.as_deref() == Some(input.id.as_str()),
+                                "{input.label()}"
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((source, current)) = mismatch {
+                div { class: "mt-2 flex flex-wrap items-center gap-2 text-muted",
+                    span { "Device is on {current}; this zone arrives on {source}." }
+                    button {
+                        class: "btn btn-outline btn-sm",
+                        disabled: disabled,
+                        onclick: move |_| {
+                            if let Some(source_id) = source_id.clone() {
+                                on_device.call((id_switch.clone(), "select_input".to_string(), Some(source_id)));
+                            }
+                        },
+                        "Switch to {source}"
+                    }
+                }
+            }
+            div { class: "mt-2",
+                a { class: "text-muted", href: "{settings_href}", "Device settings →" }
             }
         }
     }

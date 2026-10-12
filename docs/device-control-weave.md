@@ -499,3 +499,21 @@ families, built to spec and labelled alpha / implementation-derived. What change
 | A mismatch captured from real hardware | **not met** | none occurred passively on 2× SR6008 + 6 WiiMs; forcing one would interrupt playback. Covered against mocks by `device_safety::critical_mismatches_are_captured_only_when_opted_in_and_previewed_redacted` |
 
 The live UI check found four presentation bugs, all fixed in 375248f1: `Some(100.0)` debug output, the vendor printed twice, "user-captured capture", and a folded JSON section that looked empty.
+
+## Execute: device-control UI (2026-10-12)
+
+**Task:** full workflows in the web UI — enable, link a zone to a device (with the input it arrives on), control, and set an optional ceiling — mirroring HQPlayer's pairing pattern.
+
+**Design:** two entry points, one editor. The Devices page is the setup hub (one card per device: live power/input/volume/mute controls, "Max volume" ceiling, "Feeds these zones" links + link form). The zone card is daily use (a device strip with power and input; the existing −/+ already drives the linked device). The link form is the onboarding: no tour, no modal; the takeover sentence ("After linking, volume on {zone} controls {device} (knob, Watch, Home Assistant, MCP) instead of {provider}") renders before the user commits, and the input help states D2 ("It never switches inputs for you"). The zone strip shows "Device is on X; this zone arrives on Y" with an explicit "Switch to Y" button — the honest alternative to auto-switching.
+
+| Criterion | Result | Evidence |
+|---|---|---|
+| Enable → find the page | met | Settings row links "Open Devices →"; nav shows Devices (Alpha) when enabled |
+| Link a zone, with optional input | met | live: Deck (UPnP) linked to Bedroom SR6008 via the form; link row + feedback rendered |
+| Volume takeover visible on the zone | met | live: Deck zone card showed −59.0 dB (the Marantz's level) and the device strip after linking |
+| Control from the card | met | live: WiiM Ultra input Network → Bluetooth → Network through the card select, "Confirmed." both ways |
+| Unlink restores the zone | met | live: "Link removed. Deck is back on its own volume; nothing on Bedroom changed." |
+| Ceiling optional, only lowers | met | "Max volume · device max −10.0 dB" trigger; validation refuses a limit above the device max |
+| D2 notice + explicit switch | built, not exercised live | needs a link with a source_id and the device on another input; covered by the strip's `on_linked_input == Some(false)` branch |
+
+Found in the live check and fixed: `/zones` returns `{zones: [...]}` not an array (the Devices page fetched the wrong shape); `SseEvent::ZoneDiscovered` grew past clippy's enum-variant limit once `Zone.device` existed (boxed); Tailwind classes new to the page needed `make css`.
