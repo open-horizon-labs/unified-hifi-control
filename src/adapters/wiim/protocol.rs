@@ -34,15 +34,20 @@ pub const NO_POWER: &str =
     "power is not supported by this device: WiiM/LinkPlay exposes no power command (pause is \
      transport, not power)";
 
-/// `switchmode` arguments the HTTP API documents, with display names. Which of them a given model
-/// physically has is model dependent and not reported by the device; the device refuses the rest.
+/// `switchmode` arguments, with display names. Which of them a given model physically has is model
+/// dependent and not reported by the device; the device refuses the rest.
+///
+/// Provenance (audited against the primary sources): the WiiM PDF (v1.2, 2.7.1) documents
+/// `line-in`, `bluetooth`, `optical`, `udisk`, `wifi`; the Arylic/LinkPlay page adds `co-axial`,
+/// `line-in2`, `udisk`, `PCUSB`; `HDMI` and `phono` appear in neither document and come only from
+/// the vendor SDK (`Linkplay2020/wiim` `consts.py`, `InputMode`). `RCA` appears in no source at
+/// all and was removed: this adapter does not send an undocumented command.
 pub const INPUTS: &[(&str, &str)] = &[
     ("wifi", "Network"),
     ("line-in", "Line In"),
     ("bluetooth", "Bluetooth"),
     ("optical", "Optical"),
     ("co-axial", "Coaxial"),
-    ("RCA", "RCA"),
     ("HDMI", "HDMI"),
     ("phono", "Phono"),
 ];
@@ -216,12 +221,13 @@ pub fn parse_player_status(body: &str) -> Option<PlayerStatus> {
 pub fn input_for_mode(mode: u32) -> Option<String> {
     let id = match mode {
         1 | 2 | 10 | 20 | 30..=39 => "wifi",
-        // Vendor SDK `PlayingMode`: 10 network, 40 line-in, 41 bluetooth, 43 optical, 49 HDMI,
-        // 54 phono. 46 (line-in 2) and 44 (coaxial) are from the arylic HTTP API notes.
-        40 | 46 => "line-in",
+        // WiiM PDF v1.2 / Arylic page: 40 line-in/AUX, 41 BT, 43 optical. Vendor SDK
+        // `PlayingMode` only (in neither document): 49 HDMI, 54 phono. Arylic also lists 47
+        // (line-in #2) and 51 (USB DAC), which have no `switchmode` id in this catalog, and no
+        // source gives a `mode` for coaxial, so those name no input rather than a guessed one.
+        40 => "line-in",
         41 => "bluetooth",
         43 => "optical",
-        44 => "co-axial",
         49 => "HDMI",
         54 => "phono",
         _ => return None,
@@ -328,7 +334,13 @@ mod tests {
         assert_eq!(input_for_mode(43).as_deref(), Some("optical"));
         assert_eq!(input_for_mode(49).as_deref(), Some("HDMI"));
         assert_eq!(input_for_mode(54).as_deref(), Some("phono"));
+        assert_eq!(input_for_mode(40).as_deref(), Some("line-in"));
         assert_eq!(input_for_mode(42), None);
+        // Arylic: 47 is line-in #2, 51 USB DAC; 44 and 46 are in no source.
+        assert_eq!(input_for_mode(47), None);
+        assert_eq!(input_for_mode(51), None);
+        assert_eq!(input_for_mode(44), None);
+        assert_eq!(input_for_mode(46), None);
         assert_eq!(input_for_mode(0), None);
         assert_eq!(input_for_mode(99), None);
     }

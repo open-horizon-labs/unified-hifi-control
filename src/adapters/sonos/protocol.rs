@@ -6,6 +6,18 @@
 //!   `GetVolume`/`SetVolume`/`GetMute`/`SetMute`, `InstanceID` 0, `Channel` `Master`),
 //!   `fixed_volume` (`GetOutputFixed`), `switch_to_line_in` (`x-rincon-stream:<uid>`),
 //!   `switch_to_tv` (`x-sonos-htastream:<uid>:spdif`), `is_playing_line_in`/`is_playing_tv`.
+//!   Audited against SoCo `soco/core.py` and `soco/services.py` on `master`
+//!   (<https://raw.githubusercontent.com/SoCo/SoCo/master/soco/core.py>): `volume` is "an integer
+//!   between 0 and 100" (SoCo coerces; this adapter refuses out-of-range instead), `GetVolume` /
+//!   `SetVolume` / `GetMute` / `SetMute` use `InstanceID` 0 + `Channel` `Master` and
+//!   `DesiredVolume` / `DesiredMute` "1"/"0", `GetOutputFixed` -> `CurrentFixed` "1" (SoCo: only
+//!   Connect and Port can be fixed; `GetSupportsOutputFixed` is the capability probe), line-in is
+//!   `x-rincon-stream:<uid>` and TV is `x-sonos-htastream:<uid>:spdif` via `SetAVTransportURI` with
+//!   empty metadata, input detection is `TrackURI` matched with `^x-rincon-stream:` /
+//!   `^x-sonos-htastream:`, control URLs are `/MediaRenderer/<Service>/Control`, discovery is
+//!   `urn:schemas-upnp-org:device:ZonePlayer:1` and port 1400. All match. SoCo does not follow
+//!   `SetAVTransportURI` with `Play`; this adapter does, because the transport otherwise stays
+//!   stopped (kept; it is not in SoCo). Which models have line-in / TV is not in SoCo either.
 //! - node-sonos (MIT) <https://github.com/bencevans/node-sonos>: the same SOAP envelopes and the
 //!   `/MediaRenderer/RenderingControl/Control` and `/MediaRenderer/AVTransport/Control` paths.
 //! - UPnP AV `RenderingControl:1` and `AVTransport:1` service templates (upnp.org).

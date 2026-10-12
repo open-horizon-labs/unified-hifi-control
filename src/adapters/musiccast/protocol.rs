@@ -8,8 +8,20 @@
 //!   <https://github.com/vigonotion/aiomusiccast>
 //! - Second reference for `getFeatures` / `getStatus` field names:
 //!   <https://github.com/foxthefox/yamaha-yxc-nodejs>
-//! - The Yamaha "Extended Control API Specification (Basic)" documents the same fields; it is
-//!   distributed by Yamaha to developers and was not fetched here.
+//! - Yamaha "Extended Control API Specification (Basic)" Rev. 2.00 (2018, 129 pages), audited
+//!   against the PDF (<https://github.com/rsc-dev/pyamaha/raw/master/doc/YXC_API_Spec_Basic_v2.0.pdf>,
+//!   same file as <https://community.symcon.de/uploads/short-url/7r8QTdkYFNfJVJmKbtqvdleuzKt.pdf>)
+//!   and Yamaha's "HTTP simplified API for Control Systems" V1.1 (port 80,
+//!   <https://forum.smartapfel.de/attachment/4358-yxc-api-spec-basic-pdf/>). Confirmed against the
+//!   spec: `getDeviceInfo` (`model_name`, `device_id` from API 1.17, `serial_number`, `system_id`
+//!   shown in the example only), `getFeatures` (`zone[].id`, `func_list`, string `input_list`,
+//!   `range_step[]` `volume` `{min,max,step}`, `actual_volume_mode_list`), `getStatus` (`power`
+//!   "on"/"standby", `volume`, `mute`, `max_volume`, `input`, `actual_volume{mode,value,unit}`),
+//!   `setPower?power=on|standby|toggle`, `setVolume?volume=<int on the range_step grid>`,
+//!   `setMute?enable=true|false`, `setInput?input=<id from getFeatures>`, `getNameText`,
+//!   `getNetworkStatus.network_name`, and the section-10 response code list. Not used here:
+//!   `getStatus.disable_flags` (b[0] volume / b[1] mute currently not operable) and
+//!   `setInput&mode=autoplay_disabled` (API 1.12+).
 //!
 //! Anything the sources do not pin down is marked implementation-derived.
 
@@ -30,19 +42,35 @@ pub const ZONE: &str = "main";
 /// also answer the YXC probe before it is accepted).
 pub const MANUFACTURER: &str = "Yamaha Corporation";
 
-/// `response_code` meanings from the YXC specification, as listed by `aiomusiccast`/`yxc-nodejs`.
+/// `response_code` meanings: YXC spec Rev. 2.00 section 10 "Response Code List".
 pub fn response_code_name(code: i64) -> &'static str {
     match code {
         0 => "successful request",
         1 => "initializing",
         2 => "internal error",
-        3 => "invalid request (unsupported on this model or source)",
-        4 => "invalid parameter (outside the device's range)",
-        5 => "guarded (the device refuses this in its current state)",
+        3 => "invalid request (a method did not exist, a method wasn't appropriate)",
+        4 => "invalid parameter (out of range, invalid characters)",
+        5 => "guarded (unable to set up in the current status)",
         6 => "time out",
         99 => "firmware updating",
-        100..=103 => "access error (the device refused the request)",
-        104..=106 => "other errors (the device refused the request)",
+        100 => "streaming service: access error",
+        101 => "streaming service: other error",
+        102 => "streaming service: wrong user name",
+        103 => "streaming service: wrong password",
+        104 => "streaming service: account expired",
+        105 => "streaming service: account disconnected, gone off or shut down",
+        106 => "streaming service: account number reached its limit",
+        107 => "streaming service: server maintenance",
+        108 => "streaming service: invalid account",
+        109 => "streaming service: license error",
+        110 => "streaming service: read only mode",
+        111 => "streaming service: max stations",
+        112 => "streaming service: access denied",
+        113 => "streaming service: an additional destination playlist must be specified",
+        114 => "streaming service: a new playlist must be created",
+        115 => "streaming service: simultaneous login limit reached",
+        200 => "distribution: linking in progress",
+        201 => "distribution: unlinking in progress",
         _ => "unknown error",
     }
 }
@@ -614,6 +642,18 @@ mod tests {
             .unwrap_err()
             .contains("invalid parameter"));
         assert!(check_response("{}").is_err());
+    }
+
+    /// YXC spec Rev. 2.00 section 10.
+    #[test]
+    fn response_codes_follow_the_spec_list() {
+        assert_eq!(response_code_name(1), "initializing");
+        assert_eq!(response_code_name(99), "firmware updating");
+        assert!(response_code_name(5).starts_with("guarded"));
+        assert!(response_code_name(102).contains("wrong user name"));
+        assert!(response_code_name(107).contains("server maintenance"));
+        assert!(response_code_name(200).contains("linking in progress"));
+        assert_eq!(response_code_name(7), "unknown error");
     }
 
     #[test]

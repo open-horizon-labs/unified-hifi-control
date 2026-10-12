@@ -8,7 +8,19 @@
 //!   `src/pyblu/parse.py` (response attributes: `SyncStatus@mac`, `@id`, `@db`, `@volume`;
 //!   `status/volume`, `/db`, `/mute`, `/inputId`; `volume@db`/`@mute`; `radiotime/item@id|@text|@URL`).
 //!   <https://github.com/LouisChrist/pyblu>
-//! - BluOS Custom Integration API reference (Bluesound), for the 0-100 volume range.
+//! - BluOS Custom Integration API v1.5 (Lenbrook), audited line by line (PDF fetched from
+//!   <https://www.psbspeakers.com/int/amfile/file/download/file/2885/product/56>; the Bluesound
+//!   copy is <https://www.bluesoundprofessional.com/wp-content/uploads/2022/10/BluOS-Custom-Integration-API-v1.5.pdf>).
+//!   Confirmed: port 11000 (section 1); `/Status` and `/SyncStatus` (section 2); `/SyncStatus`
+//!   `mac` attribute ("unique id for network interface, may be a MAC address") and `volume`
+//!   "-1 means fixed volume"; `/Volume?level=0..100`, `/Volume?mute=1|0` (3.4/3.5; the parameter
+//!   table in 3.1 has the 0/1 meaning transposed, but both worked examples and the 3.4/3.5
+//!   sections say mute=1 mutes, so that wins), `/Volume?abs_db=` and `?db=` (relative); response
+//!   `<volume db mute muteDb muteVolume>`; direct input = `/Play?url=` with the `URL` attribute of
+//!   `/RadioBrowse?service=Capture` (section 11). The same Capture listing also holds cloud
+//!   services (`serviceType="CloudService"`, e.g. Spotify) and a Hub's `remoteitem`s; neither is
+//!   an input this adapter offers. `/Status` carries no `inputId` in the spec (pyblu reads it).
+//!   While muted, `/Status` `<volume>` reads 0 and `<muteVolume>` holds the unmuted level.
 //!
 //! Anything the sources do not pin down is marked implementation-derived.
 
@@ -170,7 +182,14 @@ pub fn parse_status(xml: &str) -> Result<Status, String> {
             .map(|n| n.text.trim().to_string())
             .filter(|t| !t.is_empty())
     };
-    let (volume, volume_support) = match text("volume") {
+    let muted = text("mute").map(|m| m == "1");
+    // Spec (/Status attributes): while muted the player reports `<volume>0</volume>` and keeps
+    // the unmuted level in `<muteVolume>`; observe the latter so a mute does not read as level 0.
+    let raw_volume = match (muted, text("muteVolume")) {
+        (Some(true), Some(unmuted)) if text("volume").is_some_and(|v| v != "-1") => Some(unmuted),
+        _ => text("volume"),
+    };
+    let (volume, volume_support) = match raw_volume {
         None => (None, VolumeSupport::Unknown),
         Some(raw) => match raw.parse::<i64>() {
             Ok(level) if level < 0 => (None, VolumeSupport::Fixed),
@@ -185,7 +204,7 @@ pub fn parse_status(xml: &str) -> Result<Status, String> {
         muted: if volume_support == VolumeSupport::Fixed {
             None
         } else {
-            text("mute").map(|m| m == "1")
+            muted
         },
         input_id: text("inputId"),
     })
@@ -212,6 +231,8 @@ pub fn parse_inputs(xml: &str) -> Result<Vec<CaptureInput>, String> {
     Ok(nodes
         .iter()
         .filter(|node| node.name == "item")
+        // Cloud services (Spotify, ...) share this listing but are not inputs (spec section 11).
+        .filter(|item| item.attrs.get("serviceType").map(String::as_str) != Some("CloudService"))
         .filter_map(|item| {
             let raw = item.attrs.get("URL").or_else(|| item.attrs.get("url"))?;
             let url = urlencoding::decode(raw).ok()?.to_string();
@@ -445,6 +466,39 @@ mod tests {
         assert_eq!(status.input_id.as_deref(), Some("input0"));
         let muted = parse_status(&STATUS.replace("<mute>0</mute>", "<mute>1</mute>")).unwrap();
         assert_eq!(muted.muted, Some(true));
+    }
+
+    /// API v1.5 section 3.4 / `/Status` attributes: a muted player reads level 0 and keeps the
+    /// unmuted level in `muteVolume`.
+    #[test]
+    fn muted_status_reports_the_unmuted_level() {
+        let muted = parse_status(
+            "<status><db>-100</db><mute>1</mute><muteDb>-43.1</muteDb><muteVolume>11</muteVolume>\
+             <volume>0</volume></status>",
+        )
+        .unwrap();
+        assert_eq!(muted.muted, Some(true));
+        assert_eq!(muted.volume, Some(11));
+        // A fixed-output player stays fixed whatever else it says.
+        let fixed = parse_status(
+            "<status><mute>1</mute><muteVolume>11</muteVolume><volume>-1</volume></status>",
+        )
+        .unwrap();
+        assert_eq!(fixed.volume_support, VolumeSupport::Fixed);
+        assert_eq!(fixed.volume, None);
+    }
+
+    /// API v1.5 section 11 example: the Capture listing also holds cloud services.
+    #[test]
+    fn cloud_services_in_the_capture_listing_are_not_inputs() {
+        let xml = r#"<radiotime service="Capture">
+            <item playerName="Tick" text="Analog Input" inputType="analog" id="input0" URL="Capture%3Aplughw%3A2%2C0%2F48000%2F24%2F2%3Fid%3Dinput0" type="audio"/>
+            <item playerName="Tick" text="Spotify" id="Spotify" URL="Spotify%3Aplay" serviceType="CloudService" type="audio"/>
+            </radiotime>"#;
+        let inputs = parse_inputs(xml).unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].id, "input0");
+        assert_eq!(inputs[0].url, "Capture:plughw:2,0/48000/24/2?id=input0");
     }
 
     #[test]

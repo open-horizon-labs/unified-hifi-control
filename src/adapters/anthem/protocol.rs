@@ -8,9 +8,18 @@
 //!   `_populate_inputs`, `_parse_message`, `Zone` volume/power/mute/input shapes, the error
 //!   prefixes `!I` `!R` `!E` `!Z`), `anthemav/connection.py` (port 14999) and
 //!   `tests/test_protocol.py` (`IDMMRX 740`, `Z1VOL-42`, `Z1PVOL53`, `Z1INP3`, `ISN01`, `IS1IN`).
-//! - Anthem's own protocol sheets, linked from that README: MRX-x20 / AVM-60 and
-//!   MRX-x40 / AVM-70 / AVM-90 (IP / RS-232 .xls). They were not available offline; every
-//!   command below is the one the library sends, so the library is the evidence.
+//! - Anthem's own protocol sheets, linked from that README: MRX-x20 / AVM-60
+//!   (<https://www.anthemav.com/downloads/MRX-x20-AVM-60-IP-RS-232.xls>, Feb 2 2016) and
+//!   MRX-x40 / AVM-70 / AVM-90 (<https://www.anthemav.com/downloads/MRX-x40-AVM-70-90-IP-RS-232-v5.xls>,
+//!   2020). Audited against both sheets (fetched via the Internet Archive): `ZxPOWy`, `ZxVOLsyy`,
+//!   `ZzPVOLyy`, `ZxMUTy`, `ZxINPyy`, `IDM?`, `IDN?` (x20 only), `EMAC`/`WMAC` (x40 only),
+//!   `ICN?`, `ISNyy?` (x20 short name), `ISiINyyyy` (x40), `ECHx` (x20), `GCTXSx` (x40) and the
+//!   `!I` `!R` `!E` `!Z` error prefixes all match. The sheets do **not** state the x20 volume
+//!   range or step (only that entries are "rounded to nearest valid value" and that `Z1VOL+50`
+//!   is out of range), so the x20 `-90..0` / whole-dB limits below are conservative control
+//!   limits, not a spec fact. The x40 sheet's volume table puts 100% at +10 dB, so readbacks up
+//!   to +10 dB are accepted. Standby: the sheets say only `IDM?`, `ZxPOWy` and `ZxPOW?` are valid
+//!   in standby; everything else is `!I`.
 //!
 //! # x20 versus x40
 //!
@@ -215,7 +224,9 @@ pub fn parse_message(message: &str) -> Option<AnthemEvent> {
     }
     if let Some(value) = zone.strip_prefix("VOL") {
         let db: i32 = value.trim().parse().ok()?;
-        return ((-90..=0).contains(&db)).then_some(AnthemEvent::VolumeDb(db));
+        // Readback is accepted up to +10 dB (x40 sheet: 100% = +10 dB; x20 range unstated) even
+        // though this adapter only *sends* levels up to `MAX_DB`.
+        return ((-90..=10).contains(&db)).then_some(AnthemEvent::VolumeDb(db));
     }
     if let Some(value) = zone.strip_prefix("MUT") {
         return match value.trim() {
@@ -410,7 +421,10 @@ mod tests {
     #[test]
     fn malformed_and_out_of_range_values_are_refused() {
         assert_eq!(parse_message("Z1VOL-91"), None);
-        assert_eq!(parse_message("Z1VOL5"), None);
+        // The x40 sheet's volume table tops out at +10 dB; the x20 sheet gives no range.
+        assert_eq!(parse_message("Z1VOL+10"), Some(AnthemEvent::VolumeDb(10)));
+        assert_eq!(parse_message("Z1VOL+11"), None);
+        assert_eq!(parse_message("Z1VOL+50"), None);
         assert_eq!(parse_message("Z1VOLabc"), None);
         assert_eq!(parse_message("Z1PVOL101"), None);
         assert_eq!(parse_message("Z1PVOL-1"), None);

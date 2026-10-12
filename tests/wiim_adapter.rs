@@ -51,8 +51,6 @@ fn mode_for(input: &str) -> Option<u32> {
         "line-in" => 40,
         "bluetooth" => 41,
         "optical" => 43,
-        "RCA" => 43,
-        "co-axial" => 44,
         _ => return None,
     })
 }
