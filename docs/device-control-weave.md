@@ -482,3 +482,20 @@ families, built to spec and labelled alpha / implementation-derived. What change
 - **Sources.** Each worker reported which references it actually fetched; citations not fetched
   are marked in code comments. Every non-SR6008 claim is `implementation-derived`, and
   `tests/device_claims.rs` fails any other evidence label.
+
+## Execute: mismatch reporting (2026-10-12)
+
+**Task:** an optional, user-initiated capture of device spec mismatches that becomes a GitHub issue the user previews and submits.
+
+| Criterion | Result | Evidence |
+|---|---|---|
+| Off by default; nothing recorded while off; off clears | met | `anomalies::critical_nothing_is_recorded_while_recording_is_off`, `turning_recording_off_forgets_everything` |
+| Memory only, bounded | met | ring buffer of 200 per device; no disk writes |
+| Redaction identical across preview, URL, bundle | met | `report::critical_redaction_removes_every_identifier_everywhere` |
+| Raw excerpts opt-in | met | `raw_excerpts_are_opt_in` |
+| Issue URL within budget, whole sections dropped and named | met | `oversized_reports_drop_whole_sections_and_say_so`; live URL 4.9 KB |
+| No `labels` URL param (labels come from the template) | met | `the_issue_url_uses_the_template_not_labels` |
+| Structured preview, not a scrollable dump | met | live `/ui/devices`: section cards, include checkboxes, redaction legend, Raw tab |
+| A mismatch captured from real hardware | **not met** | none occurred passively on 2× SR6008 + 6 WiiMs; forcing one would interrupt playback. Covered against mocks by `device_safety::critical_mismatches_are_captured_only_when_opted_in_and_previewed_redacted` |
+
+The live UI check found four presentation bugs, all fixed in 375248f1: `Some(100.0)` debug output, the vendor printed twice, "user-captured capture", and a folded JSON section that looked empty.
