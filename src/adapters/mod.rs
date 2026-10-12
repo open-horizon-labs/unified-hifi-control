@@ -9,6 +9,7 @@ pub mod arcam;
 pub mod bluos;
 pub mod didl;
 pub mod eiscp;
+pub mod eversolo;
 pub mod handle;
 pub mod hegel;
 pub mod homeassistant_devices;
@@ -50,6 +51,7 @@ pub fn device_families(
         std::sync::Arc::new(hegel::HegelAdapter::new(bus.clone())),
         std::sync::Arc::new(lyngdorf::LyngdorfAdapter::new(bus.clone())),
         std::sync::Arc::new(anthem::AnthemAdapter::new(bus.clone())),
+        std::sync::Arc::new(eversolo::EversoloAdapter::new(bus.clone())),
         std::sync::Arc::new(homeassistant_devices::HomeAssistantDevices::new(bus)),
     ]
 }

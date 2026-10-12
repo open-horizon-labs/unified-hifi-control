@@ -92,6 +92,10 @@ fn family_rows() -> Vec<(String, unified_hifi_control::devices::DeviceCapabiliti
     rows.push(("Lyngdorf".to_string(), lyngdorf::capabilities_for("MP-60")));
     rows.push(("Anthem".to_string(), anthem::capabilities_for("MRX 540")));
     rows.push((
+        "Eversolo DMP-A6".to_string(),
+        eversolo::capabilities_for("DMP-A6"),
+    ));
+    rows.push((
         "Home Assistant media_player".to_string(),
         homeassistant_devices::protocol::capabilities(4 | 8 | 128 | 256 | 2048),
     ));

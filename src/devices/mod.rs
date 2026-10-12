@@ -44,6 +44,7 @@ pub const DEVICE_KINDS: &[&str] = &[
     "anthem",
     "arcam",
     "trinnov",
+    "eversolo",
     // Home Assistant media_player entities (#790).
     "ha",
 ];
