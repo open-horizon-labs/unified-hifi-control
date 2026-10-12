@@ -1041,6 +1041,7 @@ pub fn Settings() -> Element {
                 s.adapters.hqplayer,
                 s.adapters.lms,
                 s.adapters.spotify,
+                s.adapters.devices,
             );
             settings_ctx.mark_loaded();
         }
@@ -1945,6 +1946,7 @@ pub fn Settings() -> Element {
             hide_hqp: !hqplayer_enabled(),
             hide_lms: !lms_enabled(),
             hide_spotify: !spotify_enabled(),
+            hide_devices: !devices_enabled(),
             hide_knobs: hide_knobs(),
 
             h1 { class: "text-2xl font-bold mb-6", "Settings" }

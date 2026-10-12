@@ -17,8 +17,8 @@ pub mod theme;
 
 use components::BootstrapPrompt;
 use pages::{
-    HqPlayer, Knobs, LibraryHome, LibraryLocation, LibrarySource, LibraryView, Lms, Settings,
-    Spotify, Zones,
+    Devices, HqPlayer, Knobs, LibraryHome, LibraryLocation, LibrarySource, LibraryView, Lms,
+    Settings, Spotify, Zones,
 };
 use settings_context::use_settings_provider;
 use sse::use_sse_provider;
@@ -172,6 +172,10 @@ pub enum Route {
     Lms {},
     #[route("/spotify")]
     Spotify {},
+    // `GET /devices` is the (frozen) JSON API and would shadow the page, so like
+    // /ui/zones (#560) the page lives under /ui.
+    #[route("/ui/devices")]
+    Devices {},
     #[route("/knobs")]
     Knobs {},
     #[route("/settings")]

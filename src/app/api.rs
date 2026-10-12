@@ -1704,6 +1704,160 @@ pub struct FetchFirmwareResponse {
 }
 
 // =============================================================================
+// Playback devices (#774, alpha): GET /devices and the mismatch-report routes
+// =============================================================================
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct DeviceInputInfo {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct DeviceVolumeInfo {
+    /// `decibel`, `percentage`, `linear`, `steps` or `unknown`.
+    #[serde(default)]
+    pub scale: String,
+    #[serde(default)]
+    pub value: Option<f32>,
+    #[serde(default)]
+    pub is_muted: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct DeviceInfo {
+    pub device_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub vendor: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub host: String,
+    /// `on`, `standby` or `unknown`.
+    #[serde(default)]
+    pub power: String,
+    #[serde(default)]
+    pub input: Option<String>,
+    #[serde(default)]
+    pub inputs: Vec<DeviceInputInfo>,
+    #[serde(default)]
+    pub volume: DeviceVolumeInfo,
+    #[serde(default)]
+    pub linked_zone_ids: Vec<String>,
+}
+
+impl DeviceInfo {
+    /// The current input's user-visible name, falling back to its protocol code.
+    pub fn input_label(&self) -> Option<String> {
+        let current = self.input.as_deref()?;
+        Some(
+            self.inputs
+                .iter()
+                .find(|input| input.id == current && !input.name.is_empty())
+                .map(|input| input.name.clone())
+                .unwrap_or_else(|| current.to_string()),
+        )
+    }
+
+    /// The volume as `value unit`, in the device's own scale, or `None` until read.
+    pub fn volume_label(&self) -> Option<String> {
+        let value = self.volume.value?;
+        let text = match self.volume.scale.as_str() {
+            "decibel" => format!("{value:.1} dB"),
+            "percentage" => format!("{value:.0}%"),
+            "linear" => format!("{value:.2} (linear)"),
+            "steps" => format!("{value:.0} (steps)"),
+            _ => format!("{value}"),
+        };
+        Some(if self.volume.is_muted == Some(true) {
+            format!("{text}, muted")
+        } else {
+            text
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct DeviceLinkInfo {
+    pub zone_id: String,
+    #[serde(default)]
+    pub zone_name: Option<String>,
+    pub device_id: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct DeviceInventory {
+    #[serde(default)]
+    pub devices: Vec<DeviceInfo>,
+    #[serde(default)]
+    pub links: Vec<DeviceLinkInfo>,
+    #[serde(default)]
+    pub mismatch_recording: bool,
+    #[serde(default)]
+    pub mismatch_counts: std::collections::HashMap<String, usize>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct ReportSectionInfo {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub lines: Vec<String>,
+    #[serde(default)]
+    pub included_by_default: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct MismatchReportInfo {
+    pub title: String,
+    #[serde(default)]
+    pub fingerprint: String,
+    #[serde(default)]
+    pub sections: Vec<ReportSectionInfo>,
+    #[serde(default)]
+    pub redactions: Vec<String>,
+    #[serde(default)]
+    pub anomaly_count: usize,
+    #[serde(default)]
+    pub evidence: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct MismatchPreview {
+    pub report: MismatchReportInfo,
+    #[serde(default)]
+    pub included_sections: Vec<String>,
+    #[serde(default)]
+    pub markdown: String,
+    #[serde(default)]
+    pub issue_url: String,
+    #[serde(default)]
+    pub omitted_from_link: Vec<String>,
+    #[serde(default)]
+    pub search_url: String,
+    #[serde(default)]
+    pub bundle_url: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// `GET /devices/{id}/report`. `include` is `None` for the server's defaults, or the exact
+/// section ids to include (an empty slice means none).
+pub async fn fetch_device_report(
+    device_id: &str,
+    include: Option<&[String]>,
+) -> Result<MismatchPreview, String> {
+    let url = match include {
+        Some(ids) => format!("/devices/{device_id}/report?include={}", ids.join(",")),
+        None => format!("/devices/{device_id}/report"),
+    };
+    fetch_json(&url).await
+}
+
+// =============================================================================
 // Client-side fetch helpers (for use in effects/resources)
 // =============================================================================
 

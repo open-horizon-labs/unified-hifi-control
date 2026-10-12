@@ -21,6 +21,9 @@ pub struct NavProps {
     /// Hide Knobs tab (fallback if settings not loaded)
     #[props(default = false)]
     pub hide_knobs: bool,
+    /// Hide Devices tab (fallback if settings not loaded)
+    #[props(default = false)]
+    pub hide_devices: bool,
 }
 
 /// Navigation bar using Tailwind CSS with mobile toggle.
@@ -32,12 +35,13 @@ pub fn Nav(props: NavProps) -> Element {
     let settings_ctx = use_settings();
 
     // Use context values if loaded, otherwise fall back to props
-    let (hide_hqp, hide_lms, hide_spotify, hide_knobs) = if settings_ctx.is_loaded() {
+    let (hide_hqp, hide_lms, hide_spotify, hide_knobs, hide_devices) = if settings_ctx.is_loaded() {
         (
             settings_ctx.hide_hqp(),
             settings_ctx.hide_lms(),
             settings_ctx.hide_spotify(),
             settings_ctx.hide_knobs(),
+            settings_ctx.hide_devices(),
         )
     } else {
         (
@@ -45,6 +49,7 @@ pub fn Nav(props: NavProps) -> Element {
             props.hide_lms,
             props.hide_spotify,
             props.hide_knobs,
+            props.hide_devices,
         )
     };
 
@@ -119,6 +124,15 @@ pub fn Nav(props: NavProps) -> Element {
                         tabindex: if hide_knobs { "-1" } else { "0" },
                         "Controllers"
                     }
+                    Link {
+                        class: nav_link_class("devices"),
+                        to: Route::Devices {},
+                        hidden: hide_devices,
+                        aria_hidden: hide_devices,
+                        tabindex: if hide_devices { "-1" } else { "0" },
+                        "Devices"
+                        span { class: "badge badge-secondary ml-1", "Alpha" }
+                    }
                     Link { class: nav_link_class("settings"), to: Route::Settings {}, "Settings" }
                 }
 
@@ -189,6 +203,16 @@ pub fn Nav(props: NavProps) -> Element {
                         tabindex: if hide_knobs { "-1" } else { "0" },
                         onclick: move |_| menu_open.set(false),
                         "Controllers"
+                    }
+                    Link {
+                        class: nav_link_class("devices"),
+                        to: Route::Devices {},
+                        hidden: hide_devices,
+                        aria_hidden: hide_devices,
+                        tabindex: if hide_devices { "-1" } else { "0" },
+                        onclick: move |_| menu_open.set(false),
+                        "Devices"
+                        span { class: "badge badge-secondary ml-1", "Alpha" }
                     }
                     Link { class: nav_link_class("settings"), to: Route::Settings {}, onclick: move |_| menu_open.set(false), "Settings" }
                 }
