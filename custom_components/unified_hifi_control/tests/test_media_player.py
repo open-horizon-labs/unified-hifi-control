@@ -348,3 +348,66 @@ def test_group_members_empty_for_unavailable_zone():
     coordinator = _FakeCoordinator({})
     player = UnifiedHifiControlMediaPlayer(coordinator, "roon:missing")
     assert player.group_members == []
+
+
+# --- Linked playback devices (#774, alpha) ---------------------------------
+
+_LINKED = {
+    "device_id": "marantz:0006781E0AB8",
+    "name": "front",
+    "maturity": "alpha",
+    "present": True,
+    "power": "on",
+    "input": "MPLAY",
+    "input_name": "WiiM",
+    "inputs": [
+        {"id": "MPLAY", "name": "WiiM", "available": True},
+        {"id": "TV", "name": "TV AUDIO", "available": True},
+        {"id": "CD", "name": "CD", "available": False},
+    ],
+}
+
+
+def test_unlinked_zone_has_no_power_or_source_features():
+    zone = ZoneState(zone_id="roon:1", zone_name="Kitchen", source="roon")
+    features = _supported_features(zone)
+    assert not (features & MediaPlayerEntityFeature.TURN_ON)
+    assert not (features & MediaPlayerEntityFeature.SELECT_SOURCE)
+    assert _player(zone).source_list is None
+
+
+def test_linked_zone_gains_power_and_source_from_its_device():
+    zone = ZoneState(zone_id="roon:1", zone_name="Kitchen", source="roon", device=dict(_LINKED))
+    features = _supported_features(zone)
+    assert features & MediaPlayerEntityFeature.TURN_ON
+    assert features & MediaPlayerEntityFeature.TURN_OFF
+    assert features & MediaPlayerEntityFeature.SELECT_SOURCE
+    player = _player(zone)
+    assert player.source == "WiiM"
+    # Source-deleted inputs are not offered.
+    assert player.source_list == ["WiiM", "TV AUDIO"]
+    assert player.extra_state_attributes["linked_device_maturity"] == "alpha"
+
+
+def test_linked_zone_in_standby_reports_off():
+    zone = ZoneState(
+        zone_id="roon:1", zone_name="Kitchen", source="roon", state="playing",
+        device=dict(_LINKED, power="standby"),
+    )
+    assert _player(zone).state == "off"
+
+
+async def test_select_source_sends_the_stable_input_id():
+    zone = ZoneState(zone_id="roon:1", zone_name="Kitchen", source="roon", device=dict(_LINKED))
+    player = _player(zone)
+    await player.async_select_source("TV AUDIO")
+    player.coordinator.client.async_control.assert_awaited_with("roon:1", "select_input", "TV")
+
+
+async def test_turn_on_and_off_send_power_actions():
+    zone = ZoneState(zone_id="roon:1", zone_name="Kitchen", source="roon", device=dict(_LINKED))
+    player = _player(zone)
+    await player.async_turn_on()
+    player.coordinator.client.async_control.assert_awaited_with("roon:1", "power_on", None)
+    await player.async_turn_off()
+    player.coordinator.client.async_control.assert_awaited_with("roon:1", "power_off", None)

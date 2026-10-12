@@ -9,8 +9,8 @@ mod logging;
 #[cfg(feature = "server")]
 mod server {
     use unified_hifi_control::{
-        adapters, aggregator, api, app, bus, cloud_connector, config, coordinator, embedded,
-        firmware, knobs, mcp, mdns, mqtt,
+        adapters, aggregator, api, app, bus, cloud_connector, config, coordinator, devices,
+        embedded, firmware, knobs, mcp, mdns, mqtt,
     };
 
     // Import load_app_settings for checking adapter enabled state
@@ -446,6 +446,12 @@ mod server {
             upnp.clone(),
         ];
 
+        // Denon/Marantz receiver control (#774, alpha): a device adapter. It publishes devices,
+        // never zones, and receives commands only through `DeviceService`.
+        let denonavr = Arc::new(adapters::denonavr::DenonAvrAdapter::new(bus.clone()));
+        let mut legacy_startables = legacy_startables;
+        legacy_startables.push(denonavr.clone());
+
         let mut provider_startables: Vec<Arc<dyn adapters::Startable>> = vec![spotify.clone()];
         let mut startable_adapters = legacy_startables.clone();
         startable_adapters.extend(provider_startables.iter().cloned());
@@ -489,7 +495,17 @@ mod server {
         // SSE closes as soon as graceful HTTP shutdown begins.
         let shutdown_token = CancellationToken::new();
 
-        // Single loop to start all enabled adapters
+        // Single loop to start all enabled adapters. Manual device hosts are read straight from
+        // the link document so the device adapter can probe them on its first discovery pass.
+        denonavr
+            .set_manual_hosts(
+                devices::links::DeviceLinkStore::open_default()
+                    .document()
+                    .await
+                    .map(|document| document.manual_hosts)
+                    .unwrap_or_default(),
+            )
+            .await;
         coord.start_all_enabled(&startable_adapters).await;
 
         // Build application state (clone Arcs so we can access adapters for shutdown)
@@ -510,6 +526,11 @@ mod server {
             shutdown_token.clone(),
         )
         .with_reliable_commands(reliable_commands);
+        state.devices.register_driver(denonavr.clone()).await;
+        if let Err(error) = state.devices.load().await {
+            // The store refuses writes and keeps the file; device control continues unlinked.
+            tracing::error!("Device links not loaded: {error}");
+        }
         // The SSH reverse tunnel receives a separate, loopback-only callback
         // listener.  It must never forward to this main UHC listener: the
         // latter intentionally serves many LAN routes that are not safe to
@@ -1006,6 +1027,14 @@ mod server {
             .route("/hqp/zones/links", get(api::hqp_zone_links_handler))
             .route("/hqp/zones/link", post(api::hqp_zone_link_handler))
             .route("/hqp/zones/unlink", post(api::hqp_zone_unlink_handler))
+            // Playback devices linked to zones (#774, alpha)
+            .route("/devices", get(api::devices::devices_handler))
+            .route("/devices/links", get(api::devices::device_links_handler))
+            .route("/devices/{device_id}", get(api::devices::device_handler))
+            .route("/devices/link", post(api::devices::device_link_handler))
+            .route("/devices/unlink", post(api::devices::device_unlink_handler))
+            .route("/devices/ceiling", post(api::devices::device_ceiling_handler))
+            .route("/devices/control", post(api::devices::device_control_handler))
             .route(
                 "/hqp/zones/{zone_id}/pipeline",
                 get(api::hqp_zone_pipeline_handler),

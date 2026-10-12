@@ -55,6 +55,9 @@ pub mod cloud_connector;
 pub mod config;
 #[cfg(feature = "server")]
 pub mod coordinator;
+// Playback devices (amplifiers/receivers) linked to zones (#774). Alpha.
+#[cfg(feature = "server")]
+pub mod devices;
 #[cfg(feature = "server")]
 pub mod embedded;
 #[cfg(feature = "server")]

@@ -42,7 +42,19 @@
         "profiles": "default"
       },
       "browse_supported": true,
-      "library_tabs": ["browse", "playlists"]
+      "library_tabs": ["browse", "playlists"],
+      "device": {
+        "device_id": "marantz:0006781E0AB8",
+        "name": "front",
+        "maturity": "alpha",
+        "present": true,
+        "power": "on",
+        "input": "MPLAY",
+        "input_name": "WiiM",
+        "source_id": "MPLAY",
+        "on_linked_input": true,
+        "inputs": [{"id": "MPLAY", "name": "WiiM", "available": true}]
+      }
     },
     "always_present": [
       "zone_id",
@@ -57,9 +69,11 @@
         "These carry #[serde(skip_serializing_if = \"Option::is_none\")], so the",
         "key vanishes rather than serializing as null. The live server really",
         "does publish a zone with no volume_control (\"HQPlayer Embedded\"), so a",
-        "non-optional Swift property here fails to decode the real zone list."
+        "non-optional Swift property here fails to decode the real zone list.",
+        "`device` (#774, alpha) appears only on zones linked to an amplifier.",
+        "Clients that do not model it ignore it: Swift's JSONDecoder skips unknown keys."
       ],
-      "keys": ["volume_control", "dsp"]
+      "keys": ["volume_control", "dsp", "device"]
     },
     "minimal": {
       "zone_id": "roon:16015f6dcafe",

@@ -380,6 +380,49 @@ than inventing parallel shapes.
 | `hifi_hqplayer_load_profile` | Load HQPlayer config |
 | `hifi_hqplayer_set_pipeline` | Change HQPlayer setting |
 
+### Playback devices (alpha, #774)
+
+A **device** is the amplifier or receiver a zone plays through. It is not a zone and never
+appears in `hifi_zones`. A user *links* a zone to a device (`hifi_devices action=link`, or
+`POST /devices/link`), optionally naming the device input the zone arrives on. From then on:
+
+- the zone's `volume_control` is the device's (dB, the unit's own maximum lowered by the user's
+  ceiling), so the knob, Watch, Home Assistant and `hifi_control volume_*` drive the amplifier
+  with no client change;
+- `/knob/control` and `hifi_devices action=control` accept `power_on`, `power_off`,
+  `power_toggle`, `select_input`, `mute`;
+- inputs never switch automatically: `select_input` is the only path.
+
+| Tool | Purpose |
+|------|---------|
+| `hifi_devices` | List devices and inputs; link/unlink zones; set a volume ceiling; control power, input, volume, mute (alpha) |
+
+Every device payload carries `"maturity": "alpha"`. Commands succeed only when the device reports
+the requested state back (a write the device does not confirm is an error, never `ok`), and no
+level is sent before the device has reported its range. The model, data flow and safety rules are
+in `docs/device-control-weave.md`; the SR6008 captures behind the claims below are in
+`tests/fixtures/devices/marantz/sr6008/`.
+
+**This table is generated. Do not hand-edit it.** Regenerate with
+`UPDATE_AGENTS_DEVICES=1 cargo test --test device_claims`.
+
+<!-- BEGIN GENERATED DEVICE CAPABILITIES (tests/device_claims.rs) -->
+
+| Model | Observe | Volume | Mute | Power | Input select |
+|---|---|---|---|---|---|
+| Marantz SR6008 | ✅ hardware-verified | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
+| Other Denon / Marantz | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
+
+✅ hardware-verified: exercised on the units with captured fixtures · 🚧 implemented but not yet exercised on hardware (tracked by #788) · ⛔ refused while the condition holds
+
+- **SR6008 / observe** — power, level, maximum, mute, input and input catalog reads captured on this model (tests/fixtures/devices/marantz/sr6008)
+- **SR6008 / volume** — MV over Telnet, clamped to the unit's MVMAX and the user ceiling; pending on-device verification (#788)
+- **SR6008 / mute** — MU over Telnet, or formiPhoneAppMute over HTTP; pending on-device verification (#788)
+- **SR6008 / power** — ZMON/ZMOFF over Telnet, or formiPhoneAppPower over HTTP (the SR6008 refuses Telnet in standby); pending on-device verification (#788)
+- **SR6008 / input select** — SI over Telnet, or formiPhoneAppDirect over HTTP; pending on-device verification (#788)
+
+<!-- END GENERATED DEVICE CAPABILITIES -->
+
 ---
 
 ## UI Stack

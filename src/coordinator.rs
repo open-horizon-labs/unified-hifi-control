@@ -33,6 +33,7 @@ pub const AVAILABLE_ADAPTERS: &[&str] = &[
     "spotify",
     "applemusic",
     "musicassistant",
+    "denonavr",
 ];
 
 /// How long a reconfiguration waits for the aggregator to acknowledge a projection flush.
@@ -108,6 +109,7 @@ impl AdapterCoordinator {
                 "spotify" => settings.spotify,
                 "applemusic" => settings.applemusic,
                 "musicassistant" => settings.musicassistant,
+                "denonavr" => settings.denonavr,
                 _ => false,
             };
             self.register(name, enabled).await;
@@ -658,6 +660,7 @@ fn adapter_enabled(settings: &AdapterSettings, name: &str) -> Option<bool> {
         "spotify" => Some(settings.spotify),
         "applemusic" => Some(settings.applemusic),
         "musicassistant" => Some(settings.musicassistant),
+        "denonavr" => Some(settings.denonavr),
         _ => None,
     }
 }

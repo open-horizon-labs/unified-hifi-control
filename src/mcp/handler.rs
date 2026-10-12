@@ -101,6 +101,7 @@ impl ServerHandler for HifiMcpHandler {
                 tools::music_details::handle_music_details(state, args).await
             }
             HifiTools::HifiControlTool(args) => tools::transport::handle_control(state, args).await,
+            HifiTools::HifiDevicesTool(args) => tools::devices::handle_devices(state, args).await,
             HifiTools::HifiSearchTool(args) => tools::library::handle_search(state, args).await,
             HifiTools::HifiPlayTool(args) => tools::library::handle_play(state, args).await,
             HifiTools::HifiStatusTool(_) => tools::status::handle_status(state).await,

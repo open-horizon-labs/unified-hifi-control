@@ -130,6 +130,11 @@ pub struct ZoneInfo {
     /// Library page hides tabs missing from this list instead of rendering
     /// ones whose every call would be refused.
     pub library_tabs: Vec<&'static str>,
+    /// The playback device this zone is linked to (#774, alpha): power, current input and the
+    /// device's input catalog. Absent for unlinked zones, so their payload is unchanged. A linked
+    /// zone's `volume_control` is already the device's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<crate::devices::LinkedDeviceSummary>,
 }
 
 /// GET /knob/zones response
@@ -197,10 +202,17 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
     };
 
     // Filtered (adapter settings + hide list) and sorted by the shared policy.
-    crate::zone_list::visible_zones(state)
-        .await
+    let zones = crate::zone_list::visible_zones(state).await;
+    let mut devices = HashMap::new();
+    for zone in &zones {
+        if let Some(device) = state.aggregator.linked_device(&zone.zone_id).await {
+            devices.insert(zone.zone_id.clone(), device);
+        }
+    }
+    zones
         .into_iter()
         .map(|z| ZoneInfo {
+            device: devices.remove(&z.zone_id),
             dsp: get_dsp(&z.zone_id),
             browse_supported: crate::mcp::tools::collections::zone_supports_hifi_collections(
                 &z.zone_id,
@@ -608,6 +620,56 @@ pub async fn knob_image_handler(
     }
 }
 
+/// Device control for a linked zone, or `None` when the provider should handle the action.
+///
+/// Power and input actions on an unlinked zone are refused here rather than offered to a provider
+/// that has no such concept (and, for LMS, a *different* power concept — #304).
+async fn control_linked_device(
+    state: &AppState,
+    req: &KnobControlRequest,
+) -> Option<Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)>> {
+    use crate::devices::service::{
+        is_device_only_action, request_from_action, DeviceError, DeviceTarget,
+    };
+    let Some(device_id) = state.devices.linked_device_id(&req.zone_id).await else {
+        if is_device_only_action(&req.action) {
+            return Some(Err(crate::api::devices::device_error_response(
+                DeviceError::NotLinked {
+                    zone_id: req.zone_id.clone(),
+                },
+            )));
+        }
+        return None;
+    };
+    let step = state
+        .aggregator
+        .get_device(&device_id)
+        .await
+        .map(|device| device.volume.step_db)
+        .filter(|step| *step > 0.0)
+        .unwrap_or(0.5);
+    let request = match request_from_action(&req.action, req.value.as_ref(), step) {
+        Ok(Some(request)) => request,
+        Ok(None) => return None,
+        Err(message) => {
+            return Some(Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": message, "error_code": "INVALID_VALUE"})),
+            )))
+        }
+    };
+    Some(
+        match state
+            .devices
+            .control(DeviceTarget::Zone(req.zone_id.clone()), request)
+            .await
+        {
+            Ok(report) => Ok(Json(serde_json::json!({"ok": true, "result": report}))),
+            Err(error) => Err(crate::api::devices::device_error_response(error)),
+        },
+    )
+}
+
 /// Control request body
 #[derive(Deserialize)]
 pub struct KnobControlRequest {
@@ -632,6 +694,13 @@ pub async fn knob_control_handler(
             )
             .await;
     }
+    // A zone linked to an amplifier (#774, alpha): its volume, mute, power and input belong to the
+    // device, so they are resolved here, before prefix routing could hand them to the provider.
+    // Transport actions fall through to the provider below.
+    if let Some(response) = control_linked_device(&state, &req).await {
+        return response;
+    }
+
     // Route based on zone_id prefix
     if req.zone_id.starts_with("lms:") {
         // LMS player control
@@ -1802,6 +1871,7 @@ mod tests {
             volume_control: None,
             dsp: None,
             browse_supported: false,
+            device: None,
             library_tabs: Vec::new(),
         }
     }

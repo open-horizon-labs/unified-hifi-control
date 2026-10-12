@@ -17,6 +17,7 @@ use crate::bus::runtime::{
     ProjectionPayload, ProjectionUpdate,
 };
 use crate::bus::{BusEvent, NowPlaying, PrefixedZoneId, ProviderAccount, SharedBus, Zone};
+use crate::devices::{Device, DeviceId, DeviceLink, LinkedDeviceSummary};
 use crate::mcp::observation_history::PlaybackObservationHistory;
 
 fn observation_now() -> u64 {
@@ -71,6 +72,73 @@ struct AggregateState {
     projection_revision: u64,
     source_cursors: HashMap<String, ProjectionCursor>,
     projection_entries: BTreeMap<String, (u64, ProjectionPayload)>,
+    /// Playback devices as their adapters last observed them, keyed by device id (#774).
+    devices: HashMap<String, Device>,
+    /// User-confirmed zone→device links, keyed by zone id. Installed only after persistence.
+    device_links: HashMap<String, DeviceLink>,
+    /// User volume ceilings per device id, in dB.
+    device_ceilings: HashMap<String, f32>,
+}
+
+impl AggregateState {
+    /// The zone as every surface should see it: the provider's zone, with `volume_control`
+    /// owned by the linked device when there is one.
+    ///
+    /// Composed on read rather than written into the stored zone, because a provider snapshot
+    /// (`ZoneDiscovered`, a reliable projection) replaces the whole stored zone and would erase a
+    /// device's volume on the next provider update.
+    ///
+    /// A linked zone never falls back to the provider's own volume: the link says the amplifier
+    /// owns the level, so until the device can bound one the zone publishes none (the knob shows
+    /// "fixed") rather than steering a different gain stage than the user intends.
+    fn effective_zone(&self, zone: &Zone) -> Zone {
+        let Some(link) = self.device_links.get(&zone.zone_id) else {
+            return zone.clone();
+        };
+        let mut effective = zone.clone();
+        effective.volume_control = self
+            .devices
+            .get(link.device_id.as_str())
+            .and_then(Device::volume_control);
+        effective
+    }
+
+    fn linked_summary(&self, zone_id: &str) -> Option<LinkedDeviceSummary> {
+        let link = self.device_links.get(zone_id)?;
+        Some(LinkedDeviceSummary::new(
+            link,
+            self.devices.get(link.device_id.as_str()),
+        ))
+    }
+
+    fn zones_linked_to(&self, device_id: &str) -> Vec<String> {
+        let mut zone_ids: Vec<String> = self
+            .device_links
+            .values()
+            .filter(|link| link.device_id.as_str() == device_id)
+            .map(|link| link.zone_id.clone())
+            .collect();
+        zone_ids.sort();
+        zone_ids
+    }
+
+    fn apply_ceiling(&self, device: &mut Device) {
+        device.volume.ceiling_db = self.device_ceilings.get(device.device_id.as_str()).copied();
+    }
+}
+
+/// The device facts a linked zone surfaces. Two observations that agree on these need not be
+/// re-announced to linked zones.
+fn surfaced_facts(device: Option<&Device>) -> Option<impl PartialEq> {
+    device.map(|device| {
+        (
+            device.power,
+            device.input.clone(),
+            device.volume_control(),
+            device.inputs.clone(),
+            device.name.clone(),
+        )
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -303,25 +371,91 @@ impl ZoneAggregator {
                         "Volume changed: {} = {} (muted: {})",
                         output_id, value, is_muted
                     );
-                    // Find zone containing this output and update volume_control
-                    // All adapters must use prefixed output_ids (e.g., "lms:xx:xx:xx", "roon:output-id")
-                    // The lint test `bus_events_use_prefixed_output_ids` enforces this.
+                    // Update every zone that publishes this output. All adapters must use
+                    // prefixed output_ids (e.g., "lms:xx:xx:xx", "roon:output-id"); the lint test
+                    // `bus_events_use_prefixed_output_ids` enforces this.
+                    //
+                    // Every match, not the first (#775): several zones may legitimately share one
+                    // output, and stopping early left the rest reporting a stale level.
                     let mut aggregate = self.state.write().await;
                     for zone in aggregate.zones.values_mut() {
-                        let matches = zone
-                            .volume_control
-                            .as_ref()
-                            .and_then(|vc| vc.output_id.as_ref())
-                            .map(|oid| oid == &output_id)
-                            .unwrap_or(false);
-
-                        if matches {
-                            if let Some(ref mut vc) = zone.volume_control {
+                        if let Some(vc) = zone.volume_control.as_mut() {
+                            if vc.output_id.as_deref() == Some(output_id.as_str()) {
                                 vc.value = value;
                                 vc.is_muted = is_muted;
                             }
-                            break;
                         }
+                    }
+                }
+
+                BusEvent::DeviceObserved { device } => {
+                    let mut device = *device;
+                    let announcements = {
+                        let mut aggregate = self.state.write().await;
+                        aggregate.apply_ceiling(&mut device);
+                        let key = device.device_id.to_string();
+                        let before = surfaced_facts(aggregate.devices.get(&key));
+                        let after = surfaced_facts(Some(&device));
+                        let volume_changed = aggregate
+                            .devices
+                            .get(&key)
+                            .map(|previous| {
+                                (previous.volume.db, previous.volume.is_muted)
+                                    != (device.volume.db, device.volume.is_muted)
+                            })
+                            .unwrap_or(true);
+                        let volume = device.volume_control();
+                        aggregate.devices.insert(key.clone(), device);
+                        let zone_ids = aggregate.zones_linked_to(&key);
+                        if zone_ids.is_empty() || before == after {
+                            None
+                        } else {
+                            let summary = zone_ids
+                                .first()
+                                .and_then(|zone_id| aggregate.linked_summary(zone_id));
+                            Some((zone_ids, summary, volume, volume_changed))
+                        }
+                    };
+                    if let Some((zone_ids, summary, volume, volume_changed)) = announcements {
+                        if let (true, Some(control)) = (volume_changed, volume.as_ref()) {
+                            // Compatibility hint for consumers that match volume by output id
+                            // (web UI, MQTT). The aggregator never applies this back to the device:
+                            // device state is owned by `DeviceObserved` alone.
+                            if let Some(output_id) = control.output_id.clone() {
+                                self.bus.publish(BusEvent::VolumeChanged {
+                                    output_id,
+                                    value: control.value,
+                                    is_muted: control.is_muted,
+                                });
+                            }
+                        }
+                        self.bus.publish(BusEvent::LinkedDeviceChanged {
+                            zone_ids,
+                            device: summary,
+                            volume_control: volume,
+                        });
+                    }
+                }
+
+                BusEvent::DeviceRemoved { device_id } => {
+                    let announcement = {
+                        let mut aggregate = self.state.write().await;
+                        if aggregate.devices.remove(device_id.as_str()).is_none() {
+                            None
+                        } else {
+                            let zone_ids = aggregate.zones_linked_to(device_id.as_str());
+                            let summary = zone_ids
+                                .first()
+                                .and_then(|zone_id| aggregate.linked_summary(zone_id));
+                            (!zone_ids.is_empty()).then_some((zone_ids, summary))
+                        }
+                    };
+                    if let Some((zone_ids, summary)) = announcement {
+                        self.bus.publish(BusEvent::LinkedDeviceChanged {
+                            zone_ids,
+                            device: summary,
+                            volume_control: None,
+                        });
                     }
                 }
 
@@ -394,36 +528,56 @@ impl ZoneAggregator {
         info!("ZoneAggregator stopped");
     }
 
-    /// Get all zones
+    /// Get all zones, with linked device volume composed in (see `AggregateState::effective_zone`).
     pub async fn get_zones(&self) -> Vec<Zone> {
-        self.state.read().await.zones.values().cloned().collect()
+        let aggregate = self.state.read().await;
+        aggregate
+            .zones
+            .values()
+            .map(|zone| aggregate.effective_zone(zone))
+            .collect()
     }
 
     /// Get zones for a specific adapter
     pub async fn get_zones_by_adapter(&self, adapter: &str) -> Vec<Zone> {
         let prefix = format!("{}:", adapter);
-        self.state
-            .read()
-            .await
+        let aggregate = self.state.read().await;
+        aggregate
             .zones
             .values()
             .filter(|z| z.zone_id.starts_with(&prefix))
-            .cloned()
+            .map(|zone| aggregate.effective_zone(zone))
             .collect()
     }
 
-    /// Get a specific zone
+    /// Get a specific zone, with linked device volume composed in.
     pub async fn get_zone(&self, zone_id: &str) -> Option<Zone> {
-        self.state.read().await.zones.get(zone_id).cloned()
+        let aggregate = self.state.read().await;
+        aggregate
+            .zones
+            .get(zone_id)
+            .map(|zone| aggregate.effective_zone(zone))
     }
 
     /// Return whether the current device observation says this zone can accept
     /// volume commands. This is separate from `Zone::volume_control`, whose
     /// numeric value is absent when a provider reports support but no current
     /// volume value.
+    ///
+    /// For a zone linked to a device, the device answers: the provider's own volume is not the
+    /// gain stage the user drives once the zone is linked.
     pub async fn has_volume_control(&self, zone_id: &str) -> Option<bool> {
         let aggregate = self.state.read().await;
         let zone = aggregate.zones.get(zone_id)?;
+        if let Some(link) = aggregate.device_links.get(zone_id) {
+            return Some(
+                aggregate
+                    .devices
+                    .get(link.device_id.as_str())
+                    .and_then(Device::volume_control)
+                    .is_some(),
+            );
+        }
         Some(
             aggregate
                 .volume_capabilities
@@ -431,6 +585,121 @@ impl ZoneAggregator {
                 .copied()
                 .unwrap_or_else(|| zone.volume_control.is_some()),
         )
+    }
+
+    // =========================================================================
+    // Devices (#774, alpha)
+    // =========================================================================
+
+    /// Every currently observed device, ordered by id.
+    pub async fn get_devices(&self) -> Vec<Device> {
+        let mut devices: Vec<Device> = self.state.read().await.devices.values().cloned().collect();
+        devices.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        devices
+    }
+
+    /// One observed device.
+    pub async fn get_device(&self, device_id: &DeviceId) -> Option<Device> {
+        self.state
+            .read()
+            .await
+            .devices
+            .get(device_id.as_str())
+            .cloned()
+    }
+
+    /// Every installed link, ordered by zone id.
+    pub async fn get_device_links(&self) -> Vec<DeviceLink> {
+        let mut links: Vec<DeviceLink> = self
+            .state
+            .read()
+            .await
+            .device_links
+            .values()
+            .cloned()
+            .collect();
+        links.sort_by(|a, b| a.zone_id.cmp(&b.zone_id));
+        links
+    }
+
+    /// The link for one zone.
+    pub async fn get_device_link(&self, zone_id: &str) -> Option<DeviceLink> {
+        self.state.read().await.device_links.get(zone_id).cloned()
+    }
+
+    /// The device facts one zone surfaces, when it is linked.
+    pub async fn linked_device(&self, zone_id: &str) -> Option<LinkedDeviceSummary> {
+        self.state.read().await.linked_summary(zone_id)
+    }
+
+    /// Replace the installed links and ceilings with a document that has **already been
+    /// persisted**, and announce the zones whose surfaced device changed.
+    ///
+    /// The device service is the only caller: it persists first, then installs, so the read
+    /// truth never runs ahead of the durable one.
+    pub async fn install_device_configuration(
+        &self,
+        links: Vec<DeviceLink>,
+        ceilings: HashMap<DeviceId, f32>,
+    ) {
+        let announcements = {
+            let mut aggregate = self.state.write().await;
+            let before: HashMap<
+                String,
+                (
+                    Option<LinkedDeviceSummary>,
+                    Option<crate::bus::VolumeControl>,
+                ),
+            > = aggregate
+                .device_links
+                .keys()
+                .chain(links.iter().map(|link| &link.zone_id))
+                .map(|zone_id| {
+                    (
+                        zone_id.clone(),
+                        (
+                            aggregate.linked_summary(zone_id),
+                            aggregate
+                                .zones
+                                .get(zone_id)
+                                .and_then(|zone| aggregate.effective_zone(zone).volume_control),
+                        ),
+                    )
+                })
+                .collect();
+            aggregate.device_links = links
+                .into_iter()
+                .map(|link| (link.zone_id.clone(), link))
+                .collect();
+            aggregate.device_ceilings = ceilings
+                .into_iter()
+                .map(|(device_id, ceiling)| (device_id.to_string(), ceiling))
+                .collect();
+            let ceilings = aggregate.device_ceilings.clone();
+            for device in aggregate.devices.values_mut() {
+                device.volume.ceiling_db = ceilings.get(device.device_id.as_str()).copied();
+            }
+            let mut announcements = Vec::new();
+            for (zone_id, previous) in before {
+                let summary = aggregate.linked_summary(&zone_id);
+                let volume = aggregate
+                    .zones
+                    .get(&zone_id)
+                    .and_then(|zone| aggregate.effective_zone(zone).volume_control);
+                if previous != (summary.clone(), volume.clone()) {
+                    announcements.push((zone_id, summary, volume));
+                }
+            }
+            announcements.sort_by(|a, b| a.0.cmp(&b.0));
+            announcements
+        };
+        for (zone_id, device, volume_control) in announcements {
+            self.bus.publish(BusEvent::LinkedDeviceChanged {
+                zone_ids: vec![zone_id],
+                device,
+                volume_control,
+            });
+        }
     }
 
     /// Get now playing for a zone
@@ -1564,6 +1833,68 @@ mod tests {
             .await
             .expect("aggregator exits when the bus is explicitly shut down")
             .expect("aggregator task did not panic");
+    }
+
+    /// #775: a `VolumeChanged` must reach *every* zone that publishes the output, not only the
+    /// first one the map iterator happens to yield. Device links (#774) are the first feature
+    /// that makes two zones share one `output_id`; with the old `break`, the second zone kept a
+    /// stale level, so two controls for one amplifier disagreed.
+    #[tokio::test]
+    async fn volume_changed_updates_every_zone_sharing_the_output() {
+        let bus = crate::bus::create_bus();
+        let aggregator = std::sync::Arc::new(ZoneAggregator::new(bus.clone()));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let running = {
+            let aggregator = aggregator.clone();
+            tokio::spawn(async move { aggregator.run_with_ready(ready_tx).await })
+        };
+        ready_rx.await.expect("aggregator ready");
+
+        for zone_id in ["roon:shared-a", "roon:shared-b"] {
+            let mut zone = projected_zone(zone_id);
+            zone.volume_control = Some(crate::bus::VolumeControl {
+                value: -40.0,
+                min: -80.0,
+                max: 0.0,
+                step: 0.5,
+                is_muted: false,
+                scale: crate::bus::VolumeScale::Decibel,
+                output_id: Some("roon:shared-output".to_string()),
+            });
+            bus.publish(BusEvent::ZoneDiscovered { zone });
+        }
+        bus.publish(BusEvent::VolumeChanged {
+            output_id: "roon:shared-output".to_string(),
+            value: -32.5,
+            is_muted: true,
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let mut levels = Vec::new();
+                for zone_id in ["roon:shared-a", "roon:shared-b"] {
+                    levels.push(
+                        aggregator
+                            .get_zone(zone_id)
+                            .await
+                            .and_then(|zone| zone.volume_control)
+                            .map(|vc| (vc.value, vc.is_muted)),
+                    );
+                }
+                if levels.iter().all(|level| *level == Some((-32.5, true))) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both zones sharing the output must observe the new level");
+
+        bus.publish(BusEvent::ShuttingDown { reason: None });
+        tokio::time::timeout(Duration::from_secs(1), running)
+            .await
+            .expect("aggregator shutdown")
+            .expect("aggregator task");
     }
 
     #[tokio::test]

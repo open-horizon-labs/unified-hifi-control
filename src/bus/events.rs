@@ -575,6 +575,27 @@ pub enum BusEvent {
     },
 
     // =========================================================================
+    // Device Events (#774, alpha)
+    // =========================================================================
+    /// A playback device (amplifier/receiver) was observed. Published whole, on every readback,
+    /// whether or not anything changed; `device.revision` increments each time.
+    DeviceObserved { device: Box<crate::devices::Device> },
+
+    /// A device is no longer observed (adapter stopped, unit vanished). Links to it stay.
+    DeviceRemoved { device_id: crate::devices::DeviceId },
+
+    /// The device facts surfaced on one or more linked zones changed: power, input, volume or
+    /// mute moved, or a link was created or removed. Published by the aggregator, never by an
+    /// adapter, so SSE consumers (the Home Assistant integration) can update every affected zone
+    /// from one event. `device` is `None` when the zones were unlinked.
+    LinkedDeviceChanged {
+        zone_ids: Vec<String>,
+        device: Option<crate::devices::LinkedDeviceSummary>,
+        /// The effective volume control the linked zones now publish, if any.
+        volume_control: Option<VolumeControl>,
+    },
+
+    // =========================================================================
     // Command Events
     // =========================================================================
     /// A command was received for a zone
@@ -708,6 +729,9 @@ impl BusEvent {
             Self::SeekPositionChanged { .. } => "seek_position_changed",
             Self::VolumeChanged { .. } => "volume_changed",
             Self::VolumeCapabilityChanged { .. } => "volume_capability_changed",
+            Self::DeviceObserved { .. } => "device_observed",
+            Self::DeviceRemoved { .. } => "device_removed",
+            Self::LinkedDeviceChanged { .. } => "linked_device_changed",
             Self::CommandReceived { .. } => "command_received",
             Self::CommandResult { .. } => "command_result",
             Self::AdapterStopping { .. } => "adapter_stopping",
@@ -739,6 +763,7 @@ impl BusEvent {
                 | Self::ZoneRemoved { .. }
                 | Self::ZonesFlushed { .. }
                 | Self::VolumeCapabilityChanged { .. }
+                | Self::LinkedDeviceChanged { .. }
         )
     }
 

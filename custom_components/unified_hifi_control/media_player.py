@@ -100,7 +100,20 @@ def _supported_features(zone: ZoneState) -> MediaPlayerEntityFeature:
             | MediaPlayerEntityFeature.PLAY_MEDIA
             | MediaPlayerEntityFeature.MEDIA_ENQUEUE
         )
+    if zone.device:
+        # A zone linked to an amplifier (#774, alpha) gains the amplifier's
+        # power and physical input selector. Unlinked zones are unchanged.
+        features |= (
+            MediaPlayerEntityFeature.TURN_ON
+            | MediaPlayerEntityFeature.TURN_OFF
+            | MediaPlayerEntityFeature.SELECT_SOURCE
+        )
     return features
+
+
+def _device_inputs(zone: ZoneState) -> list[dict[str, Any]]:
+    inputs = (zone.device or {}).get("inputs") or []
+    return [i for i in inputs if isinstance(i, dict) and i.get("available", True)]
 
 
 class UnifiedHifiControlMediaPlayer(
@@ -144,6 +157,38 @@ class UnifiedHifiControlMediaPlayer(
         return super().available and self._zone is not None
 
     @property
+    def supported_features(self) -> MediaPlayerEntityFeature:
+        # Recomputed per read: linking a zone to a device adds power and
+        # source controls without recreating the entity.
+        zone = self._zone
+        return _supported_features(zone) if zone else MediaPlayerEntityFeature(0)
+
+    @property
+    def source(self) -> str | None:
+        zone = self._zone
+        if zone is None or not zone.device:
+            return None
+        return zone.device.get("input_name") or zone.device.get("input")
+
+    @property
+    def source_list(self) -> list[str] | None:
+        zone = self._zone
+        if zone is None or not zone.device:
+            return None
+        return [i.get("name") or i.get("id") for i in _device_inputs(zone)]
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        zone = self._zone
+        if zone is None or not zone.device:
+            return None
+        return {
+            "linked_device_id": zone.device.get("device_id"),
+            "linked_device_name": zone.device.get("name"),
+            "linked_device_maturity": zone.device.get("maturity", "alpha"),
+        }
+
+    @property
     def name(self) -> str | None:
         zone = self._zone
         return zone.zone_name if zone else self._zone_id
@@ -153,6 +198,10 @@ class UnifiedHifiControlMediaPlayer(
         zone = self._zone
         if zone is None:
             return None
+        # A zone whose linked amplifier is in standby is off, whatever its
+        # provider reports: Home Assistant's state is where power lives.
+        if zone.device and zone.device.get("power") == "standby":
+            return MediaPlayerState.OFF
         return MediaPlayerState(STATE_MAP.get(zone.state, "idle"))
 
     @property
@@ -218,6 +267,25 @@ class UnifiedHifiControlMediaPlayer(
         # already accept it (see those methods below), not as HA entity_ids.
         zone = self._zone
         return zone.group_members if zone else []
+
+    async def async_turn_on(self) -> None:
+        await self._async_control("power_on")
+
+    async def async_turn_off(self) -> None:
+        await self._async_control("power_off")
+
+    async def async_select_source(self, source: str) -> None:
+        zone = self._zone
+        if zone is None or not zone.device:
+            raise HomeAssistantError(f"Zone {self._zone_id} has no linked device")
+        # Resolve the display name to the device's stable input id.
+        match = next(
+            (i for i in _device_inputs(zone) if source in (i.get("name"), i.get("id"))),
+            None,
+        )
+        await self._async_control(
+            "select_input", value=(match or {}).get("id", source)
+        )
 
     async def async_media_play(self) -> None:
         await self._async_control("play")

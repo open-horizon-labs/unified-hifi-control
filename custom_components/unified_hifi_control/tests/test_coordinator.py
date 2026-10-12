@@ -173,3 +173,51 @@ async def test_refresh_group_members_tolerates_status_failure():
     # Must not raise.
     await coordinator._refresh_group_members(zones)
     assert zones["roon:1"].group_members == []
+
+
+# --- Linked playback devices (#774, alpha) ---------------------------------
+
+from custom_components.unified_hifi_control.coordinator import (  # noqa: E402
+    _h_linked_device_changed,
+)
+
+_DEVICE = {
+    "device_id": "marantz:0006781E0AB8",
+    "name": "front",
+    "maturity": "alpha",
+    "present": True,
+    "power": "on",
+    "input": "MPLAY",
+    "input_name": "WiiM",
+    "inputs": [{"id": "MPLAY", "name": "WiiM", "available": True}],
+}
+
+
+def test_linked_device_changed_updates_every_named_zone():
+    data = {"roon:1": _zone(), "lms:2": _zone(zone_id="lms:2"), "roon:3": _zone(zone_id="roon:3")}
+    changed = _h_linked_device_changed(
+        data,
+        {
+            "zone_ids": ["roon:1", "lms:2"],
+            "device": _DEVICE,
+            "volume_control": {"value": -35.0, "min": -80.0, "max": -10.0, "step": 0.5, "is_muted": False},
+        },
+    )
+    assert changed
+    for zone_id in ("roon:1", "lms:2"):
+        assert data[zone_id].device == _DEVICE
+        assert data[zone_id].volume == -35.0
+        assert data[zone_id].volume_max == -10.0
+    assert data["roon:3"].device is None
+
+
+def test_linked_device_changed_with_no_device_unlinks():
+    data = {"roon:1": _zone(device=_DEVICE)}
+    assert _h_linked_device_changed(data, {"zone_ids": ["roon:1"], "device": None, "volume_control": None})
+    assert data["roon:1"].device is None
+
+
+def test_linked_device_changed_ignores_unknown_zones_and_bad_payloads():
+    data = {"roon:1": _zone()}
+    assert not _h_linked_device_changed(data, {"zone_ids": ["roon:999"], "device": _DEVICE})
+    assert not _h_linked_device_changed(data, {"zone_ids": "roon:1"})

@@ -64,6 +64,10 @@ class ZoneState:
     # most recent hifi_zone_group status poll. Empty when ungrouped or when
     # this zone's provider does not support grouping.
     group_members: list[str] = field(default_factory=list)
+    # The playback device (amplifier/receiver) this zone is linked to, as
+    # /knob/zones reports it (#774, alpha): power, current input and the
+    # input catalog. None for unlinked zones.
+    device: dict[str, Any] | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -143,6 +147,8 @@ class UnifiedHifiControlCoordinator(DataUpdateCoordinator[dict[str, ZoneState]])
                     zs.volume_max = now_playing.get("volume_max", zs.volume_max)
                     zs.volume_step = now_playing.get("volume_step", zs.volume_step)
             zs.browse_supported = zone.get("browse_supported", False)
+            device = zone.get("device")
+            zs.device = device if isinstance(device, dict) else None
             result[zone_id] = zs
         await self._refresh_group_members(result)
         return result
@@ -288,6 +294,30 @@ def _h_zone_discovered(data: dict[str, ZoneState], payload: dict[str, Any]) -> b
     return True
 
 
+def _h_linked_device_changed(data: dict[str, ZoneState], payload: dict[str, Any]) -> bool:
+    """A linked amplifier's power/input/volume changed, or a link was made or
+    removed (#774). One event names every affected zone."""
+    zone_ids = payload.get("zone_ids")
+    if not isinstance(zone_ids, list):
+        return False
+    device = payload.get("device")
+    volume = payload.get("volume_control")
+    changed = False
+    for zone_id in zone_ids:
+        zs = data.get(zone_id) if isinstance(zone_id, str) else None
+        if zs is None:
+            continue
+        zs.device = device if isinstance(device, dict) else None
+        if isinstance(volume, dict):
+            zs.volume = volume.get("value", zs.volume)
+            zs.volume_min = volume.get("min", zs.volume_min)
+            zs.volume_max = volume.get("max", zs.volume_max)
+            zs.volume_step = volume.get("step", zs.volume_step)
+            zs.is_muted = volume.get("is_muted", zs.is_muted)
+        changed = True
+    return changed
+
+
 _EVENT_HANDLERS = {
     "NowPlayingChanged": _h_now_playing_changed,
     "VolumeChanged": _h_volume_changed,
@@ -295,4 +325,5 @@ _EVENT_HANDLERS = {
     "ZoneUpdated": _h_zone_updated,
     "ZoneRemoved": _h_zone_removed,
     "ZoneDiscovered": _h_zone_discovered,
+    "LinkedDeviceChanged": _h_linked_device_changed,
 }

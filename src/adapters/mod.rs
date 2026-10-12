@@ -1,6 +1,7 @@
 //! Audio source adapters (Roon, HQPlayer, LMS, OpenHome, UPnP, Apple Music, Spotify)
 
 pub mod apple_music;
+pub mod denonavr;
 pub mod didl;
 pub mod handle;
 pub mod hqplayer;

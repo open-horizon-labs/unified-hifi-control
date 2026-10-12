@@ -183,6 +183,61 @@
       "type": "object"
     }
   },
+  "hifi_devices": {
+    "description": "Alpha capability: expect refinement across releases. Amplifiers and receivers (playback devices) that zones play through, separate from the music provider. action=list shows every device with its inputs, power, volume range and linked zones. action=links lists zone links. action=link connects a zone_id to the device_id it plays through (optionally source_id, the device input the zone arrives on); after linking, that zone's volume and hifi_control volume actions drive the device. action=unlink removes a zone's link. action=set_ceiling sets a device's maximum volume in dB (omit ceiling_db to clear); a ceiling only ever lowers the device's own limit. action=control sends command (power_on, power_off, power_toggle, select_input, volume_set, volume_up, volume_down, mute, unmute) to a device_id, or to the device a zone_id is linked to. Volume values are dB. Inputs never switch automatically: use select_input. A command succeeds only when the device confirms it.",
+    "inputSchema": {
+      "properties": {
+        "action": {
+          "description": "list, links, link, unlink, set_ceiling, or control.",
+          "type": "string"
+        },
+        "ceiling_db": {
+          "description": "For set_ceiling: the maximum volume in dB. Omit to clear the ceiling.",
+          "nullable": true,
+          "type": "number"
+        },
+        "command": {
+          "description": "For control: power_on, power_off, power_toggle, select_input, volume_set, volume_up,\nvolume_down, mute, or unmute.",
+          "nullable": true,
+          "type": "string"
+        },
+        "device_id": {
+          "description": "The device, e.g. marantz:0006781E0AB8 (from action=list).",
+          "nullable": true,
+          "type": "string"
+        },
+        "input": {
+          "description": "For control select_input: the input id or its display name.",
+          "nullable": true,
+          "type": "string"
+        },
+        "muted": {
+          "description": "For control mute: true or false. Omit to toggle.",
+          "nullable": true,
+          "type": "boolean"
+        },
+        "source_id": {
+          "description": "For link: the device input this zone arrives on (an input id from action=list).",
+          "nullable": true,
+          "type": "string"
+        },
+        "value": {
+          "description": "For control: dB level for volume_set, or dB step for volume_up/volume_down (defaults to\nthe device step).",
+          "nullable": true,
+          "type": "number"
+        },
+        "zone_id": {
+          "description": "A zone id (from hifi_zones). For link/unlink, the zone to (un)link; for control, the\nlinked zone whose device to control.",
+          "nullable": true,
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  },
   "hifi_hqplayer_load_profile": {
     "annotations": {
       "destructiveHint": true

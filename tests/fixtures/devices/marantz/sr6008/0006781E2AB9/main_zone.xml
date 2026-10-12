@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<item>
+<FriendlyName><value></value></FriendlyName>
+<Power><value>STANDBY</value></Power>
+<ZonePower><value>OFF</value></ZonePower>
+<RenameZone><value></value></RenameZone>
+<TopMenuLink><value>ON</value></TopMenuLink>
+<VideoSelectDisp><value>OFF</value></VideoSelectDisp>
+<VideoSelect><value></value></VideoSelect>
+<VideoSelectOnOff><value>OFF</value></VideoSelectOnOff>
+<VideoSelectLists>
+<value index='ON'  table='On' param=''/>
+<value index='OFF'  table='Off' param=''/>
+<value index='DVD'  table='DVD' param=''/>
+<value index='MPLAY'  table='MEDIA PLAYER' param=''/>
+<value index='TV'  table='TV AUDIO ' param=''/>
+</VideoSelectLists>
+<ModelId><value>10</value></ModelId>
+<BrandId><value>MARANTZ_MODEL</value></BrandId>
+<SalesArea><value>0</value></SalesArea>
+<InputFuncSelect><value></value></InputFuncSelect>
+<NetFuncSelect><value>FLICKR</value></NetFuncSelect>
+<selectSurround><value>STEREO                         </value></selectSurround>
+<VolumeDisplay><value>Absolute</value></VolumeDisplay>
+<MasterVolume><value>-59.0</value></MasterVolume>
+<Mute><value>off</value></Mute>
+<RemoteMaintenance><value></value></RemoteMaintenance>
+<SubwooferDisplay><value>FALSE</value></SubwooferDisplay>
+<Zone2VolDisp><value>TRUE</value></Zone2VolDisp>
+</item>

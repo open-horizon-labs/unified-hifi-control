@@ -8,6 +8,7 @@
 
 pub mod hqplayer;
 pub mod lms;
+pub mod marantz;
 #[cfg(feature = "naa-proxy")]
 pub mod naa;
 pub mod openhome;
@@ -17,6 +18,7 @@ pub mod upnp;
 
 pub use hqplayer::MockHqpServer;
 pub use lms::MockLmsServer;
+pub use marantz::MockMarantz;
 pub use openhome::MockOpenHomeDevice;
 pub use roon::MockRoonCore;
 pub use roon_core::FakeRoonCore;
