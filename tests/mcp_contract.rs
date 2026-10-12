@@ -800,6 +800,8 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
             ("input", false),
             ("muted", false),
             ("ceiling", false),
+            ("enabled", false),
+            ("sections", false),
         ],
     ),
     ("hifi_now_playing", &[("zone_id", true)]),

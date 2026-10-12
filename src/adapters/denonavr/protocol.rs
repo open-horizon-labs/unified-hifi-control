@@ -78,6 +78,17 @@ pub fn parse_line(line: &str) -> Option<TelnetEvent> {
     None
 }
 
+/// A line with a prefix this adapter models (`MV`, `PW`, `ZM`, `MU`, `SI`) that it could not
+/// parse: a protocol variant the implementation does not know, worth reporting.
+pub fn is_unparsed_modeled_line(line: &str) -> bool {
+    let line = line.trim();
+    ["MV", "PW", "ZM", "MU", "SI"]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+        && !line.ends_with('?')
+        && parse_line(line).is_none()
+}
+
 /// Decode an `MV` value: two digits are whole steps, a third digit `5` is the half step.
 fn mv_to_db(digits: &str) -> Option<f32> {
     if !(2..=3).contains(&digits.len()) || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -380,6 +391,18 @@ mod tests {
         buffer.push_str("5\rMU");
         assert_eq!(drain_lines(&mut buffer), vec!["MV405".to_string()]);
         assert_eq!(buffer, "MU");
+    }
+
+    #[test]
+    fn only_malformed_modeled_lines_count_as_unparsed() {
+        assert!(is_unparsed_modeled_line("MVX12"));
+        assert!(is_unparsed_modeled_line("PWMAYBE"));
+        assert!(!is_unparsed_modeled_line("MV405"));
+        assert!(!is_unparsed_modeled_line("MVMAX 70"));
+        assert!(!is_unparsed_modeled_line("Z2ON"));
+        assert!(!is_unparsed_modeled_line("MSDIRECT"));
+        assert!(!is_unparsed_modeled_line("@VOL:-395"));
+        assert!(!is_unparsed_modeled_line("MV?"));
     }
 
     #[test]

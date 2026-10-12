@@ -23,7 +23,17 @@ use rust_mcp_sdk::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-const ACTIONS: &[&str] = &["list", "links", "link", "unlink", "set_ceiling", "control"];
+const ACTIONS: &[&str] = &[
+    "list",
+    "links",
+    "link",
+    "unlink",
+    "set_ceiling",
+    "control",
+    "report",
+    "set_recording",
+    "clear_report",
+];
 
 #[mcp_tool(
     name = "hifi_devices",
@@ -39,7 +49,13 @@ const ACTIONS: &[&str] = &["list", "links", "link", "unlink", "set_ceiling", "co
                     power_off, power_toggle, select_input, volume_set, volume_up, volume_down, \
                     mute, unmute) to a device_id, or to the device a zone_id is linked to. Volume \
                     values are dB. Inputs never switch automatically: use select_input. A command \
-                    succeeds only when the device confirms it."
+                    succeeds only when the device confirms it. Spec \
+                    mismatches: action=set_recording enabled=true opts in to recording device \
+                    protocol mismatches locally (off by default, memory only); action=report \
+                    device_id builds a redacted preview with a prefilled GitHub issue link the \
+                    user opens and submits themselves (sections: environment, anomalies, \
+                    device_state, excerpts); action=clear_report forgets a device's recordings. \
+                    Nothing is ever sent automatically."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiDevicesTool {
@@ -72,6 +88,14 @@ pub struct HifiDevicesTool {
     /// For set_ceiling: the maximum volume in dB. Omit to clear the ceiling.
     #[serde(default)]
     pub ceiling: Option<f64>,
+    /// For set_recording: true to record device protocol mismatches locally, false to stop
+    /// (and forget everything recorded).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// For report: section ids to include (environment, anomalies, device_state, excerpts).
+    /// Omit for all but raw protocol excerpts.
+    #[serde(default)]
+    pub sections: Option<Vec<String>>,
 }
 
 pub async fn handle_devices(
@@ -204,6 +228,47 @@ pub async fn handle_devices(
                 .param_opt("zone_id", args.zone_id.clone())
                 .param_opt("value", value.clone());
             control(state, env, target, &command, value.as_ref()).await
+        }
+        "report" => {
+            let Some(device_id) = args.device_id else {
+                return env.refused(
+                    "report requires device_id.",
+                    Refusal::invalid_parameter("device_id", &[], "Pass a device from action=list."),
+                );
+            };
+            let env = env.param("device_id", device_id.clone());
+            match crate::api::devices::mismatch_preview(state, &device_id, args.sections).await {
+                Ok(preview) => Ok(env.json_result(&preview)),
+                Err(error) => refuse(env, error),
+            }
+        }
+        "set_recording" => {
+            let Some(enabled) = args.enabled else {
+                return env.refused(
+                    "set_recording requires enabled.",
+                    Refusal::invalid_parameter("enabled", &["true", "false"], "Opt in or out."),
+                );
+            };
+            let env = env.param("enabled", enabled);
+            match state.devices.set_recording(enabled).await {
+                Ok(()) => Ok(env.json_result(&json!({
+                    "maturity": DEVICE_CONTROL_MATURITY,
+                    "recording": enabled,
+                }))),
+                Err(error) => refuse(env, error),
+            }
+        }
+        "clear_report" => {
+            let Some(device_id) = args.device_id.as_deref().and_then(DeviceId::parse) else {
+                return env.refused(
+                    "clear_report requires a valid device_id.",
+                    Refusal::invalid_parameter("device_id", &[], "Pass a device from action=list."),
+                );
+            };
+            state.devices.journal().clear(&device_id);
+            Ok(env
+                .param("device_id", device_id.to_string())
+                .json_result(&json!({"maturity": DEVICE_CONTROL_MATURITY, "cleared": true})))
         }
         _ => env.refused(
             "Unknown hifi_devices action.",

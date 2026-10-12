@@ -48,6 +48,9 @@ pub struct DeviceLinksDocument {
     /// Devices with no discovery mechanism (Anthem, Trinnov) or on another subnet, per family.
     #[serde(default)]
     pub manual_devices: Vec<ManualDevice>,
+    /// Whether the user opted in to recording device protocol mismatches (local, in memory).
+    #[serde(default)]
+    pub record_mismatches: bool,
 }
 
 /// A device configured by address rather than discovered.

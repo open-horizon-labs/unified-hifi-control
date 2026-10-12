@@ -179,6 +179,13 @@ impl MockMarantz {
         }
     }
 
+    /// Push an arbitrary line to the connected Telnet client, as a firmware variant might.
+    pub async fn push_raw(&self, line: &str) {
+        if self.push.send(format!("{line}\r")).is_err() {
+            // No connected client.
+        }
+    }
+
     /// Someone turned the receiver's own volume knob or remote: the level changes and the unit
     /// pushes the new `MV` line, unsolicited, to the connected Telnet client.
     pub async fn remote_set_level(&self, level_db: f32) {

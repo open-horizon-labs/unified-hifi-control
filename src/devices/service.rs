@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 
+use super::anomalies::{AnomalyJournal, AnomalyKind, DeviceAnomaly};
 use super::links::{DeviceLinkStore, DeviceLinksDocument, StoreError};
 use super::{Device, DeviceId, DeviceLink, DevicePower};
 use crate::aggregator::ZoneAggregator;
@@ -318,6 +319,7 @@ pub struct DeviceService {
     drivers: RwLock<HashMap<&'static str, Arc<dyn DeviceDriver>>>,
     device_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     confirm_timeout: Duration,
+    journal: Arc<AnomalyJournal>,
 }
 
 impl DeviceService {
@@ -329,7 +331,22 @@ impl DeviceService {
             drivers: RwLock::new(HashMap::new()),
             device_locks: Mutex::new(HashMap::new()),
             confirm_timeout: DEFAULT_CONFIRM_TIMEOUT,
+            journal: Arc::new(AnomalyJournal::new()),
         }
+    }
+
+    /// The mismatch journal (opt-in; see `crate::devices::anomalies`).
+    pub fn journal(&self) -> Arc<AnomalyJournal> {
+        self.journal.clone()
+    }
+
+    /// Turn mismatch recording on or off, persisting the choice. Off forgets everything recorded.
+    pub async fn set_recording(&self, enabled: bool) -> Result<(), DeviceError> {
+        self.store
+            .update(move |document| document.record_mismatches = enabled)
+            .await?;
+        self.journal.set_enabled(enabled);
+        Ok(())
     }
 
     /// Shorter confirmation deadline, for tests.
@@ -372,6 +389,7 @@ impl DeviceService {
     }
 
     async fn install(&self, document: DeviceLinksDocument) {
+        self.journal.set_enabled(document.record_mismatches);
         let ceilings = document
             .devices
             .iter()
@@ -504,8 +522,41 @@ impl DeviceService {
             .map(|link| link.device_id)
     }
 
-    /// Carry out a request and wait for the device to confirm it.
+    /// Carry out a request and wait for the device to confirm it. Outcomes that show the device
+    /// disagreeing with the implementation are recorded in the mismatch journal (when enabled).
     pub async fn control(
+        &self,
+        target: DeviceTarget,
+        request: DeviceRequest,
+    ) -> Result<DeviceCommandReport, DeviceError> {
+        let label = request.label();
+        let result = self.control_inner(target, request).await;
+        match &result {
+            Ok(report) if report.confirmation == Confirmation::ConfirmedDifferent => {
+                self.journal.record(DeviceAnomaly::new(
+                    report.device_id.clone(),
+                    AnomalyKind::ConfirmedDifferent,
+                    format!(
+                        "{label}: sent {:?}, device reported {:?}",
+                        report.sent_volume, report.observed.volume.value
+                    ),
+                ));
+            }
+            Err(DeviceError::Unconfirmed { device_id, detail }) => {
+                if let Some(device_id) = DeviceId::parse(device_id) {
+                    self.journal.record(DeviceAnomaly::new(
+                        device_id,
+                        AnomalyKind::Unconfirmed,
+                        format!("{label}: {detail}"),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        result
+    }
+
+    async fn control_inner(
         &self,
         target: DeviceTarget,
         request: DeviceRequest,

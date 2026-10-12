@@ -185,6 +185,8 @@ pub struct PlayerStatus {
     pub muted: Option<bool>,
     /// The current input as a `switchmode` id, when the `mode` maps to one.
     pub input: Option<String>,
+    /// An active `mode` no documented source maps (not `-1`/`0`): a spec gap worth reporting.
+    pub unknown_mode: Option<i64>,
 }
 
 /// Parse a `getPlayerStatus` body. Values arrive as strings (`"vol":"40"`). A `vol` outside
@@ -202,9 +204,11 @@ pub fn parse_player_status(body: &str) -> Option<PlayerStatus> {
         "1" => Some(true),
         _ => None,
     });
-    let input = text(&value, "mode")
-        .and_then(|v| v.parse::<u32>().ok())
+    let mode = text(&value, "mode").and_then(|v| v.parse::<i64>().ok());
+    let input = mode
+        .and_then(|m| u32::try_from(m).ok())
         .and_then(input_for_mode);
+    let unknown_mode = mode.filter(|m| *m > 0 && input.is_none());
     if volume.is_none() && muted.is_none() && input.is_none() && value.get("status").is_none() {
         return None;
     }
@@ -212,6 +216,7 @@ pub fn parse_player_status(body: &str) -> Option<PlayerStatus> {
         volume,
         muted,
         input,
+        unknown_mode,
     })
 }
 
@@ -440,5 +445,16 @@ mod tests {
             ["wifi", "line-in", "bluetooth", "optical", "HDMI"]
         );
         assert_eq!(ids("Some LinkPlay").len(), INPUTS.len());
+    }
+
+    #[test]
+    fn undocumented_active_modes_are_flagged_idle_is_not() {
+        let unknown = parse_player_status(r#"{"mode":"47","vol":"20","mute":"0"}"#).unwrap();
+        assert_eq!(unknown.input, None);
+        assert_eq!(unknown.unknown_mode, Some(47));
+        let idle = parse_player_status(r#"{"mode":"-1","vol":"20","mute":"0"}"#).unwrap();
+        assert_eq!(idle.unknown_mode, None);
+        let known = parse_player_status(r#"{"mode":"43","vol":"20","mute":"0"}"#).unwrap();
+        assert_eq!(known.unknown_mode, None);
     }
 }

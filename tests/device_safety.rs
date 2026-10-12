@@ -455,6 +455,8 @@ async fn critical_ceiling_enforced_via_knob_and_mcp() {
             input: None,
             muted: None,
             ceiling: Some(-30.0),
+            enabled: None,
+            sections: None,
         },
     )
     .await
@@ -682,6 +684,8 @@ async fn hifi_devices_lists_devices_and_links_as_alpha() {
             input: None,
             muted: None,
             ceiling: None,
+            enabled: None,
+            sections: None,
         },
     )
     .await
@@ -700,6 +704,8 @@ async fn hifi_devices_lists_devices_and_links_as_alpha() {
             input: None,
             muted: None,
             ceiling: None,
+            enabled: None,
+            sections: None,
         },
     )
     .await
@@ -743,4 +749,80 @@ async fn hifi_control_volume_on_a_linked_zone_steps_by_the_device_step() {
     .unwrap();
     assert_ne!(result.is_error, Some(true), "{result:?}");
     assert_eq!(front.snapshot().await.level_db(), -39.0);
+}
+
+// =============================================================================
+// Mismatch reports (opt-in capture -> redacted preview -> user-submitted issue)
+// =============================================================================
+
+/// CRITICAL: with recording off (the default) nothing is captured, so nothing could be reported.
+/// With it on, a real unconfirmed write and an unparseable protocol line both appear in the
+/// preview, redacted, and the preview sends nothing anywhere.
+#[tokio::test]
+async fn critical_mismatches_are_captured_only_when_opted_in_and_previewed_redacted() {
+    let h = harness().await;
+    let journal = h.state.devices.journal();
+    tokio::spawn(journal.clone().run(h.bus.clone(), CancellationToken::new()));
+    let front = MockMarantz::start().await;
+    h.attach(FRONT, "front", &front).await;
+    h.zone_ready("roon:living").await;
+    h.link("roon:living", FRONT).await;
+
+    // Off by default: an unanswered write leaves no trace.
+    front.state.lock().await.answers = false;
+    h.knob("roon:living", "vol_abs", Some(json!(-30.0)))
+        .await
+        .expect_err("unconfirmed");
+    assert!(
+        journal.counts().is_empty(),
+        "recorded while recording was off"
+    );
+
+    // Opt in, then the same failure and a firmware variant line are both recorded.
+    h.state.devices.set_recording(true).await.unwrap();
+    h.knob("roon:living", "vol_abs", Some(json!(-31.0)))
+        .await
+        .expect_err("unconfirmed");
+    front.state.lock().await.answers = true;
+    front.push_raw("MVX12 from 10.0.0.7").await;
+    h.wait_for(|state| async move {
+        state
+            .devices
+            .journal()
+            .entries(&id(FRONT))
+            .iter()
+            .any(|a| a.excerpt.is_some())
+    })
+    .await;
+
+    let preview = unified_hifi_control::api::devices::mismatch_preview(
+        &h.state,
+        id(FRONT).as_str(),
+        Some(vec![
+            "environment".into(),
+            "anomalies".into(),
+            "device_state".into(),
+            "excerpts".into(),
+        ]),
+    )
+    .await
+    .unwrap();
+    let markdown = preview["markdown"].as_str().unwrap();
+    assert!(markdown.contains("unconfirmed"), "{markdown}");
+    assert!(markdown.contains("unparsed_line"), "{markdown}");
+    for secret in ["0006781E0AB8", "127.0.0.1", "10.0.0.7", "\"front\""] {
+        assert!(!markdown.contains(secret), "{secret} leaked: {markdown}");
+        assert!(
+            !preview["issue_url"].as_str().unwrap().contains(secret),
+            "{secret} leaked into the URL"
+        );
+    }
+    assert!(preview["issue_url"]
+        .as_str()
+        .unwrap()
+        .starts_with("https://github.com/open-horizon-labs/unified-hifi-control/issues/new?template=device-mismatch.yml"));
+
+    // Opting out forgets everything.
+    h.state.devices.set_recording(false).await.unwrap();
+    assert!(journal.counts().is_empty());
 }

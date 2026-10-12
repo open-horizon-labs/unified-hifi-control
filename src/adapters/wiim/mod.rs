@@ -600,6 +600,24 @@ impl Unit {
                 Some(player) => {
                     self.reachable = true;
                     self.detail = None;
+                    let new_unknown = player.unknown_mode.filter(|mode| {
+                        self.player.as_ref().and_then(|p| p.unknown_mode) != Some(*mode)
+                    });
+                    if let Some(mode) = new_unknown {
+                        crate::devices::anomalies::report(
+                            &self.bus,
+                            crate::devices::anomalies::DeviceAnomaly::new(
+                                self.device_id.clone(),
+                                crate::devices::anomalies::AnomalyKind::UnknownValue,
+                                format!(
+                                    "getPlayerStatus mode {mode} maps to no documented input \
+                                     ({})",
+                                    self.model
+                                ),
+                            )
+                            .with_excerpt(body.clone()),
+                        );
+                    }
                     self.player = Some(player);
                 }
                 None => {

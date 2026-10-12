@@ -687,6 +687,16 @@ impl Unit {
                                 if let Some(event) = protocol::parse_line(&line) {
                                     self.state.apply_telnet(event);
                                     changed = true;
+                                } else if protocol::is_unparsed_modeled_line(&line) {
+                                    crate::devices::anomalies::report(
+                                        &self.bus,
+                                        crate::devices::anomalies::DeviceAnomaly::new(
+                                            self.device_id.clone(),
+                                            crate::devices::anomalies::AnomalyKind::UnparsedLine,
+                                            format!("{}: Telnet line not understood", self.model),
+                                        )
+                                        .with_excerpt(line.clone()),
+                                    );
                                 }
                             }
                             if changed {

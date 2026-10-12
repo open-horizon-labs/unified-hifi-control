@@ -545,6 +545,13 @@ mod server {
         for family in &device_families {
             state.devices.register_driver(family.clone()).await;
         }
+        // Opt-in mismatch journal: records adapter-reported anomalies only while enabled.
+        tokio::spawn(
+            state
+                .devices
+                .journal()
+                .run(bus.clone(), shutdown_token.clone()),
+        );
         if let Err(error) = state.devices.load().await {
             // The store refuses writes and keeps the file; device control continues unlinked.
             tracing::error!("Device links not loaded: {error}");
@@ -1053,6 +1060,13 @@ mod server {
             .route("/devices/unlink", post(api::devices::device_unlink_handler))
             .route("/devices/ceiling", post(api::devices::device_ceiling_handler))
             .route("/devices/control", post(api::devices::device_control_handler))
+            .route("/devices/recording", post(api::devices::device_recording_handler))
+            .route("/devices/report/clear", post(api::devices::device_report_clear_handler))
+            .route("/devices/{device_id}/report", get(api::devices::device_report_handler))
+            .route(
+                "/devices/{device_id}/report.json",
+                get(api::devices::device_report_bundle_handler),
+            )
             .route(
                 "/hqp/zones/{zone_id}/pipeline",
                 get(api::hqp_zone_pipeline_handler),

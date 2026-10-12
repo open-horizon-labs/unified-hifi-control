@@ -96,12 +96,15 @@ pub async fn device_inventory(state: &AppState) -> Value {
         Ok(()) => json!({"writable": true}),
         Err(detail) => json!({"writable": false, "detail": detail}),
     };
+    let journal = state.devices.journal();
     json!({
         "maturity": DEVICE_CONTROL_MATURITY,
         "devices": device_views,
         "links": link_views,
         "link_store": link_store,
         "actions": DEVICE_ACTIONS,
+        "mismatch_recording": journal.is_enabled(),
+        "mismatch_counts": journal.counts(),
     })
 }
 
@@ -271,4 +274,169 @@ pub async fn device_control_handler(
         .await
         .map_err(device_error_response)?;
     Ok(Json(json!({ "ok": true, "result": report })))
+}
+
+// =============================================================================
+// Mismatch reports (#774, alpha): opt-in capture, preview, user-submitted issue
+// =============================================================================
+
+/// Sections included when the caller does not choose: everything except raw excerpts.
+const DEFAULT_SECTIONS: &[&str] = &["environment", "anomalies", "device_state"];
+const ALL_SECTIONS: &[&str] = &["environment", "anomalies", "device_state", "excerpts"];
+
+/// Build the preview for one device: redacted sections, the prefilled issue URL for the chosen
+/// sections, and a duplicate search. Shared by HTTP and MCP. Sends nothing anywhere.
+pub async fn mismatch_preview(
+    state: &AppState,
+    device_id: &str,
+    include: Option<Vec<String>>,
+) -> Result<Value, DeviceError> {
+    let parsed = DeviceId::parse(device_id).ok_or_else(|| DeviceError::UnknownDevice {
+        device_id: device_id.to_string(),
+    })?;
+    let device =
+        state
+            .aggregator
+            .get_device(&parsed)
+            .await
+            .ok_or_else(|| DeviceError::UnknownDevice {
+                device_id: device_id.to_string(),
+            })?;
+    let journal = state.devices.journal();
+    let anomalies = journal.entries(&parsed);
+    let (report, _) = crate::devices::report::build(&device, &anomalies, env!("CARGO_PKG_VERSION"));
+    let chosen: Vec<&str> = match &include {
+        Some(ids) => ALL_SECTIONS
+            .iter()
+            .copied()
+            .filter(|id| ids.iter().any(|chosen| chosen == id))
+            .collect(),
+        None => DEFAULT_SECTIONS.to_vec(),
+    };
+    let (issue_url, dropped) = crate::devices::report::issue_url(&report, &chosen);
+    Ok(json!({
+        "maturity": DEVICE_CONTROL_MATURITY,
+        "recording": journal.is_enabled(),
+        "report": report,
+        "included_sections": chosen,
+        "markdown": crate::devices::report::render_markdown(&report, &chosen),
+        "issue_url": issue_url,
+        "omitted_from_link": dropped,
+        "search_url": crate::devices::report::search_url(&report),
+        "bundle_url": format!("/devices/{}/report.json", parsed),
+        "note": "Nothing has been sent. Review the sections, then open the issue on GitHub and \
+                 submit it yourself; attach the bundle for the full capture.",
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct MismatchPreviewQuery {
+    /// Comma-separated section ids: environment, anomalies, device_state, excerpts.
+    #[serde(default)]
+    pub include: Option<String>,
+}
+
+/// GET /devices/{device_id}/report
+pub async fn device_report_handler(
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<MismatchPreviewQuery>,
+) -> ApiResult {
+    let include = query.include.map(|list| {
+        list.split(',')
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect()
+    });
+    mismatch_preview(&state, &device_id, include)
+        .await
+        .map(Json)
+        .map_err(device_error_response)
+}
+
+/// GET /devices/{device_id}/report.json — the redacted, fixture-shaped bundle to attach.
+pub async fn device_report_bundle_handler(
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
+    use axum::response::IntoResponse;
+    let parsed = DeviceId::parse(&device_id).ok_or_else(|| {
+        device_error_response(DeviceError::UnknownDevice {
+            device_id: device_id.clone(),
+        })
+    })?;
+    let device = state.aggregator.get_device(&parsed).await.ok_or_else(|| {
+        device_error_response(DeviceError::UnknownDevice {
+            device_id: device_id.clone(),
+        })
+    })?;
+    let anomalies = state.devices.journal().entries(&parsed);
+    let (_, bundle) = crate::devices::report::build(&device, &anomalies, env!("CARGO_PKG_VERSION"));
+    let filename = format!(
+        "uhc-device-mismatch-{}-{}.json",
+        parsed.kind(),
+        device
+            .model
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>()
+    );
+    let body = serde_json::to_string_pretty(&bundle).unwrap_or_default();
+    Ok((
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+pub struct MismatchRecordingRequest {
+    pub enabled: bool,
+}
+
+/// POST /devices/recording — opt in to (or out of, clearing everything) mismatch recording.
+pub async fn device_recording_handler(
+    State(state): State<AppState>,
+    Json(request): Json<MismatchRecordingRequest>,
+) -> ApiResult {
+    state
+        .devices
+        .set_recording(request.enabled)
+        .await
+        .map_err(device_error_response)?;
+    Ok(Json(json!({
+        "ok": true,
+        "maturity": DEVICE_CONTROL_MATURITY,
+        "recording": request.enabled,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct MismatchClearRequest {
+    pub device_id: String,
+}
+
+/// POST /devices/report/clear — forget one device's recorded mismatches (e.g. after reporting).
+pub async fn device_report_clear_handler(
+    State(state): State<AppState>,
+    Json(request): Json<MismatchClearRequest>,
+) -> ApiResult {
+    let parsed = DeviceId::parse(&request.device_id).ok_or_else(|| {
+        device_error_response(DeviceError::UnknownDevice {
+            device_id: request.device_id.clone(),
+        })
+    })?;
+    state.devices.journal().clear(&parsed);
+    Ok(Json(
+        json!({"ok": true, "maturity": DEVICE_CONTROL_MATURITY}),
+    ))
 }

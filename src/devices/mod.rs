@@ -19,7 +19,9 @@
 //! Everything in this module is **alpha** ([`DEVICE_CONTROL_MATURITY`]). Every API and MCP
 //! payload that carries a device says so, and the Settings toggle wears the badge.
 
+pub mod anomalies;
 pub mod links;
+pub mod report;
 pub mod service;
 
 use serde::{Deserialize, Serialize};

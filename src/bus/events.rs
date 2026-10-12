@@ -587,6 +587,12 @@ pub enum BusEvent {
     /// A device is no longer observed (adapter stopped, unit vanished). Links to it stay.
     DeviceRemoved { device_id: crate::devices::DeviceId },
 
+    /// An adapter saw the device disagree with the implementation (unparsed line, unknown value).
+    /// Recorded only when the user has turned mismatch recording on.
+    DeviceAnomaly {
+        anomaly: Box<crate::devices::anomalies::DeviceAnomaly>,
+    },
+
     /// The device facts surfaced on one or more linked zones changed: power, input, volume or
     /// mute moved, or a link was created or removed. Published by the aggregator, never by an
     /// adapter, so SSE consumers (the Home Assistant integration) can update every affected zone
@@ -734,6 +740,7 @@ impl BusEvent {
             Self::VolumeCapabilityChanged { .. } => "volume_capability_changed",
             Self::DeviceObserved { .. } => "device_observed",
             Self::DeviceRemoved { .. } => "device_removed",
+            Self::DeviceAnomaly { .. } => "device_anomaly",
             Self::LinkedDeviceChanged { .. } => "linked_device_changed",
             Self::CommandReceived { .. } => "command_received",
             Self::CommandResult { .. } => "command_result",
