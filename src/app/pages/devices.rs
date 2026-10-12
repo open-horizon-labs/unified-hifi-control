@@ -236,7 +236,16 @@ fn DeviceRow(
     } else {
         device.name.clone()
     };
-    let model = format!("{} {}", device.vendor, device.model);
+    // Model names often carry the vendor already ("WiiM Ultra"); don't print it twice.
+    let model = if device
+        .model
+        .to_lowercase()
+        .starts_with(&device.vendor.to_lowercase())
+    {
+        device.model.clone()
+    } else {
+        format!("{} {}", device.vendor, device.model)
+    };
     let (power_class, power_text) = match device.power.as_str() {
         "on" => ("badge badge-success", "On"),
         "standby" => ("badge badge-secondary", "Standby"),
@@ -451,7 +460,7 @@ fn ReportPanel(
                     div { class: "mb-3",
                         p { class: "text-sm font-medium", "{report.report.title}" }
                         p { class: "text-xs text-muted",
-                            "UHC {report.report.evidence} capture"
+                            "Evidence: {report.report.evidence}"
                         }
                     }
 
@@ -594,6 +603,12 @@ fn SectionCard(
     let monospace = matches!(section.id.as_str(), "device_state" | "excerpts");
     // Short, human-scale sections open by default; bulky dumps stay folded.
     let open_by_default = !monospace;
+    // A folded section must say what it holds, or it reads as empty.
+    let trigger_label = if open_by_default || section.lines.is_empty() {
+        "Details".to_string()
+    } else {
+        format!("Show {} lines", section.lines.len())
+    };
     let input_id = format!("report-section-{}", section.id);
     let section_id = section.id.clone();
     let body_class = if checked { "" } else { "opacity-60" };
@@ -623,7 +638,7 @@ fn SectionCard(
                 }
             }
             Collapsible { default_open: open_by_default,
-                CollapsibleTrigger { "Details" }
+                CollapsibleTrigger { "{trigger_label}" }
                 CollapsibleContent {
                     div { class: "{body_class}",
                         if section.lines.is_empty() {

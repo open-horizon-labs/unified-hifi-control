@@ -225,6 +225,15 @@ fn device_facts(device: &Device, redacted: &mut BTreeSet<String>) -> Value {
 }
 
 /// Build the report and bundle from one device's journal.
+/// "Vendor model", without repeating a vendor the model name already carries ("WiiM WiiM Ultra").
+fn vendor_model(vendor: &str, model: &str) -> String {
+    if model.to_lowercase().starts_with(&vendor.to_lowercase()) {
+        model.to_string()
+    } else {
+        format!("{vendor} {model}")
+    }
+}
+
 pub fn build(
     device: &Device,
     anomalies: &[DeviceAnomaly],
@@ -271,12 +280,21 @@ pub fn build(
     let environment = vec![
         format!("- UHC: {uhc_version}"),
         format!("- Family: `{}`", device.device_id.kind()),
-        format!("- Vendor / model: {} {}", device.vendor, device.model),
+        format!(
+            "- Vendor / model: {}",
+            vendor_model(&device.vendor, &device.model)
+        ),
         format!("- Discovery: {}", device.discovery),
         format!("- Control channel: {:?}", device.connection.control_channel),
         format!(
-            "- Volume: {:?} scale, min {}, hardware max {:?}, step {}",
-            device.volume.scale, device.volume.min, device.volume.hardware_max, device.volume.step
+            "- Volume: {:?} scale, min {}, hardware max {}, step {}",
+            device.volume.scale,
+            device.volume.min,
+            device
+                .volume
+                .hardware_max
+                .map_or_else(|| "unknown".to_string(), |max| max.to_string()),
+            device.volume.step
         ),
     ];
 
@@ -526,6 +544,24 @@ mod tests {
         assert!(bundle_text.contains("WiiM Ultra"));
         assert!(bundle_text.contains("Linkplay.5.2.829661"));
         assert!(body.contains("mode 47"));
+    }
+
+    /// The report is read by people: no Rust debug wrappers, no vendor printed twice.
+    #[test]
+    fn environment_reads_as_prose() {
+        let (report, _) = build(&device(), &anomalies(), "4.0.0-test");
+        let text = render_markdown(&report, &["environment"]);
+        assert!(text.contains("Vendor / model: WiiM Ultra"), "{text}");
+        assert!(text.contains("hardware max 100,"), "{text}");
+        assert!(!text.contains("Some("), "{text}");
+        let mut unknown = device();
+        unknown.vendor = "Marantz".to_string();
+        unknown.model = "SR6008".to_string();
+        unknown.volume.hardware_max = None;
+        let (report, _) = build(&unknown, &[], "4.0.0-test");
+        let text = render_markdown(&report, &["environment"]);
+        assert!(text.contains("Vendor / model: Marantz SR6008"), "{text}");
+        assert!(text.contains("hardware max unknown"), "{text}");
     }
 
     #[test]
