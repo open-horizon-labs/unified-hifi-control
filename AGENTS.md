@@ -384,7 +384,7 @@ than inventing parallel shapes.
 
 A **device** is the amplifier, receiver or streamer a zone plays through. Families: Denon/Marantz,
 WiiM, Sonos, Yamaha MusicCast, BluOS, Cambridge StreamMagic, Trinnov, Onkyo/Integra/Pioneer
-(eISCP), Arcam, Hegel, Lyngdorf, Anthem, Eversolo (remote-key API only: no readback), and Home Assistant `media_player`
+(eISCP), Arcam, Hegel, Lyngdorf, Anthem, Eversolo (Zidoo JSON API from community clients), and Home Assistant `media_player`
 entities. All alpha,
 enabled together by the Settings "Receivers & amplifiers" toggle; Anthem and Trinnov (no
 discovery) are configured as `manual_devices` in `device-links.json`. Volume is carried in each
@@ -434,7 +434,7 @@ in `docs/device-control-weave.md`; the SR6008 captures behind the claims below a
 | Hegel | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
 | Lyngdorf | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
 | Anthem | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
-| Eversolo DMP-A6 | ⛔ | ⛔ | ⛔ | 🚧 implemented, #788 | 🚧 implemented, #788 |
+| Eversolo DMP-A6 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
 | Home Assistant media_player | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
 
 ✅ hardware-verified: exercised on real units with captured fixtures · 🚧 implemented from the vendor protocol or reference client, not exercised on hardware (#788) · ⛔ not supported by this family's protocol path
@@ -457,7 +457,7 @@ in `docs/device-control-weave.md`; the SR6008 captures behind the claims below a
 - **Hegel** — volume: -v.N, 0-100 percent (the protocol's full scale is the maximum; a user ceiling lowers it); power: -p.1 / -p.0 over the control session
 - **Lyngdorf** — volume: !VOL(n) in tenths of a dB, -99.9 to +24.0 dB; the unit's own !MAXVOL (read-only over the protocol) bounds the range, lowered by the user ceiling; refused while the unit is not on, because standby discards volume writes silently; implementation-derived from the lyngdorf library and vendor manual, not exercised on hardware; power: !POWERONMAIN / !POWEROFFMAIN (main zone only); implementation-derived from the lyngdorf library and vendor manual, not exercised on hardware
 - **Anthem** — volume: Z1PVOL in percent, 0 to 100; the protocol's full scale is the maximum, lowered by the user ceiling; refused while the zone is off; implementation-derived from anthemav, not exercised on hardware; Zone 1 only; power: Z1POW1 / Z1POW0 (Zone 1, not the whole unit); waking from standby needs standby IP control enabled on the unit; implementation-derived from anthemav, not exercised on hardware; Zone 1 only
-- **Eversolo DMP-A6** — volume: the document has only relative Key.VolumeUp/Key.VolumeDown: no absolute level, scale, range or step, and no readback, so a level cannot be bounded; power: Key.Poweroff only (standby); the document has no power-on key and no power state
+- **Eversolo DMP-A6** — volume: absolute GET setDevicesVolume?volume=N in native steps 0..maxVolume (200 on every captured unit), read back from getState volumeData.currenttVolume; DMP-A6: HDMI output and 6 inputs seen on firmware v1.5.46 (mase1981/uc-intg-eversolo DISCOVERY_ANALYSIS.md); the UPnP descriptor in andrewdunndev/narjo-eversolo-upnp is a DMP-A6; power: off: GET setPowerOption?tag=poweroff (fallback Key.Poweroff); standby is inferred only when the unit stops answering after UHC's own accepted power-off. On: Wake-on-LAN (UDP 9 and 9517) with the unit's MAC, currently available (ableRemoteBoot true); a magic packet is not confirmation; DMP-A6: HDMI output and 6 inputs seen on firmware v1.5.46 (mase1981/uc-intg-eversolo DISCOVERY_ANALYSIS.md); the UPnP descriptor in andrewdunndev/narjo-eversolo-upnp is a DMP-A6
 - **Home Assistant media_player** — volume: media_player.volume_set (0–1, no native scale): absolute levels are refused until a ceiling is set for this device; power: media_player.turn_on/turn_off via Home Assistant; confirmed by state readback
 
 <!-- END GENERATED DEVICE CAPABILITIES -->
