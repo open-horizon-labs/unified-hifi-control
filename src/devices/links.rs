@@ -31,7 +31,7 @@ pub const DEVICE_LINKS_VERSION: u32 = 1;
 pub struct DeviceSettings {
     /// The user's volume ceiling in dB. Only ever lowers the published maximum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub volume_ceiling_db: Option<f32>,
+    pub volume_ceiling: Option<f32>,
 }
 
 /// The whole persisted document.
@@ -45,6 +45,23 @@ pub struct DeviceLinksDocument {
     /// Hosts to probe directly when multicast discovery cannot reach a device (another subnet).
     #[serde(default)]
     pub manual_hosts: Vec<String>,
+    /// Devices with no discovery mechanism (Anthem, Trinnov) or on another subnet, per family.
+    #[serde(default)]
+    pub manual_devices: Vec<ManualDevice>,
+}
+
+/// A device configured by address rather than discovered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualDevice {
+    /// Device family (adapter) name, e.g. `anthem`, `trinnov`.
+    pub family: String,
+    pub host: String,
+    /// Control port, when not the family default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Hardware identity when the protocol cannot report one (and for Wake-on-LAN).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
 }
 
 impl DeviceLinksDocument {
@@ -272,7 +289,7 @@ mod tests {
         let path = dir.path().join(DEVICE_LINKS_FILE);
         std::fs::write(
             &path,
-            r#"{"version":1,"links":[{"zone_id":"lms:gone","device_id":"marantz:0006781E2AB9"}],"devices":{"marantz:0006781E2AB9":{"volume_ceiling_db":-30.0}}}"#,
+            r#"{"version":1,"links":[{"zone_id":"lms:gone","device_id":"marantz:0006781E2AB9"}],"devices":{"marantz:0006781E2AB9":{"volume_ceiling":-30.0}}}"#,
         )
         .unwrap();
         let store = DeviceLinkStore::open(path);
@@ -280,7 +297,7 @@ mod tests {
         assert_eq!(document.links.len(), 1);
         assert_eq!(document.links[0].source_id, None);
         assert_eq!(
-            document.devices[&DeviceId::parse("marantz:0006781E2AB9").unwrap()].volume_ceiling_db,
+            document.devices[&DeviceId::parse("marantz:0006781E2AB9").unwrap()].volume_ceiling,
             Some(-30.0)
         );
     }

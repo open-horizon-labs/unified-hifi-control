@@ -184,14 +184,14 @@
     }
   },
   "hifi_devices": {
-    "description": "Alpha capability: expect refinement across releases. Amplifiers and receivers (playback devices) that zones play through, separate from the music provider. action=list shows every device with its inputs, power, volume range and linked zones. action=links lists zone links. action=link connects a zone_id to the device_id it plays through (optionally source_id, the device input the zone arrives on); after linking, that zone's volume and hifi_control volume actions drive the device. action=unlink removes a zone's link. action=set_ceiling sets a device's maximum volume in dB (omit ceiling_db to clear); a ceiling only ever lowers the device's own limit. action=control sends command (power_on, power_off, power_toggle, select_input, volume_set, volume_up, volume_down, mute, unmute) to a device_id, or to the device a zone_id is linked to. Volume values are dB. Inputs never switch automatically: use select_input. A command succeeds only when the device confirms it.",
+    "description": "Alpha capability: expect refinement across releases. Amplifiers and receivers (playback devices) that zones play through, separate from the music provider. action=list shows every device with its inputs, power, volume range and linked zones. action=links lists zone links. action=link connects a zone_id to the device_id it plays through (optionally source_id, the device input the zone arrives on); after linking, that zone's volume and hifi_control volume actions drive the device. action=unlink removes a zone's link. action=set_ceiling sets a device's maximum volume in dB (omit ceiling to clear); a ceiling only ever lowers the device's own limit. action=control sends command (power_on, power_off, power_toggle, select_input, volume_set, volume_up, volume_down, mute, unmute) to a device_id, or to the device a zone_id is linked to. Volume values are dB. Inputs never switch automatically: use select_input. A command succeeds only when the device confirms it.",
     "inputSchema": {
       "properties": {
         "action": {
           "description": "list, links, link, unlink, set_ceiling, or control.",
           "type": "string"
         },
-        "ceiling_db": {
+        "ceiling": {
           "description": "For set_ceiling: the maximum volume in dB. Omit to clear the ceiling.",
           "nullable": true,
           "type": "number"

@@ -332,7 +332,7 @@ mod tests {
                 spotify: true,
                 applemusic: true,
                 musicassistant: true,
-                denonavr: true,
+                devices: true,
                 mqtt: true,
             },
             ..AppSettings::default()

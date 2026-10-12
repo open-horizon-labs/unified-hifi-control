@@ -405,6 +405,11 @@ impl DenonAvrAdapter {
         let cancel = {
             let mut state = self.state.write().await;
             state.running = true;
+            // After `stop_family` the adapter token is cancelled; a unit attached later needs a
+            // live one, or it would stop the moment it starts.
+            if state.cancel.is_cancelled() {
+                state.cancel = CancellationToken::new();
+            }
             state.cancel.child_token()
         };
         self.spawn_unit(device_id, host, ports, description, "manual", cancel)
@@ -462,7 +467,31 @@ impl DenonAvrAdapter {
     }
 }
 
-crate::impl_startable!(DenonAvrAdapter, "denonavr");
+#[async_trait]
+impl crate::adapters::devices::DeviceFamily for DenonAvrAdapter {
+    fn family(&self) -> &'static str {
+        ADAPTER_NAME
+    }
+
+    async fn start_family(
+        &self,
+        context: crate::adapters::devices::FamilyContext,
+    ) -> anyhow::Result<()> {
+        let hosts: Vec<String> = context
+            .manual
+            .into_iter()
+            .map(|device| device.host)
+            .collect();
+        if !hosts.is_empty() {
+            self.set_manual_hosts(hosts).await;
+        }
+        self.start_internal().await
+    }
+
+    async fn stop_family(&self) {
+        self.stop_internal().await
+    }
+}
 
 #[async_trait]
 impl DeviceDriver for DenonAvrAdapter {
@@ -813,11 +842,12 @@ impl Unit {
             input: self.state.input.clone(),
             inputs: self.state.inputs.clone(),
             volume: DeviceVolume {
-                db: self.state.volume_db,
-                min_db: protocol::MIN_DB,
-                hardware_max_db: self.state.max_db,
-                ceiling_db: None,
-                step_db: 0.5,
+                scale: crate::bus::VolumeScale::Decibel,
+                value: self.state.volume_db,
+                min: protocol::MIN_DB,
+                hardware_max: self.state.max_db,
+                ceiling: None,
+                step: 0.5,
                 is_muted: self.state.muted,
                 display: self.state.display.clone(),
             },

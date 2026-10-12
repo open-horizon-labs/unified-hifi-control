@@ -264,6 +264,9 @@ pub enum VolumeScale {
     Percentage,
     /// Linear (0.0 to 1.0)
     Linear,
+    /// Native device steps with a device-specific range (e.g. a Yamaha MusicCast 0–161). The
+    /// published `min`/`max`/`step` are authoritative; never interpret the value as dB or percent.
+    Steps,
     /// Unknown/unspecified
     #[default]
     Unknown,

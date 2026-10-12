@@ -22,12 +22,12 @@ use tokio_util::sync::CancellationToken;
 
 use unified_hifi_control::adapters::denonavr::protocol::Description;
 use unified_hifi_control::adapters::denonavr::DenonAvrAdapter;
+use unified_hifi_control::adapters::devices::DeviceFamily;
 use unified_hifi_control::adapters::hqplayer::{HqpInstanceManager, HqpZoneLinkService};
 use unified_hifi_control::adapters::lms::LmsAdapter;
 use unified_hifi_control::adapters::openhome::OpenHomeAdapter;
 use unified_hifi_control::adapters::roon::RoonAdapter;
 use unified_hifi_control::adapters::upnp::UPnPAdapter;
-use unified_hifi_control::adapters::Startable;
 use unified_hifi_control::aggregator::ZoneAggregator;
 use unified_hifi_control::api::AppState;
 use unified_hifi_control::bus::{
@@ -421,7 +421,7 @@ async fn critical_no_level_sent_on_connect_or_reconnect() {
     let h = harness().await;
     let front = MockMarantz::start().await;
     h.attach(FRONT, "front", &front).await;
-    h.adapter.stop().await;
+    h.adapter.stop_family().await;
     h.attach(FRONT, "front", &front).await;
 
     let state = front.snapshot().await;
@@ -454,7 +454,7 @@ async fn critical_ceiling_enforced_via_knob_and_mcp() {
             value: None,
             input: None,
             muted: None,
-            ceiling_db: Some(-30.0),
+            ceiling: Some(-30.0),
         },
     )
     .await
@@ -681,7 +681,7 @@ async fn hifi_devices_lists_devices_and_links_as_alpha() {
             value: None,
             input: None,
             muted: None,
-            ceiling_db: None,
+            ceiling: None,
         },
     )
     .await
@@ -699,7 +699,7 @@ async fn hifi_devices_lists_devices_and_links_as_alpha() {
             value: None,
             input: None,
             muted: None,
-            ceiling_db: None,
+            ceiling: None,
         },
     )
     .await

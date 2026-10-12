@@ -22,10 +22,74 @@ const END: &str = "<!-- END GENERATED DEVICE CAPABILITIES -->";
 
 fn cell(capability: &DeviceCapability) -> String {
     match (capability.supported, capability.evidence) {
-        (false, _) => "⛔ until range read".to_string(),
+        (false, _) => "⛔".to_string(),
         (true, CapabilityEvidence::HardwareVerified) => "✅ hardware-verified".to_string(),
         (true, CapabilityEvidence::ImplementationDerived) => "🚧 implemented, #788".to_string(),
     }
+}
+
+fn row(label: &str, claims: &unified_hifi_control::devices::DeviceCapabilities) -> String {
+    format!(
+        "| {label} | {} | {} | {} | {} | {} |\n",
+        cell(&claims.observe),
+        cell(&claims.volume),
+        cell(&claims.mute),
+        cell(&claims.power),
+        cell(&claims.input_select),
+    )
+}
+
+/// Every family's claims, from the same functions the adapters publish.
+fn family_rows() -> Vec<(String, unified_hifi_control::devices::DeviceCapabilities)> {
+    use unified_hifi_control::adapters::*;
+    let mut rows = Vec::new();
+    for (model, _) in READ_VERIFIED_MODELS {
+        rows.push((format!("Marantz {model}"), capabilities_for(model, true)));
+    }
+    rows.push((
+        "Other Denon / Marantz".to_string(),
+        capabilities_for("(other)", true),
+    ));
+    rows.push(("WiiM".to_string(), wiim::capabilities_for("WiiM")));
+    rows.push(("Sonos".to_string(), sonos::capabilities_for("Sonos", false)));
+    rows.push((
+        "Yamaha MusicCast".to_string(),
+        // A main zone advertising the usual func_list, as getFeatures reports for a receiver.
+        musiccast::capabilities_for(
+            "MusicCast",
+            &musiccast::protocol::parse_features(
+                r#"{"response_code":0,"zone":[{"id":"main","func_list":["power","volume","mute"],
+                    "range_step":[{"id":"volume","min":0,"max":161,"step":1}],
+                    "input_list":["hdmi1","net_radio"]}]}"#,
+            )
+            .expect("representative getFeatures"),
+        ),
+    ));
+    rows.push((
+        "BluOS".to_string(),
+        bluos::capabilities_for("BluOS", bluos::protocol::VolumeSupport::Variable, true),
+    ));
+    rows.push((
+        "Cambridge StreamMagic (variable output)".to_string(),
+        streammagic::capabilities_for("StreamMagic", true),
+    ));
+    rows.push((
+        "Trinnov Altitude (MAC configured)".to_string(),
+        trinnov::capabilities_for("Altitude", true),
+    ));
+    rows.push((
+        "Onkyo / Integra / Pioneer (eISCP)".to_string(),
+        eiscp::capabilities_for("eISCP"),
+    ));
+    rows.push(("Arcam".to_string(), arcam::capabilities_for("SA30")));
+    rows.push(("Hegel".to_string(), hegel::capabilities_for("H190")));
+    rows.push(("Lyngdorf".to_string(), lyngdorf::capabilities_for("MP-60")));
+    rows.push(("Anthem".to_string(), anthem::capabilities_for("MRX 540")));
+    rows.push((
+        "Home Assistant media_player".to_string(),
+        homeassistant_devices::protocol::capabilities(4 | 8 | 128 | 256 | 2048),
+    ));
+    rows
 }
 
 fn render() -> String {
@@ -33,46 +97,49 @@ fn render() -> String {
     out.push_str(BEGIN);
     out.push_str("\n\n");
     out.push_str(
-        "| Model | Observe | Volume | Mute | Power | Input select |\n|---|---|---|---|---|---|\n",
+        "| Family | Observe | Volume | Mute | Power | Input select |\n|---|---|---|---|---|---|\n",
     );
-    for (model, _) in READ_VERIFIED_MODELS {
-        let claims = capabilities_for(model, true);
-        out.push_str(&format!(
-            "| Marantz {model} | {} | {} | {} | {} | {} |\n",
-            cell(&claims.observe),
-            cell(&claims.volume),
-            cell(&claims.mute),
-            cell(&claims.power),
-            cell(&claims.input_select),
-        ));
+    for (label, claims) in family_rows() {
+        out.push_str(&row(&label, &claims));
     }
-    let other = capabilities_for("(any other Denon/Marantz model)", true);
-    out.push_str(&format!(
-        "| Other Denon / Marantz | {} | {} | {} | {} | {} |\n",
-        cell(&other.observe).replace("✅ hardware-verified", "✅"),
-        cell(&other.volume),
-        cell(&other.mute),
-        cell(&other.power),
-        cell(&other.input_select),
-    ));
     out.push_str(
-        "\n✅ hardware-verified: exercised on the units with captured fixtures · 🚧 implemented \
-         but not yet exercised on hardware (tracked by #788) · ⛔ refused while the condition \
-         holds\n\n",
+        "\n✅ hardware-verified: exercised on real units with captured fixtures · 🚧 implemented \
+         from the vendor protocol or reference client, not exercised on hardware (#788) · ⛔ not \
+         supported by this family's protocol path\n\n",
     );
-    let sr6008 = capabilities_for("SR6008", true);
-    for (name, claim) in [
-        ("observe", &sr6008.observe),
-        ("volume", &sr6008.volume),
-        ("mute", &sr6008.mute),
-        ("power", &sr6008.power),
-        ("input select", &sr6008.input_select),
-    ] {
-        out.push_str(&format!("- **SR6008 / {name}** — {}\n", claim.detail));
+    for (label, claims) in family_rows() {
+        out.push_str(&format!(
+            "- **{label}** — volume: {}; power: {}\n",
+            claims.volume.detail, claims.power.detail
+        ));
     }
     out.push('\n');
     out.push_str(END);
     out
+}
+
+/// No family other than a hardware-captured one may claim hardware verification.
+#[test]
+fn only_captured_models_claim_hardware_verification() {
+    for (label, claims) in family_rows() {
+        if label.starts_with("Marantz SR6008") {
+            continue;
+        }
+        for claim in [
+            &claims.observe,
+            &claims.volume,
+            &claims.mute,
+            &claims.power,
+            &claims.input_select,
+        ] {
+            assert_eq!(
+                claim.evidence,
+                CapabilityEvidence::ImplementationDerived,
+                "{label}: {}",
+                claim.detail
+            );
+        }
+    }
 }
 
 /// A `hardware-verified` claim must name a fixture directory that exists and documents itself.

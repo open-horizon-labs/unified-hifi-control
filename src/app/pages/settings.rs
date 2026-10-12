@@ -420,7 +420,7 @@ enum AdapterToggle {
     Spotify,
     AppleMusic,
     MusicAssistant,
-    DenonAvr,
+    Devices,
     Mqtt,
 }
 
@@ -445,8 +445,8 @@ fn settings_with_toggle(mut settings: AppSettings, toggle: SettingsToggle) -> Ap
         SettingsToggle::Adapter(AdapterToggle::MusicAssistant, enabled) => {
             settings.adapters.musicassistant = enabled
         }
-        SettingsToggle::Adapter(AdapterToggle::DenonAvr, enabled) => {
-            settings.adapters.denonavr = enabled
+        SettingsToggle::Adapter(AdapterToggle::Devices, enabled) => {
+            settings.adapters.devices = enabled
         }
         SettingsToggle::Adapter(AdapterToggle::Mqtt, enabled) => settings.adapters.mqtt = enabled,
         SettingsToggle::HideKnobs(enabled) => settings.hide_knobs_page = !enabled,
@@ -905,7 +905,7 @@ pub fn Settings() -> Element {
     let mut spotify_enabled = use_signal(|| initial_settings.adapters.spotify);
     let mut applemusic_enabled = use_signal(|| initial_settings.adapters.applemusic);
     let mut musicassistant_enabled = use_signal(|| initial_settings.adapters.musicassistant);
-    let mut denonavr_enabled = use_signal(|| initial_settings.adapters.denonavr);
+    let mut devices_enabled = use_signal(|| initial_settings.adapters.devices);
     let mut mqtt_enabled = use_signal(|| initial_settings.adapters.mqtt);
 
     // Streaming-provider onboarding state. Provider credentials are never
@@ -1031,7 +1031,7 @@ pub fn Settings() -> Element {
             spotify_enabled.set(s.adapters.spotify);
             applemusic_enabled.set(s.adapters.applemusic);
             musicassistant_enabled.set(s.adapters.musicassistant);
-            denonavr_enabled.set(s.adapters.denonavr);
+            devices_enabled.set(s.adapters.devices);
             mqtt_enabled.set(s.adapters.mqtt);
             hide_knobs.set(s.hide_knobs_page);
             confirmed_settings.set(Some(s.clone()));
@@ -2116,26 +2116,26 @@ pub fn Settings() -> Element {
                                     }
                                 }
                             }
-                            // Denon/Marantz receiver control (#774): a device adapter, not a music
-                            // provider. Alpha; links and control are API/MCP-only for now.
+                            // Playback device control (#774): receivers, amplifiers and streamers, not
+                            // music providers. Alpha; links and control are API/MCP-only for now.
                             tr { class: "border-b border-default",
                                 td { class: "py-2 px-3",
                                     FeatureToggle {
-                                        label: "Enable Denon / Marantz receiver control",
-                                        enabled: denonavr_enabled(),
+                                        label: "Enable receiver and amplifier control",
+                                        enabled: devices_enabled(),
                                         onclick: move |_| {
-                                            toggle_setting(SettingsToggle::Adapter(AdapterToggle::DenonAvr, !denonavr_enabled()));
+                                            toggle_setting(SettingsToggle::Adapter(AdapterToggle::Devices, !devices_enabled()));
                                         }
                                     }
                                 }
                                 td { class: "py-2 px-3",
                                     div { class: "flex items-center gap-2",
-                                        "Denon / Marantz receivers"
+                                        "Receivers & amplifiers"
                                         span { class: "badge badge-secondary", "Alpha" }
                                     }
                                 }
                                 td { class: "py-2 px-3",
-                                    if denonavr_enabled() {
+                                    if devices_enabled() {
                                         span { class: "text-muted",
                                             "Power, volume and input for linked zones. Link zones with hifi_devices (MCP) or POST /devices/link."
                                         }
@@ -3945,7 +3945,7 @@ mod tests {
                 spotify: false,
                 applemusic: true,
                 musicassistant: false,
-                denonavr: false,
+                devices: false,
                 mqtt: false,
             },
             hide_knobs_page: false,

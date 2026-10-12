@@ -30,7 +30,23 @@ pub const DEVICE_CONTROL_MATURITY: &str = "alpha";
 
 /// Device kinds this build can name. A kind is the vendor brand that prefixes a [`DeviceId`];
 /// one driver may serve several kinds (Denon and Marantz share one protocol family).
-pub const DEVICE_KINDS: &[&str] = &["denon", "marantz"];
+pub const DEVICE_KINDS: &[&str] = &[
+    "denon",
+    "marantz",
+    "wiim",
+    "yamaha",
+    "bluos",
+    "cambridge",
+    "hegel",
+    "lyngdorf",
+    "onkyo",
+    "sonos",
+    "anthem",
+    "arcam",
+    "trinnov",
+    // Home Assistant media_player entities (#790).
+    "ha",
+];
 
 /// A device's hardware identity: `<kind>:<hardware id>`, e.g. `marantz:0006781E0AB8`.
 ///
@@ -172,18 +188,22 @@ pub struct DeviceInput {
 /// [`Self::display`] so a UI can mirror it; it never changes what is sent.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeviceVolume {
-    /// Current level in dB. `None` until read.
-    pub db: Option<f32>,
+    /// The device's native scale. Every level, bound, ceiling and step below is in it: the clamp
+    /// and ceiling work in the device's own units, so a 0–100 streamer and a dB receiver are both
+    /// bounded without converting between scales (the v2.5 incident class).
+    pub scale: crate::bus::VolumeScale,
+    /// Current level. `None` until read.
+    pub value: Option<f32>,
     /// Lowest settable level in dB.
-    pub min_db: f32,
+    pub min: f32,
     /// The device's own maximum (Denon/Marantz `MVMAX`), in dB. `None` until read; absolute and
     /// relative volume writes are refused while it is unknown.
-    pub hardware_max_db: Option<f32>,
+    pub hardware_max: Option<f32>,
     /// The user's ceiling for this device, in dB. Only ever lowers the effective maximum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ceiling_db: Option<f32>,
+    pub ceiling: Option<f32>,
     /// Smallest settable increment in dB.
-    pub step_db: f32,
+    pub step: f32,
     pub is_muted: Option<bool>,
     /// Front-panel convention: `absolute` (0-98) or `relative` (dB). Display only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -191,14 +211,18 @@ pub struct DeviceVolume {
 }
 
 impl DeviceVolume {
-    /// The highest level UHC will publish or send: the hardware maximum, lowered by the ceiling.
-    /// `None` while the hardware maximum is unknown — the range cannot bound a level yet.
-    pub fn effective_max_db(&self) -> Option<f32> {
-        let hardware = self.hardware_max_db?;
-        Some(match self.ceiling_db {
-            Some(ceiling) if ceiling < hardware => ceiling.max(self.min_db),
-            _ => hardware,
-        })
+    /// The highest level UHC will publish or send: the hardware maximum lowered by the ceiling.
+    ///
+    /// When the device never reports its maximum (a Denon/Marantz reached only over HTTP: `MVMAX`
+    /// is Telnet-only), the user's ceiling alone bounds the range. With neither, there is no range
+    /// and every level is refused.
+    pub fn effective_max(&self) -> Option<f32> {
+        match (self.hardware_max, self.ceiling) {
+            (Some(hardware), Some(ceiling)) if ceiling < hardware => Some(ceiling.max(self.min)),
+            (Some(hardware), _) => Some(hardware),
+            (None, Some(ceiling)) => Some(ceiling.max(self.min)),
+            (None, None) => None,
+        }
     }
 }
 
@@ -267,18 +291,18 @@ impl Device {
     /// `max` is the effective maximum — the hardware limit lowered by the user's ceiling — so no
     /// client that respects the published range can even request a level above the ceiling.
     pub fn volume_control(&self) -> Option<crate::bus::VolumeControl> {
-        let value = self.volume.db?;
-        let max = self.volume.effective_max_db()?;
-        if !(self.volume.min_db.is_finite() && max.is_finite() && self.volume.min_db < max) {
+        let value = self.volume.value?;
+        let max = self.volume.effective_max()?;
+        if !(self.volume.min.is_finite() && max.is_finite() && self.volume.min < max) {
             return None;
         }
         Some(crate::bus::VolumeControl {
             value,
-            min: self.volume.min_db,
+            min: self.volume.min,
             max,
-            step: self.volume.step_db,
+            step: self.volume.step,
             is_muted: self.volume.is_muted.unwrap_or(false),
-            scale: crate::bus::VolumeScale::Decibel,
+            scale: self.volume.scale,
             output_id: Some(self.device_id.main_output_id()),
         })
     }
@@ -390,7 +414,7 @@ mod tests {
     fn parsing_refuses_non_canonical_unknown_and_zone_shaped_ids() {
         assert!(DeviceId::parse("marantz:0006781E0AB8").is_some());
         assert!(DeviceId::parse("marantz:0006781e0ab8").is_none());
-        assert!(DeviceId::parse("sonos:ABC").is_none());
+        assert!(DeviceId::parse("bose:ABC").is_none());
         assert!(DeviceId::parse("roon:zone").is_none());
         assert!(DeviceId::parse("marantz:").is_none());
         assert!(DeviceId::parse("marantz:A:B").is_none());
@@ -400,23 +424,27 @@ mod tests {
     #[test]
     fn ceiling_only_lowers_the_effective_maximum() {
         let mut volume = DeviceVolume {
-            db: Some(-40.0),
-            min_db: -80.0,
-            hardware_max_db: Some(-10.0),
-            ceiling_db: None,
-            step_db: 0.5,
+            scale: crate::bus::VolumeScale::Decibel,
+            value: Some(-40.0),
+            min: -80.0,
+            hardware_max: Some(-10.0),
+            ceiling: None,
+            step: 0.5,
             is_muted: Some(false),
             display: None,
         };
-        assert_eq!(volume.effective_max_db(), Some(-10.0));
-        volume.ceiling_db = Some(-25.0);
-        assert_eq!(volume.effective_max_db(), Some(-25.0));
+        assert_eq!(volume.effective_max(), Some(-10.0));
+        volume.ceiling = Some(-25.0);
+        assert_eq!(volume.effective_max(), Some(-25.0));
         // A ceiling above the hardware limit can never raise it.
-        volume.ceiling_db = Some(0.0);
-        assert_eq!(volume.effective_max_db(), Some(-10.0));
-        // Unknown hardware maximum: no range, whatever the ceiling.
-        volume.hardware_max_db = None;
-        volume.ceiling_db = Some(-25.0);
-        assert_eq!(volume.effective_max_db(), None);
+        volume.ceiling = Some(0.0);
+        assert_eq!(volume.effective_max(), Some(-10.0));
+        // Unknown hardware maximum: the user's ceiling alone bounds the range...
+        volume.hardware_max = None;
+        volume.ceiling = Some(-25.0);
+        assert_eq!(volume.effective_max(), Some(-25.0));
+        // ...and with neither, there is no range at all.
+        volume.ceiling = None;
+        assert_eq!(volume.effective_max(), None);
     }
 }

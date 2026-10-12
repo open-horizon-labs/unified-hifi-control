@@ -37,3 +37,19 @@ is implementation-derived until a write capture is added here.
    must be sent over HTTP, and the input catalog must be re-read when the unit wakes.
 5. **`MVMAX` is Telnet-only:** a unit reached only over HTTP has no known maximum, so UHC refuses
    every volume write to it.
+
+## Write captures (`writes/`, 2026-10-12)
+
+Small, restored changes only: volume **down** one half step then back, mute on/off, input switched
+and restored, a second Telnet client attempted, and on the standby unit an HTTP power-on followed
+by HTTP standby. Raw-socket captures (not through UHC); they establish protocol facts the adapter
+relies on:
+
+- Writes echo: `MV38` → `MV38` + `MVMAX 70`; `MUON`/`MUOFF` echo.
+- **A no-op write does not echo** (second `MV38` got no reply). The adapter's post-write `MV?`
+  query is what confirms it — a "wait for the echo" confirmation would hang here (#621).
+- `SITV` produces ~30 surround/channel-level lines and the `SI` echo ~1.2 s later.
+- **A second Telnet client is refused** while one is connected: the first holder keeps the slot.
+- Bedroom unit: `formiPhoneAppPower.xml?1+PowerOn` from standby returns `Power ON` and status reads
+  `ON`; `?1+PowerStandby` returns `OFF`. **Telnet never opened on this unit, even when on** —
+  it is HTTP-only, so it never reports `MVMAX`; its volume is bounded by a user ceiling.

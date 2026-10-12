@@ -206,9 +206,9 @@ pub struct AdapterSettings {
     pub applemusic: bool,
     #[serde(default)]
     pub musicassistant: bool,
-    /// Denon/Marantz receiver control (#774, alpha).
+    /// Playback device control (#774, alpha).
     #[serde(default)]
-    pub denonavr: bool,
+    pub devices: bool,
     #[serde(default)]
     pub mqtt: bool,
 }

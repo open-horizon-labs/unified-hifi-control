@@ -799,7 +799,7 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
             ("value", false),
             ("input", false),
             ("muted", false),
-            ("ceiling_db", false),
+            ("ceiling", false),
         ],
     ),
     ("hifi_now_playing", &[("zone_id", true)]),

@@ -34,7 +34,7 @@ const ACTIONS: &[&str] = &["list", "links", "link", "unlink", "set_ceiling", "co
                     device_id it plays through (optionally source_id, the device input the zone \
                     arrives on); after linking, that zone's volume and hifi_control volume actions \
                     drive the device. action=unlink removes a zone's link. action=set_ceiling sets \
-                    a device's maximum volume in dB (omit ceiling_db to clear); a ceiling only ever \
+                    a device's maximum volume in dB (omit ceiling to clear); a ceiling only ever \
                     lowers the device's own limit. action=control sends command (power_on, \
                     power_off, power_toggle, select_input, volume_set, volume_up, volume_down, \
                     mute, unmute) to a device_id, or to the device a zone_id is linked to. Volume \
@@ -71,7 +71,7 @@ pub struct HifiDevicesTool {
     pub muted: Option<bool>,
     /// For set_ceiling: the maximum volume in dB. Omit to clear the ceiling.
     #[serde(default)]
-    pub ceiling_db: Option<f64>,
+    pub ceiling: Option<f64>,
 }
 
 pub async fn handle_devices(
@@ -145,15 +145,15 @@ pub async fn handle_devices(
                     Refusal::invalid_parameter("device_id", &[], "Pass a device from action=list."),
                 );
             };
-            let ceiling = args.ceiling_db.map(|db| db as f32);
+            let ceiling = args.ceiling.map(|db| db as f32);
             let env = env
                 .param("device_id", device_id.clone())
-                .param_opt("ceiling_db", args.ceiling_db);
+                .param_opt("ceiling", args.ceiling);
             match state.devices.set_ceiling(&device_id, ceiling).await {
                 Ok(()) => Ok(env.json_result(&json!({
                     "maturity": DEVICE_CONTROL_MATURITY,
                     "device_id": device_id,
-                    "ceiling_db": args.ceiling_db,
+                    "ceiling": args.ceiling,
                 }))),
                 Err(error) => refuse(env, error),
             }
@@ -226,7 +226,7 @@ async fn control(
             None => None,
         },
     }
-    .map(|device| device.volume.step_db)
+    .map(|device| device.volume.step)
     .filter(|step| *step > 0.0)
     .unwrap_or(0.5);
     let request = match request_from_action(command, value, step) {

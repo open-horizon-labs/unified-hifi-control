@@ -15,7 +15,7 @@
 use std::time::{Duration, Instant};
 
 use unified_hifi_control::adapters::denonavr::DenonAvrAdapter;
-use unified_hifi_control::adapters::Startable;
+use unified_hifi_control::adapters::devices::{DeviceFamily, FamilyContext};
 use unified_hifi_control::bus::{create_bus, BusEvent};
 use unified_hifi_control::devices::{ControlChannel, Device, DeviceId, DevicePower};
 
@@ -35,7 +35,10 @@ async fn live_receivers_are_discovered_identified_and_observed() {
     let bus = create_bus();
     let mut events = bus.subscribe();
     let adapter = DenonAvrAdapter::new(bus.clone());
-    adapter.start().await.unwrap();
+    adapter
+        .start_family(FamilyContext::default())
+        .await
+        .unwrap();
 
     let mut latest: std::collections::HashMap<DeviceId, Device> = Default::default();
     let started = Instant::now();
@@ -44,8 +47,8 @@ async fn live_receivers_are_discovered_identified_and_observed() {
         let settled = expected.iter().all(|id| {
             latest.get(id).is_some_and(|device| {
                 device.power != DevicePower::Unknown
-                    && device.volume.db.is_some()
-                    && (device.power != DevicePower::On || device.volume.hardware_max_db.is_some())
+                    && device.volume.value.is_some()
+                    && (device.power != DevicePower::On || device.volume.hardware_max.is_some())
             })
         });
         if settled {
@@ -59,7 +62,7 @@ async fn live_receivers_are_discovered_identified_and_observed() {
             Err(_) => break,
         }
     }
-    adapter.stop().await;
+    adapter.stop_family().await;
 
     for id in &expected {
         let device = latest
@@ -73,8 +76,8 @@ async fn live_receivers_are_discovered_identified_and_observed() {
             device.host,
             device.power,
             device.connection.control_channel,
-            device.volume.db,
-            device.volume.hardware_max_db,
+            device.volume.value,
+            device.volume.hardware_max,
             device.volume.is_muted,
             device.input,
             device.input_name(),
@@ -82,7 +85,7 @@ async fn live_receivers_are_discovered_identified_and_observed() {
             device.connection.detail,
         );
         assert_eq!(device.model, "SR6008");
-        assert!(device.volume.db.is_some(), "{id}: no level observed");
+        assert!(device.volume.value.is_some(), "{id}: no level observed");
         assert_ne!(
             device.power,
             DevicePower::Unknown,
@@ -95,7 +98,7 @@ async fn live_receivers_are_discovered_identified_and_observed() {
                 "{id}: a powered unit should accept the push session"
             );
             assert!(
-                device.volume.hardware_max_db.is_some(),
+                device.volume.hardware_max.is_some(),
                 "{id}: MVMAX not observed"
             );
         }

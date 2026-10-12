@@ -117,7 +117,7 @@ pub fn encode_volume(db: f32) -> Option<String> {
 /// The Telnet command for an operation, and the query whose answer confirms it.
 pub fn telnet_command(operation: &DeviceOperation) -> Option<(String, &'static str)> {
     Some(match operation {
-        DeviceOperation::SetVolumeDb(db) => (encode_volume(*db)?, "MV?"),
+        DeviceOperation::SetVolume(db) => (encode_volume(*db)?, "MV?"),
         DeviceOperation::SetMute(true) => ("MUON".to_string(), "MU?"),
         DeviceOperation::SetMute(false) => ("MUOFF".to_string(), "MU?"),
         // Main zone, not the whole unit: `PWSTANDBY` would also switch off zone 2.
@@ -136,7 +136,7 @@ pub fn telnet_command(operation: &DeviceOperation) -> Option<(String, &'static s
 /// unavailable — notably power-on from standby, where the captured SR6008 refuses Telnet.
 pub fn http_command_path(operation: &DeviceOperation) -> Option<String> {
     Some(match operation {
-        DeviceOperation::SetVolumeDb(db) => {
+        DeviceOperation::SetVolume(db) => {
             // Re-validate through the Telnet encoder: same grid, same bounds.
             encode_volume(*db)?;
             format!("/goform/formiPhoneAppVolume.xml?1+{db:.1}")
@@ -418,16 +418,13 @@ mod tests {
         assert_eq!(encode_volume(-80.5), None);
         assert_eq!(encode_volume(18.5), None);
         assert_eq!(encode_volume(f32::NAN), None);
-        assert_eq!(
-            http_command_path(&DeviceOperation::SetVolumeDb(-39.7)),
-            None
-        );
+        assert_eq!(http_command_path(&DeviceOperation::SetVolume(-39.7)), None);
     }
 
     #[test]
     fn commands_carry_their_confirming_query() {
         assert_eq!(
-            telnet_command(&DeviceOperation::SetVolumeDb(-30.0)),
+            telnet_command(&DeviceOperation::SetVolume(-30.0)),
             Some(("MV50".to_string(), "MV?"))
         );
         assert_eq!(
@@ -447,7 +444,7 @@ mod tests {
             Some("/goform/formiPhoneAppDirect.xml?SISAT%2FCBL")
         );
         assert_eq!(
-            http_command_path(&DeviceOperation::SetVolumeDb(-39.5)).as_deref(),
+            http_command_path(&DeviceOperation::SetVolume(-39.5)).as_deref(),
             Some("/goform/formiPhoneAppVolume.xml?1+-39.5")
         );
     }

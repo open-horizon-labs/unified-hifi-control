@@ -205,7 +205,7 @@ pub async fn device_unlink_handler(
 pub struct DeviceCeilingRequest {
     pub device_id: String,
     /// dB; `null` clears the ceiling.
-    pub ceiling_db: Option<f32>,
+    pub ceiling: Option<f32>,
 }
 
 /// POST /devices/ceiling
@@ -215,14 +215,14 @@ pub async fn device_ceiling_handler(
 ) -> ApiResult {
     state
         .devices
-        .set_ceiling(&request.device_id, request.ceiling_db)
+        .set_ceiling(&request.device_id, request.ceiling)
         .await
         .map_err(device_error_response)?;
     Ok(Json(json!({
         "ok": true,
         "maturity": DEVICE_CONTROL_MATURITY,
         "device_id": request.device_id,
-        "ceiling_db": request.ceiling_db,
+        "ceiling": request.ceiling,
     })))
 }
 

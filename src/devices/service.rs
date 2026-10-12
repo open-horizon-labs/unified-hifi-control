@@ -40,7 +40,7 @@ pub const DEFAULT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(4);
 /// never compute a level.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeviceOperation {
-    SetVolumeDb(f32),
+    SetVolume(f32),
     SetMute(bool),
     PowerOn,
     PowerStandby,
@@ -182,7 +182,7 @@ pub struct DeviceCommandReport {
     pub confirmation: Confirmation,
     /// The level UHC sent, after clamping and quantising, for volume operations.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sent_volume_db: Option<f32>,
+    pub sent_volume: Option<f32>,
     /// True when the requested level was clamped to the effective range before sending.
     pub clamped: bool,
     /// The device as it reported itself after the command.
@@ -377,7 +377,7 @@ impl DeviceService {
             .iter()
             .filter_map(|(device_id, settings)| {
                 settings
-                    .volume_ceiling_db
+                    .volume_ceiling
                     .map(|ceiling| (device_id.clone(), ceiling))
             })
             .collect();
@@ -468,15 +468,15 @@ impl DeviceService {
     pub async fn set_ceiling(
         &self,
         device_id: &str,
-        ceiling_db: Option<f32>,
+        ceiling: Option<f32>,
     ) -> Result<(), DeviceError> {
         let device_id = DeviceId::parse(device_id).ok_or_else(|| DeviceError::UnknownDevice {
             device_id: device_id.to_string(),
         })?;
-        if let Some(ceiling) = ceiling_db {
+        if let Some(ceiling) = ceiling {
             if !ceiling.is_finite() {
                 return Err(DeviceError::InvalidValue {
-                    parameter: "ceiling_db",
+                    parameter: "ceiling",
                     detail: "must be a finite number of dB".to_string(),
                 });
             }
@@ -485,7 +485,7 @@ impl DeviceService {
             .store
             .update(move |document| {
                 let settings = document.devices.entry(device_id).or_default();
-                settings.volume_ceiling_db = ceiling_db;
+                settings.volume_ceiling = ceiling;
             })
             .await?;
         self.install(document).await;
@@ -593,7 +593,7 @@ impl DeviceService {
             // a limit of its own. Report the truth. A readback that has not moved at all is not a
             // device limit — the command may simply not have been applied — so it stays unconfirmed.
             Some(observed)
-                if plan.accepts_device_limit && observed.volume.db != device.volume.db =>
+                if plan.accepts_device_limit && observed.volume.value != device.volume.value =>
             {
                 Ok(plan.report(device_id, Confirmation::ConfirmedDifferent, observed))
             }
@@ -624,7 +624,7 @@ impl DeviceService {
 /// A request resolved against the device's observed state.
 struct Plan {
     operation: DeviceOperation,
-    sent_volume_db: Option<f32>,
+    sent_volume: Option<f32>,
     clamped: bool,
     /// Whether a readback that differs from the target is still a truthful completion (a device
     /// clamping a level to its own limit) rather than a failure.
@@ -634,9 +634,9 @@ struct Plan {
 impl Plan {
     fn satisfied_by(&self, device: &Device) -> bool {
         match &self.operation {
-            DeviceOperation::SetVolumeDb(target) => device
+            DeviceOperation::SetVolume(target) => device
                 .volume
-                .db
+                .value
                 .is_some_and(|observed| (observed - target).abs() < 0.01),
             DeviceOperation::SetMute(muted) => device.volume.is_muted == Some(*muted),
             DeviceOperation::PowerOn => device.power == DevicePower::On,
@@ -655,7 +655,7 @@ impl Plan {
             device_id,
             operation: operation_label(&self.operation),
             confirmation,
-            sent_volume_db: self.sent_volume_db,
+            sent_volume: self.sent_volume,
             clamped: self.clamped,
             observed,
             maturity: super::DEVICE_CONTROL_MATURITY,
@@ -665,7 +665,7 @@ impl Plan {
 
 fn operation_label(operation: &DeviceOperation) -> &'static str {
     match operation {
-        DeviceOperation::SetVolumeDb(_) => "volume_set",
+        DeviceOperation::SetVolume(_) => "volume_set",
         DeviceOperation::SetMute(_) => "mute",
         DeviceOperation::PowerOn => "power_on",
         DeviceOperation::PowerStandby => "power_off",
@@ -675,7 +675,7 @@ fn operation_label(operation: &DeviceOperation) -> &'static str {
 
 fn describe(device: &Device, operation: &DeviceOperation) -> String {
     match operation {
-        DeviceOperation::SetVolumeDb(_) => match device.volume.db {
+        DeviceOperation::SetVolume(_) => match device.volume.value {
             Some(db) => format!("{db} dB"),
             None => "no level".to_string(),
         },
@@ -693,12 +693,12 @@ fn plan(device: &Device, request: &DeviceRequest) -> Result<Plan, DeviceError> {
     let volume_plan = |target_db: f32| -> Result<Plan, DeviceError> {
         let max = device
             .volume
-            .effective_max_db()
+            .effective_max()
             .ok_or_else(|| DeviceError::RangeUnknown {
                 device_id: device_id.clone(),
                 detail: "the device has not reported its maximum level".to_string(),
             })?;
-        let min = device.volume.min_db;
+        let min = device.volume.min;
         if !(min.is_finite() && max.is_finite() && min < max) {
             return Err(DeviceError::RangeUnknown {
                 device_id: device_id.clone(),
@@ -706,8 +706,8 @@ fn plan(device: &Device, request: &DeviceRequest) -> Result<Plan, DeviceError> {
             });
         }
         let clamped_target = target_db.clamp(min, max);
-        let step = if device.volume.step_db > 0.0 {
-            device.volume.step_db
+        let step = if device.volume.step > 0.0 {
+            device.volume.step
         } else {
             0.5
         };
@@ -715,8 +715,8 @@ fn plan(device: &Device, request: &DeviceRequest) -> Result<Plan, DeviceError> {
         let quantised = ((clamped_target - min) / step).floor() * step + min;
         let quantised = (quantised * 100.0).round() / 100.0;
         Ok(Plan {
-            operation: DeviceOperation::SetVolumeDb(quantised),
-            sent_volume_db: Some(quantised),
+            operation: DeviceOperation::SetVolume(quantised),
+            sent_volume: Some(quantised),
             clamped: (clamped_target - target_db).abs() > f32::EPSILON,
             accepts_device_limit: true,
         })
@@ -738,15 +738,18 @@ fn plan(device: &Device, request: &DeviceRequest) -> Result<Plan, DeviceError> {
                     detail: "volume step must be a finite number of dB".to_string(),
                 });
             }
-            let current = device.volume.db.ok_or_else(|| DeviceError::RangeUnknown {
-                device_id: device_id.clone(),
-                detail: "the device has not reported its current level".to_string(),
-            })?;
+            let current = device
+                .volume
+                .value
+                .ok_or_else(|| DeviceError::RangeUnknown {
+                    device_id: device_id.clone(),
+                    detail: "the device has not reported its current level".to_string(),
+                })?;
             volume_plan(current + delta)
         }
         DeviceRequest::Mute(muted) => Ok(Plan {
             operation: DeviceOperation::SetMute(*muted),
-            sent_volume_db: None,
+            sent_volume: None,
             clamped: false,
             accepts_device_limit: false,
         }),
@@ -762,7 +765,7 @@ fn plan(device: &Device, request: &DeviceRequest) -> Result<Plan, DeviceError> {
                 })?;
             Ok(Plan {
                 operation: DeviceOperation::SetMute(!muted),
-                sent_volume_db: None,
+                sent_volume: None,
                 clamped: false,
                 accepts_device_limit: false,
             })
@@ -800,7 +803,7 @@ fn plan(device: &Device, request: &DeviceRequest) -> Result<Plan, DeviceError> {
             };
             Ok(Plan {
                 operation: DeviceOperation::SelectInput(entry.id.clone()),
-                sent_volume_db: None,
+                sent_volume: None,
                 clamped: false,
                 accepts_device_limit: false,
             })
@@ -811,7 +814,7 @@ fn plan(device: &Device, request: &DeviceRequest) -> Result<Plan, DeviceError> {
 fn power_plan(operation: DeviceOperation) -> Plan {
     Plan {
         operation,
-        sent_volume_db: None,
+        sent_volume: None,
         clamped: false,
         accepts_device_limit: false,
     }
@@ -858,11 +861,12 @@ mod tests {
                 },
             ],
             volume: DeviceVolume {
-                db,
-                min_db: -80.0,
-                hardware_max_db: hardware_max,
-                ceiling_db: None,
-                step_db: 0.5,
+                scale: crate::bus::VolumeScale::Decibel,
+                value: db,
+                min: -80.0,
+                hardware_max: hardware_max,
+                ceiling: None,
+                step: 0.5,
                 is_muted: Some(false),
                 display: Some("absolute".to_string()),
             },
@@ -880,7 +884,7 @@ mod tests {
 
     fn sent_level(plan: Result<Plan, DeviceError>) -> f32 {
         match plan.expect("plan").operation {
-            DeviceOperation::SetVolumeDb(db) => db,
+            DeviceOperation::SetVolume(db) => db,
             other => panic!("expected a volume operation, got {other:?}"),
         }
     }
@@ -924,7 +928,7 @@ mod tests {
     #[test]
     fn critical_ceiling_bounds_absolute_and_relative_requests() {
         let mut amp = device(Some(-31.0), Some(-10.0));
-        amp.volume.ceiling_db = Some(-30.0);
+        amp.volume.ceiling = Some(-30.0);
         assert_eq!(
             sent_level(plan(&amp, &DeviceRequest::VolumeAbsolute(-5.0))),
             -30.0
@@ -935,7 +939,7 @@ mod tests {
         );
         // A level already above the ceiling (set before the ceiling existed) is pulled down by
         // the next relative step rather than climbing further.
-        amp.volume.db = Some(-20.0);
+        amp.volume.value = Some(-20.0);
         assert_eq!(
             sent_level(plan(&amp, &DeviceRequest::VolumeRelative(0.5))),
             -30.0
@@ -1055,6 +1059,6 @@ mod tests {
         let amp = device(Some(-40.0), Some(-10.0));
         let resolved = plan(&amp, &DeviceRequest::PowerOn).unwrap();
         assert_eq!(resolved.operation, DeviceOperation::PowerOn);
-        assert_eq!(resolved.sent_volume_db, None);
+        assert_eq!(resolved.sent_volume, None);
     }
 }

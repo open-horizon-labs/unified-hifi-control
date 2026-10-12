@@ -458,3 +458,27 @@ child planned. The SG-4 named gap (SSE projection) is #787.
 | Write path on hardware | **Accepted, pending hardware** | — | every write claim is 🚧 in the generated AGENTS.md table until a write capture lands |
 | HA linked device | Retired | — | HA suite 64/64 incl. linked-device tests |
 | Claims drift | Retired | hand-edited ✅ | `tests/device_claims.rs` generates the table and fails a verified claim without a capture |
+
+### Course correction: the full adapter set (2026-10-12)
+
+The first pass built only the hardware the maintainer owns. The scope is the catalog: eleven more
+families, built to spec and labelled alpha / implementation-derived. What changed:
+
+- **Volume is native-scale.** `DeviceVolume` carries `scale` (`decibel`, `percentage`, `linear`,
+  new `steps` for device ranges like MusicCast 0–161). The service clamps and quantises in the
+  device's own units; nothing converts between scales. The knob renders `steps` as a number.
+- **Protocol full scale is the hardware maximum** (100 for percentage devices, Arcam 99, the
+  documented dB max for Trinnov/Lyngdorf/Anthem). Only when a maximum genuinely cannot be known
+  (Denon over HTTP, Home Assistant's 0–1) does the user ceiling become the bound; with neither,
+  every level is refused.
+- **One adapter set.** `DeviceAdapterSet` (Startable `devices`) owns every `DeviceFamily`; one
+  Alpha Settings toggle. Families without discovery (Anthem, Trinnov) use `manual_devices`.
+- **Families:** Denon/Marantz, WiiM, Sonos, MusicCast, BluOS, StreamMagic, Trinnov, eISCP
+  (from the published ISCP v1.15 spec, not the GPL client), Arcam, Hegel, Lyngdorf, Anthem, and
+  Home Assistant `media_player` entities (#790). Built by five Sonnet workers against
+  `docs/device-family-brief.md`, integrated and gated here.
+- **Push vs polling.** Lyngdorf and Anthem poll (5 s): their push modes are enabled by writing a
+  persistent setup option, which the queries-only-on-connect rule excludes.
+- **Sources.** Each worker reported which references it actually fetched; citations not fetched
+  are marked in code comments. Every non-SR6008 claim is `implementation-derived`, and
+  `tests/device_claims.rs` fails any other evidence label.

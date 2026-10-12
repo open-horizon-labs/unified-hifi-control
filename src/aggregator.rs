@@ -123,7 +123,16 @@ impl AggregateState {
     }
 
     fn apply_ceiling(&self, device: &mut Device) {
-        device.volume.ceiling_db = self.device_ceilings.get(device.device_id.as_str()).copied();
+        device.volume.ceiling = self.device_ceilings.get(device.device_id.as_str()).copied();
+        // A device that never reports its own maximum is bounded by the user's ceiling instead;
+        // say so rather than leaving a stale "refused" claim on a range that now exists.
+        if device.volume.hardware_max.is_none() && device.volume.ceiling.is_some() {
+            device.capabilities.volume.supported = true;
+            device.capabilities.volume.detail = format!(
+                "bounded by the user ceiling ({} dB): the device does not report its own maximum",
+                device.volume.ceiling.unwrap_or_default()
+            );
+        }
     }
 }
 
@@ -400,8 +409,8 @@ impl ZoneAggregator {
                             .devices
                             .get(&key)
                             .map(|previous| {
-                                (previous.volume.db, previous.volume.is_muted)
-                                    != (device.volume.db, device.volume.is_muted)
+                                (previous.volume.value, previous.volume.is_muted)
+                                    != (device.volume.value, device.volume.is_muted)
                             })
                             .unwrap_or(true);
                         let volume = device.volume_control();
@@ -675,10 +684,11 @@ impl ZoneAggregator {
                 .into_iter()
                 .map(|(device_id, ceiling)| (device_id.to_string(), ceiling))
                 .collect();
-            let ceilings = aggregate.device_ceilings.clone();
-            for device in aggregate.devices.values_mut() {
-                device.volume.ceiling_db = ceilings.get(device.device_id.as_str()).copied();
+            let mut devices = std::mem::take(&mut aggregate.devices);
+            for device in devices.values_mut() {
+                aggregate.apply_ceiling(device);
             }
+            aggregate.devices = devices;
             let mut announcements = Vec::new();
             for (zone_id, previous) in before {
                 let summary = aggregate.linked_summary(&zone_id);

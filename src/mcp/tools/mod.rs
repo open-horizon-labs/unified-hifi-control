@@ -157,7 +157,7 @@ pub fn declared_params(tool: &str) -> &'static [&'static str] {
             "value",
             "input",
             "muted",
-            "ceiling_db",
+            "ceiling",
         ],
         "hifi_search" => &["query", "zone_id", "source"],
         "hifi_play" => &["query", "zone_id", "source", "action"],

@@ -3638,10 +3638,11 @@ pub struct AdapterSettings {
     /// Music Assistant is an opt-in remote playback adapter.
     #[serde(default)]
     pub musicassistant: bool,
-    /// Denon/Marantz receiver control (#774, alpha) is opt-in and off by default: it holds the
-    /// receiver's single Telnet control session, which other Telnet clients then cannot use.
+    /// Playback device control (#774, alpha): receivers, amplifiers and streamers. Opt-in and off
+    /// by default: some families hold a device's single control session (Denon/Marantz Telnet),
+    /// which other clients then cannot use.
     #[serde(default)]
-    pub denonavr: bool,
+    pub devices: bool,
     /// The MQTT/Home Assistant discovery publisher (#508) is opt-in and off
     /// by default: it needs a broker configured before it can do anything.
     #[serde(default)]
@@ -3674,7 +3675,7 @@ impl AdapterSettings {
             "spotify" => Some(&mut self.spotify),
             "applemusic" => Some(&mut self.applemusic),
             "musicassistant" => Some(&mut self.musicassistant),
-            "denonavr" => Some(&mut self.denonavr),
+            "devices" => Some(&mut self.devices),
             "mqtt" => Some(&mut self.mqtt),
             _ => None,
         }
@@ -3695,7 +3696,7 @@ impl AdapterSettings {
             "spotify" => Some(self.spotify),
             "applemusic" => Some(self.applemusic),
             "musicassistant" => Some(self.musicassistant),
-            "denonavr" => Some(self.denonavr),
+            "devices" => Some(self.devices),
             "mqtt" => Some(self.mqtt),
             _ => None,
         }
@@ -3729,7 +3730,7 @@ impl Default for AppSettings {
                 spotify: false,
                 applemusic: false,
                 musicassistant: false,
-                denonavr: false,
+                devices: false,
                 mqtt: false,
             },
             mqtt_enabled_by: crate::api::credentials::MqttEnableSource::Automatic,
@@ -3983,7 +3984,7 @@ pub async fn api_settings_post_handler(
             "musicassistant",
             old_adapters.musicassistant != new_adapters.musicassistant,
         ),
-        ("denonavr", old_adapters.denonavr != new_adapters.denonavr),
+        ("devices", old_adapters.devices != new_adapters.devices),
         ("mqtt", old_adapters.mqtt != new_adapters.mqtt),
     ];
 
@@ -4003,7 +4004,7 @@ pub async fn api_settings_post_handler(
             "spotify" => new_adapters.spotify,
             "applemusic" => new_adapters.applemusic,
             "musicassistant" => new_adapters.musicassistant,
-            "denonavr" => new_adapters.denonavr,
+            "devices" => new_adapters.devices,
             // MQTT is a bus consumer, not a `Startable` in `adapters_list` -
             // handled separately below via `state.mqtt` (the sanctioned
             // surface `tests/adapter_boundary_lint.rs` allows this module
@@ -4341,7 +4342,7 @@ fn adapter_enabled(settings: &AdapterSettings, name: &str) -> Option<bool> {
         "spotify" => Some(settings.spotify),
         "applemusic" => Some(settings.applemusic),
         "musicassistant" => Some(settings.musicassistant),
-        "denonavr" => Some(settings.denonavr),
+        "devices" => Some(settings.devices),
         "mqtt" => Some(settings.mqtt),
         _ => None,
     }
@@ -4783,7 +4784,7 @@ mod tests {
             spotify: true,
             applemusic: true,
             musicassistant: true,
-            denonavr: true,
+            devices: true,
             mqtt: true,
         };
         for name in [
@@ -4795,7 +4796,7 @@ mod tests {
             "spotify",
             "applemusic",
             "musicassistant",
-            "denonavr",
+            "devices",
             "mqtt",
         ] {
             assert_eq!(adapter_enabled(&settings, name), Some(true), "{name}");

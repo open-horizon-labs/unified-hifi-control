@@ -436,6 +436,7 @@ pub async fn knob_now_playing_handler(
             crate::bus::VolumeScale::Decibel => "db".to_string(),
             crate::bus::VolumeScale::Percentage => "number".to_string(),
             crate::bus::VolumeScale::Linear => "number".to_string(),
+            crate::bus::VolumeScale::Steps => "number".to_string(),
             crate::bus::VolumeScale::Unknown => "fixed".to_string(),
         },
         None => "fixed".to_string(),
@@ -645,7 +646,7 @@ async fn control_linked_device(
         .aggregator
         .get_device(&device_id)
         .await
-        .map(|device| device.volume.step_db)
+        .map(|device| device.volume.step)
         .filter(|step| *step > 0.0)
         .unwrap_or(0.5);
     let request = match request_from_action(&req.action, req.value.as_ref(), step) {

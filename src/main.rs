@@ -446,11 +446,15 @@ mod server {
             upnp.clone(),
         ];
 
-        // Denon/Marantz receiver control (#774, alpha): a device adapter. It publishes devices,
-        // never zones, and receives commands only through `DeviceService`.
-        let denonavr = Arc::new(adapters::denonavr::DenonAvrAdapter::new(bus.clone()));
+        // Playback device control (#774, alpha): one Startable owning every device family. Families
+        // publish devices, never zones, and receive commands only through `DeviceService`.
+        let device_families: Vec<Arc<dyn adapters::devices::DeviceFamily>> =
+            adapters::device_families(bus.clone());
+        let device_set = Arc::new(adapters::devices::DeviceAdapterSet::new(
+            device_families.clone(),
+        ));
         let mut legacy_startables = legacy_startables;
-        legacy_startables.push(denonavr.clone());
+        legacy_startables.push(device_set.clone());
 
         let mut provider_startables: Vec<Arc<dyn adapters::Startable>> = vec![spotify.clone()];
         let mut startable_adapters = legacy_startables.clone();
@@ -497,12 +501,24 @@ mod server {
 
         // Single loop to start all enabled adapters. Manual device hosts are read straight from
         // the link document so the device adapter can probe them on its first discovery pass.
-        denonavr
-            .set_manual_hosts(
+        device_set
+            .set_manual_devices(
                 devices::links::DeviceLinkStore::open_default()
                     .document()
                     .await
-                    .map(|document| document.manual_hosts)
+                    .map(|document| {
+                        let mut manual = document.manual_devices;
+                        // Legacy bare hosts are Denon/Marantz.
+                        manual.extend(document.manual_hosts.into_iter().map(|host| {
+                            devices::links::ManualDevice {
+                                family: "denonavr".to_string(),
+                                host,
+                                port: None,
+                                mac: None,
+                            }
+                        }));
+                        manual
+                    })
                     .unwrap_or_default(),
             )
             .await;
@@ -526,7 +542,9 @@ mod server {
             shutdown_token.clone(),
         )
         .with_reliable_commands(reliable_commands);
-        state.devices.register_driver(denonavr.clone()).await;
+        for family in &device_families {
+            state.devices.register_driver(family.clone()).await;
+        }
         if let Err(error) = state.devices.load().await {
             // The store refuses writes and keeps the file; device control continues unlinked.
             tracing::error!("Device links not loaded: {error}");
