@@ -43,6 +43,7 @@ pub mod apple_bridge;
 pub mod browse;
 pub mod controller_auth;
 pub mod credentials;
+pub mod devices;
 pub mod ha_integration;
 pub mod hiphi_pairing;
 pub mod hqp_outputs;
@@ -337,6 +338,9 @@ pub struct AppState {
     /// Process-owned HiPhi connector lifecycle. It is package-agnostic and
     /// survives Settings reloads by reconstructing from owner-only config.
     pub hiphi_connector: crate::cloud_connector::runtime::ConnectorSupervisor,
+    /// Playback devices linked to zones (#774, alpha): links, ceilings, and the one command path
+    /// every surface uses to reach an amplifier.
+    pub devices: Arc<crate::devices::service::DeviceService>,
 }
 
 impl AppState {
@@ -371,6 +375,11 @@ impl AppState {
         // too, instead of relying solely on the manual stop / OAuth
         // completion / lifetime-cap paths.
         provider_auth.bind_shutdown(shutdown.clone());
+        let devices = Arc::new(crate::devices::service::DeviceService::new(
+            aggregator.clone(),
+            bus.clone(),
+            crate::devices::links::DeviceLinkStore::open_default(),
+        ));
         Self {
             roon,
             hqplayer,
@@ -409,6 +418,7 @@ impl AppState {
             reliable_commands: None,
             mqtt,
             hiphi_connector: crate::cloud_connector::runtime::ConnectorSupervisor::default(),
+            devices,
         }
     }
 
@@ -495,8 +505,8 @@ impl AppState {
     ) -> anyhow::Result<crate::bus::ImageData> {
         use crate::bus::ImageData;
         use crate::knobs::image::{
-            image_to_eink_acep6_with_policy, jpeg_to_rgb565_with_policy, EinkCacheKey,
-            Rgb565ResizePolicy,
+            image_to_display_with_policy, image_to_eink_acep6_with_policy,
+            jpeg_to_rgb565_with_policy, EinkCacheKey, Rgb565ResizePolicy,
         };
 
         let dimensions = match (width, height) {
@@ -506,14 +516,28 @@ impl AppState {
             (None, None) if format == Some("eink_acep6") => (800, 450),
             (None, None) => (240, 240),
         };
-        let resize_policy = resize_policy.unwrap_or(Rgb565ResizePolicy::Exact);
+        let compose_raster = width.is_some() || height.is_some() || resize_policy.is_some();
+        if (compose_raster || format.is_some())
+            && !crate::knobs::image::valid_artwork_dimensions(
+                dimensions.0,
+                dimensions.1,
+                if format == Some("eink_acep6") {
+                    1_536_000
+                } else {
+                    8_388_608
+                },
+            )
+        {
+            anyhow::bail!("invalid artwork dimensions");
+        }
+        let resize_policy = resize_policy.unwrap_or_default();
         let eink_cache_key = (format == Some("eink_acep6")).then(|| EinkCacheKey {
             zone_id: zone_id.to_string(),
             image_key: image_key.to_string(),
             width: dimensions.0,
             height: dimensions.1,
             resize_policy,
-            converter_version: 1,
+            converter_version: 3,
         });
         if let Some(key) = eink_cache_key.as_ref() {
             if let Some(data) = self.eink_artwork_cache.get(key) {
@@ -603,51 +627,83 @@ impl AppState {
             anyhow::bail!("remote artwork is too large");
         }
 
-        // Convert to RGB565 if requested (for ESP32 LCD/e-ink displays).
-        // The smart variant is a capability handshake: older servers return
-        // the source image, allowing firmware to detect and use its fallback.
-        if matches!(format, Some("rgb565" | "rgb565-smart")) {
-            // Use square dimensions when only one side specified (matches adapter behavior)
-            let (target_w, target_h) = dimensions;
-
-            match jpeg_to_rgb565_with_policy(&raw_image.data, target_w, target_h, resize_policy) {
-                Ok(rgb565) => Ok(ImageData {
-                    content_type: "application/octet-stream".to_string(),
-                    data: rgb565.data,
-                }),
-                Err(_) => {
-                    // Fall back to original on conversion error
-                    Ok(raw_image)
-                }
-            }
-        } else if format == Some("eink_acep6") {
-            let (target_w, target_h) = dimensions;
-            match image_to_eink_acep6_with_policy(
-                &raw_image.data,
-                target_w,
-                target_h,
-                resize_policy,
-            ) {
-                Ok(eink) => {
-                    let Some(cache_key) = eink_cache_key else {
-                        return Ok(raw_image);
-                    };
-                    let data = self.eink_artwork_cache.insert(cache_key, eink.data);
-                    Ok(ImageData {
-                        content_type: "application/octet-stream".to_string(),
-                        data: data.as_ref().clone(),
-                    })
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "Frame artwork conversion failed for {zone_id} at {target_w}x{target_h}: {error}"
-                    );
-                    Ok(raw_image)
-                }
-            }
-        } else {
-            Ok(raw_image)
+        // Bound expensive raster/native work and keep it off the async reactor.
+        // Move the permit into the closure so cancellation cannot free a slot
+        // while the blocking worker/native child is still running.
+        if !compose_raster && !matches!(format, Some("rgb565" | "rgb565-smart" | "eink_acep6")) {
+            return Ok(raw_image);
         }
+        static WORKERS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
+        let permit = Arc::clone(&WORKERS).acquire_owned().await?;
+        let format = format.map(str::to_owned);
+        let cache = self.eink_artwork_cache.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            // Convert to RGB565 if requested (for ESP32 LCD/e-ink displays).
+            // The smart variant is a capability handshake: older servers return
+            // the source image, allowing firmware to detect and use its fallback.
+            if matches!(format.as_deref(), Some("rgb565" | "rgb565-smart")) {
+                // Use square dimensions when only one side specified (matches adapter behavior)
+                let (target_w, target_h) = dimensions;
+
+                match jpeg_to_rgb565_with_policy(&raw_image.data, target_w, target_h, resize_policy)
+                {
+                    Ok(rgb565) => Ok(ImageData {
+                        content_type: "application/octet-stream".to_string(),
+                        data: rgb565.data,
+                    }),
+                    Err(_) => {
+                        // Fall back to original on conversion error
+                        Ok(raw_image)
+                    }
+                }
+            } else if format.as_deref() == Some("eink_acep6") {
+                let (target_w, target_h) = dimensions;
+                match image_to_eink_acep6_with_policy(
+                    &raw_image.data,
+                    target_w,
+                    target_h,
+                    resize_policy,
+                ) {
+                    Ok(eink) => {
+                        let Some(cache_key) = eink_cache_key else {
+                            return Ok(raw_image);
+                        };
+                        let data = cache.insert(cache_key, eink.data);
+                        Ok(ImageData {
+                            content_type: "application/octet-stream".to_string(),
+                            data: data.as_ref().clone(),
+                        })
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "Frame artwork conversion failed at {target_w}x{target_h}: {error}"
+                        );
+                        Ok(raw_image)
+                    }
+                }
+            } else {
+                let png = raw_image.content_type == "image/png";
+                match image_to_display_with_policy(
+                    &raw_image.data,
+                    dimensions.0,
+                    dimensions.1,
+                    resize_policy,
+                    png,
+                ) {
+                    Ok(data) => Ok(ImageData {
+                        content_type: if png { "image/png" } else { "image/jpeg" }.to_string(),
+                        data,
+                    }),
+                    Err(error) => {
+                        tracing::warn!("Raster artwork composition failed: {error}");
+                        Ok(raw_image)
+                    }
+                }
+            }
+        })
+        .await?
     }
 }
 
@@ -3628,6 +3684,11 @@ pub struct AdapterSettings {
     /// Music Assistant is an opt-in remote playback adapter.
     #[serde(default)]
     pub musicassistant: bool,
+    /// Playback device control (#774, alpha): receivers, amplifiers and streamers. Opt-in and off
+    /// by default: some families hold a device's single control session (Denon/Marantz Telnet),
+    /// which other clients then cannot use.
+    #[serde(default)]
+    pub devices: bool,
     /// The MQTT/Home Assistant discovery publisher (#508) is opt-in and off
     /// by default: it needs a broker configured before it can do anything.
     #[serde(default)]
@@ -3660,6 +3721,7 @@ impl AdapterSettings {
             "spotify" => Some(&mut self.spotify),
             "applemusic" => Some(&mut self.applemusic),
             "musicassistant" => Some(&mut self.musicassistant),
+            "devices" => Some(&mut self.devices),
             "mqtt" => Some(&mut self.mqtt),
             _ => None,
         }
@@ -3680,6 +3742,7 @@ impl AdapterSettings {
             "spotify" => Some(self.spotify),
             "applemusic" => Some(self.applemusic),
             "musicassistant" => Some(self.musicassistant),
+            "devices" => Some(self.devices),
             "mqtt" => Some(self.mqtt),
             _ => None,
         }
@@ -3713,6 +3776,7 @@ impl Default for AppSettings {
                 spotify: false,
                 applemusic: false,
                 musicassistant: false,
+                devices: false,
                 mqtt: false,
             },
             mqtt_enabled_by: crate::api::credentials::MqttEnableSource::Automatic,
@@ -3966,6 +4030,7 @@ pub async fn api_settings_post_handler(
             "musicassistant",
             old_adapters.musicassistant != new_adapters.musicassistant,
         ),
+        ("devices", old_adapters.devices != new_adapters.devices),
         ("mqtt", old_adapters.mqtt != new_adapters.mqtt),
     ];
 
@@ -3985,6 +4050,7 @@ pub async fn api_settings_post_handler(
             "spotify" => new_adapters.spotify,
             "applemusic" => new_adapters.applemusic,
             "musicassistant" => new_adapters.musicassistant,
+            "devices" => new_adapters.devices,
             // MQTT is a bus consumer, not a `Startable` in `adapters_list` -
             // handled separately below via `state.mqtt` (the sanctioned
             // surface `tests/adapter_boundary_lint.rs` allows this module
@@ -4322,6 +4388,7 @@ fn adapter_enabled(settings: &AdapterSettings, name: &str) -> Option<bool> {
         "spotify" => Some(settings.spotify),
         "applemusic" => Some(settings.applemusic),
         "musicassistant" => Some(settings.musicassistant),
+        "devices" => Some(settings.devices),
         "mqtt" => Some(settings.mqtt),
         _ => None,
     }
@@ -4763,6 +4830,7 @@ mod tests {
             spotify: true,
             applemusic: true,
             musicassistant: true,
+            devices: true,
             mqtt: true,
         };
         for name in [
@@ -4774,6 +4842,7 @@ mod tests {
             "spotify",
             "applemusic",
             "musicassistant",
+            "devices",
             "mqtt",
         ] {
             assert_eq!(adapter_enabled(&settings, name), Some(true), "{name}");

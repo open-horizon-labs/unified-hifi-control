@@ -46,7 +46,7 @@ fn normalized_volume(zone: &Zone) -> Option<f64> {
     use crate::bus::VolumeScale;
     match volume.scale {
         VolumeScale::Percentage => Some(volume.value as f64),
-        VolumeScale::Linear => {
+        VolumeScale::Linear | VolumeScale::Steps => {
             let span = (volume.max - volume.min).max(f32::EPSILON);
             Some((((volume.value - volume.min) / span) * 100.0) as f64)
         }

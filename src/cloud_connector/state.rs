@@ -53,6 +53,7 @@ pub async fn snapshot_from_aggregator(
                         crate::bus::VolumeScale::Decibel => "db",
                         crate::bus::VolumeScale::Percentage => "percent",
                         crate::bus::VolumeScale::Linear => "linear",
+                        crate::bus::VolumeScale::Steps => "steps",
                         crate::bus::VolumeScale::Unknown => "unknown",
                     }
                     .to_owned(),

@@ -21,6 +21,8 @@ Once the bridge is running, control your system from:
 
 ## Installation
 
+Artwork requested for a display viewport uses embedded Zensally face/saliency analysis and zenlayout composition by default. Analysis is cached across zones, sizes and orientations; no model download or external inference runtime is needed. If analysis or crop placement is unavailable, UHC tries libvips attention, then centered fill. Containers and Linux packages include libvips; standalone installs can provide `vips` on the service PATH for that fallback. Use `scale=fit` to preserve a complete cover. See [artwork composition](docs/artwork-smartcrop.md) for behavior, limits, and deployment details.
+
 See [INSTALL.md](INSTALL.md) for every supported installation and companion path.
 
 ### Docker (Recommended)

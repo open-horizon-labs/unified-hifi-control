@@ -9,7 +9,7 @@ WORKDIR /app
 # opens its HTTPS callback tunnel by running `ssh -R` (see
 # src/api/spotify_tunnel.rs). Without it that flow dies telling a container
 # user to "install the OpenSSH client", which they cannot act on.
-RUN apk add --no-cache ca-certificates openssh-client
+RUN apk add --no-cache ca-certificates openssh-client vips-tools
 
 # Copy pre-built binary (web assets are embedded)
 COPY dist/unified-hifi-control /app/

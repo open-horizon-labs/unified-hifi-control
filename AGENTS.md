@@ -380,6 +380,88 @@ than inventing parallel shapes.
 | `hifi_hqplayer_load_profile` | Load HQPlayer config |
 | `hifi_hqplayer_set_pipeline` | Change HQPlayer setting |
 
+### Playback devices (alpha, #774)
+
+A **device** is the amplifier, receiver or streamer a zone plays through. Families: Denon/Marantz,
+WiiM, Sonos, Yamaha MusicCast, BluOS, Cambridge StreamMagic, Trinnov, Onkyo/Integra/Pioneer
+(eISCP), Arcam, Hegel, Lyngdorf, Anthem, Eversolo (Zidoo JSON API from community clients), and Home Assistant `media_player`
+entities. All alpha,
+enabled together by the Settings "Receivers & amplifiers" toggle; Anthem and Trinnov (no
+discovery) are configured as `manual_devices` in `device-links.json`. Volume is carried in each
+device's native scale (`VolumeControl.scale`: `decibel`, `percentage`, `linear`, `steps`). It is not a zone and never
+appears in `hifi_zones`. A user *links* a zone to a device (`hifi_devices action=link`, or
+`POST /devices/link`), optionally naming the device input the zone arrives on. From then on:
+
+- the zone's `volume_control` is the device's (dB, the unit's own maximum lowered by the user's
+  ceiling), so the knob, Watch, Home Assistant and `hifi_control volume_*` drive the amplifier
+  with no client change;
+- `/knob/control` and `hifi_devices action=control` accept `power_on`, `power_off`,
+  `power_toggle`, `select_input`, `mute`;
+- inputs never switch automatically: `select_input` is the only path.
+
+| Tool | Purpose |
+|------|---------|
+| `hifi_devices` | List devices and inputs; link/unlink zones; set a volume ceiling; control power, input, volume, mute (alpha) |
+
+Every device payload carries `"maturity": "alpha"`. Commands succeed only when the device reports
+the requested state back (a write the device does not confirm is an error, never `ok`), and no
+level is sent before the device has reported its range. The model, data flow and safety rules are
+in `docs/device-control-weave.md`; the SR6008 captures behind the claims below are in
+`tests/fixtures/devices/marantz/sr6008/`.
+
+**This table is generated. Do not hand-edit it.** Regenerate with
+`UPDATE_AGENTS_DEVICES=1 cargo test --test device_claims`.
+
+<!-- BEGIN GENERATED DEVICE CAPABILITIES (tests/device_claims.rs) -->
+
+| Family | Observe | Volume | Mute | Power | Input select |
+|---|---|---|---|---|---|
+| Marantz SR6008 | ✅ hardware-verified | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
+| Other Denon / Marantz | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
+| WiiM Pro with gc4a | ✅ hardware-verified | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | 🚧 implemented, #788 |
+| WiiM Pro No MFI | ✅ hardware-verified | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | 🚧 implemented, #788 |
+| WiiM Ultra | ✅ hardware-verified | ✅ hardware-verified | ✅ hardware-verified | ⛔ | ✅ hardware-verified |
+| WiiM Amp Pro | ✅ hardware-verified | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | 🚧 implemented, #788 |
+| WiiM Pro Plus | ✅ hardware-verified | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | 🚧 implemented, #788 |
+| Other WiiM / LinkPlay | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | 🚧 implemented, #788 |
+| Sonos | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | ⛔ |
+| Yamaha MusicCast | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
+| BluOS | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | ⛔ | 🚧 implemented, #788 |
+| Cambridge StreamMagic (variable output) | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
+| Trinnov Altitude (MAC configured) | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
+| Onkyo / Integra / Pioneer (eISCP) | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
+| Arcam | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
+| Hegel | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
+| Lyngdorf | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
+| Anthem | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
+| Eversolo DMP-A6 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
+| Home Assistant media_player | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 | 🚧 implemented, #788 |
+
+✅ hardware-verified: exercised on real units with captured fixtures · 🚧 implemented from the vendor protocol or reference client, not exercised on hardware (#788) · ⛔ not supported by this family's protocol path
+
+- **Marantz SR6008** — volume: MV over Telnet, or formiPhoneAppVolume over HTTP; bounded by the unit's MVMAX (Telnet) or the protocol's +18 dB full scale, and by any user ceiling; pending on-device verification (#788); power: ZMON/ZMOFF over Telnet, or formiPhoneAppPower over HTTP (the SR6008 refuses Telnet in standby); pending on-device verification (#788)
+- **Other Denon / Marantz** — volume: MV over Telnet, or formiPhoneAppVolume over HTTP; bounded by the unit's MVMAX (Telnet) or the protocol's +18 dB full scale, and by any user ceiling; pending on-device verification (#788); power: ZMON/ZMOFF over Telnet, or formiPhoneAppPower over HTTP (the SR6008 refuses Telnet in standby); pending on-device verification (#788)
+- **WiiM Pro with gc4a** — volume: setPlayerCmd:vol:N, N in 0-100 (percentage). The device's max_volume setting (else 100) is the maximum; a user ceiling lowers it; fixed-output mode is not detectable over this API; power: WiiM/LinkPlay has no power command; pause is transport, not power, and is never reported as standby
+- **WiiM Pro No MFI** — volume: setPlayerCmd:vol:N, N in 0-100 (percentage). The device's max_volume setting (else 100) is the maximum; a user ceiling lowers it; fixed-output mode is not detectable over this API; power: WiiM/LinkPlay has no power command; pause is transport, not power, and is never reported as standby
+- **WiiM Ultra** — volume: setPlayerCmd:vol:N, N in 0-100 (percentage). The device's max_volume setting (else 100) is the maximum; a user ceiling lowers it; fixed-output mode is not detectable over this API; power: WiiM/LinkPlay has no power command; pause is transport, not power, and is never reported as standby
+- **WiiM Amp Pro** — volume: setPlayerCmd:vol:N, N in 0-100 (percentage). The device's max_volume setting (else 100) is the maximum; a user ceiling lowers it; fixed-output mode is not detectable over this API; power: WiiM/LinkPlay has no power command; pause is transport, not power, and is never reported as standby
+- **WiiM Pro Plus** — volume: setPlayerCmd:vol:N, N in 0-100 (percentage). The device's max_volume setting (else 100) is the maximum; a user ceiling lowers it; fixed-output mode is not detectable over this API; power: WiiM/LinkPlay has no power command; pause is transport, not power, and is never reported as standby
+- **Other WiiM / LinkPlay** — volume: setPlayerCmd:vol:N, N in 0-100 (percentage). The device's max_volume setting (else 100) is the maximum; a user ceiling lowers it; fixed-output mode is not detectable over this API; power: WiiM/LinkPlay has no power command; pause is transport, not power, and is never reported as standby
+- **Sonos** — volume: RenderingControl SetVolume, Channel Master, 0-100 (percentage), per player not per group. 100 is the maximum; a user ceiling lowers it; power: Sonos has no generic power on/off; players sleep and wake by themselves
+- **Yamaha MusicCast** — volume: main/setVolume, native units 0..161 step 1 (not a percentage and not dB; the model's own scale), limited by the unit's max_volume; implemented from the YXC specification and aiomusiccast; no MusicCast hardware exercised yet; power: main/setPower on|standby over HTTP. Waking a unit in standby needs network standby enabled on the device; otherwise it does not answer; implemented from the YXC specification and aiomusiccast; no MusicCast hardware exercised yet
+- **BluOS** — volume: /Volume?level= (0-100 percent); implemented from pyblu and the BluOS API; no BluOS hardware exercised yet; power: the BluOS API has no universal power command (a streaming module has no amplifier to switch, and power is a host-device matter); refused with an error; implemented from pyblu and the BluOS API; no BluOS hardware exercised yet
+- **Cambridge StreamMagic (variable output)** — volume: /zone/state volume_percent (Percentage 0-100), bounded by the unit's volume_limit_percent and the user ceiling; implementation-derived from aiostreammagic, not yet exercised on a unit; power: /system/power ON, and NETWORK standby (ECO standby disables the network and cannot be woken from here); implementation-derived from aiostreammagic, not yet exercised on a unit
+- **Trinnov Altitude (MAC configured)** — volume: volume <dB> (-120..+20, the protocol's full scale), lowered by the user ceiling; implementation-derived from py-trinnov-altitude, not yet exercised on a unit; power: off: power_off_SECURED_FHZMCH48FE, complete on OK. on: Wake-on-LAN magic packet to the configured MAC (UDP broadcast, port 9); a sent packet is not confirmation, the unit reads on only when its session reconnects; implementation-derived from py-trinnov-altitude, not yet exercised on a unit
+- **Onkyo / Integra / Pioneer (eISCP)** — volume: MVL in the receiver's native hexadecimal units; maximum is the spec's 100 (0x64), and models that stop at 80 clamp a higher write themselves, which the readback reports; implemented from the Onkyo ISCP spec v1.15, not yet exercised on hardware; power: PWR01/PWR00 over eISCP; a receiver in standby accepts network control only when Network Standby is enabled in its setup menu, otherwise power-on is unreachable; implemented from the Onkyo ISCP spec v1.15, not yet exercised on hardware
+- **Arcam** — volume: VOLUME (0x0D) in the unit's native 0-99 steps; 99 is the protocol's full scale; implemented from arcam_fmj and Arcam's control documents, not yet exercised on hardware; power: POWER (0x00) direct write while the unit answers; IP wake is unsupported: older Arcam models turn network control off in standby, so switch the unit on at the unit itself (newer models keep LAN control when "HDMI & IP On" is enabled); implemented from arcam_fmj and Arcam's control documents, not yet exercised on hardware
+- **Hegel** — volume: -v.N, 0-100 percent (the protocol's full scale is the maximum; a user ceiling lowers it); power: -p.1 / -p.0 over the control session
+- **Lyngdorf** — volume: !VOL(n) in tenths of a dB, -99.9 to +24.0 dB; the unit's own !MAXVOL (read-only over the protocol) bounds the range, lowered by the user ceiling; refused while the unit is not on, because standby discards volume writes silently; implementation-derived from the lyngdorf library and vendor manual, not exercised on hardware; power: !POWERONMAIN / !POWEROFFMAIN (main zone only); implementation-derived from the lyngdorf library and vendor manual, not exercised on hardware
+- **Anthem** — volume: Z1PVOL in percent, 0 to 100; the protocol's full scale is the maximum, lowered by the user ceiling; refused while the zone is off; implementation-derived from anthemav, not exercised on hardware; Zone 1 only; power: Z1POW1 / Z1POW0 (Zone 1, not the whole unit); waking from standby needs standby IP control enabled on the unit; implementation-derived from anthemav, not exercised on hardware; Zone 1 only
+- **Eversolo DMP-A6** — volume: absolute GET setDevicesVolume?volume=N in native steps 0..maxVolume (200 on every captured unit), read back from getState volumeData.currenttVolume; DMP-A6: HDMI output and 6 inputs seen on firmware v1.5.46 (mase1981/uc-intg-eversolo DISCOVERY_ANALYSIS.md); the UPnP descriptor in andrewdunndev/narjo-eversolo-upnp is a DMP-A6; power: off: GET setPowerOption?tag=poweroff (fallback Key.Poweroff); standby is inferred only when the unit stops answering after UHC's own accepted power-off. On: Wake-on-LAN (UDP 9 and 9517) with the unit's MAC, currently available (ableRemoteBoot true); a magic packet is not confirmation; DMP-A6: HDMI output and 6 inputs seen on firmware v1.5.46 (mase1981/uc-intg-eversolo DISCOVERY_ANALYSIS.md); the UPnP descriptor in andrewdunndev/narjo-eversolo-upnp is a DMP-A6
+- **Home Assistant media_player** — volume: media_player.volume_set (0–1), bounded by any user ceiling; confirmed by state readback; power: media_player.turn_on/turn_off via Home Assistant; confirmed by state readback
+
+<!-- END GENERATED DEVICE CAPABILITIES -->
+
 ---
 
 ## UI Stack

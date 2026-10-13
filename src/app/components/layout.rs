@@ -28,6 +28,9 @@ pub struct LayoutProps {
     /// Hide Knobs tab in nav
     #[props(default = false)]
     pub hide_knobs: bool,
+    /// Hide Devices tab in nav
+    #[props(default = false)]
+    pub hide_devices: bool,
 }
 
 /// Main layout component wrapping all pages.
@@ -93,8 +96,12 @@ pub fn Layout(props: LayoutProps) -> Element {
             hide_lms: props.hide_lms,
             hide_spotify: props.hide_spotify,
             hide_knobs: props.hide_knobs,
+            hide_devices: props.hide_devices,
         }
         main { class: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-4",
+            if props.nav_active != "settings" {
+                crate::app::cloud_connection::CloudConnectionNotice { standalone: true }
+            }
             {props.children}
         }
         footer { class: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center py-3",

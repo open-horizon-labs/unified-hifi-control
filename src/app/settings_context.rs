@@ -46,6 +46,9 @@ pub struct NavigationVisibility {
     pub hide_lms: bool,
     pub hide_spotify: bool,
     pub hide_knobs: bool,
+    /// Playback devices page (#774, alpha): hidden until the `devices` adapter is enabled.
+    #[serde(default)]
+    pub hide_devices: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -56,6 +59,7 @@ fn initial_navigation_visibility() -> Option<NavigationVisibility> {
         hide_lms: !settings.adapters.lms,
         hide_spotify: !settings.adapters.spotify,
         hide_knobs: settings.hide_knobs_page,
+        hide_devices: !settings.adapters.devices,
     })
 }
 
@@ -81,6 +85,8 @@ pub struct SettingsContext {
     lms_enabled: Signal<bool>,
     /// Spotify adapter enabled (page visible when true)
     spotify_enabled: Signal<bool>,
+    /// Playback devices adapter enabled (page visible when true)
+    devices_enabled: Signal<bool>,
     /// Whether settings have been loaded from server
     loaded: Signal<bool>,
 }
@@ -111,6 +117,11 @@ impl SettingsContext {
         !(self.spotify_enabled)()
     }
 
+    /// Whether the Devices page should be visible.
+    pub fn hide_devices(&self) -> bool {
+        !(self.devices_enabled)()
+    }
+
     /// Update settings - now takes adapter enabled states
     pub fn update(
         &self,
@@ -118,6 +129,7 @@ impl SettingsContext {
         hqp_enabled: bool,
         lms_enabled: bool,
         spotify_enabled: bool,
+        devices_enabled: bool,
     ) {
         let mut hk = self.hide_knobs;
         let mut he = self.hqp_enabled;
@@ -127,6 +139,8 @@ impl SettingsContext {
         le.set(lms_enabled);
         let mut se = self.spotify_enabled;
         se.set(spotify_enabled);
+        let mut de = self.devices_enabled;
+        de.set(devices_enabled);
     }
 
     /// Mark settings as loaded
@@ -144,6 +158,7 @@ pub fn use_settings_provider() -> NavigationVisibility {
     let hqp_enabled = use_signal(move || !visibility.hide_hqp);
     let lms_enabled = use_signal(move || !visibility.hide_lms);
     let spotify_enabled = use_signal(move || !visibility.hide_spotify);
+    let devices_enabled = use_signal(move || !visibility.hide_devices);
     // When the SSR bootstrap marker is available, its settings are already
     // authoritative for the first Nav render.  The browser still refreshes
     // them below so another client can update visibility later.
@@ -154,6 +169,7 @@ pub fn use_settings_provider() -> NavigationVisibility {
         hqp_enabled,
         lms_enabled,
         spotify_enabled,
+        devices_enabled,
         loaded,
     };
 
@@ -173,6 +189,7 @@ pub fn use_settings_provider() -> NavigationVisibility {
                         settings.adapters.hqplayer,
                         settings.adapters.lms,
                         settings.adapters.spotify,
+                        settings.adapters.devices,
                     );
                     ctx.mark_loaded();
                 }

@@ -6,20 +6,18 @@ use dioxus::prelude::*;
 
 use crate::app::api::{
     source_label, AppSettings, AppleBridgeStatus, HiphiCompleteRequest, HiphiCompleteResponse,
-    HiphiEnrollmentHandoff, HiphiInitiateRequest, HiphiInitiateResponse, HiphiPairingStatus,
-    HiphiPrepareResponse, HqpStatus, LmsConfig, ManagedZone, ManagedZonesResponse, MoveDirection,
-    MqttConfigureRequest, MqttStatusResponse, MusicAssistantConfigureRequest,
-    MusicAssistantStatusResponse, ProviderAuthResponse, ProviderOAuthStart, RoonStatus,
-    SpotifyAccountResponse, SpotifyConfigureRequest, SpotifyConfigureResponse, SpotifyTunnelStatus,
-    ZoneNameRequest, ZoneOrderRequest, ZoneVisibilityRequest, ZonesResponse,
+    HiphiEnrollmentHandoff, HiphiInitiateRequest, HiphiInitiateResponse, HiphiPrepareResponse,
+    HqpStatus, LmsConfig, ManagedZone, ManagedZonesResponse, MoveDirection, MqttConfigureRequest,
+    MqttStatusResponse, MusicAssistantConfigureRequest, MusicAssistantStatusResponse,
+    ProviderAuthResponse, ProviderOAuthStart, RoonStatus, SpotifyAccountResponse,
+    SpotifyConfigureRequest, SpotifyConfigureResponse, SpotifyTunnelStatus, ZoneNameRequest,
+    ZoneOrderRequest, ZoneVisibilityRequest, ZonesResponse,
 };
 use crate::app::components::{ErrorAlert, Layout};
 use crate::app::settings_context::{initial_app_settings, use_settings};
 use crate::app::sse::use_sse;
 use crate::app::theme::{use_theme, Theme};
 use crate::app::{McpEndpoint, Route};
-
-const HIPHI_STATUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// OpenHome status response
 #[derive(Clone, Debug, Default, serde::Deserialize, PartialEq)]
@@ -120,22 +118,7 @@ fn HiphiCloudPairing() -> Element {
     let public_key_copy = use_signal(CopyState::default);
     let pairing_id_copy = use_signal(CopyState::default);
     let pairing_secret_copy = use_signal(CopyState::default);
-    let mut pairing_status = use_resource(|| async {
-        crate::app::api::fetch_json::<HiphiPairingStatus>("/api/hiphi/pairing/status").await
-    });
-
-    // Pairing is durable, but relay presence changes independently of page
-    // navigation. Refresh only this small status resource so a page opened
-    // while online cannot keep claiming connectivity after a disconnect (or
-    // stay on "connecting" after recovery).
-    use_effect(move || {
-        spawn(async move {
-            loop {
-                dioxus_sdk_time::sleep(HIPHI_STATUS_POLL_INTERVAL).await;
-                pairing_status.restart();
-            }
-        });
-    });
+    let mut pairing_status = crate::app::cloud_connection::use_cloud_connection().status;
 
     let prepare = move |_| {
         action.set(ProviderActionState::Loading);
@@ -225,31 +208,9 @@ fn HiphiCloudPairing() -> Element {
         });
     };
 
-    let resume_cloud = move |_| {
-        if matches!(action(), ProviderActionState::Loading) {
-            return;
-        }
-        action.set(ProviderActionState::Loading);
-        error.set(None);
-        spawn(async move {
-            match crate::app::api::post_json::<serde_json::Value, HiphiPairingStatus>(
-                "/api/hiphi/connection/resume",
-                &serde_json::json!({}),
-            )
-            .await
-            {
-                Ok(_) => action.set(ProviderActionState::Success),
-                Err(message) => {
-                    action.set(ProviderActionState::Failed);
-                    error.set(crate::app::api::suppress_controller_unauthorized(message));
-                }
-            }
-            pairing_status.restart();
-        });
-    };
-
     let status_snapshot = pairing_status.read().as_ref().cloned();
     let status_pending = status_snapshot.is_none();
+    let status_failed = matches!(status_snapshot, Some(Err(_)));
     let paired_status = status_snapshot
         .and_then(Result::ok)
         .filter(|status| status.paired);
@@ -266,27 +227,18 @@ fn HiphiCloudPairing() -> Element {
             div { class: "card p-5 sm:p-6 space-y-6",
                 if status_pending {
                     p { class: "text-sm text-secondary", "Checking this installation’s HiPhi Cloud connection…" }
+                } else if status_failed {
+                    p { role: "alert", "UHC couldn’t check its Cloud connection. Try again shortly; you don’t need to start pairing again." }
                 } else if let Some(status) = paired_status {
                     div { class: if status.connector_state == "online" { "status-ok" } else { "text-secondary" }, role: "status",
                         p { class: "font-medium", "This UHC installation is paired." }
-                        p { class: "mt-1", "{status.display_state()}" }
+                        if status.pause_reason.is_none() {
+                            p { class: "mt-1", "{status.display_state()}" }
+                        }
                         if status.connector_state == "offline" && status.pause_reason.is_none() {
                             p { class: "mt-2 text-sm", "UHC retries automatically. During an outage, retries slow to about once every 15 minutes to limit Cloud usage." }
                         }
-                        if status.pause_reason.as_deref() == Some("cost_limit") {
-                            p { class: "mt-2 text-sm", "Cloud traffic or repeated connection attempts reached a safety limit. Local playback is unaffected. Resume after the Cloud issue is resolved; cost protection stays enabled." }
-                            button {
-                                r#type: "button", class: "btn btn-primary mt-3",
-                                disabled: !status.can_resume || matches!(action(), ProviderActionState::Loading),
-                                onclick: resume_cloud,
-                                "Resume Cloud connection"
-                            }
-                            if !status.can_resume {
-                                p { class: "mt-2 text-sm", "Recovery attempts are limited to once every 15 minutes. If this persists, the saved recovery state needs attention." }
-                            }
-                        } else if status.pause_reason.is_some() {
-                            p { class: "mt-2 text-sm", "Cloud safety or replay state could not be read or saved. Check the UHC logs and configuration storage before resuming. Pairing and local playback are preserved." }
-                        }
+                        crate::app::cloud_connection::CloudConnectionNotice {}
                         if let Some(installation_id) = status.installation_id {
                             p { class: "mt-2 text-xs text-muted break-all", "Installation ID: {installation_id}" }
                         }
@@ -420,6 +372,7 @@ enum AdapterToggle {
     Spotify,
     AppleMusic,
     MusicAssistant,
+    Devices,
     Mqtt,
 }
 
@@ -443,6 +396,9 @@ fn settings_with_toggle(mut settings: AppSettings, toggle: SettingsToggle) -> Ap
         }
         SettingsToggle::Adapter(AdapterToggle::MusicAssistant, enabled) => {
             settings.adapters.musicassistant = enabled
+        }
+        SettingsToggle::Adapter(AdapterToggle::Devices, enabled) => {
+            settings.adapters.devices = enabled
         }
         SettingsToggle::Adapter(AdapterToggle::Mqtt, enabled) => settings.adapters.mqtt = enabled,
         SettingsToggle::HideKnobs(enabled) => settings.hide_knobs_page = !enabled,
@@ -508,6 +464,7 @@ fn FeatureToggle(label: &'static str, enabled: bool, onclick: EventHandler<Mouse
                 "Enable HQPlayer" => "adapters.hqplayer",
                 "Enable Spotify" => "adapters.spotify",
                 "Enable Apple Music" => "adapters.applemusic",
+                "Enable receiver and amplifier control" => "adapters.devices",
                 "Enable MQTT/Home Assistant" => "adapters.mqtt",
                 "Show Controllers page" => "hide_knobs_page",
                 _ => "",
@@ -901,6 +858,7 @@ pub fn Settings() -> Element {
     let mut spotify_enabled = use_signal(|| initial_settings.adapters.spotify);
     let mut applemusic_enabled = use_signal(|| initial_settings.adapters.applemusic);
     let mut musicassistant_enabled = use_signal(|| initial_settings.adapters.musicassistant);
+    let mut devices_enabled = use_signal(|| initial_settings.adapters.devices);
     let mut mqtt_enabled = use_signal(|| initial_settings.adapters.mqtt);
 
     // Streaming-provider onboarding state. Provider credentials are never
@@ -1026,6 +984,7 @@ pub fn Settings() -> Element {
             spotify_enabled.set(s.adapters.spotify);
             applemusic_enabled.set(s.adapters.applemusic);
             musicassistant_enabled.set(s.adapters.musicassistant);
+            devices_enabled.set(s.adapters.devices);
             mqtt_enabled.set(s.adapters.mqtt);
             hide_knobs.set(s.hide_knobs_page);
             confirmed_settings.set(Some(s.clone()));
@@ -1035,6 +994,7 @@ pub fn Settings() -> Element {
                 s.adapters.hqplayer,
                 s.adapters.lms,
                 s.adapters.spotify,
+                s.adapters.devices,
             );
             settings_ctx.mark_loaded();
         }
@@ -1939,6 +1899,7 @@ pub fn Settings() -> Element {
             hide_hqp: !hqplayer_enabled(),
             hide_lms: !lms_enabled(),
             hide_spotify: !spotify_enabled(),
+            hide_devices: !devices_enabled(),
             hide_knobs: hide_knobs(),
 
             h1 { class: "text-2xl font-bold mb-6", "Settings" }
@@ -2104,6 +2065,35 @@ pub fn Settings() -> Element {
                                             }
                                         } else {
                                             "..."
+                                        }
+                                    } else {
+                                        span { class: "text-muted", "-" }
+                                    }
+                                }
+                            }
+                            // Playback device control (#774): receivers, amplifiers and streamers, not
+                            // music providers. Alpha; links and control are API/MCP-only for now.
+                            tr { class: "border-b border-default",
+                                td { class: "py-2 px-3",
+                                    FeatureToggle {
+                                        label: "Enable receiver and amplifier control",
+                                        enabled: devices_enabled(),
+                                        onclick: move |_| {
+                                            toggle_setting(SettingsToggle::Adapter(AdapterToggle::Devices, !devices_enabled()));
+                                        }
+                                    }
+                                }
+                                td { class: "py-2 px-3",
+                                    div { class: "flex items-center gap-2",
+                                        "Receivers & amplifiers"
+                                        span { class: "badge badge-secondary", "Alpha" }
+                                    }
+                                }
+                                td { class: "py-2 px-3",
+                                    if devices_enabled() {
+                                        span { class: "text-muted",
+                                            "Power, volume and input for linked zones. "
+                                            Link { class: "link", to: Route::Devices {}, "Open Devices →" }
                                         }
                                     } else {
                                         span { class: "text-muted", "-" }
@@ -3911,6 +3901,7 @@ mod tests {
                 spotify: false,
                 applemusic: true,
                 musicassistant: false,
+                devices: false,
                 mqtt: false,
             },
             hide_knobs_page: false,

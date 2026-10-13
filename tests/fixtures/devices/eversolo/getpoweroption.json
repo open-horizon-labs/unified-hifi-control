@@ -1,0 +1,25 @@
+{
+  "status": 200,
+  "data": [
+    {
+      "name": "Power off",
+      "tag": "poweroff"
+    },
+    {
+      "name": "Reboot",
+      "tag": "reboot"
+    },
+    {
+      "name": "Standby",
+      "tag": "standby"
+    },
+    {
+      "name": "Screen off",
+      "tag": "screen"
+    },
+    {
+      "name": "Timed shutdown",
+      "tag": "timeshutdown"
+    }
+  ]
+}

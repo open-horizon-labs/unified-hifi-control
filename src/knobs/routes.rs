@@ -130,6 +130,11 @@ pub struct ZoneInfo {
     /// Library page hides tabs missing from this list instead of rendering
     /// ones whose every call would be refused.
     pub library_tabs: Vec<&'static str>,
+    /// The playback device this zone is linked to (#774, alpha): power, current input and the
+    /// device's input catalog. Absent for unlinked zones, so their payload is unchanged. A linked
+    /// zone's `volume_control` is already the device's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<crate::devices::LinkedDeviceSummary>,
 }
 
 /// GET /knob/zones response
@@ -197,10 +202,17 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
     };
 
     // Filtered (adapter settings + hide list) and sorted by the shared policy.
-    crate::zone_list::visible_zones(state)
-        .await
+    let zones = crate::zone_list::visible_zones(state).await;
+    let mut devices = HashMap::new();
+    for zone in &zones {
+        if let Some(device) = state.aggregator.linked_device(&zone.zone_id).await {
+            devices.insert(zone.zone_id.clone(), device);
+        }
+    }
+    zones
         .into_iter()
         .map(|z| ZoneInfo {
+            device: devices.remove(&z.zone_id),
             dsp: get_dsp(&z.zone_id),
             browse_supported: crate::mcp::tools::collections::zone_supports_hifi_collections(
                 &z.zone_id,
@@ -424,6 +436,7 @@ pub async fn knob_now_playing_handler(
             crate::bus::VolumeScale::Decibel => "db".to_string(),
             crate::bus::VolumeScale::Percentage => "number".to_string(),
             crate::bus::VolumeScale::Linear => "number".to_string(),
+            crate::bus::VolumeScale::Steps => "number".to_string(),
             crate::bus::VolumeScale::Unknown => "fixed".to_string(),
         },
         None => "fixed".to_string(),
@@ -465,6 +478,7 @@ pub struct ImageQuery {
     pub height: Option<u32>,
     pub format: Option<String>,
     pub scale: Option<String>,
+    /// Accepted for older firmware; attention fill no longer uses an area budget.
     pub crop_limit: Option<u8>,
 }
 
@@ -483,25 +497,20 @@ pub async fn knob_image_handler(
     let format = params.format.as_deref();
     let rgb565_requested = matches!(format, Some("rgb565" | "rgb565-smart"));
     let eink_requested = format == Some("eink_acep6");
-    if eink_requested
-        && (target_width == 0
-            || target_height == 0
-            || u64::from(target_width) * u64::from(target_height) > 1_536_000)
-    {
+    if !crate::knobs::image::valid_artwork_dimensions(
+        target_width,
+        target_height,
+        if eink_requested { 1_536_000 } else { 8_388_608 },
+    ) {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
-            .body(Body::from("invalid e-ink artwork dimensions"))
+            .body(Body::from("invalid artwork dimensions"))
             .unwrap();
     }
-    let resize_policy = match (format, params.scale.as_deref()) {
-        (Some("rgb565-smart" | "eink_acep6"), _) | (_, Some("smart")) => {
-            Some(crate::knobs::image::Rgb565ResizePolicy::SmartCover {
-                max_crop_percent: params.crop_limit.unwrap_or(10).min(25),
-            })
-        }
-        (_, Some("fit")) => Some(crate::knobs::image::Rgb565ResizePolicy::Fit),
-        _ => None,
-    };
+    let resize_policy = Some(match params.scale.as_deref() {
+        Some("fit") => crate::knobs::image::Rgb565ResizePolicy::Fit,
+        _ => crate::knobs::image::Rgb565ResizePolicy::AttentionCover,
+    });
 
     // Helper to return placeholder image in appropriate format
     let placeholder_response = || -> Response {
@@ -608,6 +617,56 @@ pub async fn knob_image_handler(
     }
 }
 
+/// Device control for a linked zone, or `None` when the provider should handle the action.
+///
+/// Power and input actions on an unlinked zone are refused here rather than offered to a provider
+/// that has no such concept (and, for LMS, a *different* power concept — #304).
+async fn control_linked_device(
+    state: &AppState,
+    req: &KnobControlRequest,
+) -> Option<Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)>> {
+    use crate::devices::service::{
+        is_device_only_action, request_from_action, DeviceError, DeviceTarget,
+    };
+    let Some(device_id) = state.devices.linked_device_id(&req.zone_id).await else {
+        if is_device_only_action(&req.action) {
+            return Some(Err(crate::api::devices::device_error_response(
+                DeviceError::NotLinked {
+                    zone_id: req.zone_id.clone(),
+                },
+            )));
+        }
+        return None;
+    };
+    let step = state
+        .aggregator
+        .get_device(&device_id)
+        .await
+        .map(|device| device.volume.step)
+        .filter(|step| *step > 0.0)
+        .unwrap_or(0.5);
+    let request = match request_from_action(&req.action, req.value.as_ref(), step) {
+        Ok(Some(request)) => request,
+        Ok(None) => return None,
+        Err(message) => {
+            return Some(Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": message, "error_code": "INVALID_VALUE"})),
+            )))
+        }
+    };
+    Some(
+        match state
+            .devices
+            .control(DeviceTarget::Zone(req.zone_id.clone()), request)
+            .await
+        {
+            Ok(report) => Ok(Json(serde_json::json!({"ok": true, "result": report}))),
+            Err(error) => Err(crate::api::devices::device_error_response(error)),
+        },
+    )
+}
+
 /// Control request body
 #[derive(Deserialize)]
 pub struct KnobControlRequest {
@@ -632,6 +691,13 @@ pub async fn knob_control_handler(
             )
             .await;
     }
+    // A zone linked to an amplifier (#774, alpha): its volume, mute, power and input belong to the
+    // device, so they are resolved here, before prefix routing could hand them to the provider.
+    // Transport actions fall through to the provider below.
+    if let Some(response) = control_linked_device(&state, &req).await {
+        return response;
+    }
+
     // Route based on zone_id prefix
     if req.zone_id.starts_with("lms:") {
         // LMS player control
@@ -1802,6 +1868,7 @@ mod tests {
             volume_control: None,
             dsp: None,
             browse_supported: false,
+            device: None,
             library_tabs: Vec::new(),
         }
     }

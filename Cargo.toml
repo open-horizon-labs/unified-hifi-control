@@ -24,6 +24,10 @@ server = [
     "dep:tracing-appender",
     "dep:config",
     "dep:image",
+    "dep:tempfile",
+    "dep:zensally",
+    "dep:zensally-tract",
+    "dep:zenlayout",
     "dep:resvg",
     "dep:tokio-stream",
     "dep:tokio-util",
@@ -38,6 +42,7 @@ server = [
     "dep:rumqttc",
     "dep:ed25519-dalek",
     "dep:uuid",
+    "dep:rustix",
 ]
 # UHC-owned NAA relay for HQPlayer output routing. Server builds include it by default; use
 # `--no-default-features --features server` when a relay-free server is specifically required.
@@ -130,6 +135,7 @@ config = { version = "0.15", optional = true }
 
 # Image processing (server only)
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"], optional = true }
+tempfile = { version = "3", optional = true }
 
 # Tokio stream utilities (server only)
 tokio-stream = { version = "0.1", features = ["sync"], optional = true }
@@ -197,6 +203,10 @@ name = "uhc-music-details"
 path = "src/bin/uhc_music_details.rs"
 required-features = ["server"]
 
+[target.'cfg(unix)'.dependencies]
+# Open the exact connection files without following links during owner recovery.
+rustix = { version = "1", features = ["fs", "process"], optional = true }
+
 [dev-dependencies]
 tokio-test = "0.4"
 serial_test = "3"
@@ -233,3 +243,21 @@ panic = "abort"
 # Build with: cargo build --release --target x86_64-unknown-linux-musl
 # Or use cross: cross build --release --target x86_64-unknown-linux-musl
 # Available targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, armv7-unknown-linux-musleabihf
+
+# Server-only embedded face/saliency models; pinned to the offline evaluation.
+[dependencies.zensally]
+git = "https://github.com/imazen/zensally"
+rev = "a8888d08c6d4bd1fe0969cdce40da6c01b8032be"
+features = ["zenlayout"]
+optional = true
+[dependencies.zensally-tract]
+git = "https://github.com/imazen/zensally"
+rev = "a8888d08c6d4bd1fe0969cdce40da6c01b8032be"
+default-features = false
+features = ["analyzer"]
+optional = true
+[dependencies.zenlayout]
+version = "=0.2.2"
+default-features = false
+features = ["smart-crop", "alloc"]
+optional = true

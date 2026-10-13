@@ -26,6 +26,7 @@
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use unified_hifi_control::bus::events::{VolumeControl, VolumeScale};
+use unified_hifi_control::devices::{DeviceId, DeviceInput, DevicePower, LinkedDeviceSummary};
 use unified_hifi_control::knobs::routes::{DspInfo, NowPlayingResponse, ZoneInfo};
 
 fn fixture() -> Value {
@@ -85,6 +86,27 @@ fn sample_zone_full() -> ZoneInfo {
         }),
         browse_supported: true,
         library_tabs: vec!["browse", "playlists"],
+        device: Some(sample_linked_device()),
+    }
+}
+
+/// A linked playback device (#774, alpha), as a linked zone carries it.
+fn sample_linked_device() -> LinkedDeviceSummary {
+    LinkedDeviceSummary {
+        device_id: DeviceId::parse("marantz:0006781E0AB8").unwrap(),
+        name: "front".to_string(),
+        maturity: "alpha".to_string(),
+        present: true,
+        power: DevicePower::On,
+        input: Some("MPLAY".to_string()),
+        input_name: Some("WiiM".to_string()),
+        source_id: Some("MPLAY".to_string()),
+        on_linked_input: Some(true),
+        inputs: vec![DeviceInput {
+            id: "MPLAY".to_string(),
+            name: "WiiM".to_string(),
+            available: true,
+        }],
     }
 }
 
@@ -100,6 +122,7 @@ fn sample_zone_minimal() -> ZoneInfo {
         dsp: None,
         browse_supported: true,
         library_tabs: vec!["browse", "playlists"],
+        device: None,
     }
 }
 

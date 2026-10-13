@@ -9,8 +9,8 @@ mod logging;
 #[cfg(feature = "server")]
 mod server {
     use unified_hifi_control::{
-        adapters, aggregator, api, app, bus, cloud_connector, config, coordinator, embedded,
-        firmware, knobs, mcp, mdns, mqtt,
+        adapters, aggregator, api, app, bus, cloud_connector, config, coordinator, devices,
+        embedded, firmware, knobs, mcp, mdns, mqtt,
     };
 
     // Import load_app_settings for checking adapter enabled state
@@ -446,6 +446,16 @@ mod server {
             upnp.clone(),
         ];
 
+        // Playback device control (#774, alpha): one Startable owning every device family. Families
+        // publish devices, never zones, and receive commands only through `DeviceService`.
+        let device_families: Vec<Arc<dyn adapters::devices::DeviceFamily>> =
+            adapters::device_families(bus.clone());
+        let device_set = Arc::new(adapters::devices::DeviceAdapterSet::new(
+            device_families.clone(),
+        ));
+        let mut legacy_startables = legacy_startables;
+        legacy_startables.push(device_set.clone());
+
         let mut provider_startables: Vec<Arc<dyn adapters::Startable>> = vec![spotify.clone()];
         let mut startable_adapters = legacy_startables.clone();
         startable_adapters.extend(provider_startables.iter().cloned());
@@ -489,7 +499,29 @@ mod server {
         // SSE closes as soon as graceful HTTP shutdown begins.
         let shutdown_token = CancellationToken::new();
 
-        // Single loop to start all enabled adapters
+        // Single loop to start all enabled adapters. Manual device hosts are read straight from
+        // the link document so the device adapter can probe them on its first discovery pass.
+        device_set
+            .set_manual_devices(
+                devices::links::DeviceLinkStore::open_default()
+                    .document()
+                    .await
+                    .map(|document| {
+                        let mut manual = document.manual_devices;
+                        // Legacy bare hosts are Denon/Marantz.
+                        manual.extend(document.manual_hosts.into_iter().map(|host| {
+                            devices::links::ManualDevice {
+                                family: "denonavr".to_string(),
+                                host,
+                                port: None,
+                                mac: None,
+                            }
+                        }));
+                        manual
+                    })
+                    .unwrap_or_default(),
+            )
+            .await;
         coord.start_all_enabled(&startable_adapters).await;
 
         // Build application state (clone Arcs so we can access adapters for shutdown)
@@ -510,6 +542,20 @@ mod server {
             shutdown_token.clone(),
         )
         .with_reliable_commands(reliable_commands);
+        for family in &device_families {
+            state.devices.register_driver(family.clone()).await;
+        }
+        // Opt-in mismatch journal: records adapter-reported anomalies only while enabled.
+        tokio::spawn(
+            state
+                .devices
+                .journal()
+                .run(bus.clone(), shutdown_token.clone()),
+        );
+        if let Err(error) = state.devices.load().await {
+            // The store refuses writes and keeps the file; device control continues unlinked.
+            tracing::error!("Device links not loaded: {error}");
+        }
         // The SSH reverse tunnel receives a separate, loopback-only callback
         // listener.  It must never forward to this main UHC listener: the
         // latter intentionally serves many LAN routes that are not safe to
@@ -1006,6 +1052,21 @@ mod server {
             .route("/hqp/zones/links", get(api::hqp_zone_links_handler))
             .route("/hqp/zones/link", post(api::hqp_zone_link_handler))
             .route("/hqp/zones/unlink", post(api::hqp_zone_unlink_handler))
+            // Playback devices linked to zones (#774, alpha)
+            .route("/devices", get(api::devices::devices_handler))
+            .route("/devices/links", get(api::devices::device_links_handler))
+            .route("/devices/{device_id}", get(api::devices::device_handler))
+            .route("/devices/link", post(api::devices::device_link_handler))
+            .route("/devices/unlink", post(api::devices::device_unlink_handler))
+            .route("/devices/ceiling", post(api::devices::device_ceiling_handler))
+            .route("/devices/control", post(api::devices::device_control_handler))
+            .route("/devices/recording", post(api::devices::device_recording_handler))
+            .route("/devices/report/clear", post(api::devices::device_report_clear_handler))
+            .route("/devices/{device_id}/report", get(api::devices::device_report_handler))
+            .route(
+                "/devices/{device_id}/report.json",
+                get(api::devices::device_report_bundle_handler),
+            )
             .route(
                 "/hqp/zones/{zone_id}/pipeline",
                 get(api::hqp_zone_pipeline_handler),

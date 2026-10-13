@@ -2,7 +2,7 @@ name: API Guard
 
 on:
   pull_request:
-    branches: [master, v3, v4]
+    branches: [master, v3, v4, 'integration/v4-*']
     types: [opened, synchronize, reopened, labeled, unlabeled]
     paths:
       - '.github/workflows/api-guard.yml'

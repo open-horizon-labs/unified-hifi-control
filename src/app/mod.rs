@@ -7,6 +7,7 @@ use dioxus::prelude::*;
 
 pub mod api;
 pub mod base_path;
+pub mod cloud_connection;
 pub mod components;
 pub mod controller_auth;
 pub mod embedded_assets;
@@ -17,8 +18,8 @@ pub mod theme;
 
 use components::BootstrapPrompt;
 use pages::{
-    HqPlayer, Knobs, LibraryHome, LibraryLocation, LibrarySource, LibraryView, Lms, Settings,
-    Spotify, Zones,
+    Devices, HqPlayer, Knobs, LibraryHome, LibraryLocation, LibrarySource, LibraryView, Lms,
+    Settings, Spotify, Zones,
 };
 use settings_context::use_settings_provider;
 use sse::use_sse_provider;
@@ -106,6 +107,7 @@ pub fn App() -> Element {
 
     // Initialize SSE context at app root (single EventSource for all pages)
     use_sse_provider();
+    cloud_connection::use_cloud_connection_provider();
 
     // Initialize theme context at app root (handles localStorage + DOM class)
     use_theme_provider();
@@ -172,6 +174,10 @@ pub enum Route {
     Lms {},
     #[route("/spotify")]
     Spotify {},
+    // `GET /devices` is the (frozen) JSON API and would shadow the page, so like
+    // /ui/zones (#560) the page lives under /ui.
+    #[route("/ui/devices")]
+    Devices {},
     #[route("/knobs")]
     Knobs {},
     #[route("/settings")]

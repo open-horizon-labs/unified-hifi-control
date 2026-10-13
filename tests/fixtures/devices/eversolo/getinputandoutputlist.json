@@ -1,0 +1,114 @@
+{
+  "status": 200,
+  "isSupportHideInput": true,
+  "hideInputTag": "[\"USB\",\"RCA\",\"XLR_A\",\"RCA_A\"]",
+  "inputData": [
+    {
+      "name": "Internal player",
+      "historyName": "Internal player",
+      "tag": "XMOS",
+      "isEdit": false,
+      "index": 0,
+      "icon": "/SystemSettings/getItemSettingIcon?iconName=XMOS.png",
+      "selecticon": "/SystemSettings/getItemSettingIcon?iconName=XMOS_select.png"
+    },
+    {
+      "name": "Bluetooth In",
+      "historyName": "Bluetooth In",
+      "tag": "BT",
+      "isEdit": false,
+      "index": 1,
+      "icon": "/SystemSettings/getItemSettingIcon?iconName=BT.png",
+      "selecticon": "/SystemSettings/getItemSettingIcon?iconName=BT_select.png"
+    },
+    {
+      "name": "Record Player",
+      "historyName": "Optical In",
+      "tag": "SPDIF",
+      "isEdit": true,
+      "index": 2,
+      "icon": "/SystemSettings/getItemSettingIcon?iconName=SPDIF.png",
+      "selecticon": "/SystemSettings/getItemSettingIcon?iconName=SPDIF_select.png"
+    },
+    {
+      "name": "TV",
+      "historyName": "ARC In",
+      "tag": "EARC",
+      "isEdit": true,
+      "index": 3,
+      "icon": "/SystemSettings/getItemSettingIcon?iconName=EARC.png",
+      "selecticon": "/SystemSettings/getItemSettingIcon?iconName=EARC_select.png"
+    }
+  ],
+  "subwooferSetting": {
+    "name": "Subwoofer",
+    "status": 1,
+    "setUrl": "/SystemSettings/audioSettings/getSubOutputOption"
+  },
+  "inputIndex": 0,
+  "outputData": [
+    {
+      "name": "BAL-XLR",
+      "tag": "XLR",
+      "enable": true,
+      "icon": "/SystemSettings/getItemSettingIcon?iconName=out_XLR.png",
+      "selecticon": "/SystemSettings/getItemSettingIcon?iconName=out_XLR_select.png"
+    },
+    {
+      "name": "Analog-RCA",
+      "tag": "RCA",
+      "enable": true,
+      "icon": "/SystemSettings/getItemSettingIcon?iconName=out_RCA0.png",
+      "selecticon": "/SystemSettings/getItemSettingIcon?iconName=out_RCA0_select.png"
+    },
+    {
+      "name": "XLR/RCA",
+      "tag": "XLRRCA",
+      "enable": true,
+      "icon": "/SystemSettings/getItemSettingIcon?iconName=out_XLR_RCA.png",
+      "selecticon": "/SystemSettings/getItemSettingIcon?iconName=out_XLR_RCA_select.png"
+    },
+    {
+      "name": "IIS",
+      "tag": "IIS",
+      "enable": true,
+      "icon": "/SystemSettings/getItemSettingIcon?iconName=out_HDMI.png",
+      "selecticon": "/SystemSettings/getItemSettingIcon?iconName=out_HDMI_select.png"
+    },
+    {
+      "name": "OPT/COAX/AES",
+      "tag": "SPDIF",
+      "enable": true,
+      "icon": "/SystemSettings/getItemSettingIcon?iconName=out_SPDIF.png",
+      "selecticon": "/SystemSettings/getItemSettingIcon?iconName=out_SPDIF_select.png"
+    },
+    {
+      "name": "USB DAC",
+      "tag": "USB",
+      "enable": false,
+      "icon": "/SystemSettings/getItemSettingIcon?iconName=out_USB.png",
+      "selecticon": "/SystemSettings/getItemSettingIcon?iconName=out_USB_select.png"
+    }
+  ],
+  "outputInfo": {
+    "vidPid": "",
+    "name": "",
+    "format": "PCM 32bit,DSD512",
+    "sampleRate": "768000 Hz",
+    "infolist": [
+      {
+        "title": "Format：",
+        "value": "PCM 32bit,DSD512"
+      },
+      {
+        "title": "Max sampling rate：",
+        "value": "768000 Hz"
+      }
+    ],
+    "isConnect": true,
+    "setUrl": "/SystemSettings/audioSettings/getXlrOutputOption",
+    "title": "XLR/RCA output",
+    "option": 3
+  },
+  "outputIndex": 1
+}

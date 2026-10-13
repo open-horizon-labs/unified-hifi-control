@@ -102,6 +102,11 @@ pub async fn handle_control(
     // its own dispatch, branched before the closed-set check below rather than
     // folded into it. `ZoneTarget::classify` is pure and does no I/O, so checking
     // it first costs nothing on the other providers' path.
+    // A zone linked to an amplifier (#774, alpha) has its volume owned by the device, whichever
+    // provider the zone belongs to — HQPlayer included — so this is checked first.
+    if let Some(result) = crate::mcp::tools::devices::linked_zone_volume(state, &args).await {
+        return result;
+    }
     if ZoneTarget::classify(&args.zone_id) == ZoneTarget::HqPlayer {
         return handle_hqplayer_control(state, args).await;
     }
