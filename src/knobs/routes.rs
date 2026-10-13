@@ -574,15 +574,24 @@ pub async fn knob_image_handler(
     };
 
     // Get zone from aggregator to find image_key
+    // Every placeholder is logged with its reason: clients fetch once per
+    // image_key and never retry, so a placeholder sticks for the whole track
+    // and the log line is the only evidence of why it was served.
     let zone = match state.aggregator.get_zone(&zone_id).await {
         Some(z) => z,
-        None => return placeholder_response(),
+        None => {
+            tracing::warn!(zone_id = %zone_id, format = ?format, "Artwork placeholder served: zone not found");
+            return placeholder_response();
+        }
     };
 
     // Get image_key from now_playing
     let image_key = match zone.now_playing.and_then(|np| np.image_key) {
         Some(key) => key,
-        None => return placeholder_response(),
+        None => {
+            tracing::warn!(zone_id = %zone_id, format = ?format, "Artwork placeholder served: zone has no now-playing image_key");
+            return placeholder_response();
+        }
     };
 
     // Fetch image through unified interface (handles format conversion)
@@ -609,6 +618,13 @@ pub async fn knob_image_handler(
             if (rgb565_requested || eink_requested)
                 && image_data.content_type != "application/octet-stream"
             {
+                tracing::warn!(
+                    zone_id = %zone_id,
+                    image_key = %image_key,
+                    format = ?format,
+                    source_content_type = %image_data.content_type,
+                    "Artwork placeholder served: display conversion failed"
+                );
                 return placeholder_response();
             }
 
@@ -649,7 +665,15 @@ pub async fn knob_image_handler(
                 }
             }
         }
-        Err(_) => placeholder_response(),
+        Err(error) => {
+            tracing::warn!(
+                zone_id = %zone_id,
+                image_key = %image_key,
+                format = ?format,
+                "Artwork placeholder served: artwork fetch failed: {error:#}"
+            );
+            placeholder_response()
+        }
     }
 }
 
