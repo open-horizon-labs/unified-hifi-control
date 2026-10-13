@@ -321,8 +321,10 @@ pub struct AppState {
     /// provider-native image handle behind it. Deliberately a separate table
     /// from `mcp_refs` -- see `crate::mcp::refs::ImageRef`'s docs for why.
     pub image_refs: crate::mcp::refs::ImageRefTable,
-    /// Bounded cache of fully composed, dithered, and packed Frame artwork.
-    pub eink_artwork_cache: crate::knobs::image::EinkArtworkCache,
+    /// Byte-budgeted cache of composed artwork for every output format (#801).
+    pub artwork_output_cache: crate::knobs::artwork_cache::ArtworkOutputCache,
+    /// Byte-budgeted cache of provider bytes as fetched (#801).
+    pub artwork_source_cache: crate::knobs::artwork_cache::SourceArtworkCache,
     /// UHC-owned requested listening sequences, separate from provider queue
     /// observations (#483).
     pub listening_plans: crate::mcp::listening_plan::ListeningPlanStore,
@@ -412,7 +414,8 @@ impl AppState {
                 crate::mcp::collection_locations::LocationKeyCache::new(),
             ),
             image_refs: crate::mcp::refs::ImageRefTable::new(),
-            eink_artwork_cache: crate::knobs::image::EinkArtworkCache::default(),
+            artwork_output_cache: crate::knobs::artwork_cache::ArtworkOutputCache::default(),
+            artwork_source_cache: crate::knobs::artwork_cache::SourceArtworkCache::default(),
             listening_plans: crate::mcp::listening_plan::ListeningPlanStore::from_config(),
             apple_feedback: crate::mcp::feedback::FeedbackStore::from_config(),
             reliable_commands: None,
@@ -454,6 +457,24 @@ impl AppState {
         format: Option<&str>,
         resize_policy: Option<crate::knobs::image::Rgb565ResizePolicy>,
     ) -> anyhow::Result<crate::bus::ImageData> {
+        Ok(self
+            .get_image_tagged(zone_id, image_key, width, height, format, resize_policy)
+            .await?
+            .image)
+    }
+
+    /// [`Self::get_image`] plus the strong validator the HTTP layer sends as
+    /// `ETag` (#801). `etag` is `None` when the bytes are a conversion-failure
+    /// fallback, which must never be revalidated as if it were the real output.
+    pub async fn get_image_tagged(
+        &self,
+        zone_id: &str,
+        image_key: &str,
+        width: Option<u32>,
+        height: Option<u32>,
+        format: Option<&str>,
+        resize_policy: Option<crate::knobs::image::Rgb565ResizePolicy>,
+    ) -> anyhow::Result<ArtworkResponse> {
         self.get_image_with_source_limit(
             zone_id,
             image_key,
@@ -464,6 +485,20 @@ impl AppState {
             None,
         )
         .await
+    }
+
+    /// `/roon/image`: provider-sized bytes served through the source cache.
+    /// Not composed, so the source *is* the output and carries the validator.
+    pub async fn get_roon_image_tagged(
+        &self,
+        image_key: &str,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> anyhow::Result<ArtworkResponse> {
+        let source = self
+            .cached_source("roon:", image_key, (width, height), None)
+            .await?;
+        Ok(source_response("roon", image_key, (width, height), &source))
     }
 
     /// Connector-only artwork fetch with a hard streaming source ceiling.
@@ -480,16 +515,18 @@ impl AppState {
             max_source_bytes > 0,
             "artwork source limit must be positive"
         );
-        self.get_image_with_source_limit(
-            zone_id,
-            image_key,
-            None,
-            None,
-            None,
-            None,
-            Some(max_source_bytes),
-        )
-        .await
+        Ok(self
+            .get_image_with_source_limit(
+                zone_id,
+                image_key,
+                None,
+                None,
+                None,
+                None,
+                Some(max_source_bytes),
+            )
+            .await?
+            .image)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -502,11 +539,14 @@ impl AppState {
         format: Option<&str>,
         resize_policy: Option<crate::knobs::image::Rgb565ResizePolicy>,
         source_limit: Option<usize>,
-    ) -> anyhow::Result<crate::bus::ImageData> {
+    ) -> anyhow::Result<ArtworkResponse> {
         use crate::bus::ImageData;
+        use crate::knobs::artwork_cache::{
+            OutputCacheKey, EINK_CONVERTER_VERSION, RASTER_CONVERTER_VERSION,
+        };
         use crate::knobs::image::{
             image_to_display_with_policy, image_to_eink_acep6_with_policy,
-            jpeg_to_rgb565_with_policy, EinkCacheKey, Rgb565ResizePolicy,
+            jpeg_to_rgb565_with_policy, Rgb565ResizePolicy,
         };
 
         let dimensions = match (width, height) {
@@ -531,22 +571,6 @@ impl AppState {
             anyhow::bail!("invalid artwork dimensions");
         }
         let resize_policy = resize_policy.unwrap_or_default();
-        let eink_cache_key = (format == Some("eink_acep6")).then(|| EinkCacheKey {
-            zone_id: zone_id.to_string(),
-            image_key: image_key.to_string(),
-            width: dimensions.0,
-            height: dimensions.1,
-            resize_policy,
-            converter_version: 3,
-        });
-        if let Some(key) = eink_cache_key.as_ref() {
-            if let Some(data) = self.eink_artwork_cache.get(key) {
-                return Ok(ImageData {
-                    content_type: "application/octet-stream".to_string(),
-                    data: data.as_ref().clone(),
-                });
-            }
-        }
 
         // Smart composition needs the source aspect ratio. Asking a provider
         // for the final rectangle first can irreversibly stretch or crop it
@@ -557,8 +581,174 @@ impl AppState {
             (None, None)
         };
 
-        // Fetch raw image from appropriate adapter
-        let raw_image = if zone_id.starts_with("lms:") {
+        let source = self
+            .cached_source(zone_id, image_key, provider_dimensions, source_limit)
+            .await?;
+        let provider = artwork_provider(zone_id);
+
+        // Bound expensive raster/native work and keep it off the async reactor.
+        // Move the permit into the closure so cancellation cannot free a slot
+        // while the blocking worker/native child is still running.
+        if !compose_raster && !matches!(format, Some("rgb565" | "rgb565-smart" | "eink_acep6")) {
+            return Ok(source_response(
+                &provider,
+                image_key,
+                provider_dimensions,
+                &source,
+            ));
+        }
+        let output_format: &'static str = match format {
+            Some("rgb565") => "rgb565",
+            Some("rgb565-smart") => "rgb565-smart",
+            Some("eink_acep6") => "eink_acep6",
+            _ => "raster",
+        };
+        let cache_key = OutputCacheKey {
+            provider,
+            image_key: image_key.to_string(),
+            source_digest: source.digest.clone(),
+            width: dimensions.0,
+            height: dimensions.1,
+            format: output_format,
+            resize_policy,
+            converter_version: if output_format == "eink_acep6" {
+                EINK_CONVERTER_VERSION
+            } else {
+                RASTER_CONVERTER_VERSION
+            },
+        };
+        if let Some(hit) = self.artwork_output_cache.get(&cache_key) {
+            return Ok(ArtworkResponse {
+                etag: Some(cache_key.etag()),
+                image: ImageData {
+                    content_type: hit.content_type.clone(),
+                    data: hit.data.clone(),
+                },
+            });
+        }
+        static WORKERS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
+        let permit = Arc::clone(&WORKERS).acquire_owned().await?;
+        let cache = self.artwork_output_cache.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let fallback = || ImageData {
+                content_type: source.content_type.clone(),
+                data: source.data.clone(),
+            };
+            let (target_w, target_h) = dimensions;
+            // The smart RGB565 variant is a capability handshake: older servers
+            // return the source image, allowing firmware to detect and use its
+            // fallback. Conversion failures fall back to the source the same
+            // way, and a fallback is never cached or tagged.
+            let converted: Option<(String, Vec<u8>)> = match output_format {
+                "rgb565" | "rgb565-smart" => {
+                    jpeg_to_rgb565_with_policy(&source.data, target_w, target_h, resize_policy)
+                        .ok()
+                        .map(|rgb565| ("application/octet-stream".to_string(), rgb565.data))
+                }
+                "eink_acep6" => {
+                    match image_to_eink_acep6_with_policy(
+                        &source.data,
+                        target_w,
+                        target_h,
+                        resize_policy,
+                    ) {
+                        Ok(eink) => Some(("application/octet-stream".to_string(), eink.data)),
+                        Err(error) => {
+                            tracing::warn!(
+                                "Frame artwork conversion failed at {target_w}x{target_h}: {error}"
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => {
+                    let png = source.content_type == "image/png";
+                    match image_to_display_with_policy(
+                        &source.data,
+                        target_w,
+                        target_h,
+                        resize_policy,
+                        png,
+                    ) {
+                        Ok(data) => Some((
+                            if png { "image/png" } else { "image/jpeg" }.to_string(),
+                            data,
+                        )),
+                        Err(error) => {
+                            tracing::warn!("Raster artwork composition failed: {error}");
+                            None
+                        }
+                    }
+                }
+            };
+            Ok(match converted {
+                Some((content_type, data)) => {
+                    let etag = cache_key.etag();
+                    let stored = cache.insert(cache_key, content_type, data);
+                    ArtworkResponse {
+                        etag: Some(etag),
+                        image: ImageData {
+                            content_type: stored.content_type.clone(),
+                            data: stored.data.clone(),
+                        },
+                    }
+                }
+                None => ArtworkResponse {
+                    etag: None,
+                    image: fallback(),
+                },
+            })
+        })
+        .await?
+    }
+
+    /// Provider bytes for `(zone_id's provider, image_key, provider dims)`,
+    /// from the source cache when present. A provider error propagates and is
+    /// never cached; an over-limit body is rejected before it is retained.
+    async fn cached_source(
+        &self,
+        zone_id: &str,
+        image_key: &str,
+        provider_dimensions: (Option<u32>, Option<u32>),
+        source_limit: Option<usize>,
+    ) -> anyhow::Result<Arc<crate::knobs::artwork_cache::SourceArtwork>> {
+        use crate::knobs::artwork_cache::{SourceArtwork, SourceCacheKey};
+        let key = SourceCacheKey {
+            provider: artwork_provider(zone_id),
+            image_key: image_key.to_string(),
+            provider_width: provider_dimensions.0,
+            provider_height: provider_dimensions.1,
+        };
+        let source = match self.artwork_source_cache.get(&key) {
+            Some(hit) => hit,
+            None => {
+                let raw = self
+                    .fetch_provider_image(zone_id, image_key, provider_dimensions, source_limit)
+                    .await?;
+                if source_limit.is_some_and(|limit| raw.data.len() > limit) {
+                    anyhow::bail!("remote artwork is too large");
+                }
+                self.artwork_source_cache
+                    .insert(key, SourceArtwork::new(raw.content_type, raw.data))
+            }
+        };
+        if source_limit.is_some_and(|limit| source.data.len() > limit) {
+            anyhow::bail!("remote artwork is too large");
+        }
+        Ok(source)
+    }
+
+    async fn fetch_provider_image(
+        &self,
+        zone_id: &str,
+        image_key: &str,
+        provider_dimensions: (Option<u32>, Option<u32>),
+        source_limit: Option<usize>,
+    ) -> anyhow::Result<crate::bus::ImageData> {
+        use crate::bus::ImageData;
+        Ok(if zone_id.starts_with("lms:") {
             let (content_type, data) = match source_limit {
                 Some(limit) => {
                     self.lms
@@ -631,89 +821,107 @@ impl AppState {
             }
         } else {
             anyhow::bail!("Unknown zone type for image: {}", zone_id)
-        };
-        if source_limit.is_some_and(|limit| raw_image.data.len() > limit) {
-            anyhow::bail!("remote artwork is too large");
-        }
-
-        // Bound expensive raster/native work and keep it off the async reactor.
-        // Move the permit into the closure so cancellation cannot free a slot
-        // while the blocking worker/native child is still running.
-        if !compose_raster && !matches!(format, Some("rgb565" | "rgb565-smart" | "eink_acep6")) {
-            return Ok(raw_image);
-        }
-        static WORKERS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
-            std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
-        let permit = Arc::clone(&WORKERS).acquire_owned().await?;
-        let format = format.map(str::to_owned);
-        let cache = self.eink_artwork_cache.clone();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            // Convert to RGB565 if requested (for ESP32 LCD/e-ink displays).
-            // The smart variant is a capability handshake: older servers return
-            // the source image, allowing firmware to detect and use its fallback.
-            if matches!(format.as_deref(), Some("rgb565" | "rgb565-smart")) {
-                // Use square dimensions when only one side specified (matches adapter behavior)
-                let (target_w, target_h) = dimensions;
-
-                match jpeg_to_rgb565_with_policy(&raw_image.data, target_w, target_h, resize_policy)
-                {
-                    Ok(rgb565) => Ok(ImageData {
-                        content_type: "application/octet-stream".to_string(),
-                        data: rgb565.data,
-                    }),
-                    Err(_) => {
-                        // Fall back to original on conversion error
-                        Ok(raw_image)
-                    }
-                }
-            } else if format.as_deref() == Some("eink_acep6") {
-                let (target_w, target_h) = dimensions;
-                match image_to_eink_acep6_with_policy(
-                    &raw_image.data,
-                    target_w,
-                    target_h,
-                    resize_policy,
-                ) {
-                    Ok(eink) => {
-                        let Some(cache_key) = eink_cache_key else {
-                            return Ok(raw_image);
-                        };
-                        let data = cache.insert(cache_key, eink.data);
-                        Ok(ImageData {
-                            content_type: "application/octet-stream".to_string(),
-                            data: data.as_ref().clone(),
-                        })
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            "Frame artwork conversion failed at {target_w}x{target_h}: {error}"
-                        );
-                        Ok(raw_image)
-                    }
-                }
-            } else {
-                let png = raw_image.content_type == "image/png";
-                match image_to_display_with_policy(
-                    &raw_image.data,
-                    dimensions.0,
-                    dimensions.1,
-                    resize_policy,
-                    png,
-                ) {
-                    Ok(data) => Ok(ImageData {
-                        content_type: if png { "image/png" } else { "image/jpeg" }.to_string(),
-                        data,
-                    }),
-                    Err(error) => {
-                        tracing::warn!("Raster artwork composition failed: {error}");
-                        Ok(raw_image)
-                    }
-                }
-            }
         })
-        .await?
     }
+}
+
+/// A served artwork body plus its strong HTTP validator (#801).
+pub struct ArtworkResponse {
+    pub image: crate::bus::ImageData,
+    /// Quoted ETag, or `None` when the bytes must not be revalidated (a
+    /// conversion-failure fallback).
+    pub etag: Option<String>,
+}
+
+/// The cache namespace image keys live in. Zones of one provider share an
+/// `image_key` namespace; an HQPlayer cover is per instance.
+fn artwork_provider(zone_id: &str) -> String {
+    if zone_id.starts_with("hqplayer:") {
+        return zone_id.to_string();
+    }
+    match zone_id.split_once(':') {
+        Some((prefix, _)) => prefix.to_string(),
+        None => "roon".to_string(),
+    }
+}
+
+/// Unmodified provider bytes as the response; the validator covers the
+/// provider dimensions and the content digest.
+fn source_response(
+    provider: &str,
+    image_key: &str,
+    provider_dimensions: (Option<u32>, Option<u32>),
+    source: &crate::knobs::artwork_cache::SourceArtwork,
+) -> ArtworkResponse {
+    let key = crate::knobs::artwork_cache::OutputCacheKey {
+        provider: provider.to_string(),
+        image_key: image_key.to_string(),
+        source_digest: source.digest.clone(),
+        width: provider_dimensions.0.unwrap_or(0),
+        height: provider_dimensions.1.unwrap_or(0),
+        format: "source",
+        resize_policy: Default::default(),
+        converter_version: crate::knobs::artwork_cache::RASTER_CONVERTER_VERSION,
+    };
+    ArtworkResponse {
+        etag: Some(key.etag()),
+        image: crate::bus::ImageData {
+            content_type: source.content_type.clone(),
+            data: source.data.clone(),
+        },
+    }
+}
+
+/// `Cache-Control` for artwork whose URL names the image itself (a
+/// `/roon/image` image_key or a collections ref): the bytes behind that URL do
+/// not change, and 5 minutes covers a browsing session without outliving a
+/// ref's usefulness.
+pub const ARTWORK_CACHE_CONTROL_IMMUTABLE: &str = "private, max-age=300";
+/// `Cache-Control` for now-playing artwork. The URL (`?zone_id=`) is the same
+/// across tracks, so any max-age would show the previous cover for up to that
+/// long after a track change. `no-cache` stores the body but always
+/// revalidates; the ETag turns that into a cheap 304 while the track stays.
+pub const ARTWORK_CACHE_CONTROL_NOW_PLAYING: &str = "private, no-cache";
+
+/// RFC 9110 `If-None-Match` (weak comparison): `*` or any listed tag.
+pub fn if_none_match_matches(headers: &axum::http::HeaderMap, etag: &str) -> bool {
+    let strip = |tag: &str| tag.trim().trim_start_matches("W/").to_string();
+    let ours = strip(etag);
+    headers
+        .get_all(axum::http::header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|candidate| candidate.trim() == "*" || strip(candidate) == ours)
+}
+
+/// 200 (or body-less 304 when the client already holds `etag`) for artwork
+/// with a validator. Callers that have no validator build their own response.
+pub fn artwork_http_response(
+    request_headers: &axum::http::HeaderMap,
+    image: crate::bus::ImageData,
+    etag: &str,
+    cache_control: &'static str,
+    extra_headers: &[(&'static str, String)],
+) -> axum::response::Response {
+    use axum::http::header;
+    let mut builder = axum::response::Response::builder()
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, cache_control);
+    if if_none_match_matches(request_headers, etag) {
+        return builder
+            .status(StatusCode::NOT_MODIFIED)
+            .body(axum::body::Body::empty())
+            .unwrap_or_default();
+    }
+    builder = builder.header(header::CONTENT_TYPE, image.content_type);
+    for (name, value) in extra_headers {
+        builder = builder.header(*name, value);
+    }
+    builder
+        .status(StatusCode::OK)
+        .body(axum::body::Body::from(image.data))
+        .unwrap_or_default()
 }
 
 async fn fetch_apple_music_artwork(
@@ -1241,23 +1449,29 @@ pub struct ImageQuery {
 /// GET /roon/image - fetch album art
 pub async fn roon_image_handler(
     State(state): State<AppState>,
+    request_headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<ImageQuery>,
 ) -> impl IntoResponse {
     match state
-        .roon
-        .get_image(&params.image_key, params.width, params.height)
+        .get_roon_image_tagged(&params.image_key, params.width, params.height)
         .await
     {
-        Ok(image_data) => {
-            let headers = [(
-                axum::http::header::CONTENT_TYPE,
-                image_data
-                    .content_type
-                    .parse()
-                    .unwrap_or(axum::http::HeaderValue::from_static("image/jpeg")),
-            )];
-            (StatusCode::OK, headers, image_data.data).into_response()
-        }
+        Ok(ArtworkResponse {
+            image,
+            etag: Some(etag),
+        }) => artwork_http_response(
+            &request_headers,
+            image,
+            &etag,
+            ARTWORK_CACHE_CONTROL_IMMUTABLE,
+            &[],
+        ),
+        Ok(ArtworkResponse { image, etag: None }) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, image.content_type)],
+            image.data,
+        )
+            .into_response(),
         Err(e) => {
             tracing::warn!("Image fetch failed: {}", e);
             (
@@ -1298,6 +1512,7 @@ pub struct CollectionImageQuery {
 /// docs on why that collapse is the point).
 pub async fn collections_image_handler(
     State(state): State<AppState>,
+    request_headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<CollectionImageQuery>,
 ) -> impl IntoResponse {
     let Some(target) = state.image_refs.resolve(&params.r#ref).await else {
@@ -1310,7 +1525,7 @@ pub async fn collections_image_handler(
             .into_response();
     };
     match state
-        .get_image(
+        .get_image_tagged(
             &target.zone_id,
             &target.image_key,
             params.width,
@@ -1320,16 +1535,22 @@ pub async fn collections_image_handler(
         )
         .await
     {
-        Ok(image_data) => {
-            let headers = [(
-                axum::http::header::CONTENT_TYPE,
-                image_data
-                    .content_type
-                    .parse()
-                    .unwrap_or(axum::http::HeaderValue::from_static("image/jpeg")),
-            )];
-            (StatusCode::OK, headers, image_data.data).into_response()
-        }
+        Ok(ArtworkResponse {
+            image,
+            etag: Some(etag),
+        }) => artwork_http_response(
+            &request_headers,
+            image,
+            &etag,
+            ARTWORK_CACHE_CONTROL_IMMUTABLE,
+            &[],
+        ),
+        Ok(ArtworkResponse { image, etag: None }) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, image.content_type)],
+            image.data,
+        )
+            .into_response(),
         Err(e) => {
             tracing::warn!("Collection image fetch failed: {}", e);
             (

@@ -491,6 +491,7 @@ use crate::knobs::image::svg_to_rgb565;
 pub async fn knob_image_handler(
     State(state): State<AppState>,
     Query(params): Query<ImageQuery>,
+    request_headers: axum::http::HeaderMap,
 ) -> Response {
     let target_width = params.width.unwrap_or(240);
     let target_height = params.height.unwrap_or(240);
@@ -513,7 +514,7 @@ pub async fn knob_image_handler(
     });
 
     // Helper to return placeholder image in appropriate format
-    let placeholder_response = || -> Response {
+    let placeholder_body = || -> Response {
         let svg = placeholder_svg(target_width, target_height);
         if eink_requested {
             let bytes_per_row = target_width.div_ceil(2) as usize;
@@ -554,6 +555,17 @@ pub async fn knob_image_handler(
         }
     };
 
+    // Placeholders deliberately carry no ETag and `no-store`: an error
+    // placeholder cached or revalidated as "unchanged" would hide recovery.
+    let placeholder_response = || -> Response {
+        let mut response = placeholder_body();
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-store"),
+        );
+        response
+    };
+
     // Handle legacy zone_id without prefix (assume Roon)
     let zone_id = if !params.zone_id.contains(':') {
         format!("roon:{}", params.zone_id)
@@ -575,7 +587,7 @@ pub async fn knob_image_handler(
 
     // Fetch image through unified interface (handles format conversion)
     match state
-        .get_image(
+        .get_image_tagged(
             &zone_id,
             &image_key,
             Some(target_width),
@@ -585,7 +597,10 @@ pub async fn knob_image_handler(
         )
         .await
     {
-        Ok(image_data) => {
+        Ok(crate::api::ArtworkResponse {
+            image: image_data,
+            etag,
+        }) => {
             // If RGB565 was requested but conversion failed (content_type != octet-stream),
             // return the placeholder instead of misleading headers
             if (rgb565_requested || eink_requested)
@@ -594,24 +609,41 @@ pub async fn knob_image_handler(
                 return placeholder_response();
             }
 
-            let mut response = Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, &image_data.content_type);
-
             // Add RGB565 metadata headers for ESP32 clients
-            if eink_requested {
-                response = response
-                    .header("X-Image-Format", "eink_acep6")
-                    .header("X-Image-Width", target_width.to_string())
-                    .header("X-Image-Height", target_height.to_string());
-            } else if rgb565_requested {
-                response = response
-                    .header("X-Image-Format", "rgb565")
-                    .header("X-Image-Width", target_width.to_string())
-                    .header("X-Image-Height", target_height.to_string());
+            let mut extra: Vec<(&'static str, String)> = Vec::new();
+            if eink_requested || rgb565_requested {
+                extra.push((
+                    "X-Image-Format",
+                    if eink_requested {
+                        "eink_acep6"
+                    } else {
+                        "rgb565"
+                    }
+                    .to_string(),
+                ));
+                extra.push(("X-Image-Width", target_width.to_string()));
+                extra.push(("X-Image-Height", target_height.to_string()));
             }
 
-            response.body(Body::from(image_data.data)).unwrap()
+            match etag {
+                Some(etag) => crate::api::artwork_http_response(
+                    &request_headers,
+                    image_data,
+                    &etag,
+                    crate::api::ARTWORK_CACHE_CONTROL_NOW_PLAYING,
+                    &extra,
+                ),
+                // A conversion-failure fallback is not revalidatable.
+                None => {
+                    let mut response = Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, &image_data.content_type);
+                    for (name, value) in &extra {
+                        response = response.header(*name, value);
+                    }
+                    response.body(Body::from(image_data.data)).unwrap()
+                }
+            }
         }
         Err(_) => placeholder_response(),
     }

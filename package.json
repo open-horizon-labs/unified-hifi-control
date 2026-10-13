@@ -13,7 +13,7 @@
     "type": "git",
     "url": "git+https://github.com/open-horizon-labs/unified-hifi-control.git"
   },
-  "author": "Muness Castle",
+  "author": "Open Horizon Labs",
   "license": "SEE LICENSE IN LICENSE",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

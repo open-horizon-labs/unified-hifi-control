@@ -326,9 +326,9 @@ pub fn Knobs() -> Element {
             // Knobs section
             section { id: "knobs-section", class: "mb-8",
                 if is_loading {
-                    div { class: "card p-6", aria_busy: "true", "Loading knobs..." }
+                    div { class: "card p-6", aria_busy: "true", "Loading controllers..." }
                 } else if knobs_list.is_empty() {
-                    div { class: "card p-6 text-muted", "No knobs registered. Connect a knob to see it here." }
+                    div { class: "card p-6 text-muted", "No controllers registered. Connect a controller to see it here." }
                 } else {
                     div { class: "card p-6 overflow-x-auto",
                         table { class: "w-full",
@@ -785,7 +785,7 @@ fn ConfigModal(
                             input {
                                 class: "input",
                                 r#type: "text",
-                                placeholder: "Living Room Knob",
+                                placeholder: "Living Room Controller",
                                 value: "{name}",
                                 oninput: move |e| on_name_change.call(e.value())
                             }
