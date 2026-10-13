@@ -12,10 +12,8 @@ use image::{
     imageops::{self, FilterType},
     DynamicImage, ImageFormat, Rgba, RgbaImage,
 };
-use std::collections::VecDeque;
 use std::io::Cursor;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// RGB565 image data for LCD display
@@ -31,54 +29,6 @@ pub struct EinkAcep6Image {
     pub data: Vec<u8>,
     pub width: u32,
     pub height: u32,
-}
-
-const EINK_CACHE_CAPACITY: usize = 8;
-type EinkCacheEntries = VecDeque<(EinkCacheKey, Arc<Vec<u8>>)>;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EinkCacheKey {
-    pub zone_id: String,
-    pub image_key: String,
-    pub width: u32,
-    pub height: u32,
-    pub resize_policy: Rgb565ResizePolicy,
-    pub converter_version: u8,
-}
-
-/// Small process-local LRU for already packed Frame artwork. Eight 800x450
-/// entries consume about 1.4 MiB while covering ordinary back/forward skips.
-#[derive(Clone, Default)]
-pub struct EinkArtworkCache {
-    entries: Arc<Mutex<EinkCacheEntries>>,
-}
-
-impl EinkArtworkCache {
-    pub fn get(&self, key: &EinkCacheKey) -> Option<Arc<Vec<u8>>> {
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let index = entries.iter().position(|(candidate, _)| candidate == key)?;
-        let entry = entries.remove(index)?;
-        let data = Arc::clone(&entry.1);
-        entries.push_front(entry);
-        Some(data)
-    }
-
-    pub fn insert(&self, key: EinkCacheKey, data: Vec<u8>) -> Arc<Vec<u8>> {
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(index) = entries.iter().position(|(candidate, _)| candidate == &key) {
-            entries.remove(index);
-        }
-        let data = Arc::new(data);
-        entries.push_front((key, Arc::clone(&data)));
-        entries.truncate(EINK_CACHE_CAPACITY);
-        data
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -1049,29 +999,6 @@ mod tests {
             0x11,
             "right edge remains white mat"
         );
-    }
-
-    #[test]
-    fn eink_cache_key_prevents_stale_dimensions_and_evicts_lru() {
-        let cache = EinkArtworkCache::default();
-        let key = |index: usize, width: u32| EinkCacheKey {
-            zone_id: "roon:zone".to_string(),
-            image_key: format!("art-{index}"),
-            width,
-            height: 450,
-            resize_policy: Rgb565ResizePolicy::SmartCover {
-                max_crop_percent: 10,
-            },
-            converter_version: 1,
-        };
-
-        cache.insert(key(0, 800), vec![0]);
-        assert!(cache.get(&key(0, 799)).is_none());
-        for index in 1..=EINK_CACHE_CAPACITY {
-            cache.insert(key(index, 800), vec![index as u8]);
-        }
-        assert!(cache.get(&key(0, 800)).is_none(), "oldest entry is evicted");
-        assert_eq!(&*cache.get(&key(8, 800)).expect("newest entry"), &[8]);
     }
 
     #[test]
