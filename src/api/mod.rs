@@ -612,10 +612,19 @@ impl AppState {
             }
             image
         } else if zone_id.starts_with("roon:") || !zone_id.contains(':') {
-            let img = self
-                .roon
-                .get_image(image_key, provider_dimensions.0, provider_dimensions.1)
-                .await?;
+            // Byte-bounded lanes (knob picture cache, cloud) keep the small
+            // rendition; unbounded lanes fall through to the adapter's
+            // full-size source default.
+            let (roon_w, roon_h) = if source_limit.is_some() && provider_dimensions == (None, None)
+            {
+                (
+                    Some(crate::adapters::roon::ROON_SMALL_ART),
+                    Some(crate::adapters::roon::ROON_SMALL_ART),
+                )
+            } else {
+                provider_dimensions
+            };
+            let img = self.roon.get_image(image_key, roon_w, roon_h).await?;
             ImageData {
                 content_type: img.content_type,
                 data: img.data,
