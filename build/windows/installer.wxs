@@ -4,7 +4,7 @@
 
   <?define ProductName = "Unified Hi-Fi Control" ?>
   <?define ProductVersion = "$(var.Version)" ?>
-  <?define ProductManufacturer = "Cloud Atlas" ?>
+  <?define ProductManufacturer = "Open Horizon Labs" ?>
   <?define UpgradeCode = "F8E7D6C5-B4A3-4281-9060-504030201000" ?>
 
   <Product Id="*"
