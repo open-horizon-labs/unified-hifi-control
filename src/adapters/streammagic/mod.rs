@@ -397,7 +397,7 @@ async fn connect(endpoint: &Endpoint) -> Result<Ws, String> {
 /// Connect and ask for `/system/info`. The socket is returned open so the unit task reuses it.
 async fn probe(endpoint: &Endpoint) -> Result<(Ws, Info), String> {
     let mut ws = connect(endpoint).await?;
-    ws.send(Message::Text(protocol::query(protocol::PATH_INFO)))
+    ws.send(Message::Text(protocol::query(protocol::PATH_INFO).into()))
         .await
         .map_err(|error| format!("probe write failed: {error}"))?;
     let deadline = Instant::now() + PROBE_TIMEOUT;
@@ -604,7 +604,7 @@ async fn next_frame(
 
 async fn send_text(ws: &mut Option<Ws>, text: String) -> Result<(), String> {
     let socket = ws.as_mut().ok_or_else(|| "no session".to_string())?;
-    tokio::time::timeout(WRITE_TIMEOUT, socket.send(Message::Text(text)))
+    tokio::time::timeout(WRITE_TIMEOUT, socket.send(Message::Text(text.into())))
         .await
         .map_err(|_| "write timed out".to_string())?
         .map_err(|error| format!("write failed: {error}"))
@@ -727,7 +727,7 @@ impl Unit {
                         next_connect = Instant::now();
                         self.publish();
                     } else if let Some(socket) = ws.as_mut() {
-                        if let Err(error) = socket.send(Message::Ping(Vec::new())).await {
+                        if let Err(error) = socket.send(Message::Ping(Vec::new().into())).await {
                             tracing::debug!(device_id = %self.device_id, "ping failed: {error}");
                         }
                     }

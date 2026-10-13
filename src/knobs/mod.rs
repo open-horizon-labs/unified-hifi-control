@@ -12,6 +12,7 @@
 //! - RGB565 image conversion for LCD display
 
 mod artwork_analysis;
+pub mod artwork_cache;
 pub mod image;
 pub mod routes;
 pub mod store;

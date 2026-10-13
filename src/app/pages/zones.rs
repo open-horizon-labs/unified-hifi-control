@@ -138,19 +138,27 @@ pub fn Zones() -> Element {
         }
     });
 
-    // Control handler
-    let control = move |(zone_id, action): (String, String)| {
+    // Control handler. `value` carries the seek position in seconds; other actions pass `None`.
+    let mut control_error = use_signal(|| None::<String>);
+    let control = move |(zone_id, action, value): (String, String, Option<f64>)| {
+        let is_seek = action == "seek";
         spawn(async move {
             let req = ControlRequest {
                 zone_id,
                 action,
-                value: None,
+                value,
             };
             if let Err(e) = crate::app::api::post_json_no_response("/control", &req).await {
                 #[cfg(target_arch = "wasm32")]
                 web_sys::console::warn_1(&format!("Control request failed: {e}").into());
                 #[cfg(not(target_arch = "wasm32"))]
                 tracing::warn!("Control request failed: {e}");
+                // Seek is the one control the user can't see fail by the state not changing.
+                if is_seek {
+                    control_error.set(Some(format!("Seek: {e}")));
+                }
+            } else if is_seek {
+                control_error.set(None);
             }
         });
     };
@@ -343,6 +351,14 @@ pub fn Zones() -> Element {
 
             h1 { class: "text-2xl font-bold mb-6", "Zones" }
 
+            // Seek error display
+            if let Some(error) = control_error() {
+                ErrorAlert {
+                    message: error,
+                    on_dismiss: move |_| control_error.set(None),
+                }
+            }
+
             // HQP error display
             if let Some(error) = hqp_error() {
                 ErrorAlert {
@@ -373,7 +389,7 @@ fn ZoneCard(
     now_playing: Option<NowPlaying>,
     hqp_profiles: Vec<HqpProfile>,
     hqp_matrix: Option<HqpMatrixProfilesResponse>,
-    on_control: EventHandler<(String, String)>,
+    on_control: EventHandler<(String, String, Option<f64>)>,
     on_load_profile: EventHandler<String>,
     on_set_matrix: EventHandler<String>,
     // (device_id, action, input id for `select_input`)
@@ -386,6 +402,7 @@ fn ZoneCard(
     let zone_id_next = zone_id.clone();
     let zone_id_vol_down = zone_id.clone();
     let zone_id_vol_up = zone_id.clone();
+    let zone_id_seek = zone_id.clone();
 
     let np = now_playing.as_ref();
     let is_playing = np.map(|n| n.is_playing).unwrap_or(false);
@@ -434,6 +451,20 @@ fn ZoneCard(
         })
         .unwrap_or_default();
 
+    // Seek row. The web client is not told per-zone seekability (`is_seekable` stays server-side),
+    // so gate on providers whose `/control` seek is known to work: Roon and HQPlayer. Other
+    // providers either refuse seek or only support it in some states.
+    let supports_seek = zone_id.starts_with("roon:") || zone_id.starts_with("hqplayer:") || has_hqp;
+    let seek_length = np.and_then(|n| n.length).unwrap_or(0);
+    let seek_position = np
+        .and_then(|n| n.seek_position)
+        .unwrap_or(0)
+        .clamp(0, seek_length as i64) as u32;
+    let show_seek = supports_seek && seek_length > 0 && !track.is_empty();
+    // Position being dragged, if any; while set it wins over incoming now-playing updates.
+    let mut drag_position = use_signal(|| None::<u32>);
+    let shown_position = drag_position().unwrap_or(seek_position).min(seek_length);
+
     // HQP matrix info
     let has_matrix = hqp_matrix.is_some();
     let matrix_profiles = hqp_matrix
@@ -475,6 +506,37 @@ fn ZoneCard(
                     if !track.is_empty() {
                         p { class: "font-medium text-sm truncate mb-1", "{track}" }
                         p { class: "text-sm text-muted truncate", "{artist}" }
+                        if show_seek {
+                            div { class: "flex items-center gap-2 mt-2 text-xs text-muted tabular-nums",
+                                span { "aria-label": "Elapsed", "{format_seek_time(shown_position)}" }
+                                input {
+                                    class: "hqp-seek !h-6 flex-1 min-w-0",
+                                    r#type: "range",
+                                    min: "0",
+                                    max: "{seek_length}",
+                                    value: "{shown_position}",
+                                    "aria-label": "Seek position",
+                                    // Track the thumb locally while dragging; only `onchange`
+                                    // (release / keyboard commit) talks to the server.
+                                    oninput: move |event| {
+                                        if let Ok(p) = event.value().parse::<f64>() {
+                                            drag_position.set(Some(p.max(0.0) as u32));
+                                        }
+                                    },
+                                    onchange: move |event| {
+                                        drag_position.set(None);
+                                        if let Ok(p) = event.value().parse::<f64>() {
+                                            on_control.call((
+                                                zone_id_seek.clone(),
+                                                "seek".to_string(),
+                                                Some(p.max(0.0).floor()),
+                                            ));
+                                        }
+                                    },
+                                }
+                                span { "aria-label": "Track length", "{format_seek_time(seek_length)}" }
+                            }
+                        }
                     } else {
                         p { class: "text-sm text-muted", "Nothing playing" }
                     }
@@ -498,7 +560,7 @@ fn ZoneCard(
                 button {
                     class: "btn btn-ghost",
                     "aria-label": "Previous track",
-                    onclick: move |_| on_control.call((zone_id_prev.clone(), "previous".to_string())),
+                    onclick: move |_| on_control.call((zone_id_prev.clone(), "previous".to_string(), None)),
                     svg { class: "w-5 h-5", fill: "currentColor", view_box: "0 0 24 24",
                         path { d: "M6 6h2v12H6zm3.5 6l8.5 6V6z" }
                     }
@@ -506,7 +568,7 @@ fn ZoneCard(
                 button {
                     class: "btn btn-primary",
                     "aria-label": if is_playing { "Pause" } else { "Play" },
-                    onclick: move |_| on_control.call((zone_id_play.clone(), "play_pause".to_string())),
+                    onclick: move |_| on_control.call((zone_id_play.clone(), "play_pause".to_string(), None)),
                     if is_playing {
                         svg { class: "w-5 h-5", fill: "currentColor", view_box: "0 0 24 24",
                             path { d: "M6 19h4V5H6v14zm8-14v14h4V5h-4z" }
@@ -520,7 +582,7 @@ fn ZoneCard(
                 button {
                     class: "btn btn-ghost",
                     "aria-label": "Next track",
-                    onclick: move |_| on_control.call((zone_id_next.clone(), "next".to_string())),
+                    onclick: move |_| on_control.call((zone_id_next.clone(), "next".to_string(), None)),
                     svg { class: "w-5 h-5", fill: "currentColor", view_box: "0 0 24 24",
                         path { d: "M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" }
                     }
@@ -530,8 +592,8 @@ fn ZoneCard(
                     volume: volume,
                     volume_type: volume_type,
                     volume_step: volume_step,
-                    on_vol_down: move |_| on_control.call((zone_id_vol_down.clone(), "vol_down".to_string())),
-                    on_vol_up: move |_| on_control.call((zone_id_vol_up.clone(), "vol_up".to_string())),
+                    on_vol_down: move |_| on_control.call((zone_id_vol_down.clone(), "vol_down".to_string(), None)),
+                    on_vol_up: move |_| on_control.call((zone_id_vol_up.clone(), "vol_up".to_string(), None)),
                 }
             }
 
@@ -669,4 +731,9 @@ fn DeviceStrip(
             }
         }
     }
+}
+
+/// `m:ss` for the zone card's seek row.
+fn format_seek_time(seconds: u32) -> String {
+    format!("{}:{:02}", seconds / 60, seconds % 60)
 }

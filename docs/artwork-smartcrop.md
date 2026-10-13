@@ -8,6 +8,16 @@ Existing `/now_playing/image` and `/knob/now_playing/image` routes, including br
 
 [Integration evidence and commercial licensing](zensally-artwork-integration.md) and [QNAP acceptance steps](qnap-beta4-cloud-recovery.md) cover the new pipeline. Crop quality and Pi 3 latency require real hardware/user acceptance; the small embedded models and Mac timing do not establish Pi performance. Minimal mode prefers detected subjects but cannot guarantee retaining all text or widely separated faces in a rectangular crop.
 
+## Resampling and source size (#802)
+
+The crop rectangle still comes from zenlayout (or the centered/Fit geometry); the final resize is a single zenresize pass that takes that rectangle as its source region. Pixels are linearized from sRGB, filtered in f32 and re-encoded, so high-contrast edges keep their brightness instead of the dark fringe that filtering gamma-encoded bytes produces: a black/white checkerboard averages to sRGB ~188 (50% linear light), not 128. Straight alpha is premultiplied for the filter.
+
+The filter is chosen in one function, `resampler_for` in `src/knobs/image.rs`. If the output is larger than the crop on either axis, it uses Ginseng (jinc-windowed sinc), with `resize_sharpen(15%)`. Otherwise (reduction or 1:1), it uses Robidoux, the zenresize default with almost no ringing. Sharpening only amplifies, so a goal at or below Ginseng's natural negative-lobe ratio is a no-op. By zenresize's metric that ratio is 13.2%, so 15% is a mild real increase rather than the 10-13% values that would do nothing. The `image` crate still decodes and encodes. The libvips and centered fallbacks are unchanged, and a resampler fault on the infallible paths degrades to the old bilinear resize instead of failing the request. zenresize is server-only, like zensally and zenlayout. It is absent from the `web` feature's dependency tree and has the same AGPL-3.0-only or Imazen commercial terms ([licensing](zensally-artwork-integration.md#licensing-and-model-provenance)).
+
+Artwork responses on `/now_playing/image`, `/knob/now_playing/image`, `/roon/image` and `/api/collections/image` carry `X-Artwork-Source: <w>x<h>`, the decoded, EXIF-oriented source size before any crop, read from the image headers once per fetched source. They also carry `X-Artwork-Scale: up|down|none`, which applies the same either-axis rule to the policy's crop geometry. Clients and tests can therefore tell a genuine 4K render from an upscale. Both are response headers only. They are sent on 200 and omitted on 304, and the ETag is unaffected. SVG sources have no size and send neither header. Converter versions were bumped, so cached outputs and ETags from the bilinear resampler are not reused.
+
+Super-resolution (Imazen's zensr) is pre-0.1. If adopted, it belongs behind the output cache (#801) and must never run per request on a Pi.
+
 ## Historical #770 implementation record
 
 The following records the original libvips implementation and its verification. Its default crop mechanism is superseded by #772 above; its native fallback, bounds, original-image behavior and client compatibility remain relevant.

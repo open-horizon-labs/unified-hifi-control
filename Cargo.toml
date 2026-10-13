@@ -2,7 +2,7 @@
 name = "unified-hifi-control"
 version = "0.0.0"  # Injected from git tag at build time
 edition = "2021"
-authors = ["Muness Castle"]
+authors = ["Open Horizon Labs"]
 description = "Source-agnostic hi-fi control bridge for hardware surfaces and Home Assistant"
 license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/open-horizon-labs/unified-hifi-control"
@@ -28,6 +28,7 @@ server = [
     "dep:zensally",
     "dep:zensally-tract",
     "dep:zenlayout",
+    "dep:zenresize",
     "dep:resvg",
     "dep:tokio-stream",
     "dep:tokio-util",
@@ -124,7 +125,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "coo
 # WebSocket client (server only) - Music Assistant event subscription (#506).
 # rustls to match reqwest's TLS backend rather than pulling in a second (native-tls)
 # implementation.
-tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"], optional = true }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"], optional = true }
 
 # Logging subscriber (server only - needs tokio)
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
@@ -260,4 +261,9 @@ optional = true
 version = "=0.2.2"
 default-features = false
 features = ["smart-crop", "alloc"]
+optional = true
+# Server-only linear-light artwork resampling (#802); same Imazen
+# AGPL-3.0-only OR commercial terms as zensally/zenlayout.
+[dependencies.zenresize]
+version = "=0.3.1"
 optional = true

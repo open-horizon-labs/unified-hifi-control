@@ -1303,7 +1303,11 @@ type Writer = Arc<Mutex<futures::stream::SplitSink<WebSocketStream<TcpStream>, M
 
 async fn send(writer: &Writer, verb: &str, name: &str, req_id: usize, body: Option<&Value>) {
     let frame = encode_moo(verb, name, req_id, body);
-    let _ = writer.lock().await.send(Message::Binary(frame)).await;
+    let _ = writer
+        .lock()
+        .await
+        .send(Message::Binary(frame.into()))
+        .await;
 }
 
 /// Send a response *and record it*, so a test can tell "the Core answered
@@ -1378,8 +1382,8 @@ async fn serve_connection(stream: TcpStream, state: Arc<RwLock<CoreState>>, root
 
     while let Some(Ok(msg)) = read.next().await {
         let data = match msg {
-            Message::Binary(data) => data,
-            Message::Text(text) => text.into_bytes(),
+            Message::Binary(data) => data.to_vec(),
+            Message::Text(text) => text.as_bytes().to_vec(),
             Message::Close(_) => break,
             _ => continue,
         };
@@ -1514,7 +1518,11 @@ async fn handle_request(
             )
             .into_bytes();
             frame.extend_from_slice(PNG_1X1);
-            let _ = writer.lock().await.send(Message::Binary(frame)).await;
+            let _ = writer
+                .lock()
+                .await
+                .send(Message::Binary(frame.into()))
+                .await;
         }
         RequestKind::GroupOutputs => handle_group_outputs(req_id, &body, &core, &writer).await,
         RequestKind::UngroupOutputs => handle_ungroup_outputs(req_id, &body, &core, &writer).await,

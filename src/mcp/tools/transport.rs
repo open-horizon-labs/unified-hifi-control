@@ -76,15 +76,15 @@ use serde::{Deserialize, Serialize};
 /// Control playback across the shared adapters, including direct HQPlayer zones.
 #[mcp_tool(
     name = "hifi_control",
-    description = "Control playback and volume: play, pause, playpause (toggle), next, previous, repeat_off/repeat_context/repeat_track, shuffle_on/shuffle_off, volume_set, volume_up, volume_down. HQPlayer zones use the managed instance runtime and also support stop, seek, and mute."
+    description = "Control playback and volume: play, pause, playpause (toggle), next, previous, repeat_off/repeat_context/repeat_track, shuffle_on/shuffle_off, volume_set, volume_up, volume_down, seek (value = position in seconds; Roon and HQPlayer zones support it, other providers refuse it, see hifi_capabilities). HQPlayer zones use the managed instance runtime and also support stop and mute."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiControlTool {
     /// The zone ID to control
     pub zone_id: String,
-    /// Action: play, pause, playpause, next, previous, repeat_off, repeat_context, repeat_track, shuffle_on, shuffle_off, volume_set, volume_up, or volume_down. HQPlayer also accepts stop, seek, and mute.
+    /// Action: play, pause, playpause, next, previous, repeat_off, repeat_context, repeat_track, shuffle_on, shuffle_off, volume_set, volume_up, volume_down, or seek (Roon and HQPlayer zones). HQPlayer also accepts stop and mute.
     pub action: String,
-    /// For seek, the position in seconds. For volume: 0-100 for normalized providers, or decimal dB for HQPlayer; relative amounts use the provider's scale.
+    /// For seek, the absolute position in seconds (required, finite and non-negative). For volume: 0-100 for normalized providers, or decimal dB for HQPlayer; relative amounts use the provider's scale.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<f64>,
 }
@@ -167,6 +167,9 @@ pub async fn handle_control(
         "repeat_off" | "repeat_context" | "repeat_track" | "shuffle_on" | "shuffle_off" => {
             args.action.as_str()
         }
+        // Validated after the capability gate below, so a provider that cannot
+        // seek is refused by name whatever `value` says.
+        "seek" => "seek",
         // Unreachable: CONTROL_ACTIONS gates this whole match, and
         // `routing::tests::control_actions_cover_the_documented_set` proves the
         // two lists agree. Refused rather than forwarded, because forwarding is
@@ -189,6 +192,25 @@ pub async fn handle_control(
             return refuse_zone(state, env, &args.zone_id, target, capability).await;
         }
     }
+
+    let mut seek_position = None;
+    if backend_action == "seek" {
+        match parse_seek_position(args.value) {
+            Ok(position) => seek_position = Some(position),
+            Err(detail) => {
+                return env
+                    .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await)
+                    .refused(
+                        "seek requires a value: a finite, non-negative position in seconds",
+                        Refusal::invalid_parameter("value", &["seconds >= 0"], detail),
+                    );
+            }
+        }
+    }
+    let env = match seek_position {
+        Some(position) => env.param("value", position),
+        None => env,
+    };
 
     let route = target.for_transport();
     if let TransportRoute::Refused(refused) = route {
@@ -217,10 +239,16 @@ pub async fn handle_control(
             Ok(command) => dispatch_upnp_runtime_command(state, &args.zone_id, command).await,
             Err(error) => Err(error),
         },
-        TransportRoute::Roon => match renderer_runtime_command_from_action(backend_action, None) {
-            Ok(command) => dispatch_roon_runtime_command(state, &args.zone_id, command).await,
-            Err(error) => Err(error),
-        },
+        TransportRoute::Roon => {
+            let command = match seek_position {
+                Some(position) => Ok(Command::Seek { position }),
+                None => renderer_runtime_command_from_action(backend_action, None),
+            };
+            match command {
+                Ok(command) => dispatch_roon_runtime_command(state, &args.zone_id, command).await,
+                Err(error) => Err(error),
+            }
+        }
         TransportRoute::AppleMusic | TransportRoute::Spotify | TransportRoute::MusicAssistant => {
             dispatch_adapter_command(
                 state,
@@ -280,11 +308,11 @@ pub async fn handle_control(
 
 /// The action vocabulary a direct HQPlayer zone accepts through `hifi_control`.
 ///
-/// A superset of [`CONTROL_ACTIONS`]. `stop`, `seek` and `mute` are additions
-/// #328 wires for HQPlayer specifically: `HqpAdapter` has a working call for
-/// each (`stop`, `seek`, `volume_mute` — `src/adapters/hqplayer.rs`), and no
-/// other adapter's `hifi_control` path exposes seek at all, so adding it to the
-/// shared list would offer four providers an action that does nothing.
+/// A superset of [`CONTROL_ACTIONS`]. `stop` and `mute` are additions #328
+/// wires for HQPlayer specifically: `HqpAdapter` has a working call for each
+/// (`stop`, `volume_mute` — `src/adapters/hqplayer.rs`). `seek` is in both lists
+/// since #740: the shared path gates it on `Capability::Seek`, so providers that
+/// cannot seek refuse it by name, while HQPlayer keeps this dispatch.
 const HQPLAYER_CONTROL_ACTIONS: &[&str] = &[
     "play",
     "pause",
@@ -601,7 +629,33 @@ fn mode_capability(action: &str) -> Option<Capability> {
     match action {
         "repeat_off" | "repeat_context" | "repeat_track" => Some(Capability::RepeatMode),
         "shuffle_on" | "shuffle_off" => Some(Capability::ShuffleMode),
+        "seek" => Some(Capability::Seek),
         _ => None,
+    }
+}
+
+/// The position a `seek` asks for: required, finite and non-negative, the same
+/// rule `control_roon` applies on `/control`.
+fn parse_seek_position(value: Option<f64>) -> Result<f64, &'static str> {
+    match value {
+        None => Err("action='seek' needs `value`: the absolute position in seconds."),
+        Some(v) if v.is_finite() && v >= 0.0 => Ok(v),
+        Some(_) => Err("`value` must be a finite, non-negative number of seconds."),
+    }
+}
+
+#[cfg(test)]
+mod seek_tests {
+    use super::parse_seek_position;
+
+    #[test]
+    fn seek_position_must_be_finite_and_non_negative() {
+        assert_eq!(parse_seek_position(Some(0.0)), Ok(0.0));
+        assert_eq!(parse_seek_position(Some(42.5)), Ok(42.5));
+        assert!(parse_seek_position(None).is_err());
+        assert!(parse_seek_position(Some(-1.0)).is_err());
+        assert!(parse_seek_position(Some(f64::NAN)).is_err());
+        assert!(parse_seek_position(Some(f64::INFINITY)).is_err());
     }
 }
 

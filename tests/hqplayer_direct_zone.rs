@@ -107,7 +107,8 @@ fn fast_recovery() -> HqpRecoveryConfig {
 /// The two client-facing routes under test, wired exactly as `main.rs` wires them.
 ///
 /// `/control`, `/knob/now_playing`, and `/now_playing/image` are the knob's media surface;
-/// `/zones` is what both clients read to populate their picker. Nothing else is mounted, so a test
+/// `/zones` is what both clients read to populate their picker; `/api/collections/image` is the
+/// web UI's artwork proxy over the same per-provider dispatch. Nothing else is mounted, so a test
 /// cannot accidentally pass through a route the client does not use.
 fn client_router(state: AppState) -> Router {
     Router::new()
@@ -117,6 +118,10 @@ fn client_router(state: AppState) -> Router {
         .route("/knob/now_playing", get(knobs::knob_now_playing_handler))
         .route("/now_playing/image", get(knobs::knob_image_handler))
         .route("/zones", get(knobs::knob_zones_handler))
+        .route(
+            "/api/collections/image",
+            get(api::collections_image_handler),
+        )
         .with_state(state)
 }
 
@@ -669,6 +674,11 @@ async fn hqplayer_current_cover_reaches_the_unified_image_interface() {
 /// Frame requests for the same artwork identity must not refetch or redither
 /// the provider image. A dimension or composition change remains a cache miss.
 async fn artwork_rig() -> (Rig, tokio::task::JoinHandle<()>) {
+    artwork_rig_counted(Arc::new(AtomicUsize::new(0))).await
+}
+
+/// `artwork_rig` whose provider counts every `/cover/current` fetch (#801).
+async fn artwork_rig_counted(fetches: Arc<AtomicUsize>) -> (Rig, tokio::task::JoinHandle<()>) {
     let image = image::RgbaImage::from_pixel(100, 100, image::Rgba([255, 0, 0, 255]));
     let mut png = Vec::new();
     image::codecs::png::PngEncoder::new(&mut png)
@@ -681,7 +691,11 @@ async fn artwork_rig() -> (Rig, tokio::task::JoinHandle<()>) {
             "/cover/current",
             get(move || {
                 let png = png.clone();
-                async move { ([("content-type", "image/png")], png) }
+                let fetches = Arc::clone(&fetches);
+                async move {
+                    fetches.fetch_add(1, Ordering::SeqCst);
+                    ([("content-type", "image/png")], png)
+                }
             }),
         );
         axum::serve(listener, app).await.unwrap();
@@ -928,7 +942,13 @@ async fn packed_frame_cover_is_cached_by_artwork_identity_and_policy() {
         .await
         .expect("different geometry");
     assert_eq!(resized.data.len(), 798 * 450 / 2);
-    assert_eq!(requests.load(Ordering::SeqCst), 2, "geometry is isolated");
+    // #801: geometry is isolated in the output cache (the 798-wide output above
+    // has its own size), while the source bytes are shared, so no refetch.
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "source bytes are shared across geometries"
+    );
 
     rig.shutdown().await;
     cover_server.abort();
@@ -2304,4 +2324,280 @@ fn a_nan_or_zero_width_volume_range_publishes_no_control() {
     assert_eq!(control.value, -23.5);
     assert_eq!(control.min, -60.0);
     assert_eq!(control.max, 0.0);
+}
+
+async fn image_request(
+    rig: &Rig,
+    uri: &str,
+    if_none_match: Option<&str>,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let mut request = Request::builder().uri(uri);
+    if let Some(tag) = if_none_match {
+        request = request.header("if-none-match", tag);
+    }
+    let response = rig
+        .app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = axum::body::to_bytes(response.into_body(), 10_000_000)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, headers, body)
+}
+
+/// #801: every output format, not just e-ink, is cached. Two identical
+/// requests fetch the provider once and a different width is an output miss.
+#[tokio::test]
+async fn raster_and_rgb565_outputs_are_cached_for_every_format() {
+    for format in [None, Some("rgb565")] {
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let (rig, server) = artwork_rig_counted(Arc::clone(&fetches)).await;
+        let key = match format {
+            Some(format) => format!("hqplayer:art:{format}"),
+            None => "hqplayer:art".to_string(),
+        };
+        let _ = key;
+        for _ in 0..2 {
+            let image = rig
+                .state
+                .get_image(
+                    "hqplayer:art",
+                    "artwork-default",
+                    Some(64),
+                    Some(64),
+                    format,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!image.data.is_empty());
+        }
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            1,
+            "identical requests: {format:?}"
+        );
+        let wider = rig
+            .state
+            .get_image(
+                "hqplayer:art",
+                "artwork-default",
+                Some(128),
+                Some(64),
+                format,
+                None,
+            )
+            .await
+            .unwrap();
+        let first = rig
+            .state
+            .get_image(
+                "hqplayer:art",
+                "artwork-default",
+                Some(64),
+                Some(64),
+                format,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            wider.data.len(),
+            first.data.len(),
+            "width is part of the key"
+        );
+        rig.shutdown().await;
+        server.abort();
+    }
+}
+
+/// #801: the source bytes are cached, so one cover at two sizes is one fetch.
+#[tokio::test]
+async fn one_cover_at_two_sizes_fetches_the_provider_once() {
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let (rig, server) = artwork_rig_counted(Arc::clone(&fetches)).await;
+    for (w, h) in [(32, 32), (48, 48), (64, 40)] {
+        rig.state
+            .get_image(
+                "hqplayer:art",
+                "artwork-default",
+                Some(w),
+                Some(h),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    rig.shutdown().await;
+    server.abort();
+}
+
+/// #801: artwork routes carry a strong ETag and honour `If-None-Match` with a
+/// body-less 304; the SVG placeholder never carries a cacheable validator.
+#[tokio::test]
+async fn artwork_route_supports_etag_revalidation_and_placeholder_is_uncacheable() {
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let (rig, server) = artwork_rig_counted(Arc::clone(&fetches)).await;
+    let uri = "/now_playing/image?zone_id=hqplayer:art&width=64&height=64";
+
+    let (status, headers, body) = image_request(&rig, uri, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.is_empty());
+    let etag = headers
+        .get("etag")
+        .expect("etag")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        etag.starts_with('"') && !etag.starts_with("W/"),
+        "strong etag: {etag}"
+    );
+    assert!(headers.get("cache-control").is_some());
+
+    let (status, headers, body) = image_request(&rig, uri, Some(&etag)).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert!(body.is_empty());
+    assert_eq!(headers.get("etag").unwrap().to_str().unwrap(), etag);
+
+    let (_, _, _) = image_request(&rig, uri, Some("\"other\"")).await;
+    let (status, other, _) = image_request(
+        &rig,
+        "/now_playing/image?zone_id=hqplayer:art&width=32&height=32",
+        Some(&etag),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "etag is size specific");
+    assert_ne!(other.get("etag").unwrap().to_str().unwrap(), etag);
+    assert_eq!(fetches.load(Ordering::SeqCst), 1);
+
+    let (status, headers, _) = image_request(
+        &rig,
+        "/now_playing/image?zone_id=hqplayer:missing&width=64&height=64",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get("content-type").unwrap(), "image/svg+xml");
+    assert!(
+        headers.get("etag").is_none(),
+        "placeholder must not be validated"
+    );
+    let cache_control = headers
+        .get("cache-control")
+        .map(|v| v.to_str().unwrap().to_string());
+    assert!(
+        cache_control
+            .as_deref()
+            .is_none_or(|v| v.contains("no-store") || v.contains("no-cache")),
+        "placeholder must not be cacheable: {cache_control:?}"
+    );
+    let (status, _, _) = image_request(
+        &rig,
+        "/now_playing/image?zone_id=hqplayer:missing&width=64&height=64",
+        Some("*"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "placeholder never answers 304");
+    rig.shutdown().await;
+    server.abort();
+}
+
+/// #802: artwork responses report the decoded source size and whether the
+/// output enlarged it, so a client can tell a genuine 4K render from an
+/// upscale. Response headers only; the 304 path and the ETag are unchanged.
+#[tokio::test]
+async fn artwork_route_reports_source_size_and_scale_on_200_only() {
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let (rig, server) = artwork_rig_counted(Arc::clone(&fetches)).await;
+    let header = |headers: &axum::http::HeaderMap, name: &str| {
+        headers
+            .get(name)
+            .map(|value| value.to_str().unwrap().to_string())
+    };
+
+    let small = "/now_playing/image?zone_id=hqplayer:art&width=64&height=64";
+    let (status, headers, _) = image_request(&rig, small, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        header(&headers, "x-artwork-source").as_deref(),
+        Some("100x100")
+    );
+    assert_eq!(header(&headers, "x-artwork-scale").as_deref(), Some("down"));
+    let etag = header(&headers, "etag").expect("etag");
+
+    let (status, cached, _) = image_request(&rig, small, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        header(&cached, "x-artwork-source").as_deref(),
+        Some("100x100"),
+        "an output-cache hit still reports the source"
+    );
+    assert_eq!(header(&cached, "etag").as_deref(), Some(etag.as_str()));
+
+    let (status, not_modified, body) = image_request(&rig, small, Some(&etag)).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert!(body.is_empty());
+    assert_eq!(
+        header(&not_modified, "etag").as_deref(),
+        Some(etag.as_str())
+    );
+
+    let large = "/now_playing/image?zone_id=hqplayer:art&width=320&height=180";
+    let (status, headers, _) = image_request(&rig, large, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        header(&headers, "x-artwork-source").as_deref(),
+        Some("100x100")
+    );
+    assert_eq!(header(&headers, "x-artwork-scale").as_deref(), Some("up"));
+
+    let packed = "/now_playing/image?zone_id=hqplayer:art&width=100&height=100&format=rgb565";
+    let (status, headers, _) = image_request(&rig, packed, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        header(&headers, "x-artwork-source").as_deref(),
+        Some("100x100")
+    );
+    assert_eq!(header(&headers, "x-artwork-scale").as_deref(), Some("none"));
+
+    // The collections proxy reports the same, for composed and source bytes.
+    let token = rig
+        .state
+        .image_refs
+        .mint(unified_hifi_control::mcp::refs::ImageRef {
+            zone_id: "hqplayer:art".into(),
+            image_key: "artwork-default".into(),
+        })
+        .await;
+    let composed = format!("/api/collections/image?ref={token}&width=400&height=400");
+    let (status, headers, _) = image_request(&rig, &composed, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        header(&headers, "x-artwork-source").as_deref(),
+        Some("100x100")
+    );
+    assert_eq!(header(&headers, "x-artwork-scale").as_deref(), Some("up"));
+    let etag = header(&headers, "etag").expect("etag");
+    let (status, _, body) = image_request(&rig, &composed, Some(&etag)).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert!(body.is_empty());
+    let (status, headers, _) =
+        image_request(&rig, &format!("/api/collections/image?ref={token}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        header(&headers, "x-artwork-source").as_deref(),
+        Some("100x100")
+    );
+    assert_eq!(header(&headers, "x-artwork-scale").as_deref(), Some("none"));
+
+    rig.shutdown().await;
+    server.abort();
 }

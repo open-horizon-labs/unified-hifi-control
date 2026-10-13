@@ -52,7 +52,7 @@ pub fn Layout(props: LayoutProps) -> Element {
             )
         }
     };
-    let full_title = format!("{} - Unified Hi-Fi Control", props.title);
+    let full_title = format!("{} - {}", props.title, crate::brand::PRODUCT_NAME);
 
     rsx! {
         // Head elements - Dioxus hoists these to the real <head>
@@ -105,7 +105,7 @@ pub fn Layout(props: LayoutProps) -> Element {
             {props.children}
         }
         footer { class: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center py-3",
-            small { class: "text-muted", "Unified Hi-Fi Control v{version} ({git_sha})" }
+            small { class: "text-muted", "{crate::brand::PRODUCT_NAME} v{version} ({git_sha})" }
             div { class: "app-attribution",
                 a {
                     href: "https://hiphi.audio/",
@@ -113,7 +113,7 @@ pub fn Layout(props: LayoutProps) -> Element {
                     rel: "noopener noreferrer",
                     "A HiPhi project"
                 }
-                span { " by Open Horizon Labs · Local control, optional Cloud" }
+                span { " by {crate::brand::COMPANY_NAME} · Local control, optional Cloud" }
             }
         }
     }

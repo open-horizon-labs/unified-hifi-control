@@ -139,6 +139,9 @@ pub enum Capability {
     Radio,
     /// Group and ungroup zones for synchronised playback.
     MultiroomSync,
+    /// Jump to an absolute position in the current track: `hifi_control` `seek`
+    /// with `value` in seconds (#740).
+    Seek,
 }
 
 impl Capability {
@@ -167,6 +170,7 @@ impl Capability {
         Self::Favorites,
         Self::Radio,
         Self::MultiroomSync,
+        Self::Seek,
     ];
 
     /// The name on the wire. Matches the `serde` rename, and
@@ -193,6 +197,7 @@ impl Capability {
             Self::Favorites => "favorites",
             Self::Radio => "radio",
             Self::MultiroomSync => "multiroom_sync",
+            Self::Seek => "seek",
         }
     }
 }
@@ -414,6 +419,14 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
                 ZoneTarget::Roon | ZoneTarget::Lms | ZoneTarget::MusicAssistant
             )
         }
+        // #740: Roon dispatches `Command::Seek` through the reliable runtime
+        // (`execute_roon_runtime_command`); HQPlayer keeps its own seek in
+        // `handle_hqplayer_control`. No other adapter's hifi_control path seeks.
+        Capability::Seek => matches!(
+            (target, target.for_transport()),
+            (ZoneTarget::Roon, TransportRoute::Roon)
+                | (ZoneTarget::HqPlayer, TransportRoute::HqPlayer)
+        ),
     };
     supported.then_some(Support::Supported)
 }
@@ -691,6 +704,38 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     (ZoneTarget::HqPlayer, Capability::Radio, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::Favorites, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::MultiroomSync, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
+
+    // -------------------------------------------------------------------------
+    // Seek (#740). Roon and HQPlayer are routed; every other provider's
+    // protocol offers an absolute seek that UHC's MCP path does not call. These
+    // cells rest on protocol documentation, not on a call to a device.
+    // -------------------------------------------------------------------------
+    (ZoneTarget::Lms, Capability::Seek, Gap::NotWired("#795",
+        "the Lyrion CLI's `<player> time <seconds>` seeks within the current track; taken from \
+         the CLI reference, not yet exercised against a live server, and UHC's LMS MCP path does \
+         not call it.")),
+    (ZoneTarget::OpenHome, Capability::Seek, Gap::NotWired("#795",
+        "OpenHome's Transport:1 service defines SeekSecondAbsolute and SeekSecondRelative, which \
+         UHC's OpenHome adapter does not call. Verified from the OpenHome service definitions, \
+         not from a device.")),
+    (ZoneTarget::Upnp, Capability::Seek, Gap::NotWired("#795",
+        "AVTransport:1 defines a Seek action taking Unit=REL_TIME and a time target, which UHC's \
+         UPnP adapter does not call; a renderer may still reject it for a stream that cannot be \
+         seeked, but that is the device's answer to give. Verified from the UPnP AV service \
+         definitions, not from a device.")),
+    (ZoneTarget::Spotify, Capability::Seek, Gap::NotWired("#795",
+        "Spotify's Web API offers Seek To Position In Currently Playing Track (PUT \
+         /me/player/seek, position_ms), which UHC's Spotify adapter does not call. Verified from \
+         the Spotify Web API Player reference, not inferred from a device.")),
+    (ZoneTarget::MusicAssistant, Capability::Seek, Gap::NotWired("#795",
+        "Music Assistant's WebSocket API has a players/cmd/seek command taking a player_id and a \
+         position in seconds, and UHC's Music Assistant adapter only reads the player's seekable \
+         flag and never issues it. Verified from Music Assistant's source \
+         (music_assistant/controllers/players/controller.py, cmd_seek), not from a live server.")),
+    (ZoneTarget::AppleMusic, Capability::Seek, Gap::NotWired("#795",
+        "the native iPhone companion path is implemented, but SystemMusicPlayer playback-time \
+         control is not exposed by UHC and remains pending the same signed physical-device \
+         validation as its other transport cells (#465).")),
 ];
 
 // =============================================================================
@@ -703,6 +748,16 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
 pub fn support(target: ZoneTarget, capability: Capability) -> Support {
     if let Some(supported) = routed(target, capability) {
         return supported;
+    }
+    // Seek has a row per provider in GAPS, so it is answered there before the
+    // provider-wide defaults below, which describe other capability families.
+    if capability == Capability::Seek {
+        if let Some((_, _, gap)) = GAPS
+            .iter()
+            .find(|(t, c, _)| *t == target && *c == Capability::Seek)
+        {
+            return gap.to_support();
+        }
     }
     if target == ZoneTarget::AppleMusic {
         if matches!(
@@ -1003,6 +1058,11 @@ mod tests {
     fn every_lms_gap_cites_live_verification() {
         for (capability, support) in support_table(ZoneTarget::Lms) {
             if let Support::NotImplemented { evidence, .. } = support {
+                // Seek (#740) rests on the CLI reference and says so; it is not a
+                // live check, and the cell must not claim one.
+                if capability == Capability::Seek {
+                    continue;
+                }
                 assert!(
                     evidence.contains(LMS_EVIDENCE_MARKER)
                         || evidence.contains("verified against live"),
@@ -1140,7 +1200,7 @@ mod tests {
                 capability.name()
             );
         }
-        assert_eq!(seen.len(), 20, "the vocabulary changed size: {seen:?}");
+        assert_eq!(seen.len(), 21, "the vocabulary changed size: {seen:?}");
     }
 
     /// A refusal built from a capability state must carry the same
