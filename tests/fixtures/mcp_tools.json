@@ -159,15 +159,15 @@
     }
   },
   "hifi_control": {
-    "description": "Control playback and volume: play, pause, playpause (toggle), next, previous, repeat_off/repeat_context/repeat_track, shuffle_on/shuffle_off, volume_set, volume_up, volume_down. HQPlayer zones use the managed instance runtime and also support stop, seek, and mute.",
+    "description": "Control playback and volume: play, pause, playpause (toggle), next, previous, repeat_off/repeat_context/repeat_track, shuffle_on/shuffle_off, volume_set, volume_up, volume_down, seek (value = position in seconds; Roon and HQPlayer zones support it, other providers refuse it, see hifi_capabilities). HQPlayer zones use the managed instance runtime and also support stop and mute.",
     "inputSchema": {
       "properties": {
         "action": {
-          "description": "Action: play, pause, playpause, next, previous, repeat_off, repeat_context, repeat_track, shuffle_on, shuffle_off, volume_set, volume_up, or volume_down. HQPlayer also accepts stop, seek, and mute.",
+          "description": "Action: play, pause, playpause, next, previous, repeat_off, repeat_context, repeat_track, shuffle_on, shuffle_off, volume_set, volume_up, volume_down, or seek (Roon and HQPlayer zones). HQPlayer also accepts stop and mute.",
           "type": "string"
         },
         "value": {
-          "description": "For seek, the position in seconds. For volume: 0-100 for normalized providers, or decimal dB for HQPlayer; relative amounts use the provider's scale.",
+          "description": "For seek, the absolute position in seconds (required, finite and non-negative). For volume: 0-100 for normalized providers, or decimal dB for HQPlayer; relative amounts use the provider's scale.",
           "nullable": true,
           "type": "number"
         },
