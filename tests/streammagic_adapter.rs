@@ -216,7 +216,7 @@ async fn serve(
             _ = kick.recv() => break,
             pushed = push.recv() => {
                 let Ok(frame) = pushed else { continue };
-                if ws.send(Message::Text(frame)).await.is_err() { break }
+                if ws.send(Message::Text(frame.into())).await.is_err() { break }
             }
             message = ws.next() => {
                 let Some(Ok(message)) = message else { break };
@@ -224,7 +224,7 @@ async fn serve(
                 let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
                 let replies = handle(&state, frame).await;
                 for reply in replies {
-                    if ws.send(Message::Text(reply)).await.is_err() { return }
+                    if ws.send(Message::Text(reply.into())).await.is_err() { return }
                 }
             }
         }

@@ -100,7 +100,7 @@ async fn start_mock(registry_ok: bool) -> (Shared, String, String) {
         while let Ok((stream, _)) = ws.accept().await {
             tokio::spawn(async move {
                 let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-                let send = |v: Value| Message::Text(v.to_string());
+                let send = |v: Value| Message::Text(v.to_string().into());
                 socket
                     .send(send(json!({"type": "auth_required"})))
                     .await

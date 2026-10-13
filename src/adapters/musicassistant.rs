@@ -837,7 +837,9 @@ impl MusicAssistantAdapter {
         };
         write
             .send(WsMessage::Text(
-                serde_json::to_string(&subscribe).context("encode Music Assistant subscribe")?,
+                serde_json::to_string(&subscribe)
+                    .context("encode Music Assistant subscribe")?
+                    .into(),
             ))
             .await
             .context("send Music Assistant subscribe")?;
