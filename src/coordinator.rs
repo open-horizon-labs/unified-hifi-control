@@ -1292,6 +1292,8 @@ pub fn relay_artwork_url(
     }
     let address = std::net::SocketAddr::new(ip, listener.port());
     let mut url = reqwest::Url::parse(&format!("http://{address}/roon/image")).ok()?;
+    // Relay lane: small by design (NAA relay picture budget), so it keeps the
+    // explicit 300x300 now that /roon/image's unsized default is full-size.
     url.query_pairs_mut()
         .append_pair("image_key", key)
         .append_pair("width", "300")

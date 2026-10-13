@@ -225,6 +225,7 @@ Two things this table does **not** claim:
 | `favorites` | 🚧 #531 | ✅ | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #482 | ✅ | ✅ |
 | `radio` | ✅ | ✅ | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #462 | 🚧 #462 | ✅ |
 | `multiroom_sync` | ✅ | ✅ | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #462 | ⛔ | ✅ |
+| `seek` | ✅ | 🚧 #795 | 🚧 #795 | 🚧 #795 | ✅ | 🚧 #795 | 🚧 #795 | 🚧 #795 |
 
 ✅ supported · ⛔ the provider's protocol cannot do it · 🚧 the provider can, UHC has not wired it (issue that will)
 
@@ -330,6 +331,12 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - 🚧 **hqplayer / `multiroom_sync`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `multiroom_sync`** (#462) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
 - ⛔ **spotify / `multiroom_sync`** — Spotify's Transfer Playback endpoint accepts a single target device and does not synchronize multiple Connect devices; transfer is device selection, not multiroom grouping. Verified from the Spotify Web API Transfer Playback reference, not inferred from a device.
+- 🚧 **lms / `seek`** (#795) — the Lyrion CLI's `<player> time <seconds>` seeks within the current track; taken from the CLI reference, not yet exercised against a live server, and UHC's LMS MCP path does not call it.
+- 🚧 **openhome / `seek`** (#795) — OpenHome's Transport:1 service defines SeekSecondAbsolute and SeekSecondRelative, which UHC's OpenHome adapter does not call. Verified from the OpenHome service definitions, not from a device.
+- 🚧 **upnp / `seek`** (#795) — AVTransport:1 defines a Seek action taking Unit=REL_TIME and a time target, which UHC's UPnP adapter does not call; a renderer may still reject it for a stream that cannot be seeked, but that is the device's answer to give. Verified from the UPnP AV service definitions, not from a device.
+- 🚧 **applemusic / `seek`** (#795) — the native iPhone companion path is implemented, but SystemMusicPlayer playback-time control is not exposed by UHC and remains pending the same signed physical-device validation as its other transport cells (#465).
+- 🚧 **spotify / `seek`** (#795) — Spotify's Web API offers Seek To Position In Currently Playing Track (PUT /me/player/seek, position_ms), which UHC's Spotify adapter does not call. Verified from the Spotify Web API Player reference, not inferred from a device.
+- 🚧 **musicassistant / `seek`** (#795) — Music Assistant's WebSocket API has a players/cmd/seek command taking a player_id and a position in seconds, and UHC's Music Assistant adapter only reads the player's seekable flag and never issues it. Verified from Music Assistant's source (music_assistant/controllers/players/controller.py, cmd_seek), not from a live server.
 <!-- END GENERATED CAPABILITY MATRIX (#398) -->
 
 `hqplayer:` is a fifth zone prefix: `PrefixedZoneId` lists it and `HqpAdapter`
