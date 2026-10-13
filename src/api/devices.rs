@@ -259,7 +259,19 @@ pub async fn device_control_handler(
         (None, Some(zone_id)) => DeviceTarget::Zone(zone_id.clone()),
         _ => return Err(bad_request("pass exactly one of device_id or zone_id")),
     };
-    let device_request = request_from_action(&request.action, request.value.as_ref(), 0.5)
+    // "+"/"−" without a magnitude move one of the device's own steps (0.5 dB on a Marantz,
+    // 1% on a WiiM), as the knob and MCP paths already do.
+    let step = match &target {
+        DeviceTarget::Device(device_id) => state.aggregator.get_device(device_id).await,
+        DeviceTarget::Zone(zone_id) => match state.devices.linked_device_id(zone_id).await {
+            Some(device_id) => state.aggregator.get_device(&device_id).await,
+            None => None,
+        },
+    }
+    .map(|device| device.volume.step)
+    .filter(|step| *step > 0.0)
+    .unwrap_or(0.5);
+    let device_request = request_from_action(&request.action, request.value.as_ref(), step)
         .map_err(bad_request)?
         .ok_or_else(|| {
             bad_request(format!(

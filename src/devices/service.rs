@@ -796,6 +796,14 @@ fn plan(device: &Device, request: &DeviceRequest) -> Result<Plan, DeviceError> {
                     device_id: device_id.clone(),
                     detail: "the device has not reported its current level".to_string(),
                 })?;
+            // A step finer than the device's own would quantise back to the current level (up)
+            // or a whole step (down); widen it to one device step so both directions move.
+            let device_step = device.volume.step;
+            let delta = if device_step > 0.0 && delta.abs() < device_step {
+                device_step.copysign(*delta)
+            } else {
+                *delta
+            };
             volume_plan(current + delta)
         }
         DeviceRequest::Mute(muted) => Ok(Plan {
@@ -1033,6 +1041,36 @@ mod tests {
         assert_eq!(
             sent_level(plan(&amp, &DeviceRequest::VolumeRelative(-0.5))),
             -40.5
+        );
+    }
+
+    /// A relative step smaller than the device's own step must still move the volume, in both
+    /// directions. The tempting bug: quantising 55 + 0.5 down to 55 makes "+" a silent no-op on
+    /// a 1%-step WiiM while "−" (55 − 0.5 → 54.5 → 54) appears to work.
+    #[test]
+    fn critical_relative_steps_below_the_device_step_still_move_the_volume() {
+        let mut wiim = device(Some(55.0), Some(100.0));
+        wiim.volume.scale = crate::bus::VolumeScale::Percentage;
+        wiim.volume.min = 0.0;
+        wiim.volume.step = 1.0;
+        assert_eq!(
+            sent_level(plan(&wiim, &DeviceRequest::VolumeRelative(0.5))),
+            56.0
+        );
+        assert_eq!(
+            sent_level(plan(&wiim, &DeviceRequest::VolumeRelative(-0.5))),
+            54.0
+        );
+        // A full step behaves as before.
+        assert_eq!(
+            sent_level(plan(&wiim, &DeviceRequest::VolumeRelative(1.0))),
+            56.0
+        );
+        // At the maximum, "+" stays at the maximum rather than overshooting.
+        wiim.volume.value = Some(100.0);
+        assert_eq!(
+            sent_level(plan(&wiim, &DeviceRequest::VolumeRelative(0.5))),
+            100.0
         );
     }
 
