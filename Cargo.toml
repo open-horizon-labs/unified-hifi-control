@@ -28,6 +28,7 @@ server = [
     "dep:zensally",
     "dep:zensally-tract",
     "dep:zenlayout",
+    "dep:zenresize",
     "dep:resvg",
     "dep:tokio-stream",
     "dep:tokio-util",
@@ -260,4 +261,9 @@ optional = true
 version = "=0.2.2"
 default-features = false
 features = ["smart-crop", "alloc"]
+optional = true
+# Server-only linear-light artwork resampling (#802); same Imazen
+# AGPL-3.0-only OR commercial terms as zensally/zenlayout.
+[dependencies.zenresize]
+version = "=0.3.1"
 optional = true

@@ -44,9 +44,11 @@ pub const SOURCE_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Converter revision for non-e-ink outputs. Bump when JPEG/PNG/RGB565
 /// composition changes so older cached bytes and old ETags are abandoned.
-pub const RASTER_CONVERTER_VERSION: u8 = 1;
-/// Converter revision for packed ACeP6 outputs (unchanged semantics).
-pub const EINK_CONVERTER_VERSION: u8 = 3;
+/// 2: linear-light zenresize resampling (#802).
+pub const RASTER_CONVERTER_VERSION: u8 = 2;
+/// Converter revision for packed ACeP6 outputs. 4: the composition before
+/// dithering is resampled in linear light (#802).
+pub const EINK_CONVERTER_VERSION: u8 = 4;
 
 /// LRU bounded by the summed byte size of its values.
 struct ByteLru<K, V> {
@@ -124,6 +126,10 @@ pub struct SourceArtwork {
     /// a changed cover under an unchanged `image_key` can never be served from
     /// a stale output or revalidated with a stale tag.
     pub digest: String,
+    /// Decoded (EXIF-oriented) pixel size, read from the image headers once at
+    /// fetch time; `None` for SVG or undecodable bytes. Reported to clients as
+    /// `X-Artwork-Source` (#802).
+    pub dimensions: Option<(u32, u32)>,
     fetched_at: Instant,
 }
 
@@ -131,10 +137,12 @@ impl SourceArtwork {
     pub fn new(content_type: String, data: Vec<u8>) -> Self {
         use sha2::{Digest, Sha256};
         let digest = hex::encode(&Sha256::digest(&data)[..16]);
+        let dimensions = super::image::probe_artwork_dimensions(&data);
         Self {
             content_type,
             data,
             digest,
+            dimensions,
             fetched_at: Instant::now(),
         }
     }
