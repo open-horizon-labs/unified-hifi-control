@@ -834,8 +834,8 @@ impl FakeRoonCore {
         self.state.write().await.delay = delay;
     }
 
-    /// Delay only browses carrying `item_key`, so responses can be forced to
-    /// arrive out of order.
+    /// Delay only browses carrying `item_key` (or `get_image` requests carrying
+    /// it as `image_key`), so responses can be forced to arrive out of order.
     pub async fn set_delay_for_item_key(&self, item_key: &str, delay: Duration) {
         self.state
             .write()
@@ -1422,8 +1422,11 @@ async fn handle_request(
             body: body.clone(),
             unhandled: kind == RequestKind::Unknown,
         });
+        // `image_key` shares the per-key table so a test can hold one cover's
+        // `get_image` reply in flight while a track change fans out requests.
         let delay = body
             .get("item_key")
+            .or_else(|| body.get("image_key"))
             .and_then(Value::as_str)
             .and_then(|k| st.key_delays.get(k).copied())
             .or_else(|| {
