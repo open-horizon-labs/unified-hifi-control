@@ -2295,7 +2295,7 @@ jobs:
                 <desc lang="EN">Beta builds of Unified Hi-Fi Control for testing.</desc>
                 <url>${REPO_URL}/releases/download/v${VERSION}/lms-unified-hifi-control-${VERSION}.zip</url>
                 <sha>${SHA}</sha>
-                <creator>Muness Castle</creator>
+                <creator>Open Horizon Labs</creator>
                 <link>https://github.com/${{ github.repository }}/releases/tag/v${VERSION}</link>
               </plugin>
             </plugins>
@@ -2376,7 +2376,7 @@ jobs:
                 <desc lang="EN">Source-agnostic hi-fi control bridge for Roon, LMS, HQPlayer, and hardware knobs. Provides HTTP APIs, MQTT integration, and web UI for controlling your audio system from anywhere.</desc>
                 <url>URL_PLACEHOLDER</url>
                 <sha>SHA_PLACEHOLDER</sha>
-                <creator>Muness Castle</creator>
+                <creator>Open Horizon Labs</creator>
                 <link>https://forums.lyrion.org/forum/user-forums/3rd-party-hardware/1804977-roon-knob-includes-lms-support</link>
               </plugin>
             </plugins>

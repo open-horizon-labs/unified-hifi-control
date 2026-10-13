@@ -9,7 +9,7 @@
       <desc lang="EN">Beta builds of Unified Hi-Fi Control for testing.</desc>
       <url>https://github.com/open-horizon-labs/unified-hifi-control/releases/download/v4.0.0-beta.4/lms-unified-hifi-control-4.0.0-beta.4.zip</url>
       <sha>4ab01589950fdc0aa37f1e4fbab20b6c9ba5e153</sha>
-      <creator>Muness Castle</creator>
+      <creator>Open Horizon Labs</creator>
       <link>https://github.com/open-horizon-labs/unified-hifi-control/releases/tag/v4.0.0-beta.4</link>
     </plugin>
   </plugins>
