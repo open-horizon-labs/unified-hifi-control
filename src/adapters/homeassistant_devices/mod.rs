@@ -297,7 +297,7 @@ async fn read_json(socket: &mut Socket) -> Result<Value, String> {
 
 async fn send_json(socket: &mut Socket, value: Value) -> Result<(), String> {
     socket
-        .send(Message::Text(value.to_string()))
+        .send(Message::Text(value.to_string().into()))
         .await
         .map_err(|e| e.to_string())
 }

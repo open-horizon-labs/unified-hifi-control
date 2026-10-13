@@ -422,11 +422,9 @@ async fn run(
                 continue;
             }
         };
-        let websocket_limits = WebSocketConfig {
-            max_message_size: Some(super::protocol::MAX_MESSAGE_BYTES),
-            max_frame_size: Some(super::protocol::MAX_MESSAGE_BYTES),
-            ..WebSocketConfig::default()
-        };
+        let websocket_limits = WebSocketConfig::default()
+            .max_message_size(Some(super::protocol::MAX_MESSAGE_BYTES))
+            .max_frame_size(Some(super::protocol::MAX_MESSAGE_BYTES));
         let request = match websocket_upgrade_request(config.endpoint.as_str(), &grant) {
             Ok(request) => request,
             Err(error) => {
@@ -614,7 +612,11 @@ where
     validate_challenge(&challenge, config.endpoint.as_str(), now_ms())?;
     // Private relay API expects the proof object itself, not a tagged envelope.
     let proof = sign_installation_session_proof(identity, grant.to_owned(), &challenge, now_ms());
-    send_message(&mut socket, Message::Text(serde_json::to_string(&proof)?)).await?;
+    send_message(
+        &mut socket,
+        Message::Text(serde_json::to_string(&proof)?.into()),
+    )
+    .await?;
     let epoch = match tokio::time::timeout(
         std::time::Duration::from_secs(10),
         next_relay_message(&mut socket),
@@ -1000,7 +1002,7 @@ async fn send_json<S, T: serde::Serialize>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    send_message(socket, Message::Text(serde_json::to_string(value)?)).await
+    send_message(socket, Message::Text(serde_json::to_string(value)?.into())).await
 }
 
 async fn dispatch(
@@ -1192,7 +1194,7 @@ fn schedule_artwork(
         let Ok(text) = serde_json::to_string(&response) else {
             return;
         };
-        if artwork_tx.send(Message::Text(text)).await.is_err() {
+        if artwork_tx.send(Message::Text(text.into())).await.is_err() {
             return;
         }
         for (index, bytes) in image.data.chunks(MAX_ARTWORK_CHUNK_BYTES).enumerate() {
@@ -1205,7 +1207,11 @@ fn schedule_artwork(
             .encode() else {
                 return;
             };
-            if artwork_tx.send(Message::Binary(frame)).await.is_err() {
+            if artwork_tx
+                .send(Message::Binary(frame.into()))
+                .await
+                .is_err()
+            {
                 return;
             }
         }
