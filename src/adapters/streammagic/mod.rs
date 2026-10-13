@@ -360,6 +360,7 @@ impl StreamMagicAdapter {
             name: info.name,
             discovery: discovery.to_string(),
             state: UnitState::default(),
+            owed: HashMap::new(),
         };
         tokio::spawn(unit.run(ws, receiver, cancel.child_token()));
     }
@@ -586,6 +587,9 @@ struct Unit {
     name: String,
     discovery: String,
     state: UnitState,
+    /// Replies still owed for queries and subscriptions, per path. The protocol has no request
+    /// ids, so a command's reply is the first one on its path *after* these.
+    owed: HashMap<String, u32>,
 }
 
 /// Read the next frame if there is a session; pends forever otherwise.
@@ -607,6 +611,29 @@ async fn send_text(ws: &mut Option<Ws>, text: String) -> Result<(), String> {
 }
 
 impl Unit {
+    /// Send a query or subscription and remember that its path owes a reply.
+    async fn request(
+        &mut self,
+        ws: &mut Option<Ws>,
+        path: &str,
+        frame: String,
+    ) -> Result<(), String> {
+        send_text(ws, frame).await?;
+        *self.owed.entry(path.to_string()).or_default() += 1;
+        Ok(())
+    }
+
+    /// A reply arrived on `path`: one fewer owed. Returns whether it was owed.
+    fn settle(&mut self, path: &str) -> bool {
+        match self.owed.get_mut(path) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
     async fn run(
         mut self,
         first: Ws,
@@ -653,6 +680,9 @@ impl Unit {
                     match frame {
                         Some(Ok(Message::Text(text))) => {
                             if let Some(incoming) = protocol::parse_message(&text) {
+                                if incoming.is_response() {
+                                    self.settle(&incoming.path);
+                                }
                                 self.state.apply(&incoming, &mut self.name);
                                 if let Some(error) = incoming.error() {
                                     tracing::warn!(device_id = %self.device_id, path = %incoming.path, "StreamMagic rejected a request: {error}");
@@ -675,6 +705,7 @@ impl Unit {
                     match connect(&self.endpoint).await {
                         Ok(socket) => {
                             ws = Some(socket);
+                            self.owed.clear();
                             backoff = RECONNECT_MIN;
                             last_rx = Instant::now();
                             self.open_session(&mut ws).await;
@@ -710,22 +741,22 @@ impl Unit {
 
     /// Queries and subscriptions only: opening a session never changes the unit.
     async fn open_session(&mut self, ws: &mut Option<Ws>) {
-        let mut frames: Vec<String> = [
+        let mut frames: Vec<(&str, String)> = [
             protocol::PATH_INFO,
             protocol::PATH_SOURCES,
             protocol::PATH_ZONE_STATE,
             protocol::PATH_AUDIO,
         ]
         .iter()
-        .map(|path| protocol::query(path))
+        .map(|path| (*path, protocol::query(path)))
         .collect();
         frames.extend(
             protocol::SUBSCRIPTIONS
                 .iter()
-                .map(|path| protocol::subscribe(path)),
+                .map(|path| (*path, protocol::subscribe(path))),
         );
-        for frame in frames {
-            if let Err(error) = send_text(ws, frame).await {
+        for (path, frame) in frames {
+            if let Err(error) = self.request(ws, path, frame).await {
                 tracing::debug!(device_id = %self.device_id, "session setup failed: {error}");
                 *ws = None;
                 self.state.session_lost(error);
@@ -768,6 +799,8 @@ impl Unit {
             }
         };
         send_text(ws, frame).await.inspect_err(|_| *ws = None)?;
+        // Replies already owed on this path come first; the unit answers in order.
+        let mut ahead = self.owed.get(path).copied().unwrap_or(0);
         let deadline = Instant::now() + WRITE_TIMEOUT;
         loop {
             let next = {
@@ -783,12 +816,23 @@ impl Unit {
                         continue;
                     };
                     self.state.apply(&incoming, &mut self.name);
-                    if incoming.is_response() && incoming.path == path {
-                        if let Some(error) = incoming.error() {
-                            return Err(format!("the unit refused the command: {error}"));
-                        }
-                        break;
+                    if !incoming.is_response() {
+                        continue;
                     }
+                    if incoming.path == path && ahead > 0 {
+                        ahead -= 1;
+                        self.settle(path);
+                        continue;
+                    }
+                    if incoming.path != path {
+                        self.settle(&incoming.path);
+                        continue;
+                    }
+                    // This path's owed replies are past: this one answers the command.
+                    if let Some(error) = incoming.error() {
+                        return Err(format!("the unit refused the command: {error}"));
+                    }
+                    break;
                 }
                 Ok(Some(Ok(_))) => {}
                 Ok(Some(Err(_))) | Ok(None) => {
@@ -797,9 +841,13 @@ impl Unit {
                 }
             }
         }
-        send_text(ws, protocol::query(protocol::PATH_ZONE_STATE))
-            .await
-            .inspect_err(|_| *ws = None)
+        self.request(
+            ws,
+            protocol::PATH_ZONE_STATE,
+            protocol::query(protocol::PATH_ZONE_STATE),
+        )
+        .await
+        .inspect_err(|_| *ws = None)
     }
 
     fn publish(&self) {

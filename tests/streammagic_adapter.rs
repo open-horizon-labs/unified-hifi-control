@@ -45,6 +45,9 @@ struct MockState {
     /// Every frame received, in order, across all connections.
     frames: Vec<Value>,
     connections: usize,
+    /// How long the unit takes to answer each query or subscription. A slow answer keeps the
+    /// session-setup replies in flight when a command is sent.
+    query_delay: Duration,
 }
 
 impl MockState {
@@ -61,6 +64,7 @@ impl MockState {
             limit: Some(80),
             frames: Vec::new(),
             connections: 0,
+            query_delay: Duration::ZERO,
         }
     }
 
@@ -228,13 +232,20 @@ async fn serve(
 }
 
 async fn handle(state: &Arc<Mutex<MockState>>, frame: Value) -> Vec<String> {
-    let mut state = state.lock().await;
-    state.frames.push(frame.clone());
+    let mut guard = state.lock().await;
+    guard.frames.push(frame.clone());
     let path = frame["path"].as_str().unwrap_or_default().to_string();
     let params = frame["params"].clone();
     if !is_write(&frame) {
-        return vec![response(&path, 200, "OK", state.data(&path))];
+        let (reply, delay) = (
+            response(&path, 200, "OK", guard.data(&path)),
+            guard.query_delay,
+        );
+        drop(guard);
+        tokio::time::sleep(delay).await;
+        return vec![reply];
     }
+    let mut state = guard;
     let mut refused = None;
     if let Some(volume) = params.get("volume_percent").and_then(Value::as_u64) {
         state.volume = volume as u32;
@@ -588,6 +599,25 @@ async fn fixed_output_units_report_volume_unsupported_and_refuse_writes() {
         .unwrap_err();
     assert!(error.contains("not supported"), "{error}");
     assert!(mock.writes().await.is_empty());
+}
+
+/// CRITICAL: the reply to a command is the unit's answer to *that* command, not a still-pending
+/// answer to a session-setup query on the same path. The protocol has no request ids, so the
+/// tempting bug is "first `/zone/state` response after sending = ours", which reports a refused
+/// command as done whenever setup replies are still in flight (it failed CI intermittently).
+#[tokio::test]
+async fn critical_a_refused_command_is_not_acknowledged_by_a_pending_query_reply() {
+    let h = harness().await;
+    let mut slow = MockState::evo("0AABBCCDDEE0", "Living Room");
+    slow.query_delay = Duration::from_millis(100);
+    let mock = MockStreamMagic::start(slow).await;
+    let device_id = h.attach("0AABBCCDDEE0", &mock).await;
+    let error = h
+        .adapter
+        .execute(&device_id, DeviceOperation::SelectInput("NOPE".into()))
+        .await
+        .expect_err("the unit refused NOPE");
+    assert!(error.contains("refused"), "{error}");
 }
 
 #[tokio::test]
