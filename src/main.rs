@@ -1430,6 +1430,9 @@ mod server {
 #[cfg(feature = "server")]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Before anything can open a TLS connection (see `tls::install_crypto_provider`).
+    unified_hifi_control::tls::install_crypto_provider();
+
     // Handle --version and --help before starting server
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {

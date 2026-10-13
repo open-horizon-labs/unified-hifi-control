@@ -29,6 +29,8 @@
 // Adaptive-control producer contract (shared: server, WASM consumers, MCP).
 // Deliberately not feature-gated - see src/adaptive/mod.rs for the dependency rule.
 pub mod adaptive;
+#[cfg(feature = "server")]
+pub mod tls;
 
 pub mod brand;
 
