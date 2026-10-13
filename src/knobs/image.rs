@@ -1,11 +1,15 @@
-//! Image processing for S3 Knob LCD display
+//! Artwork decoding, composition and device encodings.
 //!
-//! The S3 Knob uses a 240x240 LCD that expects RGB565 format (2 bytes per pixel).
-//! This module handles:
-//! - JPEG, PNG, GIF, BMP, WebP decoding
-//! - SVG rasterization (via resvg)
-//! - Image resizing (bilinear)
-//! - RGB565 conversion (little-endian for ESP32)
+//! Serves every artwork client from one pipeline: round/square knob LCDs
+//! (240-360 px RGB565), Frame e-ink panels (packed six-colour ACeP), browser
+//! and Roku/TV displays up to 4K (PNG/JPEG). This module handles:
+//! - JPEG, PNG, GIF, BMP, WebP decoding (with EXIF orientation), SVG via resvg
+//! - Composition policies: subject-aware cover (zensally analysis + zenlayout
+//!   crop, falling back to libvips attention, then a centered crop), explicit
+//!   Fit on a gallery mat, SmartCover and Exact
+//! - Resampling in linear light with zenresize (#802): Ginseng with mild
+//!   sharpening when enlarging, Robidoux when reducing; see [`resampler_for`]
+//! - RGB565 (little-endian, ESP32) and ACeP6 packing
 
 use image::{
     codecs::jpeg::JpegEncoder,
@@ -279,9 +283,15 @@ fn cover_crop_percent(source_w: u32, source_h: u32, target_w: u32, target_h: u32
 }
 
 fn fit_on_gallery_mat(img: &DynamicImage, target_w: u32, target_h: u32) -> DynamicImage {
-    let fitted = img
-        .resize(target_w, target_h, FilterType::Triangle)
-        .to_rgba8();
+    let (fit_w, fit_h) = zenresize::fit_dims(
+        img.width(),
+        img.height(),
+        target_w,
+        target_h,
+        zenresize::FitMode::Fit,
+    );
+    let fitted =
+        resample_or_bilinear(img, (0, 0, img.width(), img.height()), fit_w, fit_h).to_rgba8();
     let offset_x = (target_w - fitted.width()) / 2;
     let offset_y = (target_h - fitted.height()) / 2;
     let mut canvas = RgbaImage::from_pixel(target_w, target_h, GALLERY_MAT);
@@ -307,6 +317,243 @@ fn fit_on_gallery_mat(img: &DynamicImage, target_w: u32, target_h: u32) -> Dynam
     DynamicImage::ImageRgba8(canvas)
 }
 
+/// Resampling kernel and in-kernel sharpening chosen for one resize (#802).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Resampler {
+    pub filter: zenresize::Filter,
+    /// `resize_sharpen` goal in percent; `None` keeps the filter's natural lobes.
+    pub sharpen_percent: Option<f32>,
+}
+
+/// Negative-lobe goal for enlargement, in percent.
+///
+/// `resize_sharpen` only ever amplifies: a goal at or below the filter's
+/// natural negative-lobe area is a silent no-op. Measured with zenresize's own
+/// metric, Ginseng's natural ratio is 13.2% (Lanczos-3 is 13.7%), so the
+/// 10-13% range commonly quoted for "mild" sharpening would do nothing here.
+/// 15% raises the negative lobes by ~14%: enough to restore some of the edge
+/// contrast a 2-3x enlargement of a 600-1500 px cover loses, small enough that
+/// ringing stays below the level that outlines typography. Zero cost: it
+/// reshapes the weight table rather than running an unsharp pass.
+pub(crate) const ENLARGE_SHARPEN_PERCENT: f32 = 15.0;
+
+/// The one place the resampling filter is chosen.
+///
+/// Enlargement on either axis (output larger than the cropped source) uses
+/// Ginseng, a jinc-windowed sinc that keeps enlarged edges crisp without
+/// Lanczos' blockiness, plus [`ENLARGE_SHARPEN_PERCENT`]. Everything else is a
+/// reduction (or 1:1) and uses Robidoux, zenresize's default: a near-zero-ringing
+/// cubic that does not alias fine cover detail into moire.
+pub(crate) fn resampler_for(crop_w: u32, crop_h: u32, out_w: u32, out_h: u32) -> Resampler {
+    if out_w > crop_w || out_h > crop_h {
+        Resampler {
+            filter: zenresize::Filter::Ginseng,
+            sharpen_percent: Some(ENLARGE_SHARPEN_PERCENT),
+        }
+    } else {
+        Resampler {
+            filter: zenresize::Filter::Robidoux,
+            sharpen_percent: None,
+        }
+    }
+}
+
+/// Source-pixel rectangle `(x, y, width, height)`.
+pub(crate) type CropRect = (u32, u32, u32, u32);
+
+/// Crop `rect` out of `img` and resample it to `out_w`x`out_h` in linear
+/// light, in one zenresize pass (source-region crop + resize).
+///
+/// sRGB bytes are linearized, filtered in f32 and re-encoded, so a
+/// high-contrast edge averages to the correct brightness instead of the dark
+/// fringe gamma-space filtering produces. Straight alpha is premultiplied
+/// for the filter and restored afterwards.
+pub(crate) fn resample(
+    img: &DynamicImage,
+    rect: CropRect,
+    out_w: u32,
+    out_h: u32,
+) -> anyhow::Result<DynamicImage> {
+    use zenresize::{PixelDescriptor, ResizeConfig, Resizer};
+    let alpha = img.color().has_alpha();
+    let converted;
+    let pixels: &[u8] = match img {
+        DynamicImage::ImageRgb8(buffer) => buffer.as_raw(),
+        DynamicImage::ImageRgba8(buffer) => buffer.as_raw(),
+        other if alpha => {
+            converted = other.to_rgba8().into_raw();
+            &converted
+        }
+        other => {
+            converted = other.to_rgb8().into_raw();
+            &converted
+        }
+    };
+    let descriptor = if alpha {
+        PixelDescriptor::RGBA8_SRGB
+    } else {
+        PixelDescriptor::RGB8_SRGB
+    };
+    let (x, y, crop_w, crop_h) = rect;
+    let resampler = resampler_for(crop_w, crop_h, out_w, out_h);
+    let mut builder = ResizeConfig::builder(img.width(), img.height(), out_w, out_h)
+        .filter(resampler.filter)
+        .format(descriptor)
+        .linear()
+        .crop(x, y, crop_w, crop_h);
+    if let Some(percent) = resampler.sharpen_percent {
+        builder = builder.resize_sharpen(percent);
+    }
+    let config = builder.build();
+    config.validate().map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        pixels.len() == config.input_row_len() * img.height() as usize,
+        "artwork pixel buffer does not match its dimensions"
+    );
+    let output = Resizer::new(&config).resize(pixels);
+    let resized = if alpha {
+        RgbaImage::from_raw(out_w, out_h, output).map(DynamicImage::ImageRgba8)
+    } else {
+        image::RgbImage::from_raw(out_w, out_h, output).map(DynamicImage::ImageRgb8)
+    };
+    resized.ok_or_else(|| anyhow::anyhow!("resampler returned a short buffer"))
+}
+
+/// [`resample`] for the infallible composition paths. Every input reaching
+/// here has already passed the dimension checks, so the bilinear arm exists
+/// only so a resampler fault degrades quality instead of failing the request.
+fn resample_or_bilinear(
+    img: &DynamicImage,
+    rect: CropRect,
+    out_w: u32,
+    out_h: u32,
+) -> DynamicImage {
+    resample(img, rect, out_w, out_h).unwrap_or_else(|error| {
+        tracing::warn!("Linear-light artwork resampling failed; using bilinear: {error}");
+        let (x, y, width, height) = rect;
+        img.crop_imm(x, y, width, height)
+            .resize_exact(out_w, out_h, FilterType::Triangle)
+    })
+}
+
+/// Largest centered rectangle of the target aspect inside the source. Cropping
+/// before resizing means a very wide source and a tall viewport cannot
+/// allocate an enormous full-size intermediate.
+fn centered_cover_rect(source_w: u32, source_h: u32, width: u32, height: u32) -> CropRect {
+    let (crop_w, crop_h) =
+        if u64::from(source_w) * u64::from(height) > u64::from(source_h) * u64::from(width) {
+            (
+                ((u64::from(source_h) * u64::from(width) / u64::from(height)) as u32).max(1),
+                source_h,
+            )
+        } else {
+            (
+                source_w,
+                ((u64::from(source_w) * u64::from(height) / u64::from(width)) as u32).max(1),
+            )
+        };
+    (
+        (source_w - crop_w) / 2,
+        (source_h - crop_h) / 2,
+        crop_w,
+        crop_h,
+    )
+}
+
+/// Whether a composition enlarged, reduced or kept its source's resolution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtworkScale {
+    Up,
+    Down,
+    None,
+}
+
+impl ArtworkScale {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Scale implied by `policy`'s geometry for a `source` composed to `target`,
+/// using the same "either axis" enlargement rule as [`resampler_for`]. Cover
+/// policies crop to the target aspect (a subject-aware crop has the same size
+/// as the centered one); Fit compares the fitted art, not the mat.
+pub fn artwork_scale(
+    source: (u32, u32),
+    target: (u32, u32),
+    policy: Rgb565ResizePolicy,
+) -> ArtworkScale {
+    let (source_w, source_h) = source;
+    let (target_w, target_h) = target;
+    if source_w == 0 || source_h == 0 || target_w == 0 || target_h == 0 {
+        return ArtworkScale::None;
+    }
+    if source == target {
+        return ArtworkScale::None;
+    }
+    let fit = || {
+        let (w, h) = zenresize::fit_dims(
+            source_w,
+            source_h,
+            target_w,
+            target_h,
+            zenresize::FitMode::Fit,
+        );
+        ((source_w, source_h), (w, h))
+    };
+    let cover = || {
+        let (_, _, w, h) = centered_cover_rect(source_w, source_h, target_w, target_h);
+        ((w, h), target)
+    };
+    let ((crop_w, crop_h), (out_w, out_h)) = match policy {
+        Rgb565ResizePolicy::AttentionCover => cover(),
+        Rgb565ResizePolicy::Exact => (source, target),
+        Rgb565ResizePolicy::Fit => fit(),
+        Rgb565ResizePolicy::SmartCover { max_crop_percent }
+            if cover_crop_percent(source_w, source_h, target_w, target_h)
+                <= f64::from(max_crop_percent) =>
+        {
+            cover()
+        }
+        Rgb565ResizePolicy::SmartCover { .. } => fit(),
+    };
+    if out_w > crop_w || out_h > crop_h {
+        ArtworkScale::Up
+    } else if (out_w, out_h) == (crop_w, crop_h) {
+        ArtworkScale::None
+    } else {
+        ArtworkScale::Down
+    }
+}
+
+/// Decoded dimensions of artwork bytes, after EXIF orientation, from the
+/// headers alone (no pixel decode). `None` for SVG and undecodable bytes.
+pub fn probe_artwork_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    use image::{metadata::Orientation, ImageDecoder};
+    let mut decoder = image::ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .ok()?
+        .into_decoder()
+        .ok()?;
+    let (width, height) = decoder.dimensions();
+    let swapped = matches!(
+        decoder.orientation().unwrap_or(Orientation::NoTransforms),
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    );
+    (width > 0 && height > 0).then_some(if swapped {
+        (height, width)
+    } else {
+        (width, height)
+    })
+}
+
 fn resize_with_policy(
     img: &DynamicImage,
     target_w: u32,
@@ -327,13 +574,15 @@ fn resize_with_policy(
                 attention_cover(img, target_w, target_h)
             }),
         ),
-        Rgb565ResizePolicy::Exact => img.resize_exact(target_w, target_h, FilterType::Triangle),
+        Rgb565ResizePolicy::Exact => {
+            resample_or_bilinear(img, (0, 0, img.width(), img.height()), target_w, target_h)
+        }
         Rgb565ResizePolicy::Fit => fit_on_gallery_mat(img, target_w, target_h),
         Rgb565ResizePolicy::SmartCover { max_crop_percent }
             if cover_crop_percent(img.width(), img.height(), target_w, target_h)
                 <= f64::from(max_crop_percent) =>
         {
-            img.resize_to_fill(target_w, target_h, FilterType::Triangle)
+            centered_cover(img, target_w, target_h)
         }
         Rgb565ResizePolicy::SmartCover { .. } => fit_on_gallery_mat(img, target_w, target_h),
     }
@@ -354,30 +603,10 @@ fn attention_or_center(
     }
 }
 
-/// Crop the source before resizing so a very wide source and tall viewport
-/// cannot allocate an enormous full-size intermediate in the fallback.
+/// Centered fill: the last fallback, and SmartCover within its crop budget.
 fn centered_cover(img: &DynamicImage, width: u32, height: u32) -> DynamicImage {
-    let source_w = img.width();
-    let source_h = img.height();
-    let (crop_w, crop_h) =
-        if u64::from(source_w) * u64::from(height) > u64::from(source_h) * u64::from(width) {
-            (
-                ((u64::from(source_h) * u64::from(width) / u64::from(height)) as u32).max(1),
-                source_h,
-            )
-        } else {
-            (
-                source_w,
-                ((u64::from(source_w) * u64::from(height) / u64::from(width)) as u32).max(1),
-            )
-        };
-    img.crop_imm(
-        (source_w - crop_w) / 2,
-        (source_h - crop_h) / 2,
-        crop_w,
-        crop_h,
-    )
-    .resize_exact(width, height, FilterType::Triangle)
+    let rect = centered_cover_rect(img.width(), img.height(), width, height);
+    resample_or_bilinear(img, rect, width, height)
 }
 
 pub fn image_to_eink_acep6_with_policy(
@@ -529,7 +758,12 @@ pub fn image_to_rgb565(img: &DynamicImage, target_width: u32, target_height: u32
     // Avoid clone when dimensions already match
     let resized;
     let img_ref = if img.width() != target_width || img.height() != target_height {
-        resized = img.resize_exact(target_width, target_height, FilterType::Triangle);
+        resized = resample_or_bilinear(
+            img,
+            (0, 0, img.width(), img.height()),
+            target_width,
+            target_height,
+        );
         &resized
     } else {
         img
@@ -577,7 +811,12 @@ pub fn resize_jpeg(
     let img = image::load_from_memory_with_format(jpeg_data, ImageFormat::Jpeg)?;
 
     let resized = if img.width() != target_width || img.height() != target_height {
-        img.resize_exact(target_width, target_height, FilterType::Triangle)
+        resample_or_bilinear(
+            &img,
+            (0, 0, img.width(), img.height()),
+            target_width,
+            target_height,
+        )
     } else {
         img
     };
@@ -609,15 +848,81 @@ mod tests {
     use super::*;
     use image::ImageEncoder;
 
+    /// 2x2 black/white checkerboard. Its true average is 50% *linear* light,
+    /// which is sRGB ~188; averaging the gamma-encoded bytes gives ~128.
+    fn checkerboard() -> DynamicImage {
+        DynamicImage::ImageRgb8(image::RgbImage::from_fn(2, 2, |x, y| {
+            if (x + y) % 2 == 0 {
+                image::Rgb([0, 0, 0])
+            } else {
+                image::Rgb([255, 255, 255])
+            }
+        }))
+    }
+
+    #[test]
+    fn resampling_happens_in_linear_light() {
+        let source = checkerboard();
+        for (label, out) in [
+            (
+                "exact",
+                resize_with_policy(&source, 1, 1, Rgb565ResizePolicy::Exact),
+            ),
+            ("centered cover", centered_cover(&source, 1, 1)),
+        ] {
+            let pixel = out.to_rgb8().get_pixel(0, 0).0;
+            for channel in pixel {
+                assert!(
+                    channel.abs_diff(188) <= 2,
+                    "{label}: 50% linear light must encode as sRGB ~188, got {pixel:?} \
+                     (128 means the resize averaged gamma-encoded bytes)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resampler_uses_ginseng_to_enlarge_and_robidoux_to_reduce() {
+        use zenresize::Filter;
+        let enlarge = Resampler {
+            filter: Filter::Ginseng,
+            sharpen_percent: Some(ENLARGE_SHARPEN_PERCENT),
+        };
+        let reduce = Resampler {
+            filter: Filter::Robidoux,
+            sharpen_percent: None,
+        };
+        // 1400 px cover onto a 4K frame: enlargement on both axes.
+        assert_eq!(resampler_for(1400, 788, 3840, 2160), enlarge);
+        // Enlargement on either axis counts (a crop taller than it is wide).
+        assert_eq!(resampler_for(600, 200, 300, 400), enlarge);
+        assert_eq!(resampler_for(200, 600, 400, 300), enlarge);
+        // Knob-sized output from a larger cover: reduction.
+        assert_eq!(resampler_for(1400, 1400, 360, 360), reduce);
+        assert_eq!(
+            resampler_for(640, 360, 640, 360),
+            reduce,
+            "1:1 is not enlargement"
+        );
+        assert_eq!(resampler_for(240, 135, 240, 100), reduce);
+        // The sharpen goal must actually exceed Ginseng's natural negative-lobe
+        // ratio, or `resize_sharpen` is a silent no-op.
+        let natural = zenresize::filter::InterpolationDetails::create(Filter::Ginseng)
+            .calculate_percent_negative_weight()
+            * 100.0;
+        assert!(
+            f64::from(ENLARGE_SHARPEN_PERCENT) > natural,
+            "sharpen {ENLARGE_SHARPEN_PERCENT}% must exceed Ginseng natural {natural:.1}%"
+        );
+    }
+
     #[test]
     fn default_landscape_crop_preserves_upper_face() {
         let source =
             image::load_from_memory(include_bytes!("../../tests/fixtures/artwork/crown.png"))
                 .unwrap();
         let actual = resize_with_policy(&source, 800, 450, Rgb565ResizePolicy::default());
-        let expected = source
-            .crop_imm(0, 0, 240, 135)
-            .resize_exact(800, 450, FilterType::Triangle);
+        let expected = resample(&source, (0, 0, 240, 135), 800, 450).unwrap();
         assert!(
             actual.to_rgb8() == expected.to_rgb8(),
             "landscape cover must retain the face at the top of this artwork"
@@ -653,6 +958,201 @@ mod tests {
             frame.data == expected_frame.data,
             "Frame eInk palette packing must use the face-preserving crop"
         );
+    }
+
+    #[test]
+    fn scale_header_geometry_matches_the_resampler_rule() {
+        use ArtworkScale::{Down, None, Up};
+        let cover = Rgb565ResizePolicy::default();
+        assert_eq!(artwork_scale((1400, 1400), (360, 360), cover), Down);
+        assert_eq!(artwork_scale((1400, 1400), (3840, 2160), cover), Up);
+        // 1400 wide crop of 788 rows -> 1400x788 is 1:1, not an upscale.
+        assert_eq!(artwork_scale((1400, 1400), (1400, 788), cover), None);
+        assert_eq!(artwork_scale((100, 100), (100, 100), cover), None);
+        // Fit compares the fitted art: 1000x1000 into 1920x1080 -> 1080x1080.
+        assert_eq!(
+            artwork_scale((1000, 1000), (1920, 1080), Rgb565ResizePolicy::Fit),
+            Up
+        );
+        assert_eq!(
+            artwork_scale((1200, 1200), (1920, 1080), Rgb565ResizePolicy::Fit),
+            Down
+        );
+        assert_eq!(
+            artwork_scale((600, 600), (300, 900), Rgb565ResizePolicy::Exact),
+            Up
+        );
+    }
+
+    #[test]
+    fn probe_reports_oriented_source_dimensions_without_decoding() {
+        let png = encode_solid_png(30, 20, Rgba([1, 2, 3, 255]));
+        assert_eq!(probe_artwork_dimensions(&png), Some((30, 20)));
+        assert_eq!(probe_artwork_dimensions(b"<svg/>"), Option::None);
+        let mut jpeg = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image::RgbImage::from_pixel(40, 20, image::Rgb([255, 0, 0])))
+            .write_with_encoder(JpegEncoder::new_with_quality(&mut jpeg, 90))
+            .unwrap();
+        let jpeg = jpeg.into_inner();
+        let exif = b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0";
+        let mut oriented = vec![0xff, 0xd8, 0xff, 0xe1];
+        oriented.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+        oriented.extend_from_slice(exif);
+        oriented.extend_from_slice(&jpeg[2..]);
+        assert_eq!(probe_artwork_dimensions(&oriented), Some((20, 40)));
+    }
+
+    #[test]
+    fn transparent_art_keeps_alpha_and_has_no_dark_premultiply_fringe() {
+        // Opaque white beside fully transparent black: a straight-alpha
+        // filter that skips premultiplication bleeds the black into the edge.
+        let source = DynamicImage::ImageRgba8(RgbaImage::from_fn(8, 8, |x, _| {
+            if x < 4 {
+                Rgba([255, 255, 255, 255])
+            } else {
+                Rgba([0, 0, 0, 0])
+            }
+        }));
+        let out = resample(&source, (0, 0, 8, 8), 32, 32).unwrap().to_rgba8();
+        for pixel in out.pixels().filter(|p| p[3] > 16) {
+            assert!(pixel[0] > 240, "visible edge pixels stay white: {pixel:?}");
+        }
+        assert_eq!(out.get_pixel(31, 16)[3], 0, "transparency is preserved");
+    }
+
+    /// Where the large-render review images go: under the cargo target
+    /// directory, never in the repository.
+    fn review_dir() -> std::path::PathBuf {
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target"));
+        let dir = target.join("artwork-802");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Lossless but barely compressed, so 4K review renders do not dominate
+    /// the debug-build test time.
+    fn save_fast_png(image: &DynamicImage, path: &std::path::Path) {
+        use image::codecs::png::{CompressionType, FilterType as PngFilter, PngEncoder};
+        let rgb = image.to_rgb8();
+        let file = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        PngEncoder::new_with_quality(file, CompressionType::Fast, PngFilter::NoFilter)
+            .write_image(
+                &rgb,
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+    }
+
+    /// Deterministic stand-in for a photographic 1400 px cover: smooth
+    /// gradients, fine noise and a block of hard black/white "type".
+    fn photographic_1400() -> DynamicImage {
+        DynamicImage::ImageRgb8(image::RgbImage::from_fn(1400, 1400, |x, y| {
+            let noise = ((x.wrapping_mul(73_856_093) ^ y.wrapping_mul(19_349_663)) % 23) as f32;
+            if (500..900).contains(&x) && (620..780).contains(&y) {
+                let stroke = (x / 9 + y / 13) % 3 == 0;
+                return if stroke {
+                    image::Rgb([250, 250, 250])
+                } else {
+                    image::Rgb([8, 8, 8])
+                };
+            }
+            let fx = x as f32 / 1400.0;
+            let fy = y as f32 / 1400.0;
+            image::Rgb([
+                (40.0 + 180.0 * fx + noise) as u8,
+                (60.0 + 120.0 * (fx * 9.0).sin().abs() * fy + noise) as u8,
+                (200.0 - 150.0 * fy + noise) as u8,
+            ])
+        }))
+    }
+
+    /// Compose `source` at `width`x`height`, assert the geometry, and save
+    /// the compose plus a same-crop zenresize/bilinear pair for side-by-side
+    /// review of softness and edge halos. The linear-light property itself
+    /// is pinned by `resampling_happens_in_linear_light`.
+    fn render_for_review(name: &str, source: &DynamicImage, width: u32, height: u32) {
+        let dir = review_dir();
+        let start = Instant::now();
+        let new = resize_with_policy(source, width, height, Rgb565ResizePolicy::default());
+        let elapsed = start.elapsed();
+        assert_eq!((new.width(), new.height()), (width, height));
+        let rect = centered_cover_rect(source.width(), source.height(), width, height);
+        let centered_new = resample(source, rect, width, height).unwrap();
+        let centered_old = source
+            .crop_imm(rect.0, rect.1, rect.2, rect.3)
+            .resize_exact(width, height, FilterType::Triangle);
+        let new_path = dir.join(format!("{name}_{width}x{height}_compose.png"));
+        save_fast_png(&new, &new_path);
+        save_fast_png(
+            &centered_new,
+            &dir.join(format!("{name}_{width}x{height}_centered_zenresize.png")),
+        );
+        save_fast_png(
+            &centered_old,
+            &dir.join(format!("{name}_{width}x{height}_centered_bilinear.png")),
+        );
+        println!(
+            "#802 render {name} -> {width}x{height}: compose {elapsed:?} -> {}",
+            new_path.display()
+        );
+    }
+
+    /// #802 acceptance renders: no panic, exact dimensions, saved for review.
+    #[test]
+    fn large_display_renders_have_exact_dimensions_and_are_saved_for_review() {
+        let crown =
+            image::load_from_memory(include_bytes!("../../tests/fixtures/artwork/crown.png"))
+                .unwrap();
+        render_for_review("crown", &crown, 1600, 900);
+        render_for_review("crown", &crown, 3840, 2160);
+        render_for_review("photographic1400", &photographic_1400(), 1600, 900);
+    }
+
+    /// The 1400 px -> 4K acceptance render. Ignored by default only because
+    /// four 8-megapixel images take ~10 s in a debug build; run with
+    /// `cargo test --lib knobs::image::tests::photographic_4k -- --ignored`.
+    #[test]
+    #[ignore = "slow in debug builds; run explicitly for #802 review renders"]
+    fn photographic_4k_render_for_review() {
+        render_for_review("photographic1400", &photographic_1400(), 3840, 2160);
+    }
+
+    /// #802 timing: new resampler vs the old bilinear path at knob and 1080p
+    /// sizes. Printed, not asserted: debug-build numbers are only a relative
+    /// signal, and the hardware budget is the 3 s libvips deadline on a Pi.
+    #[test]
+    fn resampler_timing_at_knob_and_1080p_sizes() {
+        let photo = photographic_1400();
+        for (width, height) in [(360, 360), (1920, 1080)] {
+            let rect = centered_cover_rect(photo.width(), photo.height(), width, height);
+            let runs = 3;
+            let start = Instant::now();
+            for _ in 0..runs {
+                resample(&photo, rect, width, height).unwrap();
+            }
+            let new = start.elapsed() / runs;
+            let start = Instant::now();
+            for _ in 0..runs {
+                let _ = photo.crop_imm(rect.0, rect.1, rect.2, rect.3).resize_exact(
+                    width,
+                    height,
+                    FilterType::Triangle,
+                );
+            }
+            let old = start.elapsed() / runs;
+            let start = Instant::now();
+            let composed = resize_with_policy(&photo, width, height, Rgb565ResizePolicy::default());
+            let compose = start.elapsed();
+            assert_eq!((composed.width(), composed.height()), (width, height));
+            println!(
+                "#802 timing 1400x1400 -> {width}x{height}: zenresize {new:?}, \
+                 old bilinear {old:?}, full compose (first analysis) {compose:?}"
+            );
+        }
     }
 
     fn encode_solid_png(width: u32, height: u32, color: image::Rgba<u8>) -> Vec<u8> {
@@ -786,9 +1286,10 @@ mod tests {
         assert_eq!((fallback.width(), fallback.height()), (100, 100));
         assert_eq!(
             fallback.to_rgba8(),
-            source
-                .resize_to_fill(100, 100, FilterType::Triangle)
-                .to_rgba8()
+            resample(&source, (100, 0, 200, 200), 100, 100)
+                .unwrap()
+                .to_rgba8(),
+            "centered 200x200 crop of the 400x200 source"
         );
     }
 

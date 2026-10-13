@@ -597,10 +597,13 @@ pub async fn knob_image_handler(
         )
         .await
     {
-        Ok(crate::api::ArtworkResponse {
-            image: image_data,
-            etag,
-        }) => {
+        Ok(artwork) => {
+            let source_headers = artwork.artwork_headers();
+            let crate::api::ArtworkResponse {
+                image: image_data,
+                etag,
+                ..
+            } = artwork;
             // If RGB565 was requested but conversion failed (content_type != octet-stream),
             // return the placeholder instead of misleading headers
             if (rgb565_requested || eink_requested)
@@ -624,6 +627,7 @@ pub async fn knob_image_handler(
                 extra.push(("X-Image-Width", target_width.to_string()));
                 extra.push(("X-Image-Height", target_height.to_string()));
             }
+            extra.extend(source_headers);
 
             match etag {
                 Some(etag) => crate::api::artwork_http_response(

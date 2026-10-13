@@ -545,8 +545,8 @@ impl AppState {
             OutputCacheKey, EINK_CONVERTER_VERSION, RASTER_CONVERTER_VERSION,
         };
         use crate::knobs::image::{
-            image_to_display_with_policy, image_to_eink_acep6_with_policy,
-            jpeg_to_rgb565_with_policy, Rgb565ResizePolicy,
+            artwork_scale, image_to_display_with_policy, image_to_eink_acep6_with_policy,
+            jpeg_to_rgb565_with_policy, ArtworkScale, Rgb565ResizePolicy,
         };
 
         let dimensions = match (width, height) {
@@ -617,6 +617,10 @@ impl AppState {
                 RASTER_CONVERTER_VERSION
             },
         };
+        let source_dimensions = source.dimensions;
+        let scale = source_dimensions.map_or(ArtworkScale::None, |source| {
+            artwork_scale(source, dimensions, resize_policy)
+        });
         if let Some(hit) = self.artwork_output_cache.get(&cache_key) {
             return Ok(ArtworkResponse {
                 etag: Some(cache_key.etag()),
@@ -624,6 +628,8 @@ impl AppState {
                     content_type: hit.content_type.clone(),
                     data: hit.data.clone(),
                 },
+                source_dimensions,
+                scale,
             });
         }
         static WORKERS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
@@ -693,11 +699,16 @@ impl AppState {
                             content_type: stored.content_type.clone(),
                             data: stored.data.clone(),
                         },
+                        source_dimensions,
+                        scale,
                     }
                 }
+                // The fallback is the unmodified source.
                 None => ArtworkResponse {
                     etag: None,
                     image: fallback(),
+                    source_dimensions,
+                    scale: ArtworkScale::None,
                 },
             })
         })
@@ -822,6 +833,25 @@ pub struct ArtworkResponse {
     /// Quoted ETag, or `None` when the bytes must not be revalidated (a
     /// conversion-failure fallback).
     pub etag: Option<String>,
+    /// Decoded source size before any crop (#802); `None` when unknown (SVG).
+    pub source_dimensions: Option<(u32, u32)>,
+    /// Whether the served bytes enlarged, reduced or kept the source.
+    pub scale: crate::knobs::image::ArtworkScale,
+}
+
+impl ArtworkResponse {
+    /// `X-Artwork-Source: <w>x<h>` and `X-Artwork-Scale: up|down|none`, so a
+    /// client can tell a genuine 4K render from an upscale (#802). Sent on
+    /// 200 only; a 304 carries just the validator.
+    pub fn artwork_headers(&self) -> Vec<(&'static str, String)> {
+        match self.source_dimensions {
+            Some((width, height)) => vec![
+                ("X-Artwork-Source", format!("{width}x{height}")),
+                ("X-Artwork-Scale", self.scale.as_str().to_string()),
+            ],
+            None => Vec::new(),
+        }
+    }
 }
 
 /// The cache namespace image keys live in. Zones of one provider share an
@@ -860,6 +890,8 @@ fn source_response(
             content_type: source.content_type.clone(),
             data: source.data.clone(),
         },
+        source_dimensions: source.dimensions,
+        scale: crate::knobs::image::ArtworkScale::None,
     }
 }
 
@@ -884,6 +916,15 @@ pub fn if_none_match_matches(headers: &axum::http::HeaderMap, etag: &str) -> boo
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(','))
         .any(|candidate| candidate.trim() == "*" || strip(candidate) == ours)
+}
+
+/// Add `(name, value)` pairs to a built response, skipping invalid values.
+fn append_headers(response: &mut axum::response::Response, extra: &[(&'static str, String)]) {
+    for (name, value) in extra {
+        if let Ok(value) = axum::http::HeaderValue::from_str(value) {
+            response.headers_mut().insert(*name, value);
+        }
+    }
 }
 
 /// 200 (or body-less 304 when the client already holds `etag`) for artwork
@@ -1447,22 +1488,28 @@ pub async fn roon_image_handler(
         .get_roon_image_tagged(&params.image_key, params.width, params.height)
         .await
     {
-        Ok(ArtworkResponse {
-            image,
-            etag: Some(etag),
-        }) => artwork_http_response(
-            &request_headers,
-            image,
-            &etag,
-            ARTWORK_CACHE_CONTROL_IMMUTABLE,
-            &[],
-        ),
-        Ok(ArtworkResponse { image, etag: None }) => (
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, image.content_type)],
-            image.data,
-        )
-            .into_response(),
+        Ok(artwork) => {
+            let extra = artwork.artwork_headers();
+            match artwork.etag {
+                Some(etag) => artwork_http_response(
+                    &request_headers,
+                    artwork.image,
+                    &etag,
+                    ARTWORK_CACHE_CONTROL_IMMUTABLE,
+                    &extra,
+                ),
+                None => {
+                    let mut response = (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, artwork.image.content_type)],
+                        artwork.image.data,
+                    )
+                        .into_response();
+                    append_headers(&mut response, &extra);
+                    response
+                }
+            }
+        }
         Err(e) => {
             tracing::warn!("Image fetch failed: {}", e);
             (
@@ -1526,22 +1573,28 @@ pub async fn collections_image_handler(
         )
         .await
     {
-        Ok(ArtworkResponse {
-            image,
-            etag: Some(etag),
-        }) => artwork_http_response(
-            &request_headers,
-            image,
-            &etag,
-            ARTWORK_CACHE_CONTROL_IMMUTABLE,
-            &[],
-        ),
-        Ok(ArtworkResponse { image, etag: None }) => (
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, image.content_type)],
-            image.data,
-        )
-            .into_response(),
+        Ok(artwork) => {
+            let extra = artwork.artwork_headers();
+            match artwork.etag {
+                Some(etag) => artwork_http_response(
+                    &request_headers,
+                    artwork.image,
+                    &etag,
+                    ARTWORK_CACHE_CONTROL_IMMUTABLE,
+                    &extra,
+                ),
+                None => {
+                    let mut response = (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, artwork.image.content_type)],
+                        artwork.image.data,
+                    )
+                        .into_response();
+                    append_headers(&mut response, &extra);
+                    response
+                }
+            }
+        }
         Err(e) => {
             tracing::warn!("Collection image fetch failed: {}", e);
             (

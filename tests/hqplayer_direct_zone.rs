@@ -107,7 +107,8 @@ fn fast_recovery() -> HqpRecoveryConfig {
 /// The two client-facing routes under test, wired exactly as `main.rs` wires them.
 ///
 /// `/control`, `/knob/now_playing`, and `/now_playing/image` are the knob's media surface;
-/// `/zones` is what both clients read to populate their picker. Nothing else is mounted, so a test
+/// `/zones` is what both clients read to populate their picker; `/api/collections/image` is the
+/// web UI's artwork proxy over the same per-provider dispatch. Nothing else is mounted, so a test
 /// cannot accidentally pass through a route the client does not use.
 fn client_router(state: AppState) -> Router {
     Router::new()
@@ -117,6 +118,10 @@ fn client_router(state: AppState) -> Router {
         .route("/knob/now_playing", get(knobs::knob_now_playing_handler))
         .route("/now_playing/image", get(knobs::knob_image_handler))
         .route("/zones", get(knobs::knob_zones_handler))
+        .route(
+            "/api/collections/image",
+            get(api::collections_image_handler),
+        )
         .with_state(state)
 }
 
@@ -2501,6 +2506,98 @@ async fn artwork_route_supports_etag_revalidation_and_placeholder_is_uncacheable
     )
     .await;
     assert_eq!(status, StatusCode::OK, "placeholder never answers 304");
+    rig.shutdown().await;
+    server.abort();
+}
+
+/// #802: artwork responses report the decoded source size and whether the
+/// output enlarged it, so a client can tell a genuine 4K render from an
+/// upscale. Response headers only; the 304 path and the ETag are unchanged.
+#[tokio::test]
+async fn artwork_route_reports_source_size_and_scale_on_200_only() {
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let (rig, server) = artwork_rig_counted(Arc::clone(&fetches)).await;
+    let header = |headers: &axum::http::HeaderMap, name: &str| {
+        headers
+            .get(name)
+            .map(|value| value.to_str().unwrap().to_string())
+    };
+
+    let small = "/now_playing/image?zone_id=hqplayer:art&width=64&height=64";
+    let (status, headers, _) = image_request(&rig, small, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        header(&headers, "x-artwork-source").as_deref(),
+        Some("100x100")
+    );
+    assert_eq!(header(&headers, "x-artwork-scale").as_deref(), Some("down"));
+    let etag = header(&headers, "etag").expect("etag");
+
+    let (status, cached, _) = image_request(&rig, small, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        header(&cached, "x-artwork-source").as_deref(),
+        Some("100x100"),
+        "an output-cache hit still reports the source"
+    );
+    assert_eq!(header(&cached, "etag").as_deref(), Some(etag.as_str()));
+
+    let (status, not_modified, body) = image_request(&rig, small, Some(&etag)).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert!(body.is_empty());
+    assert_eq!(
+        header(&not_modified, "etag").as_deref(),
+        Some(etag.as_str())
+    );
+
+    let large = "/now_playing/image?zone_id=hqplayer:art&width=320&height=180";
+    let (status, headers, _) = image_request(&rig, large, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        header(&headers, "x-artwork-source").as_deref(),
+        Some("100x100")
+    );
+    assert_eq!(header(&headers, "x-artwork-scale").as_deref(), Some("up"));
+
+    let packed = "/now_playing/image?zone_id=hqplayer:art&width=100&height=100&format=rgb565";
+    let (status, headers, _) = image_request(&rig, packed, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        header(&headers, "x-artwork-source").as_deref(),
+        Some("100x100")
+    );
+    assert_eq!(header(&headers, "x-artwork-scale").as_deref(), Some("none"));
+
+    // The collections proxy reports the same, for composed and source bytes.
+    let token = rig
+        .state
+        .image_refs
+        .mint(unified_hifi_control::mcp::refs::ImageRef {
+            zone_id: "hqplayer:art".into(),
+            image_key: "artwork-default".into(),
+        })
+        .await;
+    let composed = format!("/api/collections/image?ref={token}&width=400&height=400");
+    let (status, headers, _) = image_request(&rig, &composed, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        header(&headers, "x-artwork-source").as_deref(),
+        Some("100x100")
+    );
+    assert_eq!(header(&headers, "x-artwork-scale").as_deref(), Some("up"));
+    let etag = header(&headers, "etag").expect("etag");
+    let (status, _, body) = image_request(&rig, &composed, Some(&etag)).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert!(body.is_empty());
+    let (status, headers, _) =
+        image_request(&rig, &format!("/api/collections/image?ref={token}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        header(&headers, "x-artwork-source").as_deref(),
+        Some("100x100")
+    );
+    assert_eq!(header(&headers, "x-artwork-scale").as_deref(), Some("none"));
+
     rig.shutdown().await;
     server.abort();
 }

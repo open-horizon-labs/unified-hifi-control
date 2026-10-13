@@ -1,7 +1,7 @@
 //! Process-local analysis cache shared by every display size and zone.
 //! Models load lazily once. A single lock serializes inference and coalesces
 //! concurrent misses, bounding model working memory on small servers.
-use image::{imageops::FilterType, DynamicImage};
+use image::DynamicImage;
 use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
@@ -126,9 +126,12 @@ fn compose_analyzed(
                 .is_some_and(|bottom| bottom <= source.height()),
         "invalid artwork crop bounds"
     );
-    Ok(source
-        .crop_imm(rect.x, rect.y, rect.width, rect.height)
-        .resize_exact(width, height, FilterType::Triangle))
+    super::image::resample(
+        source,
+        (rect.x, rect.y, rect.width, rect.height),
+        width,
+        height,
+    )
 }
 
 #[cfg(test)]
