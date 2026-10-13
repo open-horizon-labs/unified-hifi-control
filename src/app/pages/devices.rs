@@ -711,7 +711,7 @@ fn ZoneLinks(
 
     rsx! {
         div { class: "mt-4 pt-3 border-t border-default",
-            h4 { class: "font-medium mb-2", "Feeds these zones" }
+            h4 { class: "font-medium mb-2", "Zones playing through this device" }
             if !links.is_empty() {
                 ul { class: "mb-2 space-y-1",
                     for link in links.iter() {
