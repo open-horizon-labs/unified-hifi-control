@@ -1468,7 +1468,8 @@ jobs:
       always() &&
       needs.plan.outputs.build_lms == 'true' &&
       needs.build-linux-x64.result == 'success'
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
+    # Packaging only (prebuilt artifacts); needs zip / a docker daemon, which the self-hosted fleet image lacks — same reason build-qnap is pinned.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
@@ -1755,7 +1756,8 @@ jobs:
       always() &&
       needs.plan.outputs.build_qnap_arm == 'true' &&
       needs.build-linux-arm.result == 'success'
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
+    # Packaging only (prebuilt artifacts); needs zip / a docker daemon, which the self-hosted fleet image lacks — same reason build-qnap is pinned.
+    runs-on: ubuntu-latest
     # `secrets` isn't allowed directly in step `if:` conditions, so surface
     # the presence check as a job-level env var instead.
     env:
