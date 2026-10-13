@@ -160,7 +160,7 @@ resvg = { version = "0.47.0", features = ["default"], optional = true }
 rust-mcp-sdk = { version = "0.8", default-features = false, features = ["server", "macros", "hyper-server", "sse"], optional = true }
 
 # MQTT publisher for Home Assistant discovery (server only, issue #508)
-rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"], optional = true }
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls"], optional = true }
 
 # Public-key-only verification and locally held installation identity for the
 # optional outbound HiPhi Cloud connector. The cloud signing key never enters UHC.
