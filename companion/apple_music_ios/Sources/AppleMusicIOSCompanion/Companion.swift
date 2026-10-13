@@ -767,7 +767,7 @@ public actor SystemMusicPlayerCompanion {
                 title: song.title,
                 artist: song.artistName,
                 album: song.albumTitle ?? "",
-                artworkURL: song.artwork?.url(width: 512, height: 512)?.absoluteString,
+                artworkURL: song.artwork?.url(width: 2048, height: 2048)?.absoluteString,
                 positionSeconds: finite(player.playbackTime),
                 durationSeconds: song.duration
             )
@@ -1272,7 +1272,7 @@ public struct AppleMusicSearchItem: Sendable, Equatable {
         title = song.title
         artist = song.artistName
         album = song.albumTitle ?? ""
-        artworkURL = song.artwork?.url(width: 512, height: 512)
+        artworkURL = song.artwork?.url(width: 2048, height: 2048)
     }
 }
 
@@ -1303,7 +1303,7 @@ public struct AppleMusicPlaylistEntrySummary: Sendable, Equatable {
         title = entry.title
         artist = entry.artistName
         album = entry.albumTitle ?? ""
-        artworkURL = entry.artwork?.url(width: 512, height: 512)
+        artworkURL = entry.artwork?.url(width: 2048, height: 2048)
         isPlayable = entry.item != nil
     }
 }

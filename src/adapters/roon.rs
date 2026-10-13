@@ -1935,13 +1935,7 @@ impl RoonAdapter {
                 .ok_or_else(|| anyhow::anyhow!("Image service not available"))?
         };
 
-        // Build scaling args
-        let scaling = match (width, height) {
-            (Some(w), Some(h)) => Some(Scaling::new(Scale::Fit, w, h)),
-            (Some(w), None) => Some(Scaling::new(Scale::Fit, w, w)),
-            (None, Some(h)) => Some(Scaling::new(Scale::Fit, h, h)),
-            (None, None) => Some(Scaling::new(Scale::Fit, 300, 300)),
-        };
+        let scaling = Some(image_scaling(width, height));
 
         // Request the image (lock not held)
         let args = ImageArgs::new(scaling, Some(ImageFormat::Jpeg));
@@ -5139,8 +5133,38 @@ mod defect_573_row_classification {
     }
 }
 
+/// Source-art bound used when the caller names no size (the composed artwork
+/// path drops client dimensions so smart-crop sees the true aspect; `/roon/image`
+/// without params). `Scale::Fit` preserves aspect and never enlarges past the
+/// original. The roon-api `Scaling` takes arbitrary u32 width/height and does
+/// not document a cap; 2048 covers 4K-class outputs without risking
+/// MAX_REMOTE_ARTWORK_BYTES (a 2048 JPEG is typically well under 1 MiB).
+pub const ROON_SOURCE_ART_MAX: u32 = 2048;
+
+/// Size used by lanes with tight byte budgets (knob picture cache, cloud lane).
+pub const ROON_SMALL_ART: u32 = 300;
+
+fn image_scaling(width: Option<u32>, height: Option<u32>) -> Scaling {
+    match (width, height) {
+        (Some(w), Some(h)) => Scaling::new(Scale::Fit, w, h),
+        (Some(w), None) => Scaling::new(Scale::Fit, w, w),
+        (None, Some(h)) => Scaling::new(Scale::Fit, h, h),
+        (None, None) => Scaling::new(Scale::Fit, ROON_SOURCE_ART_MAX, ROON_SOURCE_ART_MAX),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unsized_roon_image_request_is_fit_at_source_bound_not_300() {
+        let v = serde_json::to_value(image_scaling(None, None)).unwrap();
+        assert_eq!(v["scale"], "fit");
+        assert_eq!(v["width"], 2048);
+        assert_eq!(v["height"], 2048);
+        let v = serde_json::to_value(image_scaling(Some(300), Some(300))).unwrap();
+        assert_eq!(v["width"], 300);
+    }
+
     use super::*;
 
     #[test]
