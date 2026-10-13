@@ -171,9 +171,10 @@ pub fn Devices() -> Element {
                                 ", then give discovery a minute to find your hardware."
                             }
                             p { class: "text-muted text-sm",
-                                "Discovery listens for Denon/Marantz, Sonos, Yamaha, Arcam, Hegel and Lyngdorf over SSDP and WiiM, BluOS and Cambridge over mDNS; "
+                                "Discovery listens for Denon/Marantz, Sonos, Yamaha, Arcam, Hegel, Lyngdorf and Eversolo over SSDP, "
+                                "WiiM, BluOS and Cambridge over mDNS, and Onkyo/Integra/Pioneer over eISCP; "
                                 "Home Assistant media players appear when its API is configured. "
-                                "Anthem, Trinnov and Eversolo need their address in "
+                                "Anthem and Trinnov need their address in "
                                 code { class: "font-mono text-xs", "manual_devices" }
                                 " in device-links.json. Use Refresh above to look again."
                             }
