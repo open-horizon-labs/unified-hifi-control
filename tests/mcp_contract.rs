@@ -1557,6 +1557,80 @@ async fn hifi_control_volume_argument_handling_is_pinned() {
     }
 }
 
+/// `hifi_control action=seek` (#740): Roon routes to the Roon runtime, a bad or
+/// missing position is an `invalid_parameter` refusal naming `value`, and every
+/// provider without a wired seek refuses citing the `seek` capability rather than
+/// "unknown action".
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn hifi_control_seek_routes_roon_and_refuses_the_rest_by_capability() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    // Roon: reaches the Roon runtime dispatch (no Core in this harness, so that
+    // is where it stops), not the unknown-action refusal.
+    let text = result_text(
+        &app.call_tool(
+            "hifi_control",
+            json!({ "zone_id": UNKNOWN_ROON_ZONE, "action": "seek", "value": 42 }),
+        )
+        .await,
+    );
+    assert_eq!(
+        text, "Error: Control error: Not connected to Roon",
+        "seek on a Roon zone must reach the Roon runtime dispatch"
+    );
+
+    // A missing or negative position is refused, naming `value`.
+    for args in [
+        json!({ "zone_id": UNKNOWN_ROON_ZONE, "action": "seek" }),
+        json!({ "zone_id": UNKNOWN_ROON_ZONE, "action": "seek", "value": -1 }),
+    ] {
+        let result = app.call_tool("hifi_control", args.clone()).await;
+        let env = &result["structuredContent"];
+        assert_eq!(env["outcome"], "invalid", "{args}: {result}");
+        assert_eq!(env["refusal"]["reason"], "invalid_parameter", "{args}");
+        assert_eq!(env["refusal"]["parameter"], "value", "{args}");
+        assert_eq!(env["operation"], "seek", "{args}");
+    }
+
+    // Providers without a wired seek name the capability.
+    for zone_id in [
+        "lms:aa:bb:cc:dd:ee:ff",
+        "openhome:abc",
+        "upnp:abc",
+        "spotify:abc",
+        "musicassistant:abc",
+        "applemusic:abc",
+    ] {
+        let result = app
+            .call_tool(
+                "hifi_control",
+                json!({ "zone_id": zone_id, "action": "seek", "value": 10 }),
+            )
+            .await;
+        let env = &result["structuredContent"];
+        assert_eq!(env["outcome"], "unsupported", "{zone_id}: {result}");
+        assert_eq!(env["refusal"]["reason"], "not_implemented", "{zone_id}");
+        assert_eq!(env["refusal"]["operation"], "seek", "{zone_id}");
+        assert_eq!(env["refusal"]["tracked_by"], "#795", "{zone_id}");
+    }
+
+    // HQPlayer keeps its own seek path (an unknown instance is refused by that
+    // path, not by the capability gate or the unknown-action refusal).
+    let result = app
+        .call_tool(
+            "hifi_control",
+            json!({ "zone_id": "hqplayer:nope", "action": "seek", "value": 10 }),
+        )
+        .await;
+    assert_ne!(
+        result["structuredContent"]["refusal"]["reason"], "not_implemented",
+        "{result}"
+    );
+    assert_ne!(result["structuredContent"]["operation"], "unknown_action");
+}
+
 /// `hifi_play` refuses `action='radio'` for LMS before touching the network. The
 /// exact wording is contract: the model is expected to read it and retry with a
 /// supported action.
@@ -4310,7 +4384,7 @@ const TEXT_CORRECTIONS: &[(&str, &str, &str)] = &[
         "Error: Control error: Device not found: abc",
         "Error: Unknown action 'frobnicate'. Valid actions: play, pause, playpause, next, \
          previous, prev, volume_set, volume_up, volume_down, repeat_off, repeat_context, \
-         repeat_track, shuffle_on, shuffle_off.",
+         repeat_track, shuffle_on, shuffle_off, seek.",
     ),
     (
         "hifi_hqplayer_set_pipeline/unknown_setting",
@@ -5721,6 +5795,7 @@ const EXPECTED_CAPABILITIES: &[&str] = &[
     "favorites",
     "radio",
     "multiroom_sync",
+    "seek",
 ];
 
 /// Every provider a zone id can name.
@@ -6175,6 +6250,11 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
                 "hifi_control",
                 json!({ "zone_id": zone_id, "action": "shuffle_off" }),
             )),
+            // #740: Roon's seek reaches the Roon runtime dispatch.
+            "seek" => Some((
+                "hifi_control",
+                json!({ "zone_id": zone_id, "action": "seek", "value": 30 }),
+            )),
             // musicassistant's "multiroom" library is never registered in this
             // generic TestApp, so a scoped status call reaches the registry's
             // own "not configured" wording -- the same fingerprint every other
@@ -6252,15 +6332,15 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
     // queue_transfer (#507), plus two more for Roon and LMS multiroom_sync,
     // generalized from the Music Assistant-only original (#517), plus five
     // for #531's LMS (browse, saved_playlists, favorites) and Roon (browse,
-    // saved_playlists) hifi_collections cells.
+    // saved_playlists) hifi_collections cells, plus one for Roon's seek (#740).
     // Apple Music's transport/skip/volume
     // cells remain gated until signed physical companion validation (#465).
     // Asserted exactly, not as a floor: a floor would pass while a cell silently
     // stopped being reported as supported, which is the direction that hides a
     // capability rather than inventing one.
     assert_eq!(
-        proved, 55,
-        "{proved} supported cells were proved end to end, expected 55. If a capability was deliberately wired or unwired, change this number in the same commit."
+        proved, 56,
+        "{proved} supported cells were proved end to end, expected 56. If a capability was deliberately wired or unwired, change this number in the same commit."
     );
 }
 

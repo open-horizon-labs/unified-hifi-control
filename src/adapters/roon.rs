@@ -11,7 +11,7 @@ use roon_api::{
     },
     image::{Args as ImageArgs, Format as ImageFormat, Image, Scale, Scaling},
     status::{self, Status},
-    transport::{self, volume, Control, Transport, Zone as RoonZone},
+    transport::{self, volume, Control, Seek, Transport, Zone as RoonZone},
     CoreEvent, Info, Parsed, RoonApi, RoonApiError, Services, Svc,
 };
 use serde::{Deserialize, Serialize};
@@ -1151,6 +1151,13 @@ enum RoonObservationExpectation {
         seek_position: Option<f64>,
     },
     Volume(f32),
+    /// Target absolute position in seconds. Roon's zone state only reports
+    /// whole seconds, and there's normal round-trip lag between the seek
+    /// landing and the next zone callback carrying it, so this accepts
+    /// anything within 2s of the target rather than requiring an exact
+    /// match - the same tolerance PreviousApplied already uses for "did the
+    /// position reset" below.
+    SeekPosition(f64),
 }
 
 impl RoonObservationExpectation {
@@ -1179,6 +1186,11 @@ impl RoonObservationExpectation {
                 .volume_control
                 .as_ref()
                 .is_some_and(|volume| (volume.value - expected).abs() <= 0.01),
+            Self::SeekPosition(expected) => zone
+                .now_playing
+                .as_ref()
+                .and_then(|now_playing| now_playing.seek_position)
+                .is_some_and(|observed| (observed - expected).abs() <= 2.0),
         }
     }
 }
@@ -1575,6 +1587,25 @@ impl RoonAdapter {
         Ok(())
     }
 
+    /// Seek to an absolute position in the currently playing track. `seconds`
+    /// is whole seconds from the start, matching the granularity Roon's own
+    /// zone state already reports position/duration at (`NowPlaying::seek_position`/
+    /// `length` below) - there is no finer-grained seek on this transport.
+    pub async fn seek(&self, zone_id: &str, seconds: i32) -> Result<()> {
+        let zone_id = strip_roon_prefix(zone_id);
+
+        let transport = {
+            let state = self.state.read().await;
+            state
+                .transport
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Not connected to Roon"))?
+        };
+
+        transport.seek(zone_id, &Seek::Absolute, seconds).await;
+        Ok(())
+    }
+
     /// Change volume
     ///
     /// SAFETY CRITICAL: For absolute volume, we must clamp to the output's actual
@@ -1904,13 +1935,7 @@ impl RoonAdapter {
                 .ok_or_else(|| anyhow::anyhow!("Image service not available"))?
         };
 
-        // Build scaling args
-        let scaling = match (width, height) {
-            (Some(w), Some(h)) => Some(Scaling::new(Scale::Fit, w, h)),
-            (Some(w), None) => Some(Scaling::new(Scale::Fit, w, w)),
-            (None, Some(h)) => Some(Scaling::new(Scale::Fit, h, h)),
-            (None, None) => Some(Scaling::new(Scale::Fit, 300, 300)),
-        };
+        let scaling = Some(image_scaling(width, height));
 
         // Request the image (lock not held)
         let args = ImageArgs::new(scaling, Some(ImageFormat::Jpeg));
@@ -4141,6 +4166,9 @@ async fn roon_expectation(
                 max,
             )))
         }
+        RuntimeCommand::Control(Command::Seek { position }) => {
+            Ok(RoonObservationExpectation::SeekPosition(*position))
+        }
         RuntimeCommand::Control(_) | RuntimeCommand::Hqplayer(_) => {
             anyhow::bail!("Roon command has no authoritative observation predicate")
         }
@@ -4167,9 +4195,13 @@ async fn execute_roon_runtime_command(
             delta,
             output_id: None,
         } => adapter.change_volume(zone_id, delta, true).await,
+        // control_roon() (src/knobs/routes.rs) already validated this is
+        // finite and non-negative before building the command; Roon's own
+        // transport takes whole seconds, so this only loses precision Roon
+        // itself has no way to use.
+        Command::Seek { position } => adapter.seek(zone_id, position.round() as i32).await,
         Command::Mute { .. }
         | Command::MuteToggle { .. }
-        | Command::Seek { .. }
         | Command::SeekRelative { .. }
         | Command::Shuffle { .. }
         | Command::Repeat { .. }
@@ -5101,8 +5133,38 @@ mod defect_573_row_classification {
     }
 }
 
+/// Source-art bound used when the caller names no size (the composed artwork
+/// path drops client dimensions so smart-crop sees the true aspect; `/roon/image`
+/// without params). `Scale::Fit` preserves aspect and never enlarges past the
+/// original. The roon-api `Scaling` takes arbitrary u32 width/height and does
+/// not document a cap; 2048 covers 4K-class outputs without risking
+/// MAX_REMOTE_ARTWORK_BYTES (a 2048 JPEG is typically well under 1 MiB).
+pub const ROON_SOURCE_ART_MAX: u32 = 2048;
+
+/// Size used by lanes with tight byte budgets (knob picture cache, cloud lane).
+pub const ROON_SMALL_ART: u32 = 300;
+
+fn image_scaling(width: Option<u32>, height: Option<u32>) -> Scaling {
+    match (width, height) {
+        (Some(w), Some(h)) => Scaling::new(Scale::Fit, w, h),
+        (Some(w), None) => Scaling::new(Scale::Fit, w, w),
+        (None, Some(h)) => Scaling::new(Scale::Fit, h, h),
+        (None, None) => Scaling::new(Scale::Fit, ROON_SOURCE_ART_MAX, ROON_SOURCE_ART_MAX),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unsized_roon_image_request_is_fit_at_source_bound_not_300() {
+        let v = serde_json::to_value(image_scaling(None, None)).unwrap();
+        assert_eq!(v["scale"], "fit");
+        assert_eq!(v["width"], 2048);
+        assert_eq!(v["height"], 2048);
+        let v = serde_json::to_value(image_scaling(Some(300), Some(300))).unwrap();
+        assert_eq!(v["width"], 300);
+    }
+
     use super::*;
 
     #[test]

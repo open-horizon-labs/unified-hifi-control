@@ -254,7 +254,7 @@ impl SpotifyPlayback {
                 .map(|artist| artist.name.clone())
                 .unwrap_or_default(),
             album: track.album.name.clone(),
-            image_key: track.album.images.first().map(|image| image.url.clone()),
+            image_key: largest_image_url(&track.album.images),
             seek_position: self.progress_ms.map(|ms| ms as f64 / 1000.0),
             duration: track.duration_ms.map(|ms| ms as f64 / 1000.0),
             metadata: None,
@@ -436,6 +436,24 @@ pub struct SpotifyAlbum {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SpotifyImage {
     pub url: String,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
+/// Largest declared image; first entry when no sizes are declared.
+fn largest_image_url(images: &[SpotifyImage]) -> Option<String> {
+    images
+        .iter()
+        .enumerate()
+        .max_by_key(|(i, img)| {
+            (
+                u64::from(img.width.unwrap_or(0)) * u64::from(img.height.unwrap_or(0)),
+                std::cmp::Reverse(*i),
+            )
+        })
+        .map(|(_, img)| img.url.clone())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2076,13 +2094,38 @@ fn track_identity(
             .map(|artist| artist.name.clone())
             .unwrap_or_default(),
         track.album.name.clone(),
-        track.album.images.first().map(|image| image.url.clone()),
+        largest_image_url(&track.album.images),
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn img(url: &str, w: Option<u32>, h: Option<u32>) -> SpotifyImage {
+        SpotifyImage {
+            url: url.into(),
+            width: w,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn largest_image_wins_regardless_of_order() {
+        let images = [
+            img("s", Some(64), Some(64)),
+            img("l", Some(640), Some(640)),
+            img("m", Some(300), Some(300)),
+        ];
+        assert_eq!(largest_image_url(&images).as_deref(), Some("l"));
+    }
+
+    #[test]
+    fn unsized_images_fall_back_to_first() {
+        let images = [img("a", None, None), img("b", None, None)];
+        assert_eq!(largest_image_url(&images).as_deref(), Some("a"));
+        assert_eq!(largest_image_url(&[]), None);
+    }
 
     #[test]
     fn profile_maps_only_non_secret_identity_fields() {

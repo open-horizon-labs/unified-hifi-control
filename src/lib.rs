@@ -30,6 +30,8 @@
 // Deliberately not feature-gated - see src/adaptive/mod.rs for the dependency rule.
 pub mod adaptive;
 
+pub mod brand;
+
 // Dioxus UI app (shared between server SSR and WASM client)
 pub mod app;
 

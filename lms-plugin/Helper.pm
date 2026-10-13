@@ -94,6 +94,13 @@ sub start {
 
     my $lmsPort = $serverPrefs->get('httpport');
 
+    # Where the spawned UHC reaches this LMS. An explicit LMS_HOST in LMS's environment wins;
+    # otherwise use LMS's own --httpaddr, because an LMS bound to one address refuses 127.0.0.1.
+    # A wildcard bind (or none) is reachable on loopback.
+    my $httpaddr = $main::httpaddr;
+    my $lmsHost = $ENV{LMS_HOST}
+        || (($httpaddr && $httpaddr !~ /^(?:0\.0\.0\.0|::)$/) ? $httpaddr : '127.0.0.1');
+
     $log->info("Starting Unified Hi-Fi Control: $binary on port $port");
 
     # Set environment variables for the subprocess
@@ -101,11 +108,11 @@ sub start {
     local $ENV{PORT} = $port;
     local $ENV{CONFIG_DIR} = $configDir;
     local $ENV{UHC_CONFIG_DIR} = $configDir;
-    local $ENV{LMS_HOST} = '127.0.0.1';
+    local $ENV{LMS_HOST} = $lmsHost;
     local $ENV{LMS_PORT} = $lmsPort;
     local $ENV{LMS_UNIFIEDHIFI_STARTED} = 'true';
 
-    $log->debug("Running: $binary (with env: PORT=$port CONFIG_DIR=$configDir LMS_HOST=127.0.0.1 LMS_PORT=$lmsPort)");
+    $log->debug("Running: $binary (with env: PORT=$port CONFIG_DIR=$configDir LMS_HOST=$lmsHost LMS_PORT=$lmsPort)");
     # Platform-specific process spawning
     if (main::ISWINDOWS) {
         # Windows: run binary directly, Proc::Background handles it
