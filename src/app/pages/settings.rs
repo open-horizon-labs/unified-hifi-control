@@ -372,6 +372,7 @@ enum AdapterToggle {
     Spotify,
     AppleMusic,
     MusicAssistant,
+    Devices,
     Mqtt,
 }
 
@@ -395,6 +396,9 @@ fn settings_with_toggle(mut settings: AppSettings, toggle: SettingsToggle) -> Ap
         }
         SettingsToggle::Adapter(AdapterToggle::MusicAssistant, enabled) => {
             settings.adapters.musicassistant = enabled
+        }
+        SettingsToggle::Adapter(AdapterToggle::Devices, enabled) => {
+            settings.adapters.devices = enabled
         }
         SettingsToggle::Adapter(AdapterToggle::Mqtt, enabled) => settings.adapters.mqtt = enabled,
         SettingsToggle::HideKnobs(enabled) => settings.hide_knobs_page = !enabled,
@@ -460,6 +464,7 @@ fn FeatureToggle(label: &'static str, enabled: bool, onclick: EventHandler<Mouse
                 "Enable HQPlayer" => "adapters.hqplayer",
                 "Enable Spotify" => "adapters.spotify",
                 "Enable Apple Music" => "adapters.applemusic",
+                "Enable receiver and amplifier control" => "adapters.devices",
                 "Enable MQTT/Home Assistant" => "adapters.mqtt",
                 "Show Controllers page" => "hide_knobs_page",
                 _ => "",
@@ -853,6 +858,7 @@ pub fn Settings() -> Element {
     let mut spotify_enabled = use_signal(|| initial_settings.adapters.spotify);
     let mut applemusic_enabled = use_signal(|| initial_settings.adapters.applemusic);
     let mut musicassistant_enabled = use_signal(|| initial_settings.adapters.musicassistant);
+    let mut devices_enabled = use_signal(|| initial_settings.adapters.devices);
     let mut mqtt_enabled = use_signal(|| initial_settings.adapters.mqtt);
 
     // Streaming-provider onboarding state. Provider credentials are never
@@ -978,6 +984,7 @@ pub fn Settings() -> Element {
             spotify_enabled.set(s.adapters.spotify);
             applemusic_enabled.set(s.adapters.applemusic);
             musicassistant_enabled.set(s.adapters.musicassistant);
+            devices_enabled.set(s.adapters.devices);
             mqtt_enabled.set(s.adapters.mqtt);
             hide_knobs.set(s.hide_knobs_page);
             confirmed_settings.set(Some(s.clone()));
@@ -987,6 +994,7 @@ pub fn Settings() -> Element {
                 s.adapters.hqplayer,
                 s.adapters.lms,
                 s.adapters.spotify,
+                s.adapters.devices,
             );
             settings_ctx.mark_loaded();
         }
@@ -1891,6 +1899,7 @@ pub fn Settings() -> Element {
             hide_hqp: !hqplayer_enabled(),
             hide_lms: !lms_enabled(),
             hide_spotify: !spotify_enabled(),
+            hide_devices: !devices_enabled(),
             hide_knobs: hide_knobs(),
 
             h1 { class: "text-2xl font-bold mb-6", "Settings" }
@@ -2056,6 +2065,35 @@ pub fn Settings() -> Element {
                                             }
                                         } else {
                                             "..."
+                                        }
+                                    } else {
+                                        span { class: "text-muted", "-" }
+                                    }
+                                }
+                            }
+                            // Playback device control (#774): receivers, amplifiers and streamers, not
+                            // music providers. Alpha; links and control are API/MCP-only for now.
+                            tr { class: "border-b border-default",
+                                td { class: "py-2 px-3",
+                                    FeatureToggle {
+                                        label: "Enable receiver and amplifier control",
+                                        enabled: devices_enabled(),
+                                        onclick: move |_| {
+                                            toggle_setting(SettingsToggle::Adapter(AdapterToggle::Devices, !devices_enabled()));
+                                        }
+                                    }
+                                }
+                                td { class: "py-2 px-3",
+                                    div { class: "flex items-center gap-2",
+                                        "Receivers & amplifiers"
+                                        span { class: "badge badge-secondary", "Alpha" }
+                                    }
+                                }
+                                td { class: "py-2 px-3",
+                                    if devices_enabled() {
+                                        span { class: "text-muted",
+                                            "Power, volume and input for linked zones. "
+                                            Link { class: "link", to: Route::Devices {}, "Open Devices →" }
                                         }
                                     } else {
                                         span { class: "text-muted", "-" }
@@ -3863,6 +3901,7 @@ mod tests {
                 spotify: false,
                 applemusic: true,
                 musicassistant: false,
+                devices: false,
                 mqtt: false,
             },
             hide_knobs_page: false,

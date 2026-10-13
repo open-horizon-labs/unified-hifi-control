@@ -36,6 +36,11 @@ GET /apple-touch-icon.png
 GET /assets/{*path}
 GET /config/{knob_id}
 GET /control
+GET /devices
+GET /devices/links
+GET /devices/{device_id}
+GET /devices/{device_id}/report
+GET /devices/{device_id}/report.json
 GET /dx-components-theme.css
 GET /events
 GET /favicon.ico
@@ -120,6 +125,12 @@ POST /api/zones/name
 POST /api/zones/order
 POST /api/zones/visibility
 POST /control
+POST /devices/ceiling
+POST /devices/control
+POST /devices/link
+POST /devices/recording
+POST /devices/report/clear
+POST /devices/unlink
 POST /hqp/detect
 POST /hqp/instances
 POST /hqp/instances/{name}/matrix/profile

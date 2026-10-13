@@ -233,6 +233,25 @@ convention, feature-branch-based PRs (including the one that introduced
 this integration) do not run CI — the workflow was verified locally and
 becomes active once this lands on `v4`.
 
+## Linked playback devices (alpha, #774)
+
+A zone linked to an amplifier (see AGENTS.md "Playback devices") carries a `device` block on
+`/knob/zones`. The integration then:
+
+- adds `TURN_ON`, `TURN_OFF` and `SELECT_SOURCE` to that zone's entity (`supported_features` is
+  recomputed per read, so linking does not recreate the entity);
+- reports the entity `off` while the amplifier is in standby — Home Assistant's state is where
+  power lives, even though UHC keeps power and playback separate;
+- offers the device's available inputs as `source_list`, sending the stable input id on select;
+- applies the server's `LinkedDeviceChanged` SSE event to every zone it names, so a change made on
+  the amplifier's own remote reaches every linked entity without a poll;
+- exposes `linked_device_id`, `linked_device_name` and `linked_device_maturity: alpha` as
+  attributes.
+
+Volume needs no change: the linked zone's `volume_control` is the amplifier's, and its published
+`max` is the amplifier's limit lowered by the user's ceiling, so the entity's 0..1 slider can never
+map past the ceiling.
+
 ## Known follow-ups
 
 - No plain-REST route exists for zone grouping itself (`hifi_zone_group`)

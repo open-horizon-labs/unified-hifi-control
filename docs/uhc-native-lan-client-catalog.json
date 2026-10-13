@@ -1,0 +1,1053 @@
+{
+  "title": "UHC native-LAN hardware-control client catalog",
+  "schema_version": "1.0",
+  "as_of": "2026-10-12",
+  "selection_basis": "Practical twelve-family implementation shortlist, not a measured market-share ranking; Denon/Marantz included as the known baseline.",
+  "scope": {
+    "include": [
+      "Native Ethernet/Wi-Fi control",
+      "LAN discovery",
+      "Power/volume/mute/physical inputs",
+      "Model-qualified playback and DSP"
+    ],
+    "exclude": [
+      "RS232",
+      "USB control",
+      "IR blasters",
+      "Serial-to-IP gateways",
+      "Cloud account/API implementation"
+    ]
+  },
+  "interpretation": [
+    "Features describe upstream-evidenced prospective UHC support, not functionality implemented or tested in UHC by this research.",
+    "A supported family is not a promise for every model, firmware, zone, source or operating mode.",
+    "A missing feature/discovery mechanism means not established in the selected path, not necessarily impossible.",
+    "HA pins are observed development-branch requirements, not a proposed lockfile or a claim that PyPI latest is identical.",
+    "Licenses are project-level findings; inspect exact files and transitive dependencies before vendoring."
+  ],
+  "records": [
+    {
+      "id": "denon_avr",
+      "family": "Denon / Marantz AVR",
+      "scope": "native_lan_only",
+      "reference_client": {
+        "repository": "https://github.com/ol-iver/denonavr",
+        "package": "denonavr",
+        "language": "Python",
+        "license": "MIT",
+        "ha_requirement_observed": "denonavr==1.3.3",
+        "license_basis": "Project repository / publisher package metadata inspected"
+      },
+      "alternative_clients": [],
+      "home_assistant_manifest": "https://github.com/home-assistant/core/blob/dev/homeassistant/components/denonavr/manifest.json",
+      "discovery": [
+        {
+          "method": "ssdp",
+          "device_types": [
+            "urn:schemas-upnp-org:device:MediaRenderer:1",
+            "urn:schemas-upnp-org:device:MediaServer:1",
+            "urn:schemas-denon-com:device:AiosDevice:1"
+          ],
+          "manufacturers": [
+            "Denon",
+            "DENON",
+            "DENON PROFESSIONAL",
+            "Marantz"
+          ],
+          "identity": "Fetch LOCATION device description; match device/model/firmware, not IP alone"
+        }
+      ],
+      "protocols": [
+        {
+          "name": "Telnet-like ASCII over TCP",
+          "default_port": 23,
+          "notes": "Long-lived feedback/control session"
+        },
+        {
+          "name": "HTTP/XML",
+          "default_port": null,
+          "notes": "Endpoint generation is model dependent; HA documents TCP 8080 and 60006 as well as 23. Do not assume every receiver uses every port."
+        }
+      ],
+      "state_feedback": "TCP push plus HTTP state/configuration queries",
+      "features": {
+        "power_standby": "supported; network standby required for wake",
+        "volume_mute": "supported",
+        "physical_input_selection": "supported",
+        "playback_and_track_metadata": "model/source dependent; HEOS is separate",
+        "zones_or_grouping": "independent receiver zones where equipped",
+        "dsp_or_presets": "sound modes, tone and Audyssey controls where supported"
+      },
+      "additional_controls": [
+        "Input names and enabled/deleted-input quirks",
+        "Zone 2 / Zone 3",
+        "Sound modes and supported Audyssey options"
+      ],
+      "model_and_runtime_boundaries": [
+        "Do not conflate the AVR hardware API with the HEOS playback/grouping API.",
+        "Some models permit only one control/Telnet connection. Share one connection inside UHC.",
+        "Fetch actual volume range/step and source names; generation-specific HTTP behavior matters."
+      ],
+      "what_to_harvest": [
+        "Discovery manufacturer variants",
+        "HTTP generation probing",
+        "TCP message parsers and callbacks",
+        "Per-model input naming, zones and Audyssey quirks"
+      ],
+      "protocol_examples": [],
+      "sources": [
+        "https://github.com/ol-iver/denonavr",
+        "https://pypi.org/project/denonavr/",
+        "https://www.home-assistant.io/integrations/denonavr/",
+        "https://github.com/home-assistant/core/blob/dev/homeassistant/components/denonavr/manifest.json"
+      ],
+      "verification": {
+        "method": "Repository/package/documentation inspection",
+        "hardware_tested_here": false,
+        "implemented_in_uhc_by_this_task": false,
+        "observed_date": "2026-10-12"
+      }
+    },
+    {
+      "id": "wiim",
+      "family": "WiiM",
+      "scope": "native_lan_only",
+      "reference_client": {
+        "repository": "https://github.com/Linkplay2020/wiim",
+        "package": "wiim",
+        "language": "Python",
+        "license": "MIT",
+        "ha_requirement_observed": "wiim==0.2.1",
+        "license_basis": "Project repository / publisher package metadata inspected"
+      },
+      "alternative_clients": [],
+      "home_assistant_manifest": "https://github.com/home-assistant/core/blob/dev/homeassistant/components/wiim/manifest.json",
+      "discovery": [
+        {
+          "method": "mdns_dnssd",
+          "service_types": [
+            "_linkplay._tcp.local."
+          ],
+          "ports": "Use resolved SRV/advertised endpoint"
+        }
+      ],
+      "protocols": [
+        {
+          "name": "UPnP SOAP and event subscriptions",
+          "default_port": null,
+          "notes": "Use advertised description/control/event URLs, not a fixed description port"
+        },
+        {
+          "name": "LinkPlay HTTP API",
+          "default_port": null,
+          "notes": "SDK combines HTTP and UPnP; prefer device-advertised endpoints"
+        }
+      ],
+      "state_feedback": "UPnP push notifications with HTTP polling fallback",
+      "features": {
+        "power_standby": "not established by this SDK review; do not model pause as power",
+        "volume_mute": "supported; fixed-output mode is a capability constraint",
+        "physical_input_selection": "model dependent: only installed inputs",
+        "playback_and_track_metadata": "supported; active-source dependent",
+        "zones_or_grouping": "WiiM grouping",
+        "dsp_or_presets": "presets verified; full EQ/DSP coverage not established in selected SDK"
+      },
+      "additional_controls": [
+        "Input and output selection",
+        "Queue/preset inspection",
+        "Transport capability inspection"
+      ],
+      "model_and_runtime_boundaries": [
+        "Vendor-owned Python SDK, but API coverage varies by model, firmware and active source.",
+        "Do not infer support for every other LinkPlay-based brand from WiiM support.",
+        "Controlling a WiiM endpoint does not establish native-IP control of an attached non-network amplifier."
+      ],
+      "what_to_harvest": [
+        "Zeroconf discovery and UPnP-device validation",
+        "Input/output and capability models",
+        "UPnP event handling and polling fallback",
+        "Grouping and current-state normalization"
+      ],
+      "protocol_examples": [],
+      "sources": [
+        "https://github.com/Linkplay2020/wiim",
+        "https://pypi.org/project/wiim/",
+        "https://www.home-assistant.io/integrations/wiim/",
+        "https://faq.wiimhome.com/en/support/solutions/articles/72000646690-integrating-wiim-devices-with-home-assistant",
+        "https://github.com/home-assistant/core/blob/dev/homeassistant/components/wiim/manifest.json"
+      ],
+      "verification": {
+        "method": "Repository/package/documentation inspection",
+        "hardware_tested_here": false,
+        "implemented_in_uhc_by_this_task": false,
+        "observed_date": "2026-10-12"
+      }
+    },
+    {
+      "id": "musiccast",
+      "family": "Yamaha MusicCast / Extended Control",
+      "scope": "native_lan_only",
+      "reference_client": {
+        "repository": "https://github.com/vigonotion/aiomusiccast",
+        "package": "aiomusiccast",
+        "language": "Python",
+        "license": "MIT",
+        "ha_requirement_observed": "aiomusiccast==0.15.0",
+        "license_basis": "Project repository / publisher package metadata inspected"
+      },
+      "alternative_clients": [
+        {
+          "repository": "https://github.com/foxthefox/yamaha-yxc-nodejs",
+          "package": "yamaha-yxc-nodejs",
+          "language": "JavaScript",
+          "license": "MIT",
+          "notes": "Useful second reference: discovery, explicit getFeatures, broad YXC command surface and examples."
+        }
+      ],
+      "home_assistant_manifest": "https://github.com/home-assistant/core/blob/dev/homeassistant/components/yamaha_musiccast/manifest.json",
+      "discovery": [
+        {
+          "method": "ssdp",
+          "device_types": [],
+          "manufacturers": [
+            "Yamaha Corporation"
+          ],
+          "identity": "Fetch LOCATION device description; match device/model/firmware, not IP alone"
+        }
+      ],
+      "protocols": [
+        {
+          "name": "Yamaha Extended Control HTTP/JSON",
+          "default_port": null,
+          "notes": "/YamahaExtendedControl/v1/; verify service availability after SSDP"
+        },
+        {
+          "name": "UDP event notifications",
+          "default_port": null,
+          "notes": "Controller advertises its callback port; do not invent a fixed destination"
+        }
+      ],
+      "state_feedback": "UDP change notifications plus HTTP state reads",
+      "features": {
+        "power_standby": "supported with network standby enabled",
+        "volume_mute": "supported",
+        "physical_input_selection": "model dependent inputs",
+        "playback_and_track_metadata": "supported for network/USB and other exposed playback sources",
+        "zones_or_grouping": "receiver zones and MusicCast distribution/grouping",
+        "dsp_or_presets": "sound programs, EQ/tone, presets; model dependent"
+      },
+      "additional_controls": [
+        "getFeatures-style capability inventory",
+        "Sound programs, Pure Direct and enhancer where offered",
+        "Bass/treble/subwoofer trim and presets"
+      ],
+      "model_and_runtime_boundaries": [
+        "This row is MusicCast/YXC, not all Yamaha legacy receivers.",
+        "SSDP manufacturer matching is only a candidate filter. Probe YXC features before accepting the device.",
+        "Available zones, inputs, EQ and playback controls vary by model/source."
+      ],
+      "what_to_harvest": [
+        "Discovery plus capability negotiation",
+        "Request/response schema",
+        "UDP notification lifecycle",
+        "Zone and distribution control",
+        "Volume ranges and source-dependent controls"
+      ],
+      "protocol_examples": [],
+      "sources": [
+        "https://github.com/vigonotion/aiomusiccast",
+        "https://pypi.org/project/aiomusiccast/",
+        "https://www.home-assistant.io/integrations/yamaha_musiccast/",
+        "https://github.com/foxthefox/yamaha-yxc-nodejs",
+        "https://github.com/home-assistant/core/blob/dev/homeassistant/components/yamaha_musiccast/manifest.json"
+      ],
+      "verification": {
+        "method": "Repository/package/documentation inspection",
+        "hardware_tested_here": false,
+        "implemented_in_uhc_by_this_task": false,
+        "observed_date": "2026-10-12"
+      }
+    },
+    {
+      "id": "bluos",
+      "family": "BluOS: Bluesound and BluOS-equipped products",
+      "scope": "native_lan_only",
+      "reference_client": {
+        "repository": "https://github.com/LouisChrist/pyblu",
+        "package": "pyblu",
+        "language": "Python",
+        "license": "MIT",
+        "ha_requirement_observed": "pyblu==2.2.0",
+        "license_basis": "Project repository / publisher package metadata inspected"
+      },
+      "alternative_clients": [],
+      "home_assistant_manifest": "https://github.com/home-assistant/core/blob/dev/homeassistant/components/bluesound/manifest.json",
+      "discovery": [
+        {
+          "method": "mdns_dnssd",
+          "service_types": [
+            "_musc._tcp.local."
+          ],
+          "ports": "Use resolved SRV/advertised endpoint"
+        }
+      ],
+      "protocols": [
+        {
+          "name": "BluOS HTTP API / XML",
+          "default_port": 11000,
+          "notes": "Local player API; selected client requires no authentication"
+        }
+      ],
+      "state_feedback": "HTTP polling in the inspected HA integration; do not claim push based only on BluOS branding",
+      "features": {
+        "power_standby": "no universal hardware power control established",
+        "volume_mute": "supported; fixed-output mode applies",
+        "physical_input_selection": "model dependent inputs exposed through BluOS",
+        "playback_and_track_metadata": "supported",
+        "zones_or_grouping": "player grouping",
+        "dsp_or_presets": "tone, balance, output modes and volume limits; model dependent"
+      },
+      "additional_controls": [
+        "Queue and browse APIs",
+        "Input/preset-based playback selection",
+        "Dynamic settings choices and numeric limits",
+        "Fixed/variable output, bass/treble, crossover where available"
+      ],
+      "model_and_runtime_boundaries": [
+        "Only BluOS-equipped devices are covered, not the entire NAD catalog.",
+        "A BluOS streaming module need not expose every host-amplifier input or power function.",
+        "Settings setters do not necessarily enforce the advertised limits; UHC should validate them."
+      ],
+      "what_to_harvest": [
+        "mDNS identity",
+        "Endpoint/XML schemas",
+        "Playback/queue/group models",
+        "Settings availability, ranges and units"
+      ],
+      "protocol_examples": [],
+      "sources": [
+        "https://github.com/LouisChrist/pyblu",
+        "https://pypi.org/project/pyblu/",
+        "https://www.home-assistant.io/integrations/bluesound/",
+        "https://github.com/home-assistant/core/blob/dev/homeassistant/components/bluesound/manifest.json"
+      ],
+      "verification": {
+        "method": "Repository/package/documentation inspection",
+        "hardware_tested_here": false,
+        "implemented_in_uhc_by_this_task": false,
+        "observed_date": "2026-10-12"
+      }
+    },
+    {
+      "id": "streammagic",
+      "family": "Cambridge Audio StreamMagic",
+      "scope": "native_lan_only",
+      "reference_client": {
+        "repository": "https://github.com/noahhusby/aiostreammagic",
+        "package": "aiostreammagic",
+        "language": "Python",
+        "license": "MIT",
+        "ha_requirement_observed": "aiostreammagic==2.13.2",
+        "license_basis": "Project repository / publisher package metadata inspected"
+      },
+      "alternative_clients": [],
+      "home_assistant_manifest": "https://github.com/home-assistant/core/blob/dev/homeassistant/components/cambridge_audio/manifest.json",
+      "discovery": [
+        {
+          "method": "mdns_dnssd",
+          "service_types": [
+            "_stream-magic._tcp.local.",
+            "_smoip._tcp.local."
+          ],
+          "ports": "Use resolved SRV/advertised endpoint"
+        }
+      ],
+      "protocols": [
+        {
+          "name": "StreamMagic WebSocket / JSON",
+          "default_port": null,
+          "notes": "Use client/discovered device endpoint; no fixed port asserted in this catalog"
+        }
+      ],
+      "state_feedback": "WebSocket subscriptions and pushed state",
+      "features": {
+        "power_standby": "supported on network-standby-capable models/configuration",
+        "volume_mute": "model dependent: Evo/receiver/variable-preamp output; not physical Control Bus",
+        "physical_input_selection": "model dependent inputs",
+        "playback_and_track_metadata": "supported; active-source dependent",
+        "zones_or_grouping": "not claimed as a general multiroom grouping API",
+        "dsp_or_presets": "presets, balance, EQ/room settings and volume limit; model dependent"
+      },
+      "additional_controls": [
+        "Sources and dynamic transport capabilities",
+        "Output selection on equipped models",
+        "Preamp volume and supported audio settings"
+      ],
+      "model_and_runtime_boundaries": [
+        "Limit scope to native-network streamers/all-in-ones, such as Evo, CXN, Edge NQ and compatible CXR units.",
+        "Physical Control Bus volume control of a separate amplifier is excluded.",
+        "ECO standby can disable networking. Network Standby is needed for LAN wake.",
+        "Fixed-output models do not become amplifier-volume controllers just because they expose playback."
+      ],
+      "what_to_harvest": [
+        "mDNS variants",
+        "WebSocket subscriptions and reducers",
+        "Source-dependent capabilities",
+        "Variable output/preamp state",
+        "Network standby handling"
+      ],
+      "protocol_examples": [],
+      "sources": [
+        "https://github.com/noahhusby/aiostreammagic",
+        "https://pypi.org/project/aiostreammagic/",
+        "https://www.home-assistant.io/integrations/cambridge_audio/",
+        "https://github.com/home-assistant/core/blob/dev/homeassistant/components/cambridge_audio/manifest.json"
+      ],
+      "verification": {
+        "method": "Repository/package/documentation inspection",
+        "hardware_tested_here": false,
+        "implemented_in_uhc_by_this_task": false,
+        "observed_date": "2026-10-12"
+      }
+    },
+    {
+      "id": "hegel",
+      "family": "Hegel legacy native-IP amplifiers",
+      "scope": "native_lan_only",
+      "reference_client": {
+        "repository": "https://github.com/boazca/hegel-ip-client",
+        "package": "hegel-ip-client",
+        "language": "Python",
+        "license": "MIT",
+        "ha_requirement_observed": "hegel-ip-client==0.1.4",
+        "license_basis": "Project repository / publisher package metadata inspected"
+      },
+      "alternative_clients": [],
+      "home_assistant_manifest": "https://github.com/home-assistant/core/blob/dev/homeassistant/components/hegel/manifest.json",
+      "discovery": [
+        {
+          "method": "ssdp",
+          "device_types": [
+            "urn:schemas-upnp-org:device:MediaRenderer:1"
+          ],
+          "manufacturers": [
+            "Hegel"
+          ],
+          "identity": "Fetch LOCATION device description; match device/model/firmware, not IP alone"
+        }
+      ],
+      "protocols": [
+        {
+          "name": "Hegel ASCII control over TCP",
+          "default_port": 50001,
+          "notes": "Persistent command/feedback connection"
+        }
+      ],
+      "state_feedback": "Push state, command queue and reconnect handling",
+      "features": {
+        "power_standby": "supported on covered network models",
+        "volume_mute": "supported",
+        "physical_input_selection": "supported",
+        "playback_and_track_metadata": "not claimed by selected hardware-control client",
+        "zones_or_grouping": "single amplifier",
+        "dsp_or_presets": "not claimed"
+      },
+      "additional_controls": [
+        "Focused power/input/volume/mute surface"
+      ],
+      "model_and_runtime_boundaries": [
+        "HA explicitly lists Rost, H95, H120, H190, H190V, H390 and H590.",
+        "Do not extrapolate this protocol/client to newer Hegel platforms without separate verification."
+      ],
+      "what_to_harvest": [
+        "SSDP model recognition",
+        "Small ASCII command/response grammar",
+        "Command serialization",
+        "Reconnect and state callbacks"
+      ],
+      "protocol_examples": [],
+      "sources": [
+        "https://github.com/boazca/hegel-ip-client",
+        "https://pypi.org/project/hegel-ip-client/",
+        "https://www.home-assistant.io/integrations/hegel/",
+        "https://github.com/home-assistant/core/blob/dev/homeassistant/components/hegel/manifest.json"
+      ],
+      "verification": {
+        "method": "Repository/package/documentation inspection",
+        "hardware_tested_here": false,
+        "implemented_in_uhc_by_this_task": false,
+        "observed_date": "2026-10-12"
+      }
+    },
+    {
+      "id": "lyngdorf",
+      "family": "Lyngdorf / Steinway Lyngdorf network products",
+      "scope": "native_lan_only",
+      "reference_client": {
+        "repository": "https://github.com/fishloa/lyngdorf",
+        "package": "lyngdorf",
+        "language": "Python",
+        "license": "MIT",
+        "ha_requirement_observed": "lyngdorf==2.2.1",
+        "license_basis": "Project repository / publisher package metadata inspected"
+      },
+      "alternative_clients": [],
+      "home_assistant_manifest": "https://github.com/home-assistant/core/blob/dev/homeassistant/components/lyngdorf/manifest.json",
+      "discovery": [
+        {
+          "method": "ssdp",
+          "device_types": [
+            "urn:schemas-upnp-org:device:MediaRenderer:2"
+          ],
+          "manufacturers": [
+            "Lyngdorf",
+            "Steinway Lyngdorf"
+          ],
+          "identity": "Fetch LOCATION device description; match device/model/firmware, not IP alone"
+        }
+      ],
+      "protocols": [
+        {
+          "name": "Native ASCII control over TCP",
+          "default_port": 84,
+          "notes": "Persistent control/feedback session"
+        },
+        {
+          "name": "Streaming-module HTTP",
+          "default_port": 8080,
+          "notes": "Only on models with that module"
+        },
+        {
+          "name": "UPnP description / identity",
+          "default_port": null,
+          "notes": "Advertised HTTP port can vary; HA also uses unicast SSDP for configured-IP identity"
+        }
+      ],
+      "state_feedback": "Native TCP push; supplemental streaming-module reads",
+      "features": {
+        "power_standby": "supported on covered native-IP models",
+        "volume_mute": "supported",
+        "physical_input_selection": "supported",
+        "playback_and_track_metadata": "only streaming-module models and supported current sources",
+        "zones_or_grouping": "Zone B on equipped processors; not TDAI",
+        "dsp_or_presets": "RoomPerfect focus, voicings, sound processing and trims"
+      },
+      "additional_controls": [
+        "RoomPerfect positions and voicings",
+        "Tone/channel trims and lip sync",
+        "Main-zone and Zone B source/volume",
+        "Streaming track metadata and transport where exposed"
+      ],
+      "model_and_runtime_boundaries": [
+        "Select native-IP TDAI/MP/P models; exclude a model that requires serial even if the Python package lists it.",
+        "HA reports hardware testing for MP-60, TDAI-1120, TDAI-3400 and P200; other coverage can be specification-derived.",
+        "Active sources have different transport semantics. For example, pause/seek availability is not universal.",
+        "Pace commands and preserve relative-command ordering; do not turn a slider drag into an unbounded queue."
+      ],
+      "what_to_harvest": [
+        "Discovery and model/firmware capability tables",
+        "Protocol documentation/oracle evidence labels",
+        "Volume and trim units/ranges",
+        "Command pacing and state reconciliation",
+        "RoomPerfect and source catalogs"
+      ],
+      "protocol_examples": [],
+      "sources": [
+        "https://github.com/fishloa/lyngdorf",
+        "https://pypi.org/project/lyngdorf/",
+        "https://www.home-assistant.io/integrations/lyngdorf/",
+        "https://github.com/home-assistant/core/blob/dev/homeassistant/components/lyngdorf/manifest.json"
+      ],
+      "verification": {
+        "method": "Repository/package/documentation inspection",
+        "hardware_tested_here": false,
+        "implemented_in_uhc_by_this_task": false,
+        "observed_date": "2026-10-12"
+      }
+    },
+    {
+      "id": "eiscp",
+      "family": "Onkyo / Integra / eISCP-capable Pioneer",
+      "scope": "native_lan_only",
+      "reference_client": {
+        "repository": "https://github.com/arturpragacz/aioonkyo",
+        "package": "aioonkyo",
+        "language": "Python",
+        "license": "GPL-3.0-only",
+        "ha_requirement_observed": "aioonkyo==0.4.0",
+        "license_basis": "Project repository / publisher package metadata inspected"
+      },
+      "alternative_clients": [],
+      "home_assistant_manifest": "https://github.com/home-assistant/core/blob/dev/homeassistant/components/onkyo/manifest.json",
+      "discovery": [
+        {
+          "method": "ssdp",
+          "device_types": [
+            "urn:schemas-upnp-org:device:MediaRenderer:1",
+            "urn:schemas-upnp-org:device:MediaRenderer:2",
+            "urn:schemas-upnp-org:device:MediaRenderer:3"
+          ],
+          "manufacturers": [
+            "ONKYO",
+            "Onkyo & Pioneer Corporation",
+            "Pioneer"
+          ],
+          "identity": "Fetch LOCATION device description; match device/model/firmware, not IP alone"
+        },
+        {
+          "method": "eiscp_udp_discovery",
+          "port": 60128,
+          "notes": "Native receiver interview/discovery; do not assume SSDP alone proves usable eISCP control"
+        }
+      ],
+      "protocols": [
+        {
+          "name": "eISCP framed commands over TCP",
+          "default_port": 60128,
+          "notes": "Header/framing plus ISCP payload; long-lived updates"
+        }
+      ],
+      "state_feedback": "TCP push with receiver interrogation",
+      "features": {
+        "power_standby": "supported with network standby/configuration caveats",
+        "volume_mute": "supported; range varies",
+        "physical_input_selection": "supported",
+        "playback_and_track_metadata": "network-source/model dependent; not universal media browsing",
+        "zones_or_grouping": "independent receiver zones where equipped",
+        "dsp_or_presets": "listening/sound modes; model dependent"
+      },
+      "additional_controls": [
+        "Model and capability interrogation",
+        "Receiver zone control",
+        "Variable volume scaling and input enum mappings"
+      ],
+      "model_and_runtime_boundaries": [
+        "Only eISCP-capable Pioneer models. Older Pioneer protocols are a separate family.",
+        "Current HA reference is aioonkyo, not the older onkyo-eiscp dependency.",
+        "GPL-3.0-only: review reuse/licensing before copying or translating implementation into UHC.",
+        "Do not assume all eISCP commands are available on every model."
+      ],
+      "what_to_harvest": [
+        "SSDP variants plus native interview behavior",
+        "Framing and disconnect/recovery tests",
+        "Capability and model quirks",
+        "Command/reply semantics, subject to licensing review"
+      ],
+      "protocol_examples": [],
+      "sources": [
+        "https://github.com/arturpragacz/aioonkyo",
+        "https://pypi.org/project/aioonkyo/",
+        "https://www.home-assistant.io/integrations/onkyo/",
+        "https://github.com/home-assistant/core/issues/162176",
+        "https://www.gnu.org/licenses/gpl-faq.en.html",
+        "https://github.com/home-assistant/core/blob/dev/homeassistant/components/onkyo/manifest.json"
+      ],
+      "verification": {
+        "method": "Repository/package/documentation inspection",
+        "hardware_tested_here": false,
+        "implemented_in_uhc_by_this_task": false,
+        "observed_date": "2026-10-12"
+      }
+    },
+    {
+      "id": "sonos",
+      "family": "Sonos",
+      "scope": "native_lan_only",
+      "reference_client": {
+        "repository": "https://github.com/SoCo/SoCo",
+        "package": "soco",
+        "language": "Python",
+        "license": "MIT",
+        "ha_requirement_observed": "soco==0.31.5; sonos-websocket==0.2.0",
+        "license_basis": "Project repository / publisher package metadata inspected"
+      },
+      "alternative_clients": [
+        {
+          "repository": "https://github.com/bencevans/node-sonos",
+          "package": "sonos",
+          "language": "JavaScript",
+          "license": "MIT",
+          "notes": "Established alternate client and behavior reference."
+        },
+        {
+          "repository": "https://github.com/tatimblin/sonos-sdk",
+          "package": "sonos-sdk / sonos-api",
+          "language": "Rust",
+          "license": "MIT OR Apache-2.0",
+          "notes": "Evaluate as a native Rust option, not an HA-backed maturity claim. High-level SDK is sync/blocking; isolate from Tokio worker threads."
+        }
+      ],
+      "home_assistant_manifest": "https://github.com/home-assistant/core/blob/dev/homeassistant/components/sonos/manifest.json",
+      "discovery": [
+        {
+          "method": "ssdp",
+          "device_types": [
+            "urn:schemas-upnp-org:device:ZonePlayer:1"
+          ],
+          "manufacturers": [],
+          "identity": "Fetch LOCATION device description; match device/model/firmware, not IP alone"
+        },
+        {
+          "method": "mdns_dnssd",
+          "service_types": [
+            "_sonos._tcp.local."
+          ],
+          "ports": "Use resolved SRV/advertised endpoint"
+        }
+      ],
+      "protocols": [
+        {
+          "name": "UPnP / SOAP over HTTP",
+          "default_port": 1400,
+          "notes": "Selected SoCo path with event subscriptions; use discovered service descriptions"
+        },
+        {
+          "name": "Local WebSocket API",
+          "default_port": 1443,
+          "notes": "Separate modern client/protocol path, not required for the SoCo-based baseline"
+        }
+      ],
+      "state_feedback": "UPnP subscription events; modern HA additionally uses a WebSocket client",
+      "features": {
+        "power_standby": "no generic power off/on",
+        "volume_mute": "supported",
+        "physical_input_selection": "TV/line-in only on equipped models",
+        "playback_and_track_metadata": "supported; service content access remains separate",
+        "zones_or_grouping": "speaker groups, coordinator/topology, per-player and group volume",
+        "dsp_or_presets": "EQ, loudness and theater options on equipped models"
+      },
+      "additional_controls": [
+        "Group topology and coordinator changes",
+        "Queues/favorites and current metadata",
+        "TV/line-in selection",
+        "Bass/treble/loudness; night/dialogue modes where available"
+      ],
+      "model_and_runtime_boundaries": [
+        "UPnP must be enabled where current Sonos privacy/security settings require it.",
+        "Device-to-controller event callbacks must be reachable.",
+        "Local playback control does not guarantee music-service catalog/search/authentication support.",
+        "Do not treat stopped playback as a powered-off amplifier."
+      ],
+      "what_to_harvest": [
+        "Discovery and stable device identity",
+        "SCPD/action schemas",
+        "GENA event subscription lifecycle",
+        "Group topology and queue models",
+        "Fixed/variable outputs and model-specific controls"
+      ],
+      "protocol_examples": [],
+      "sources": [
+        "https://github.com/SoCo/SoCo",
+        "https://www.home-assistant.io/integrations/sonos/",
+        "https://github.com/bencevans/node-sonos",
+        "https://github.com/tatimblin/sonos-sdk",
+        "https://github.com/home-assistant/core/blob/dev/homeassistant/components/sonos/manifest.json"
+      ],
+      "verification": {
+        "method": "Repository/package/documentation inspection",
+        "hardware_tested_here": false,
+        "implemented_in_uhc_by_this_task": false,
+        "observed_date": "2026-10-12"
+      }
+    },
+    {
+      "id": "anthem",
+      "family": "Anthem native-IP MRX / AVM family",
+      "scope": "native_lan_only",
+      "reference_client": {
+        "repository": "https://github.com/nugget/python-anthemav",
+        "package": "anthemav",
+        "language": "Python",
+        "license": "MIT",
+        "ha_requirement_observed": "anthemav==1.4.2",
+        "license_basis": "Project repository / publisher package metadata inspected"
+      },
+      "alternative_clients": [],
+      "home_assistant_manifest": "https://github.com/home-assistant/core/blob/dev/homeassistant/components/anthemav/manifest.json",
+      "discovery": [
+        {
+          "method": "configured_host",
+          "automatic_discovery": "Not verified in the selected client/integration; not a claim that no discovery mechanism exists"
+        }
+      ],
+      "protocols": [
+        {
+          "name": "Anthem ASCII over TCP",
+          "default_port": 14999,
+          "notes": "Persistent connection; semicolon-framed messages"
+        }
+      ],
+      "state_feedback": "TCP status updates plus state queries",
+      "features": {
+        "power_standby": "supported with standby-IP control configured",
+        "volume_mute": "supported",
+        "physical_input_selection": "supported",
+        "playback_and_track_metadata": "not song playback/metadata; input-signal diagnostics available",
+        "zones_or_grouping": "Zone 1 is selected client baseline; extend only after validation",
+        "dsp_or_presets": "listening modes and some ARC controls; model specific"
+      },
+      "additional_controls": [
+        "Input name catalog",
+        "Listening modes",
+        "Audio/video signal diagnostics",
+        "x20/x40 model-specific command mappings in inspected source"
+      ],
+      "model_and_runtime_boundaries": [
+        "README is older than parts of current source: source contains x40 and MDX handling. Test the actual generation rather than relying only on README model list.",
+        "Inspected client initializes Zone 1; do not promise all receiver/distribution zones.",
+        "A persistent client may compete with vendor remote/ARC software on limited-connection models.",
+        "No auto-discovery mechanism verified in the selected HA integration."
+      ],
+      "what_to_harvest": [
+        "Model identification and x20/x40 command tables",
+        "Input-name and listening-mode parsing",
+        "Standby-IP behavior",
+        "Connection ownership and reconnect",
+        "Zone 1 tests before generalizing zones"
+      ],
+      "protocol_examples": [],
+      "sources": [
+        "https://github.com/nugget/python-anthemav",
+        "https://pypi.org/project/anthemav/",
+        "https://www.home-assistant.io/integrations/anthemav/",
+        "https://github.com/nugget/python-anthemav/blob/master/anthemav/connection.py",
+        "https://github.com/nugget/python-anthemav/blob/master/anthemav/protocol.py",
+        "https://github.com/home-assistant/core/blob/dev/homeassistant/components/anthemav/manifest.json"
+      ],
+      "verification": {
+        "method": "Repository/package/documentation inspection",
+        "hardware_tested_here": false,
+        "implemented_in_uhc_by_this_task": false,
+        "observed_date": "2026-10-12"
+      }
+    },
+    {
+      "id": "arcam",
+      "family": "Arcam and compatible native-IP JBL / AudioControl",
+      "scope": "native_lan_only",
+      "reference_client": {
+        "repository": "https://github.com/elupus/arcam_fmj",
+        "package": "arcam-fmj",
+        "language": "Python",
+        "license": "MIT",
+        "ha_requirement_observed": "arcam-fmj==3.0.1",
+        "license_basis": "Project repository / publisher package metadata inspected"
+      },
+      "alternative_clients": [],
+      "home_assistant_manifest": "https://github.com/home-assistant/core/blob/dev/homeassistant/components/arcam_fmj/manifest.json",
+      "discovery": [
+        {
+          "method": "ssdp",
+          "device_types": [
+            "urn:schemas-upnp-org:device:MediaRenderer:1"
+          ],
+          "manufacturers": [
+            "ARCAM"
+          ],
+          "identity": "Fetch LOCATION device description; match device/model/firmware, not IP alone"
+        }
+      ],
+      "protocols": [
+        {
+          "name": "Arcam binary control over TCP",
+          "default_port": 50000,
+          "notes": "Model-specific command/response codes"
+        }
+      ],
+      "state_feedback": "Reply/poll-based integration; use receiver feedback where available",
+      "features": {
+        "power_standby": "power-off; LAN wake only on models/settings retaining network in standby",
+        "volume_mute": "supported",
+        "physical_input_selection": "supported",
+        "playback_and_track_metadata": "not claimed generally; selected streaming models need capability checks",
+        "zones_or_grouping": "receiver zones where equipped",
+        "dsp_or_presets": "decode modes and signal diagnostics; model dependent"
+      },
+      "additional_controls": [
+        "Per-zone audio/video signal format diagnostics",
+        "Decode/listening mode selection on supported models"
+      ],
+      "model_and_runtime_boundaries": [
+        "Restrict to native-IP models such as compatible AVR/AV units, SA30 and ST60. Exclude serial-only variants.",
+        "Arcam SSDP manufacturer matcher is not proof of discovery support on every rebadged JBL/AudioControl unit.",
+        "Older models disable the network in standby. IR/serial workarounds are excluded; expose wake as unsupported.",
+        "Some newer models allow HDMI & IP On to retain LAN power control."
+      ],
+      "what_to_harvest": [
+        "Binary frame parser and response errors",
+        "Model-specific command enums",
+        "Zone capability discovery",
+        "Network-standby boundary",
+        "Input/sound-mode mappings"
+      ],
+      "protocol_examples": [],
+      "sources": [
+        "https://github.com/elupus/arcam_fmj",
+        "https://pypi.org/project/arcam-fmj/",
+        "https://www.home-assistant.io/integrations/arcam_fmj/",
+        "https://github.com/home-assistant/core/blob/dev/homeassistant/components/arcam_fmj/manifest.json"
+      ],
+      "verification": {
+        "method": "Repository/package/documentation inspection",
+        "hardware_tested_here": false,
+        "implemented_in_uhc_by_this_task": false,
+        "observed_date": "2026-10-12"
+      }
+    },
+    {
+      "id": "trinnov",
+      "family": "Trinnov Altitude",
+      "scope": "native_lan_only",
+      "reference_client": {
+        "repository": "https://github.com/binarylogic/py-trinnov-altitude",
+        "package": "trinnov-altitude",
+        "language": "Python",
+        "license": "Apache-2.0",
+        "ha_requirement_observed": null,
+        "license_basis": "Project repository / publisher package metadata inspected"
+      },
+      "alternative_clients": [],
+      "home_assistant_manifest": null,
+      "discovery": [
+        {
+          "method": "configured_host",
+          "automatic_discovery": "Not verified in the selected client/integration; not a claim that no discovery mechanism exists"
+        }
+      ],
+      "protocols": [
+        {
+          "name": "Altitude native text control over TCP",
+          "default_port": 44100,
+          "notes": "Long-lived push session with catalogs and optional command acknowledgements"
+        },
+        {
+          "name": "Wake-on-LAN",
+          "default_port": null,
+          "notes": "MAC address required; request is not proof that boot completed"
+        }
+      ],
+      "state_feedback": "TCP push, liveness probes and periodic authoritative reconciliation",
+      "features": {
+        "power_standby": "acknowledged shutdown; wake through WOL with MAC",
+        "volume_mute": "supported",
+        "physical_input_selection": "supported",
+        "playback_and_track_metadata": "not song playback/metadata; processor state instead",
+        "zones_or_grouping": "not claimed as multiroom grouping",
+        "dsp_or_presets": "presets, upmixer and processor options"
+      },
+      "additional_controls": [
+        "Named source and preset catalogs",
+        "Source/preset convergence tracking",
+        "Upmixer/decoder state",
+        "Explicit power lifecycle"
+      ],
+      "model_and_runtime_boundaries": [
+        "Configured-IP baseline; no automatic discovery established by this review.",
+        "Source profiles and processing presets are separate identities.",
+        "Sending bytes, receiving an ACK and observing the target state are different completion levels.",
+        "Never blindly retry relative commands or toggles. Wake and shutdown require lifecycle handling."
+      ],
+      "what_to_harvest": [
+        "Protocol parser and normalized event model",
+        "Catalog/identity semantics",
+        "ACK versus observed-state tests",
+        "Liveness and reconnection",
+        "Shutdown/WOL sequencing"
+      ],
+      "protocol_examples": [],
+      "sources": [
+        "https://github.com/binarylogic/py-trinnov-altitude",
+        "https://pypi.org/project/trinnov-altitude/",
+        "https://github.com/binarylogic/py-trinnov-altitude/blob/master/README.md"
+      ],
+      "verification": {
+        "method": "Repository/package/documentation inspection",
+        "hardware_tested_here": false,
+        "implemented_in_uhc_by_this_task": false,
+        "observed_date": "2026-10-12"
+      }
+    }
+  ],
+  "shared_rust_building_blocks": [
+    {
+      "name": "mdns-sd",
+      "url": "https://docs.rs/mdns-sd/latest/mdns_sd/",
+      "role": "One DNS-SD browser/cache across mDNS families; sync and async receive interfaces."
+    },
+    {
+      "name": "ssdp-client",
+      "url": "https://docs.rs/ssdp-client/latest/ssdp_client/",
+      "role": "Async SSDP search; retain LOCATION/USN and resolve advertised descriptions."
+    },
+    {
+      "name": "rupnp",
+      "url": "https://docs.rs/rupnp/latest/rupnp/",
+      "role": "UPnP discovery, service descriptions and SOAP actions. Do not assume this alone supplies the complete event-subscription lifecycle."
+    },
+    {
+      "name": "sonos-sdk / sonos-api",
+      "url": "https://github.com/tatimblin/sonos-sdk",
+      "role": "Sonos-specific Rust candidate; evaluate maturity and isolate blocking APIs."
+    }
+  ],
+  "proposed_uhc_capability_model": {
+    "identity": [
+      "vendor",
+      "model",
+      "firmware",
+      "stable_device_id",
+      "discovery_provenance"
+    ],
+    "volume": [
+      "absolute_supported",
+      "relative_supported",
+      "mute_supported",
+      "fixed_or_variable",
+      "native_units",
+      "min",
+      "max",
+      "step",
+      "user_ceiling"
+    ],
+    "power": [
+      "standby_supported",
+      "wake_supported",
+      "wake_method",
+      "network_standby_requirement",
+      "observed_state"
+    ],
+    "inputs": [
+      "stable_input_id",
+      "display_name",
+      "available",
+      "physical_or_virtual"
+    ],
+    "state": [
+      "observed_at",
+      "feedback_transport",
+      "connected",
+      "confirmed_or_pending"
+    ],
+    "features": [
+      "independent_zones",
+      "grouping",
+      "transport_by_current_source",
+      "dsp_controls_by_model"
+    ]
+  },
+  "recommended_sequence": [
+    "Use Denon/Marantz as baseline; exploit existing knowledge rather than replacing it.",
+    "First additions: WiiM, MusicCast, BluOS and StreamMagic for broader local control coverage.",
+    "Focused amplifier additions: Hegel and Lyngdorf.",
+    "Add Onkyo after settling the GPL reuse route; add Sonos when grouping/topology is in scope.",
+    "Model-specific follow-ons: Anthem, Arcam and Trinnov, with real-device transcripts."
+  ],
+  "validation_plan": [
+    "Create fixture transcripts for discovery, identity, capability negotiation, commands, notifications, errors and reconnect.",
+    "Tag evidence as implementation-derived, vendor-spec-verified or hardware-verified; do not turn source-derived support into a hardware-tested claim.",
+    "Test packet fragmentation, combined replies, stale and out-of-order events, interrupted connections and reboot.",
+    "Test volume min/max/step, fixed output, mute, source changes and zone separation without sending unsafe default levels.",
+    "One device connection owner inside UHC; frontends consume UHC state rather than opening competing device sessions.",
+    "Keep UHC music providers separate from hardware input/volume ownership."
+  ]
+}

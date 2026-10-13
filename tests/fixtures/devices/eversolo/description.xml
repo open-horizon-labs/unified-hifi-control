@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root configId="9435121" xmlns="urn:schemas-upnp-org:device-1-0" xmlns:dlna="urn:schemas-dlna-org:device-1-0">
+  <specVersion>
+    <major>1</major>
+    <minor>1</minor>
+  </specVersion>
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+    <presentationURL>/</presentationURL>
+    <friendlyName>DMP-A6</friendlyName>
+    <manufacturer>EVERSOLO</manufacturer>
+    <manufacturerURL>http://www.eversolo.com</manufacturerURL>
+    <modelDescription>Plutinosoft AV Media Renderer Device</modelDescription>
+    <modelName>AV Renderer Device</modelName>
+    <modelURL>http://www.plutinosoft.com/platinum</modelURL>
+    <UDN>uuid:800a805eef11-dmr</UDN>
+    <dlna:X_DLNADOC xmlns:dlna="urn:schemas-dlna-org:device-1-0">DMR-1.50</dlna:X_DLNADOC>
+    <iconList>
+      <icon>
+        <mimetype>image/png</mimetype>
+        <width>64</width>
+        <height>64</height>
+        <depth>16</depth>
+        <url>/images/icon-64x64.png</url>
+      </icon>
+    </iconList>
+    <serviceList>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+        <serviceId>urn:upnp-org:serviceId:AVTransport</serviceId>
+        <SCPDURL>/AVTransport/800a805eef11-dmr/scpd.xml</SCPDURL>
+        <controlURL>/AVTransport/800a805eef11-dmr/control.xml</controlURL>
+        <eventSubURL>/AVTransport/800a805eef11-dmr/event.xml</eventSubURL>
+      </service>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>
+        <serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId>
+        <SCPDURL>/ConnectionManager/800a805eef11-dmr/scpd.xml</SCPDURL>
+        <controlURL>/ConnectionManager/800a805eef11-dmr/control.xml</controlURL>
+        <eventSubURL>/ConnectionManager/800a805eef11-dmr/event.xml</eventSubURL>
+      </service>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType>
+        <serviceId>urn:upnp-org:serviceId:RenderingControl</serviceId>
+        <SCPDURL>/RenderingControl/800a805eef11-dmr/scpd.xml</SCPDURL>
+        <controlURL>/RenderingControl/800a805eef11-dmr/control.xml</controlURL>
+        <eventSubURL>/RenderingControl/800a805eef11-dmr/event.xml</eventSubURL>
+      </service>
+    </serviceList>
+  </device>
+</root>

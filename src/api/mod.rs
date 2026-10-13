@@ -43,6 +43,7 @@ pub mod apple_bridge;
 pub mod browse;
 pub mod controller_auth;
 pub mod credentials;
+pub mod devices;
 pub mod ha_integration;
 pub mod hiphi_pairing;
 pub mod hqp_outputs;
@@ -337,6 +338,9 @@ pub struct AppState {
     /// Process-owned HiPhi connector lifecycle. It is package-agnostic and
     /// survives Settings reloads by reconstructing from owner-only config.
     pub hiphi_connector: crate::cloud_connector::runtime::ConnectorSupervisor,
+    /// Playback devices linked to zones (#774, alpha): links, ceilings, and the one command path
+    /// every surface uses to reach an amplifier.
+    pub devices: Arc<crate::devices::service::DeviceService>,
 }
 
 impl AppState {
@@ -371,6 +375,11 @@ impl AppState {
         // too, instead of relying solely on the manual stop / OAuth
         // completion / lifetime-cap paths.
         provider_auth.bind_shutdown(shutdown.clone());
+        let devices = Arc::new(crate::devices::service::DeviceService::new(
+            aggregator.clone(),
+            bus.clone(),
+            crate::devices::links::DeviceLinkStore::open_default(),
+        ));
         Self {
             roon,
             hqplayer,
@@ -409,6 +418,7 @@ impl AppState {
             reliable_commands: None,
             mqtt,
             hiphi_connector: crate::cloud_connector::runtime::ConnectorSupervisor::default(),
+            devices,
         }
     }
 
@@ -3674,6 +3684,11 @@ pub struct AdapterSettings {
     /// Music Assistant is an opt-in remote playback adapter.
     #[serde(default)]
     pub musicassistant: bool,
+    /// Playback device control (#774, alpha): receivers, amplifiers and streamers. Opt-in and off
+    /// by default: some families hold a device's single control session (Denon/Marantz Telnet),
+    /// which other clients then cannot use.
+    #[serde(default)]
+    pub devices: bool,
     /// The MQTT/Home Assistant discovery publisher (#508) is opt-in and off
     /// by default: it needs a broker configured before it can do anything.
     #[serde(default)]
@@ -3706,6 +3721,7 @@ impl AdapterSettings {
             "spotify" => Some(&mut self.spotify),
             "applemusic" => Some(&mut self.applemusic),
             "musicassistant" => Some(&mut self.musicassistant),
+            "devices" => Some(&mut self.devices),
             "mqtt" => Some(&mut self.mqtt),
             _ => None,
         }
@@ -3726,6 +3742,7 @@ impl AdapterSettings {
             "spotify" => Some(self.spotify),
             "applemusic" => Some(self.applemusic),
             "musicassistant" => Some(self.musicassistant),
+            "devices" => Some(self.devices),
             "mqtt" => Some(self.mqtt),
             _ => None,
         }
@@ -3759,6 +3776,7 @@ impl Default for AppSettings {
                 spotify: false,
                 applemusic: false,
                 musicassistant: false,
+                devices: false,
                 mqtt: false,
             },
             mqtt_enabled_by: crate::api::credentials::MqttEnableSource::Automatic,
@@ -4012,6 +4030,7 @@ pub async fn api_settings_post_handler(
             "musicassistant",
             old_adapters.musicassistant != new_adapters.musicassistant,
         ),
+        ("devices", old_adapters.devices != new_adapters.devices),
         ("mqtt", old_adapters.mqtt != new_adapters.mqtt),
     ];
 
@@ -4031,6 +4050,7 @@ pub async fn api_settings_post_handler(
             "spotify" => new_adapters.spotify,
             "applemusic" => new_adapters.applemusic,
             "musicassistant" => new_adapters.musicassistant,
+            "devices" => new_adapters.devices,
             // MQTT is a bus consumer, not a `Startable` in `adapters_list` -
             // handled separately below via `state.mqtt` (the sanctioned
             // surface `tests/adapter_boundary_lint.rs` allows this module
@@ -4368,6 +4388,7 @@ fn adapter_enabled(settings: &AdapterSettings, name: &str) -> Option<bool> {
         "spotify" => Some(settings.spotify),
         "applemusic" => Some(settings.applemusic),
         "musicassistant" => Some(settings.musicassistant),
+        "devices" => Some(settings.devices),
         "mqtt" => Some(settings.mqtt),
         _ => None,
     }
@@ -4809,6 +4830,7 @@ mod tests {
             spotify: true,
             applemusic: true,
             musicassistant: true,
+            devices: true,
             mqtt: true,
         };
         for name in [
@@ -4820,6 +4842,7 @@ mod tests {
             "spotify",
             "applemusic",
             "musicassistant",
+            "devices",
             "mqtt",
         ] {
             assert_eq!(adapter_enabled(&settings, name), Some(true), "{name}");

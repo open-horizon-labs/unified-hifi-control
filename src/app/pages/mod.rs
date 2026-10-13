@@ -2,6 +2,7 @@
 //!
 //! These pages use Dioxus signals and server functions instead of inline JavaScript.
 
+mod devices;
 mod hqplayer;
 mod knobs;
 pub mod library;
@@ -10,6 +11,7 @@ mod settings;
 mod spotify;
 mod zones;
 
+pub use devices::Devices;
 pub use hqplayer::HqPlayer;
 pub use knobs::Knobs;
 pub use library::{LibraryHome, LibraryLocation, LibrarySource, LibraryView};

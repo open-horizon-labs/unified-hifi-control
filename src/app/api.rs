@@ -209,6 +209,9 @@ pub struct AdapterSettings {
     pub applemusic: bool,
     #[serde(default)]
     pub musicassistant: bool,
+    /// Playback device control (#774, alpha).
+    #[serde(default)]
+    pub devices: bool,
     #[serde(default)]
     pub mqtt: bool,
 }
@@ -665,6 +668,52 @@ pub struct Zone {
     /// behavior rather than hiding everything.
     #[serde(default)]
     pub library_tabs: Vec<String>,
+    /// The playback device this zone is linked to (#774, alpha). Absent for unlinked zones.
+    /// A linked zone's volume already is the device's; this adds power and input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<LinkedDeviceInfo>,
+}
+
+/// A zone's linked device, as `/zones` reports it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct LinkedDeviceInfo {
+    pub device_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub maturity: String,
+    /// False when the device is not currently observed (offline, adapter disabled).
+    #[serde(default = "default_true")]
+    pub present: bool,
+    /// `on`, `standby` or `unknown`.
+    #[serde(default)]
+    pub power: String,
+    #[serde(default)]
+    pub input: Option<String>,
+    #[serde(default)]
+    pub input_name: Option<String>,
+    /// The link's input, when the user named one.
+    #[serde(default)]
+    pub source_id: Option<String>,
+    /// Whether the device is on this link's input. `None` when either side is unknown.
+    #[serde(default)]
+    pub on_linked_input: Option<bool>,
+    #[serde(default)]
+    pub inputs: Vec<DeviceInputInfo>,
+}
+
+impl LinkedDeviceInfo {
+    /// The name of the link's input, for "arrives on …" copy.
+    pub fn source_label(&self) -> Option<String> {
+        let source = self.source_id.as_deref()?;
+        Some(
+            self.inputs
+                .iter()
+                .find(|input| input.id == source)
+                .map(|input| input.label().to_string())
+                .unwrap_or_else(|| source.to_string()),
+        )
+    }
 }
 
 // =============================================================================
@@ -1701,6 +1750,383 @@ pub struct FirmwareVersion {
 pub struct FetchFirmwareResponse {
     pub version: Option<String>,
     pub error: Option<String>,
+}
+
+// =============================================================================
+// Playback devices (#774, alpha): GET /devices and the mismatch-report routes
+// =============================================================================
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct DeviceInputInfo {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    /// Some devices know an input has nothing connected; `true` when unknown.
+    #[serde(default = "default_true")]
+    pub available: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl DeviceInputInfo {
+    /// The user-visible name, falling back to the protocol code.
+    pub fn label(&self) -> &str {
+        if self.name.is_empty() {
+            &self.id
+        } else {
+            &self.name
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct DeviceVolumeInfo {
+    /// `decibel`, `percentage`, `linear`, `steps` or `unknown`.
+    #[serde(default)]
+    pub scale: String,
+    #[serde(default)]
+    pub value: Option<f32>,
+    #[serde(default)]
+    pub is_muted: Option<bool>,
+    #[serde(default)]
+    pub min: f32,
+    /// The device's own maximum (its MVMAX, max_volume…) or the protocol's full scale.
+    #[serde(default)]
+    pub hardware_max: Option<f32>,
+    /// The user's optional limit, in the same units. It can only lower `hardware_max`.
+    #[serde(default)]
+    pub ceiling: Option<f32>,
+    #[serde(default)]
+    pub step: f32,
+}
+
+impl DeviceVolumeInfo {
+    /// The maximum a level is clamped to: the lower of the device's own and the user's.
+    pub fn effective_max(&self) -> Option<f32> {
+        match (self.hardware_max, self.ceiling) {
+            (Some(max), Some(ceiling)) => Some(max.min(ceiling)),
+            (Some(max), None) => Some(max),
+            (None, ceiling) => ceiling,
+        }
+    }
+
+    /// The unit suffix for this scale: `dB`, `%`, or nothing.
+    pub fn unit(&self) -> &'static str {
+        match self.scale.as_str() {
+            "decibel" => " dB",
+            "percentage" => "%",
+            _ => "",
+        }
+    }
+
+    /// A level in this scale, as the device would show it.
+    pub fn format(&self, value: f32) -> String {
+        match self.scale.as_str() {
+            "decibel" => format!("{value:.1} dB"),
+            "percentage" => format!("{value:.0}%"),
+            "linear" => format!("{value:.2}"),
+            _ => format!("{value:.0}"),
+        }
+    }
+}
+
+/// One capability claim: whether it is supported and what the claim rests on.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct DeviceCapabilityInfo {
+    #[serde(default)]
+    pub supported: bool,
+    /// `hardware-verified` or `implementation-derived`.
+    #[serde(default)]
+    pub evidence: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct DeviceCapabilitiesInfo {
+    #[serde(default)]
+    pub observe: DeviceCapabilityInfo,
+    #[serde(default)]
+    pub volume: DeviceCapabilityInfo,
+    #[serde(default)]
+    pub mute: DeviceCapabilityInfo,
+    #[serde(default)]
+    pub power: DeviceCapabilityInfo,
+    #[serde(default)]
+    pub input_select: DeviceCapabilityInfo,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct DeviceConnectionInfo {
+    /// `push`, `polling` or `none`.
+    #[serde(default)]
+    pub control_channel: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct DeviceInfo {
+    pub device_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub vendor: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub host: String,
+    /// `on`, `standby` or `unknown`.
+    #[serde(default)]
+    pub power: String,
+    #[serde(default)]
+    pub input: Option<String>,
+    #[serde(default)]
+    pub inputs: Vec<DeviceInputInfo>,
+    #[serde(default)]
+    pub volume: DeviceVolumeInfo,
+    #[serde(default)]
+    pub capabilities: DeviceCapabilitiesInfo,
+    #[serde(default)]
+    pub connection: DeviceConnectionInfo,
+    /// `mdns`, `ssdp`, `manual`, `homeassistant`…
+    #[serde(default)]
+    pub discovery: String,
+    #[serde(default)]
+    pub maturity: String,
+    #[serde(default)]
+    pub linked_zone_ids: Vec<String>,
+}
+
+impl DeviceInfo {
+    /// `Vendor Model`, without repeating a vendor the model name already carries.
+    pub fn vendor_model(&self) -> String {
+        if self
+            .model
+            .to_lowercase()
+            .starts_with(&self.vendor.to_lowercase())
+        {
+            self.model.clone()
+        } else {
+            format!("{} {}", self.vendor, self.model)
+        }
+    }
+
+    /// The current input's user-visible name, falling back to its protocol code.
+    pub fn input_label(&self) -> Option<String> {
+        let current = self.input.as_deref()?;
+        Some(
+            self.inputs
+                .iter()
+                .find(|input| input.id == current && !input.name.is_empty())
+                .map(|input| input.name.clone())
+                .unwrap_or_else(|| current.to_string()),
+        )
+    }
+
+    /// The volume as `value unit`, in the device's own scale, or `None` until read.
+    pub fn volume_label(&self) -> Option<String> {
+        let value = self.volume.value?;
+        let text = match self.volume.scale.as_str() {
+            "decibel" => format!("{value:.1} dB"),
+            "percentage" => format!("{value:.0}%"),
+            "linear" => format!("{value:.2} (linear)"),
+            "steps" => format!("{value:.0} (steps)"),
+            _ => format!("{value}"),
+        };
+        Some(if self.volume.is_muted == Some(true) {
+            format!("{text}, muted")
+        } else {
+            text
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct DeviceLinkInfo {
+    pub zone_id: String,
+    #[serde(default)]
+    pub zone_name: Option<String>,
+    /// False when the provider is not currently publishing the zone.
+    #[serde(default = "default_true")]
+    pub zone_present: bool,
+    pub device_id: String,
+    #[serde(default = "default_true")]
+    pub device_present: bool,
+    /// The device input this zone arrives on, when the user named one. Data only: nothing
+    /// switches to it automatically.
+    #[serde(default)]
+    pub source_id: Option<String>,
+}
+
+/// Whether `device-links.json` can be written (a parse failure never overwrites it).
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct LinkStoreInfo {
+    #[serde(default = "default_true")]
+    pub writable: bool,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+impl Default for LinkStoreInfo {
+    fn default() -> Self {
+        Self {
+            writable: true,
+            detail: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct DeviceInventory {
+    #[serde(default)]
+    pub devices: Vec<DeviceInfo>,
+    #[serde(default)]
+    pub links: Vec<DeviceLinkInfo>,
+    #[serde(default)]
+    pub link_store: LinkStoreInfo,
+    #[serde(default)]
+    pub mismatch_recording: bool,
+    #[serde(default)]
+    pub mismatch_counts: std::collections::HashMap<String, usize>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct ReportSectionInfo {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub lines: Vec<String>,
+    #[serde(default)]
+    pub included_by_default: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct MismatchReportInfo {
+    pub title: String,
+    #[serde(default)]
+    pub fingerprint: String,
+    #[serde(default)]
+    pub sections: Vec<ReportSectionInfo>,
+    #[serde(default)]
+    pub redactions: Vec<String>,
+    #[serde(default)]
+    pub anomaly_count: usize,
+    #[serde(default)]
+    pub evidence: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct MismatchPreview {
+    pub report: MismatchReportInfo,
+    #[serde(default)]
+    pub included_sections: Vec<String>,
+    #[serde(default)]
+    pub markdown: String,
+    #[serde(default)]
+    pub issue_url: String,
+    #[serde(default)]
+    pub omitted_from_link: Vec<String>,
+    #[serde(default)]
+    pub search_url: String,
+    #[serde(default)]
+    pub bundle_url: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// `GET /devices/{id}/report`. `include` is `None` for the server's defaults, or the exact
+/// section ids to include (an empty slice means none).
+pub async fn fetch_device_report(
+    device_id: &str,
+    include: Option<&[String]>,
+) -> Result<MismatchPreview, String> {
+    let url = match include {
+        Some(ids) => format!("/devices/{device_id}/report?include={}", ids.join(",")),
+        None => format!("/devices/{device_id}/report"),
+    };
+    fetch_json(&url).await
+}
+
+/// `POST /devices/link`: the zone's volume becomes the device's from here on.
+pub async fn link_device(
+    zone_id: &str,
+    device_id: &str,
+    source_id: Option<&str>,
+) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct Body<'a> {
+        zone_id: &'a str,
+        device_id: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_id: Option<&'a str>,
+    }
+    post_json_no_response(
+        "/devices/link",
+        &Body {
+            zone_id,
+            device_id,
+            source_id: source_id.filter(|s| !s.is_empty()),
+        },
+    )
+    .await
+}
+
+/// `POST /devices/unlink`: the zone goes back to its provider's own volume (if any).
+pub async fn unlink_device(zone_id: &str) -> Result<(), String> {
+    post_json_no_response(
+        "/devices/unlink",
+        &serde_json::json!({ "zone_id": zone_id }),
+    )
+    .await
+}
+
+/// `POST /devices/ceiling`: an optional user maximum in the device's own units; `None` clears it.
+pub async fn set_device_ceiling(device_id: &str, ceiling: Option<f32>) -> Result<(), String> {
+    post_json_no_response(
+        "/devices/ceiling",
+        &serde_json::json!({ "device_id": device_id, "ceiling": ceiling }),
+    )
+    .await
+}
+
+/// The server's report of one device command (`POST /devices/control`).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct DeviceCommandResult {
+    /// `confirmed`, or `confirmed_different` when the device applied its own limit.
+    #[serde(default)]
+    pub confirmation: String,
+    #[serde(default)]
+    pub sent_volume: Option<f32>,
+    /// True when the request was above the maximum and was lowered to it.
+    #[serde(default)]
+    pub clamped: bool,
+    #[serde(default)]
+    pub observed: DeviceInfo,
+}
+
+/// `POST /devices/control` on a device. `action` is one of `power_on`, `power_off`,
+/// `power_toggle`, `select_input` (value: input id), `volume_set` (value: level),
+/// `volume_up`/`volume_down` (value: optional magnitude), `mute`, `unmute`.
+pub async fn control_device(
+    device_id: &str,
+    action: &str,
+    value: Option<serde_json::Value>,
+) -> Result<DeviceCommandResult, String> {
+    #[derive(Deserialize)]
+    struct Envelope {
+        #[serde(default)]
+        result: DeviceCommandResult,
+    }
+    let mut body = serde_json::json!({ "device_id": device_id, "action": action });
+    if let Some(value) = value {
+        body["value"] = value;
+    }
+    post_json::<_, Envelope>("/devices/control", &body)
+        .await
+        .map(|envelope| envelope.result)
 }
 
 // =============================================================================

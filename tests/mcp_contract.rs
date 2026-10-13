@@ -528,8 +528,8 @@ async fn tools_list_matches_fixture() {
 
     assert_eq!(
         tools.len(),
-        20,
-        "expected 20 tools with HQPlayer enabled, got {}: {:?}",
+        21,
+        "expected 21 tools with HQPlayer enabled, got {}: {:?}",
         tools.len(),
         tool_names(tools)
     );
@@ -600,6 +600,7 @@ async fn tools_list_order_is_pinned() {
             "hifi_hqplayer_outputs",
             "hifi_hqplayer_output_control",
             "hifi_music_details",
+            "hifi_devices",
         ],
         "tools/list order follows the tool_box! list in src/mcp/tools/mod.rs. \
          APPEND new tools rather than inserting, so this assertion grows by one \
@@ -648,6 +649,7 @@ async fn hqplayer_tools_filtered_when_adapter_disabled() {
             "hifi_collections",
             "hifi_zone_group",
             "hifi_music_details",
+            "hifi_devices",
         ],
         "HQPlayer disabled must yield exactly the non-HQPlayer tools, in order"
     );
@@ -784,6 +786,24 @@ async fn initialize_negotiates_down_for_older_clients() {
 /// changing the optionality of a parameter is a visible edit to this table.
 const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
     ("hifi_zones", &[]),
+    // #774 (alpha): playback devices. Only `action` is required; each action
+    // names its own required subset and refuses with the parameter it lacks.
+    (
+        "hifi_devices",
+        &[
+            ("action", true),
+            ("device_id", false),
+            ("zone_id", false),
+            ("source_id", false),
+            ("command", false),
+            ("value", false),
+            ("input", false),
+            ("muted", false),
+            ("ceiling", false),
+            ("enabled", false),
+            ("sections", false),
+        ],
+    ),
     ("hifi_now_playing", &[("zone_id", true)]),
     (
         "hifi_music_details",
@@ -1082,7 +1102,7 @@ async fn a_stale_session_id_is_transparently_recovered() {
         .unwrap_or_else(|| panic!("recovered request must return the tool list, got: {response}"));
     assert_eq!(
         tools.len(),
-        20,
+        21,
         "the recovered session must serve the same tool list as a fresh one"
     );
 }

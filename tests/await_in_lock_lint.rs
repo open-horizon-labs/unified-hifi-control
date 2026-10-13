@@ -276,6 +276,15 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "_lifecycle_guard",
         "HQPlayer manager lifecycle mutations must be serialized",
     ),
+    // One command per playback device (#774): a relative step must resolve against the previous
+    // step's *readback*, so the per-device async mutex is held across dispatch and confirmation.
+    // Lock order: it is the outermost lock on that path; the aggregator RwLock and driver channel
+    // are acquired and released inside it, and nothing acquires it while holding another lock.
+    (
+        "devices/service.rs",
+        "_serialised",
+        "Device commands must be serialized per device so relative steps never race",
+    ),
 ];
 
 fn is_allowed(file: &str, guard: &str) -> bool {

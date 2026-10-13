@@ -58,8 +58,10 @@ pub enum SseEvent {
     // Roon events
     RoonConnected,
     RoonDisconnected,
+    // Boxed: a `Zone` carries its linked device's input catalog (#774), which would otherwise
+    // make this variant dwarf the rest of the enum.
     ZoneDiscovered {
-        payload: ZoneDiscoveredPayload,
+        payload: Box<ZoneDiscoveredPayload>,
     },
     ZoneUpdated {
         payload: ZonePayload,

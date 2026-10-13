@@ -836,6 +836,37 @@ pub struct McpCapabilityZone {
     /// observed" there. Absent when the aggregator holds no such zone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub has_volume_control: Option<bool>,
+    /// The playback device this zone is linked to (#774, alpha), with **per-device** capability
+    /// claims and the evidence each rests on. Present only for linked zones. When present, the
+    /// device — not the provider row — answers for volume, mute, power and input.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linked_device: Option<McpLinkedDevice>,
+}
+
+/// A linked device as `hifi_capabilities` reports it.
+#[derive(Debug, Serialize)]
+pub struct McpLinkedDevice {
+    pub device_id: String,
+    pub maturity: String,
+    /// False when the device is linked but not currently observed.
+    pub present: bool,
+    /// Absent while the device is not observed: no claim is made about hardware UHC cannot see.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<crate::devices::DeviceCapabilities>,
+}
+
+impl McpLinkedDevice {
+    /// The linked device for one zone, or `None` when the zone has no link.
+    pub async fn for_zone(state: &crate::api::AppState, zone_id: &str) -> Option<Self> {
+        let link = state.aggregator.get_device_link(zone_id).await?;
+        let device = state.aggregator.get_device(&link.device_id).await;
+        Some(Self {
+            device_id: link.device_id.to_string(),
+            maturity: crate::devices::DEVICE_CONTROL_MATURITY.to_string(),
+            present: device.is_some(),
+            capabilities: device.map(|device| device.capabilities),
+        })
+    }
 }
 
 /// `hifi_capabilities`' payload.
