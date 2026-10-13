@@ -332,28 +332,33 @@ async fn seek_sends_absolute_seconds_to_the_core() {
         .expect("seek should reach the fake core");
 
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut requests = core
-        .requests_named("com.roonlabs.transport:2/seek")
-        .await;
+    let mut requests = core.requests_named("com.roonlabs.transport:2/seek").await;
     while requests.is_empty() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
-        requests = core
-            .requests_named("com.roonlabs.transport:2/seek")
-            .await;
+        requests = core.requests_named("com.roonlabs.transport:2/seek").await;
     }
     assert_eq!(requests.len(), 1, "expected exactly one seek request");
     assert_eq!(
-        requests[0].body.get("zone_or_output_id").and_then(serde_json::Value::as_str),
+        requests[0]
+            .body
+            .get("zone_or_output_id")
+            .and_then(serde_json::Value::as_str),
         Some("zone_fake_1"),
         "seek must target the requested zone, not an output or a stale id"
     );
     assert_eq!(
-        requests[0].body.get("how").and_then(serde_json::Value::as_str),
+        requests[0]
+            .body
+            .get("how")
+            .and_then(serde_json::Value::as_str),
         Some("absolute"),
         "the knob always previews and commits an absolute position, never a relative jump"
     );
     assert_eq!(
-        requests[0].body.get("seconds").and_then(serde_json::Value::as_i64),
+        requests[0]
+            .body
+            .get("seconds")
+            .and_then(serde_json::Value::as_i64),
         Some(245)
     );
 

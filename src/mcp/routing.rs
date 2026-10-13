@@ -296,6 +296,8 @@ pub const CONTROL_ACTIONS: &[&str] = &[
     "repeat_track",
     "shuffle_on",
     "shuffle_off",
+    // #740: gated per provider by `Capability::Seek`; the others refuse it by name.
+    "seek",
 ];
 
 /// The transport subset of [`CONTROL_ACTIONS`], for "what can this zone do
@@ -650,6 +652,7 @@ mod tests {
             "volume_set",
             "volume_up",
             "volume_down",
+            "seek",
         ] {
             assert!(
                 CONTROL_ACTIONS.contains(&action),
