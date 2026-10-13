@@ -3492,3 +3492,136 @@ async fn roon_set_group_members_refuses_mixed_protocol_outputs() {
 
     core.stop().await;
 }
+
+// =============================================================================
+// Artwork fetched while a track change is in flight
+// =============================================================================
+//
+// Production symptom (v4.0.0-beta.5 on the owner's NAS): after a track change
+// the knob and the web Zones card got the "No Image" placeholder, and the Core
+// still answered the one `get_image` UHC sent ~0.3 s later. The pinned fork
+// deduplicates in-flight `get_image` calls by image key (fork
+// `src/image.rs:77-110`): a second caller is handed the first caller's
+// `req_id` without anything being sent. `get_image` then inserted its waiter
+// under that `req_id`, evicting the first caller's sender, so the first caller
+// failed with "Image request cancelled" while the cover was still in flight.
+// The fork also ignores the requested size when it dedups, so a second caller
+// asking for a different rendition was silently handed the first one's.
+
+const ART_KEY: &str = "cover_track_change";
+const ART_IN_FLIGHT: Duration = Duration::from_millis(600);
+
+fn image_requests(requests: &[mock_servers::roon_core::RecordedRequest]) -> Vec<(u64, u64)> {
+    requests
+        .iter()
+        .filter(|r| r.name == "com.roonlabs.image:1/get_image")
+        .map(|r| {
+            (
+                r.body["width"].as_u64().unwrap_or_default(),
+                r.body["height"].as_u64().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_second_request_for_an_in_flight_cover_waits_for_it_instead_of_failing_the_first() {
+    let core = FakeRoonCore::start().await;
+    let adapter = connected(&core).await;
+    core.set_delay_for_item_key(ART_KEY, ART_IN_FLIGHT).await;
+
+    let first = {
+        let adapter = adapter.clone();
+        tokio::spawn(async move { adapter.get_image(ART_KEY, None, None).await })
+    };
+    // The second client asks while the first fetch is still on the wire.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let second = {
+        let adapter = adapter.clone();
+        tokio::spawn(async move { adapter.get_image(ART_KEY, None, None).await })
+    };
+
+    let first = first.await.expect("first task");
+    let second = second.await.expect("second task");
+    assert!(
+        first.is_ok(),
+        "the first caller must receive the cover, got {:?}",
+        first.err()
+    );
+    assert!(
+        second.is_ok(),
+        "the joining caller must receive the cover, got {:?}",
+        second.err()
+    );
+    assert_eq!(
+        image_requests(&core.requests().await),
+        vec![(2048, 2048)],
+        "one cover, one size: exactly one request reaches the Core"
+    );
+
+    core.stop().await;
+}
+
+#[tokio::test]
+async fn a_different_rendition_of_an_in_flight_cover_is_fetched_at_its_own_size() {
+    let core = FakeRoonCore::start().await;
+    let adapter = connected(&core).await;
+    core.set_delay_for_item_key(ART_KEY, ART_IN_FLIGHT).await;
+
+    // The knob/web lane asks for the full-size source ...
+    let full = {
+        let adapter = adapter.clone();
+        tokio::spawn(async move { adapter.get_image(ART_KEY, None, None).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // ... and the byte-bounded relay/cloud lane asks for the small rendition.
+    let small = {
+        let adapter = adapter.clone();
+        tokio::spawn(async move { adapter.get_image(ART_KEY, Some(300), Some(300)).await })
+    };
+
+    let full = full.await.expect("full task");
+    let small = small.await.expect("small task");
+    assert!(
+        full.is_ok(),
+        "the full-size caller must receive the cover, got {:?}",
+        full.err()
+    );
+    assert!(
+        small.is_ok(),
+        "the small-rendition caller must receive the cover, got {:?}",
+        small.err()
+    );
+    assert_eq!(
+        image_requests(&core.requests().await),
+        vec![(2048, 2048), (300, 300)],
+        "each rendition must be requested at its own size, never handed the other's"
+    );
+
+    core.stop().await;
+}
+
+#[tokio::test]
+async fn back_to_back_cover_requests_never_lose_a_fast_reply() {
+    // `get_image` used to register its waiter only after the request was sent;
+    // a reply processed in that window found no waiter and the caller sat out
+    // the full 10 s timeout. With an instant fake Core, every one of these must
+    // resolve promptly.
+    let core = FakeRoonCore::start().await;
+    let adapter = connected(&core).await;
+
+    for i in 0..50 {
+        let key = format!("instant_cover_{i}");
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            adapter.get_image(&key, Some(64), Some(64)),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(Ok(_))),
+            "request {i} did not resolve promptly: {result:?}"
+        );
+    }
+
+    core.stop().await;
+}

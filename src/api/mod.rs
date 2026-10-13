@@ -726,6 +726,11 @@ impl AppState {
         source_limit: Option<usize>,
     ) -> anyhow::Result<Arc<crate::knobs::artwork_cache::SourceArtwork>> {
         use crate::knobs::artwork_cache::{SourceArtwork, SourceCacheKey};
+        // Resolve the size the provider will actually be asked for *before*
+        // keying the cache, so a bounded lane's small rendition is never
+        // stored or served as the unbounded full-size source.
+        let provider_dimensions =
+            provider_source_dimensions(zone_id, provider_dimensions, source_limit);
         let key = SourceCacheKey {
             provider: artwork_provider(zone_id),
             image_key: image_key.to_string(),
@@ -813,18 +818,7 @@ impl AppState {
             }
             image
         } else if zone_id.starts_with("roon:") || !zone_id.contains(':') {
-            // Byte-bounded lanes (knob picture cache, cloud) keep the small
-            // rendition; unbounded lanes fall through to the adapter's
-            // full-size source default.
-            let (roon_w, roon_h) = if source_limit.is_some() && provider_dimensions == (None, None)
-            {
-                (
-                    Some(crate::adapters::roon::ROON_SMALL_ART),
-                    Some(crate::adapters::roon::ROON_SMALL_ART),
-                )
-            } else {
-                provider_dimensions
-            };
+            let (roon_w, roon_h) = provider_dimensions;
             let img = self.roon.get_image(image_key, roon_w, roon_h).await?;
             ImageData {
                 content_type: img.content_type,
@@ -865,6 +859,25 @@ impl ArtworkResponse {
 
 /// The cache namespace image keys live in. Zones of one provider share an
 /// `image_key` namespace; an HQPlayer cover is per instance.
+/// The size a provider is asked for. Byte-bounded lanes (relay picture
+/// cache, Cloud) keep Roon's small rendition when no size was requested;
+/// unbounded lanes fall through to the adapter's full-size source default.
+fn provider_source_dimensions(
+    zone_id: &str,
+    requested: (Option<u32>, Option<u32>),
+    source_limit: Option<usize>,
+) -> (Option<u32>, Option<u32>) {
+    let roon = zone_id.starts_with("roon:") || !zone_id.contains(':');
+    if roon && source_limit.is_some() && requested == (None, None) {
+        (
+            Some(crate::adapters::roon::ROON_SMALL_ART),
+            Some(crate::adapters::roon::ROON_SMALL_ART),
+        )
+    } else {
+        requested
+    }
+}
+
 fn artwork_provider(zone_id: &str) -> String {
     if zone_id.starts_with("hqplayer:") {
         return zone_id.to_string();
