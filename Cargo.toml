@@ -41,6 +41,7 @@ server = [
     "dep:http-body-util",
     "dep:rust-mcp-sdk",
     "dep:rumqttc",
+    "dep:rustls",
     "dep:ed25519-dalek",
     "dep:uuid",
     "dep:rustix",
@@ -160,7 +161,13 @@ resvg = { version = "0.47.0", features = ["default"], optional = true }
 rust-mcp-sdk = { version = "0.8", default-features = false, features = ["server", "macros", "hyper-server", "sse"], optional = true }
 
 # MQTT publisher for Home Assistant discovery (server only, issue #508)
-rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"], optional = true }
+# `use-rustls-no-provider`, not `use-rustls`: the latter enables tokio-rustls/default, which
+# compiles in aws-lc-rs alongside ring and makes rustls panic on the first TLS connection.
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"], optional = true }
+# The process-wide TLS crypto provider. UHC uses ring everywhere (reqwest, tokio-tungstenite);
+# `server` installs it explicitly at startup so a dependency that enables aws-lc-rs cannot make
+# rustls's provider choice ambiguous (which panics on the first TLS connection).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
 
 # Public-key-only verification and locally held installation identity for the
 # optional outbound HiPhi Cloud connector. The cloud signing key never enters UHC.
@@ -267,3 +274,9 @@ optional = true
 [dependencies.zenresize]
 version = "=0.3.1"
 optional = true
+
+# rumqttc 0.25.1 declares rustls-webpki 0.102 (vulnerable; only used for an error type). Our fork
+# bumps it to 0.103 exactly as bytebeamio/rumqtt#1037 does. Drop this patch when a rumqttc release
+# includes #1037. Tracked in #813.
+[patch.crates-io]
+rumqttc = { git = "https://github.com/open-horizon-labs/rumqtt", rev = "5e07d401a61de5b46d9b08e4c3963efda7470c26" }

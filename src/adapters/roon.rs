@@ -449,6 +449,34 @@ fn roon_zone_ids(zone_ids: &[String], parameter: &str) -> Result<Vec<String>> {
 /// Pending image request - stores the oneshot sender to deliver the result
 type ImageRequest = oneshot::Sender<Option<ImageData>>;
 
+/// The one wire-level `get_image` waiter for an image key.
+///
+/// Keyed by image key, not `req_id`, because the waiter is registered *before*
+/// the request is sent (so a fast reply can never arrive to an empty map) and
+/// the `req_id` only exists afterwards. One entry per key is enough: the
+/// adapter's per-key flights ([`RoonAdapter::get_image`]) guarantee at most one
+/// fork request per image key is outstanding.
+struct PendingImage {
+    /// `None` between registration and the fork returning the request id.
+    req_id: Option<usize>,
+    waiter: ImageRequest,
+}
+
+/// Outcome of one wire-level image fetch, shared by every caller that joined it.
+type ImageFlightResult = std::result::Result<ImageData, String>;
+type ImageFlight = futures::future::Shared<futures::future::BoxFuture<'static, ImageFlightResult>>;
+
+/// The fetch currently on the wire for one image key, and the provider size it asked for.
+struct ImageFlightEntry {
+    dimensions: (Option<u32>, Option<u32>),
+    flight: ImageFlight,
+}
+
+type ImageFlights = Arc<std::sync::Mutex<HashMap<String, ImageFlightEntry>>>;
+
+/// Roon's reply budget for one image request.
+const IMAGE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Pending browse request - stores the oneshot sender to deliver the result
 type BrowseRequest = oneshot::Sender<Result<BrowseResult>>;
 
@@ -953,8 +981,8 @@ struct RoonState {
     transport: Option<Transport>,
     image: Option<Image>,
     browse: Option<Browse>,
-    /// Pending image requests: request_id -> (image_key, oneshot sender)
-    pending_images: HashMap<usize, (String, ImageRequest)>,
+    /// Pending wire-level image requests: image_key -> waiter (see [`PendingImage`])
+    pending_images: HashMap<String, PendingImage>,
     /// Pending browse requests: request_id -> (session_key, oneshot sender)
     pending_browses: HashMap<usize, (Option<String>, BrowseRequest)>,
     /// Pending load requests: request_id -> (session_key, oneshot sender)
@@ -1101,20 +1129,38 @@ impl RoonState {
     /// event loop writes. Widening `ImageRequest` to a `Result` would carry it
     /// through, and is not worth the churn for cover art.
     fn route_image_rejection(&mut self, req_id: usize, image_key: &str) -> ErrorRouting {
-        if let Some((pending_key, _)) = self.pending_images.get(&req_id) {
-            if pending_key != image_key {
-                return ErrorRouting::KeyMismatch;
+        match self.pending_images.get(image_key) {
+            // The waiter for this key is still learning its request id (the
+            // reply raced the fork's return), or holds exactly this one.
+            Some(pending) if pending.req_id.is_none_or(|id| id == req_id) => {
+                if let Some(pending) = self.pending_images.remove(image_key) {
+                    return if pending.waiter.send(None).is_ok() {
+                        ErrorRouting::Image
+                    } else {
+                        ErrorRouting::ReceiverGone
+                    };
+                }
+                ErrorRouting::NoWaiter
             }
-            if let Some((_, sender)) = self.pending_images.remove(&req_id) {
-                return if sender.send(None).is_ok() {
-                    ErrorRouting::Image
-                } else {
-                    ErrorRouting::ReceiverGone
-                };
+            Some(_) => ErrorRouting::KeyMismatch,
+            None if self
+                .pending_images
+                .values()
+                .any(|pending| pending.req_id == Some(req_id)) =>
+            {
+                ErrorRouting::KeyMismatch
+            }
+            None => ErrorRouting::NoWaiter,
+        }
+    }
+
+    /// Deliver a Core image reply to the request waiting on its key.
+    fn deliver_image(&mut self, image_key: &str, image: ImageData) {
+        if let Some(pending) = self.pending_images.remove(image_key) {
+            if pending.waiter.send(Some(image)).is_err() {
+                tracing::debug!("Image request cancelled (receiver dropped): {}", image_key);
             }
         }
-
-        ErrorRouting::NoWaiter
     }
 }
 
@@ -1362,6 +1408,8 @@ pub struct RoonAdapter {
     /// so each test instance gets its own file instead of racing every other
     /// `RoonAdapter` in the test binary over one shared path (issue #554).
     state_path: PathBuf,
+    /// In-flight cover fetches by image key (see [`Self::get_image`]).
+    image_flights: ImageFlights,
 }
 
 impl RoonAdapter {
@@ -1376,6 +1424,7 @@ impl RoonAdapter {
             knob_store: None,
             runtime_bridge: None,
             state_path: get_roon_state_path(),
+            image_flights: ImageFlights::default(),
         }
     }
 
@@ -1404,6 +1453,7 @@ impl RoonAdapter {
             knob_store: Some(knob_store),
             runtime_bridge,
             state_path: get_roon_state_path(),
+            image_flights: ImageFlights::default(),
         }
     }
 
@@ -1917,56 +1967,81 @@ impl RoonAdapter {
         self.multiroom_status().await
     }
 
-    /// Get album art image
+    /// Get album art image.
+    ///
+    /// Single-flight per image key: a caller asking for a cover whose fetch is
+    /// already on the wire at the same size joins that fetch and receives the
+    /// same bytes; a caller asking for a different size waits for it to finish
+    /// and then sends its own request. Both are required by the pinned fork,
+    /// which deduplicates in-flight `get_image` calls by image key alone
+    /// (fork `src/image.rs:77-110`): a second concurrent call is handed the
+    /// first call's request id -- whatever size it asked for -- or, while the
+    /// first is still being sent, no id at all. Before this, the second caller's
+    /// waiter replaced the first's, and the first failed with "Image request
+    /// cancelled" mid-flight; the knob route turned that into the placeholder
+    /// after every track change.
+    ///
+    /// The fetch runs in its own task, so a caller that gives up (an HTTP
+    /// client disconnect) cannot cancel it for the callers that joined it; it
+    /// is bounded by the 10 s Roon reply timeout either way.
     pub async fn get_image(
         &self,
         image_key: &str,
         width: Option<u32>,
         height: Option<u32>,
     ) -> Result<ImageData> {
-        let (tx, rx) = oneshot::channel();
+        use futures::FutureExt;
 
-        // Clone image service while holding lock, then release before await
-        let image = {
-            let state = self.state.read().await;
-            state
-                .image
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("Image service not available"))?
-        };
-
-        let scaling = Some(image_scaling(width, height));
-
-        // Request the image (lock not held)
-        let args = ImageArgs::new(scaling, Some(ImageFormat::Jpeg));
-        let req_id = image.get_image(image_key, args).await;
-
-        let req_id = match req_id {
-            Some(id) => {
-                // Re-acquire lock to insert pending request
-                let mut state = self.state.write().await;
-                state.pending_images.insert(id, (image_key.to_string(), tx));
-                id
+        let dimensions = (width, height);
+        loop {
+            let (flight, ours) = {
+                let mut flights = self
+                    .image_flights
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                match flights.get(image_key) {
+                    Some(entry) => (entry.flight.clone(), entry.dimensions == dimensions),
+                    None => {
+                        let state = self.state.clone();
+                        let registry = self.image_flights.clone();
+                        let key = image_key.to_string();
+                        // The task removes its own entry before resolving; it
+                        // cannot do so before this insert, because it needs
+                        // the lock held here.
+                        let task = tokio::spawn(async move {
+                            let result = fetch_image_once(&state, &key, width, height)
+                                .await
+                                .map_err(|error| error.to_string());
+                            registry
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .remove(&key);
+                            result
+                        });
+                        let flight = async move {
+                            task.await.unwrap_or_else(|error| {
+                                Err(format!("Image request task failed: {error}"))
+                            })
+                        }
+                        .boxed()
+                        .shared();
+                        flights.insert(
+                            image_key.to_string(),
+                            ImageFlightEntry {
+                                dimensions,
+                                flight: flight.clone(),
+                            },
+                        );
+                        (flight, true)
+                    }
+                }
+            };
+            let result = flight.await;
+            if ours {
+                return result.map_err(anyhow::Error::msg);
             }
-            None => return Err(anyhow::anyhow!("Failed to request image")),
-        };
-
-        tracing::debug!("Requested image {} with req_id {}", image_key, req_id);
-
-        // Wait for response with timeout
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), rx).await;
-
-        // Clean up pending request on timeout or cancellation
-        if !matches!(result, Ok(Ok(Some(_)))) {
-            let mut state = self.state.write().await;
-            state.pending_images.remove(&req_id);
-        }
-
-        match result {
-            Ok(Ok(Some(data))) => Ok(data),
-            Ok(Ok(None)) => Err(anyhow::anyhow!("Image not found")),
-            Ok(Err(_)) => Err(anyhow::anyhow!("Image request cancelled")),
-            Err(_) => Err(anyhow::anyhow!("Image request timed out")),
+            // A different rendition of this cover was on the wire. It has
+            // finished (and removed itself); ask again for ours.
         }
     }
 
@@ -4781,87 +4856,36 @@ async fn run_roon_loop(
                             }
                         }
                     }
-                    // Issue #416 checked these two arms and deliberately left them
-                    // scanning, because `pending_images` shares the *shape* of the
-                    // browse defect without sharing the defect:
-                    //
-                    // - The `req_id` is not available here. For image responses the
-                    //   fork replaces the raw message with `Value::Null` before
-                    //   sending (fork `src/lib.rs:634-639`), so unlike the browse
-                    //   arms there is nothing to read a `request_id` off. Correcting
-                    //   these would need a fork change.
-                    // - It cannot cross-deliver anyway. `Image::get_image`
-                    //   deduplicates in-flight requests by image key (fork
-                    //   `src/image.rs:77-110`): a second request for a key already in
-                    //   flight is handed the *first* request's `req_id` rather than
-                    //   being sent. So `pending_images` cannot hold two entries with
-                    //   one image key, and the scan below can only ever match the
-                    //   one request that asked for this key. The correlation key is
-                    //   the content's identity here, which is exactly what a session
-                    //   key is not.
-                    //
-                    // What that dedup *does* cost is a lost waiter, not a wrong
-                    // result: two concurrent `get_image` calls for one key resolve
-                    // to the same `req_id`, so the second `pending_images.insert`
-                    // evicts the first caller's sender and that caller gets "Image
-                    // request cancelled" while the second gets the image. Different
-                    // defect, different fix (fan-out per key), out of #416's scope -
-                    // recorded here rather than silently left.
+                    // Image replies are correlated by image key, not `req_id`: the
+                    // fork replaces the raw message with `Value::Null` before sending
+                    // (fork `src/lib.rs:634-639`), so there is no `request_id` to read.
+                    // Key correlation is exact here because `get_image` keeps at most
+                    // one fork request per image key outstanding (its per-key
+                    // flights), which is also what stops the fork's own by-key dedup
+                    // from evicting a waiter. See `RoonAdapter::get_image`.
                     Parsed::Jpeg((image_key, data)) => {
                         tracing::debug!(
                             "Received JPEG image: {} ({} bytes)",
                             image_key,
                             data.len()
                         );
-                        let mut s = state_for_events.write().await;
-                        // Find pending request by matching image_key
-                        if let Some(req_id) = s
-                            .pending_images
-                            .iter()
-                            .find(|(_, (key, _))| key == &image_key)
-                            .map(|(k, _)| *k)
-                        {
-                            if let Some((_key, sender)) = s.pending_images.remove(&req_id) {
-                                if sender
-                                    .send(Some(ImageData {
-                                        content_type: "image/jpeg".to_string(),
-                                        data,
-                                    }))
-                                    .is_err()
-                                {
-                                    tracing::debug!(
-                                        "Image request cancelled (receiver dropped): {}",
-                                        image_key
-                                    );
-                                }
-                            }
-                        }
+                        state_for_events.write().await.deliver_image(
+                            &image_key,
+                            ImageData {
+                                content_type: "image/jpeg".to_string(),
+                                data,
+                            },
+                        );
                     }
                     Parsed::Png((image_key, data)) => {
                         tracing::debug!("Received PNG image: {} ({} bytes)", image_key, data.len());
-                        let mut s = state_for_events.write().await;
-                        // Find pending request by matching image_key
-                        if let Some(req_id) = s
-                            .pending_images
-                            .iter()
-                            .find(|(_, (key, _))| key == &image_key)
-                            .map(|(k, _)| *k)
-                        {
-                            if let Some((_key, sender)) = s.pending_images.remove(&req_id) {
-                                if sender
-                                    .send(Some(ImageData {
-                                        content_type: "image/png".to_string(),
-                                        data,
-                                    }))
-                                    .is_err()
-                                {
-                                    tracing::debug!(
-                                        "Image request cancelled (receiver dropped): {}",
-                                        image_key
-                                    );
-                                }
-                            }
-                        }
+                        state_for_events.write().await.deliver_image(
+                            &image_key,
+                            ImageData {
+                                content_type: "image/png".to_string(),
+                                data,
+                            },
+                        );
                     }
                     // Issue #416: correlate on the `req_id` in the raw MOO message,
                     // with the session key as the reconnect guard - the same rule
@@ -5143,6 +5167,62 @@ pub const ROON_SOURCE_ART_MAX: u32 = 2048;
 
 /// Size used by lanes with tight byte budgets (knob picture cache, cloud lane).
 pub const ROON_SMALL_ART: u32 = 300;
+
+/// Send one `get_image` to the Core and wait for its reply.
+///
+/// The waiter is registered under the image key *before* the request is sent,
+/// so a reply the event loop processes before the fork returns the request id
+/// still finds it. Callers must hold the per-key flight (see
+/// [`RoonAdapter::get_image`]); this function assumes it is the only request
+/// for `image_key` in flight.
+async fn fetch_image_once(
+    state: &Arc<RwLock<RoonState>>,
+    image_key: &str,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<ImageData> {
+    let (tx, rx) = oneshot::channel();
+    let image = {
+        let mut state = state.write().await;
+        let image = state
+            .image
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Image service not available"))?;
+        state.pending_images.insert(
+            image_key.to_string(),
+            PendingImage {
+                req_id: None,
+                waiter: tx,
+            },
+        );
+        image
+    };
+
+    // Request the image (lock not held)
+    let args = ImageArgs::new(Some(image_scaling(width, height)), Some(ImageFormat::Jpeg));
+    let Some(req_id) = image.get_image(image_key, args).await else {
+        state.write().await.pending_images.remove(image_key);
+        return Err(anyhow::anyhow!("Failed to request image"));
+    };
+    if let Some(pending) = state.write().await.pending_images.get_mut(image_key) {
+        pending.req_id = Some(req_id);
+    }
+    tracing::debug!("Requested image {} with req_id {}", image_key, req_id);
+
+    let result = tokio::time::timeout(IMAGE_TIMEOUT, rx).await;
+
+    // Clean up the waiter on timeout or cancellation
+    if !matches!(result, Ok(Ok(Some(_)))) {
+        state.write().await.pending_images.remove(image_key);
+    }
+
+    match result {
+        Ok(Ok(Some(data))) => Ok(data),
+        Ok(Ok(None)) => Err(anyhow::anyhow!("Image not found")),
+        Ok(Err(_)) => Err(anyhow::anyhow!("Image request cancelled")),
+        Err(_) => Err(anyhow::anyhow!("Image request timed out")),
+    }
+}
 
 fn image_scaling(width: Option<u32>, height: Option<u32>) -> Scaling {
     match (width, height) {
@@ -5538,9 +5618,13 @@ mod tests {
         image_key: &str,
     ) -> oneshot::Receiver<Option<ImageData>> {
         let (tx, rx) = oneshot::channel();
-        state
-            .pending_images
-            .insert(req_id, (image_key.to_string(), tx));
+        state.pending_images.insert(
+            image_key.to_string(),
+            PendingImage {
+                req_id: Some(req_id),
+                waiter: tx,
+            },
+        );
         rx
     }
 
@@ -5800,8 +5884,8 @@ mod tests {
         // `get_image` reads None as "Image not found".
         assert!(matches!(wanted.try_recv(), Ok(None)));
         assert!(matches!(other.try_recv(), Err(TryRecvError::Empty)));
-        assert!(!state.pending_images.contains_key(&90));
-        assert!(state.pending_images.contains_key(&91));
+        assert!(!state.pending_images.contains_key("image_a"));
+        assert!(state.pending_images.contains_key("image_b"));
     }
 
     #[test]
@@ -5813,7 +5897,51 @@ mod tests {
 
         assert_eq!(routing, ErrorRouting::KeyMismatch);
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
-        assert!(state.pending_images.contains_key(&92));
+        assert!(state.pending_images.contains_key("image_a"));
+    }
+
+    #[test]
+    fn an_image_reply_racing_the_request_id_still_reaches_its_waiter() {
+        // `fetch_image_once` registers before sending; the id arrives later.
+        let mut state = RoonState::default();
+        let (tx, mut rx) = oneshot::channel();
+        state.pending_images.insert(
+            "image_a".to_string(),
+            PendingImage {
+                req_id: None,
+                waiter: tx,
+            },
+        );
+
+        state.deliver_image(
+            "image_a",
+            ImageData {
+                content_type: "image/jpeg".to_string(),
+                data: vec![1, 2, 3],
+            },
+        );
+
+        assert!(matches!(rx.try_recv(), Ok(Some(image)) if image.data == vec![1, 2, 3]));
+        assert!(state.pending_images.is_empty());
+    }
+
+    #[test]
+    fn an_image_rejection_racing_the_request_id_still_reaches_its_waiter() {
+        let mut state = RoonState::default();
+        let (tx, mut rx) = oneshot::channel();
+        state.pending_images.insert(
+            "image_a".to_string(),
+            PendingImage {
+                req_id: None,
+                waiter: tx,
+            },
+        );
+
+        assert_eq!(
+            state.route_image_rejection(93, "image_a"),
+            ErrorRouting::Image
+        );
+        assert!(matches!(rx.try_recv(), Ok(None)));
     }
 
     #[test]

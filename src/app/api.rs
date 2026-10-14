@@ -576,8 +576,14 @@ impl MqttStatusResponse {
             "That address could not be reached from here. Check they are on the same network."
         } else if lowered.contains("timed out") || lowered.contains("timeout") {
             "The broker did not answer in time."
-        } else if lowered.contains("certificate") || lowered.contains("tls") {
+        } else if lowered.contains("certificate") {
             "The secure connection was refused. Check the Use TLS setting matches the broker."
+        } else if lowered.contains("tls") {
+            // Almost always "Use TLS" ticked against a plain listener: the
+            // broker hangs up on the handshake ("tls handshake eof"), which
+            // on its own reads like a broken broker.
+            "The secure (TLS) handshake failed — is TLS enabled on this broker? \
+             Plain MQTT usually uses port 1883 without TLS."
         } else {
             return Some(error.clone());
         };
@@ -2404,6 +2410,35 @@ mod mqtt_status_tests {
         assert_eq!(
             status.connection_problem().as_deref(),
             Some("Mqtt state: Invalid state for a given operation")
+        );
+    }
+
+    /// "Use TLS" ticked against a plain listener on 1883 - the case the
+    /// raw "tls handshake eof" never explained.
+    #[test]
+    fn a_tls_handshake_failure_points_at_the_tls_setting_and_port() {
+        let mut status = retrying(
+            "TLS: I/O: tls handshake eof — is TLS enabled on this broker? Plain MQTT usually uses port 1883 without TLS",
+        );
+        status.tls = Some(true);
+        assert_eq!(
+            status.connection_problem().as_deref(),
+            Some(
+                "The secure (TLS) handshake failed — is TLS enabled on this broker? \
+                 Plain MQTT usually uses port 1883 without TLS."
+            )
+        );
+    }
+
+    #[test]
+    fn a_rejected_certificate_is_still_explained_as_a_certificate_problem() {
+        let mut status = retrying("TLS: Web Pki: invalid peer certificate: UnknownIssuer");
+        status.tls = Some(true);
+        assert_eq!(
+            status.connection_problem().as_deref(),
+            Some(
+                "The secure connection was refused. Check the Use TLS setting matches the broker."
+            )
         );
     }
 

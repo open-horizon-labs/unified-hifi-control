@@ -35,6 +35,31 @@ mod server {
         trace::TraceLayer,
     };
 
+    /// Name the route behind every 5xx. `TraceLayer`'s failure line carries
+    /// only status and latency at the default log level (its request span,
+    /// which holds the URI, is DEBUG), so production logs could show dozens
+    /// of 500s without saying what returned them. Only the path is logged:
+    /// query strings can carry OAuth codes and other credentials.
+    async fn log_server_errors(
+        request: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        let method = request.method().clone();
+        let path = request.uri().path().to_owned();
+        let started = Instant::now();
+        let response = next.run(request).await;
+        if response.status().is_server_error() {
+            tracing::warn!(
+                %method,
+                %path,
+                status = response.status().as_u16(),
+                latency_ms = started.elapsed().as_millis() as u64,
+                "HTTP request failed with a server error"
+            );
+        }
+        response
+    }
+
     /// Same-origin browser requests do not need CORS. Cross-origin browser
     /// access is opt-in because this server also exposes playback, OAuth, and
     /// companion authority endpoints; a global permissive policy would let
@@ -1236,6 +1261,7 @@ mod server {
             ))
             .layer(configured_cors_layer())
             .layer(CompressionLayer::new())
+            .layer(axum::middleware::from_fn(log_server_errors))
             .layer(TraceLayer::new_for_http())
             .with_state(state);
 
@@ -1404,6 +1430,9 @@ mod server {
 #[cfg(feature = "server")]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Before anything can open a TLS connection (see `tls::install_crypto_provider`).
+    unified_hifi_control::tls::install_crypto_provider();
+
     // Handle --version and --help before starting server
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
