@@ -274,3 +274,9 @@ optional = true
 [dependencies.zenresize]
 version = "=0.3.1"
 optional = true
+
+# rumqttc 0.25.1 declares rustls-webpki 0.102 (vulnerable; only used for an error type). Our fork
+# bumps it to 0.103 exactly as bytebeamio/rumqtt#1037 does. Drop this patch when a rumqttc release
+# includes #1037. Tracked in #813.
+[patch.crates-io]
+rumqttc = { git = "https://github.com/open-horizon-labs/rumqtt", rev = "5e07d401a61de5b46d9b08e4c3963efda7470c26" }
