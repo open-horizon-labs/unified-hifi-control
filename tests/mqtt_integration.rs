@@ -1149,3 +1149,202 @@ async fn knob_discovery_state_and_zone_select_round_trip_over_a_real_broker() {
     publisher.shutdown().await;
     assert!(!publisher.is_running().await);
 }
+
+/// Build a publisher wired to a running aggregator, ready to `configure`.
+async fn publisher_with_running_aggregator() -> (
+    MqttPublisher,
+    unified_hifi_control::bus::SharedBus,
+    Arc<ZoneAggregator>,
+) {
+    let bus = create_bus();
+    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let aggregator_task = aggregator.clone();
+    tokio::spawn(async move {
+        aggregator_task.run_with_ready(ready_tx).await;
+    });
+    ready_rx.await.expect("aggregator ready");
+    let publisher = MqttPublisher::new(
+        bus.clone(),
+        aggregator.clone(),
+        Arc::new(AdapterRegistry::default()),
+        isolated_knob_store(),
+    );
+    (publisher, bus, aggregator)
+}
+
+fn loopback_record(port: u16) -> MqttCredentialRecord {
+    MqttCredentialRecord {
+        host: "127.0.0.1".to_string(),
+        port,
+        tls: false,
+        username: None,
+        password: None,
+        base_topic: "unified-hifi".to_string(),
+        discovery_prefix: "homeassistant".to_string(),
+        source: Default::default(),
+    }
+}
+
+/// Zone traffic while the broker is unreachable must not wedge the
+/// publisher. `rumqttc` buffers outgoing requests in a bounded channel that
+/// only drains while the event loop is being polled; when the same task both
+/// polls and publishes, a full channel parks it inside a `publish().await`
+/// that nothing will ever complete. Cancellation could not reach it there,
+/// so every re-save of the broker settings logged "did not stop within 5s"
+/// and stalled the Settings request behind that 5s timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_publisher_backed_up_behind_an_unreachable_broker_is_prompt() {
+    let port = free_port(); // nothing listens here
+    let (publisher, bus, aggregator) = publisher_with_running_aggregator().await;
+    publisher.configure(loopback_record(port)).await;
+    publisher.set_enabled(true).await;
+
+    // Each discovery publishes a full zone (several retained topics) -
+    // comfortably more than the client's 64-request buffer in total.
+    // Let the task subscribe to the bus before the traffic starts.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for index in 0..20 {
+        bus.publish(BusEvent::ZoneDiscovered {
+            zone: zone_fixture(&format!("roon:backlog-{index}"), "roon"),
+        });
+    }
+    assert!(
+        wait_until_async(
+            || async { aggregator.get_zones().await.len() == 20 },
+            Duration::from_secs(5)
+        )
+        .await,
+        "aggregator saw the zones"
+    );
+    // Let the publisher work through its post-error backoff and into the
+    // full buffer.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let started = std::time::Instant::now();
+    publisher.shutdown().await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "cancellation must interrupt a backed-up publisher promptly, took {elapsed:?}"
+    );
+}
+
+/// The other face of the same wedge: a publisher whose buffer filled while
+/// the broker was away must still connect once the broker turns up, rather
+/// than sitting parked in a `publish` forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_publisher_that_backed_up_while_the_broker_was_away_still_connects() {
+    let port = free_port();
+    let (publisher, bus, aggregator) = publisher_with_running_aggregator().await;
+    publisher.configure(loopback_record(port)).await;
+    publisher.set_enabled(true).await;
+
+    // Let the task subscribe to the bus before the traffic starts.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for index in 0..20 {
+        bus.publish(BusEvent::ZoneDiscovered {
+            zone: zone_fixture(&format!("roon:late-{index}"), "roon"),
+        });
+    }
+    assert!(
+        wait_until_async(
+            || async { aggregator.get_zones().await.len() == 20 },
+            Duration::from_secs(5)
+        )
+        .await,
+        "aggregator saw the zones"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    start_test_broker(port);
+    wait_for_broker_ready(port, Duration::from_secs(5)).await;
+
+    let status = wait_for_connection(
+        &publisher,
+        MqttConnectionState::Connected,
+        Duration::from_secs(15),
+    )
+    .await;
+    assert_eq!(
+        status.connection,
+        MqttConnectionState::Connected,
+        "the publisher must reach a broker that appeared later, got {status:?}"
+    );
+    publisher.shutdown().await;
+}
+
+/// Announcing many zones on a fresh connection must not deadlock either:
+/// more retained topics than the request buffer holds, all queued from the
+/// `ConnAck` handler, have to keep flowing to the broker.
+#[tokio::test(flavor = "multi_thread")]
+async fn announcing_more_zones_than_the_request_buffer_holds_does_not_stall() {
+    let port = free_port();
+    start_test_broker(port);
+    wait_for_broker_ready(port, Duration::from_secs(5)).await;
+    let (publisher, bus, aggregator) = publisher_with_running_aggregator().await;
+    for index in 0..20 {
+        bus.publish(BusEvent::ZoneDiscovered {
+            zone: zone_fixture(&format!("roon:many-{index}"), "roon"),
+        });
+    }
+    assert!(
+        wait_until_async(
+            || async { aggregator.get_zones().await.len() == 20 },
+            Duration::from_secs(5)
+        )
+        .await,
+        "aggregator saw the zones"
+    );
+
+    let (client, mut eventloop) = connect_test_client(port, "many-zones-observer").await;
+    subscribe_and_wait(&client, &mut eventloop, "unified-hifi/#").await;
+
+    publisher.configure(loopback_record(port)).await;
+    publisher.set_enabled(true).await;
+
+    // Every zone's retained state topic has to arrive, which needs well
+    // over 64 requests to have drained through the client.
+    let mut seen = std::collections::HashSet::new();
+    let all_arrived = timeout(Duration::from_secs(15), async {
+        while seen.len() < 20 {
+            match eventloop.poll().await {
+                Ok(Event::Incoming(Packet::Publish(publish)))
+                    if publish
+                        .topic
+                        .starts_with("unified-hifi/media_player/roon_many_")
+                        && publish.topic.ends_with("/state") =>
+                {
+                    seen.insert(publish.topic.clone());
+                }
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await;
+    assert!(
+        all_arrived.is_ok(),
+        "every zone must reach the broker, saw {} of 20",
+        seen.len()
+    );
+
+    let started = std::time::Instant::now();
+    publisher.shutdown().await;
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+async fn wait_until_async<F, Fut>(predicate: F, deadline: Duration) -> bool
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let started = tokio::time::Instant::now();
+    while started.elapsed() < deadline {
+        if predicate().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    predicate().await
+}

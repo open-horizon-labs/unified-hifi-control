@@ -35,6 +35,7 @@ pub mod discovery;
 pub mod knob_command;
 pub mod knob_discovery;
 pub mod knob_state;
+pub mod resolve;
 pub mod state;
 pub mod topics;
 
@@ -217,7 +218,9 @@ pub struct MqttStatus {
     pub running: bool,
     /// Real broker connectivity (#607), independent of `running`.
     pub connection: MqttConnectionState,
-    /// Why the last connection attempt failed, verbatim from `rumqttc`.
+    /// Why the last connection attempt failed: `rumqttc`'s text, with the
+    /// likely fix appended where the raw text hides it (a TLS handshake
+    /// against a plain listener - see `describe_connection_error`).
     /// Present while retrying; cleared on a successful `ConnAck`. "bad
     /// credentials" and "unknown host" need different fixes, so the text
     /// has to survive as far as the user.
@@ -477,8 +480,14 @@ fn client_id() -> String {
     )
 }
 
-fn mqtt_options(record: &MqttCredentialRecord, availability_topic: &str) -> MqttOptions {
-    let mut options = MqttOptions::new(client_id(), record.host.clone(), record.port);
+/// Connection options for `record`, dialling `dial_host` - the configured
+/// host itself, or the address [`resolve`] found for it.
+fn mqtt_options(
+    record: &MqttCredentialRecord,
+    dial_host: &str,
+    availability_topic: &str,
+) -> MqttOptions {
+    let mut options = MqttOptions::new(client_id(), dial_host.to_string(), record.port);
     options.set_keep_alive(Duration::from_secs(30));
     if let Some(username) = record.username.as_ref().filter(|u| !u.is_empty()) {
         options.set_credentials(
@@ -840,15 +849,32 @@ async fn handle_incoming_publish(
     }
 }
 
-/// The publisher's connect/reconnect loop. `rumqttc`'s `EventLoop` retries
-/// the underlying TCP/TLS connection on its own; this loop only needs to
-/// re-announce state on every fresh `ConnAck`, since a new MQTT session (or
-/// a broker restart) has no memory of what was previously retained here.
+/// What the connection driver hands the publishing loop. Only the events
+/// the publisher acts on; acks, pings and outgoing echoes stay in the
+/// driver.
+enum Inbound {
+    /// A fresh session: re-announce everything.
+    ConnAck,
+    Publish(rumqttc::Publish),
+}
+
+/// The publisher task.
 ///
-/// It also reports what the event loop is actually doing into `connection`
-/// (#607), because "this task is alive" and "the broker answered" are not
-/// the same fact - the task stays alive indefinitely retrying a host that
-/// will never resolve.
+/// Two halves run concurrently inside it: [`drive_connection`] owns the
+/// `rumqttc` event loop and does nothing but keep it polled, and
+/// [`publish_loop`] reacts to the bus and to inbound messages. They have to
+/// be separate. `rumqttc` queues requests in a bounded channel that only
+/// drains while the event loop is polled, so a single loop that both polled
+/// and published wedged itself as soon as one burst of publishes outran the
+/// buffer - announcing more than a handful of zones on connect, or ordinary
+/// zone traffic while the broker was unreachable. Parked in a `publish`
+/// nothing would ever complete, it could neither reconnect nor be cancelled,
+/// which is what every re-save of the broker settings ran into as "did not
+/// stop within 5s".
+///
+/// Cancellation is raced against both halves at this level, so it
+/// interrupts whatever they are awaiting - a connect, a lookup, the
+/// post-error backoff, or a publish waiting for buffer space.
 #[allow(clippy::too_many_arguments)]
 async fn run(
     record: MqttCredentialRecord,
@@ -863,8 +889,167 @@ async fn run(
     shutdown: CancellationToken,
 ) {
     let availability_topic = topics::availability_topic(&record.base_topic);
-    let options = mqtt_options(&record, &availability_topic);
+    let options = mqtt_options(&record, &record.host, &availability_topic);
     let (client, mut eventloop) = AsyncClient::new(options, 64);
+    let mdns = resolve::MdnsSdResolver::new();
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {}
+        _ = drive_connection(
+            &mut eventloop,
+            &record,
+            &availability_topic,
+            &connection,
+            &mdns,
+            inbound_tx,
+        ) => {}
+        _ = publish_loop(
+            &client,
+            inbound_rx,
+            &record,
+            &bus,
+            &aggregator,
+            &adapter_registry,
+            &knobs,
+            reliable_commands.as_ref(),
+            &base_url,
+            &availability_topic,
+            &consumer,
+        ) => {}
+    }
+
+    // Say goodbye only over a live session, and only if the "offline" fits
+    // in the buffer: a clean DISCONNECT suppresses the broker's last-will,
+    // so sending one without the retained "offline" ahead of it would leave
+    // Home Assistant believing we are still online. Otherwise just drop the
+    // socket and let the last-will say it.
+    if connection.snapshot().state == MqttConnectionState::Connected
+        && client
+            .try_publish(
+                &availability_topic,
+                QoS::AtLeastOnce,
+                true,
+                b"offline".to_vec(),
+            )
+            .is_ok()
+        && client.try_disconnect().is_ok()
+    {
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match eventloop.poll().await {
+                    Ok(Event::Outgoing(rumqttc::Outgoing::Disconnect)) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+    }
+    mdns.shutdown();
+}
+
+/// Keep the `rumqttc` event loop polled, record what it is doing into
+/// `connection` (#607), and forward the events the publisher acts on.
+///
+/// Before each connection attempt the broker host is resolved afresh (see
+/// [`resolve`]), so a `.local` broker is found over mDNS and one that moved
+/// to a new address is found at it on the next reconnect. Returns only when
+/// the publishing loop has gone away.
+async fn drive_connection(
+    eventloop: &mut rumqttc::EventLoop,
+    record: &MqttCredentialRecord,
+    availability_topic: &str,
+    connection: &ConnectionMonitor,
+    mdns: &dyn resolve::MdnsResolver,
+    inbound: tokio::sync::mpsc::UnboundedSender<Inbound>,
+) {
+    let mut last_resolution: Option<resolve::Resolution> = None;
+    loop {
+        if eventloop.network.is_none() {
+            let target =
+                resolve::connect_target(&record.host, mdns, resolve::MDNS_RESOLVE_TIMEOUT).await;
+            log_resolution(&record.host, &target, last_resolution.as_ref());
+            last_resolution = Some(target.resolution.clone());
+            eventloop.mqtt_options = mqtt_options(record, &target.host, availability_topic);
+        }
+        let forwarded = match eventloop.poll().await {
+            Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                // The one moment we know entities are really reaching a
+                // broker (#607).
+                connection.connected();
+                inbound.send(Inbound::ConnAck)
+            }
+            Ok(Event::Incoming(Packet::Publish(publish))) => {
+                inbound.send(Inbound::Publish(publish))
+            }
+            // The broker hung up on us. `rumqttc` dials again, so this is
+            // "connecting", never a latched "connected".
+            Ok(Event::Incoming(Packet::Disconnect)) => {
+                connection.interrupted("the broker closed the connection");
+                Ok(())
+            }
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let message = describe_connection_error(&error);
+                // Recorded before the log line, so /api/mqtt/status and the
+                // log can never disagree about why.
+                connection.interrupted(message.clone());
+                tracing::warn!("MQTT publisher connection error: {message}");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                Ok(())
+            }
+        };
+        if forwarded.is_err() {
+            return;
+        }
+    }
+}
+
+/// Say how the broker host was resolved - at info when that changes (first
+/// attempt, mDNS starting or stopping to answer, a new address), at debug on
+/// every retry after that so a broker that stays away does not flood the
+/// log.
+fn log_resolution(
+    host: &str,
+    target: &resolve::ConnectTarget,
+    previous: Option<&resolve::Resolution>,
+) {
+    let changed = previous != Some(&target.resolution);
+    match &target.resolution {
+        resolve::Resolution::Mdns(address) if changed => {
+            tracing::info!("MQTT broker {host} resolved via mDNS to {address}");
+        }
+        resolve::Resolution::MdnsMissed if changed => {
+            tracing::info!(
+                "MQTT broker {host}: no mDNS answer within {}s; trying the system resolver",
+                resolve::MDNS_RESOLVE_TIMEOUT.as_secs()
+            );
+        }
+        resolve::Resolution::System if changed => {
+            tracing::debug!("MQTT broker {host}: using the system resolver");
+        }
+        _ => tracing::debug!(host, dial = %target.host, "MQTT broker resolution unchanged"),
+    }
+}
+
+/// React to the bus and to what the broker sends. Re-announces state on
+/// every fresh `ConnAck`, since a new MQTT session (or a broker restart) has
+/// no memory of what was previously retained here.
+#[allow(clippy::too_many_arguments)]
+async fn publish_loop(
+    client: &AsyncClient,
+    mut inbound: tokio::sync::mpsc::UnboundedReceiver<Inbound>,
+    record: &MqttCredentialRecord,
+    bus: &SharedBus,
+    aggregator: &Arc<ZoneAggregator>,
+    adapter_registry: &Arc<AdapterRegistry>,
+    knobs: &KnobStore,
+    reliable_commands: Option<&CommandGateway>,
+    base_url: &str,
+    availability_topic: &str,
+    consumer: &ConsumerMonitor,
+) {
     let mut bus_rx = bus.subscribe();
     let mut zone_slugs: HashMap<String, String> = HashMap::new();
     let mut known_knob_ids: HashSet<String> = HashSet::new();
@@ -887,19 +1072,9 @@ async fn run(
 
     loop {
         tokio::select! {
-            _ = shutdown.cancelled() => {
-                let _ = client
-                    .publish(&availability_topic, QoS::AtLeastOnce, true, b"offline".to_vec())
-                    .await;
-                let _ = client.disconnect().await;
-                break;
-            }
-            event = eventloop.poll() => {
-                match event {
-                    Ok(Event::Incoming(Packet::ConnAck(_))) => {
-                        // The one moment we know entities are really
-                        // reaching a broker (#607).
-                        connection.connected();
+            message = inbound.recv() => {
+                match message {
+                    Some(Inbound::ConnAck) => {
                         // Listen for Home Assistant announcing itself on the
                         // same broker (#610). Re-subscribed on every fresh
                         // connection because a new MQTT session carries no
@@ -913,26 +1088,26 @@ async fn run(
                             }
                         }
                         announce_all_zones(
-                            &client,
-                            &record,
-                            &aggregator,
-                            &base_url,
-                            &availability_topic,
+                            client,
+                            record,
+                            aggregator,
+                            base_url,
+                            availability_topic,
                             &mut zone_slugs,
                         )
                         .await;
                         announce_all_knobs(
-                            &client,
-                            &record,
-                            &knobs,
-                            &aggregator,
-                            &availability_topic,
+                            client,
+                            record,
+                            knobs,
+                            aggregator,
+                            availability_topic,
                             &mut known_knob_ids,
                             &mut knob_slugs,
                         )
                         .await;
                     }
-                    Ok(Event::Incoming(Packet::Publish(publish)))
+                    Some(Inbound::Publish(publish))
                         if consumer::is_status_topic(
                             &record.discovery_prefix,
                             &publish.topic,
@@ -959,64 +1134,52 @@ async fn run(
                                  re-publishing discovery"
                             );
                             announce_all_zones(
-                                &client,
-                                &record,
-                                &aggregator,
-                                &base_url,
-                                &availability_topic,
+                                client,
+                                record,
+                                aggregator,
+                                base_url,
+                                availability_topic,
                                 &mut zone_slugs,
                             )
                             .await;
                             announce_all_knobs(
-                                &client,
-                                &record,
-                                &knobs,
-                                &aggregator,
-                                &availability_topic,
+                                client,
+                                record,
+                                knobs,
+                                aggregator,
+                                availability_topic,
                                 &mut known_knob_ids,
                                 &mut knob_slugs,
                             )
                             .await;
                         }
                     }
-                    Ok(Event::Incoming(Packet::Publish(publish))) => {
+                    Some(Inbound::Publish(publish)) => {
                         handle_incoming_publish(
-                            &record,
-                            &adapter_registry,
-                            &aggregator,
-                            reliable_commands.as_ref(),
-                            &knobs,
+                            record,
+                            adapter_registry,
+                            aggregator,
+                            reliable_commands,
+                            knobs,
                             &zone_slugs,
                             &knob_slugs,
                             &publish,
                         )
                         .await;
                     }
-                    // The broker hung up on us. `rumqttc` dials again, so
-                    // this is "connecting", never a latched "connected".
-                    Ok(Event::Incoming(Packet::Disconnect)) => {
-                        connection.interrupted("the broker closed the connection");
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        // Recorded before the log line, so /api/mqtt/status
-                        // and the log can never disagree about why.
-                        connection.interrupted(error.to_string());
-                        tracing::warn!("MQTT publisher connection error: {error}");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                    }
+                    None => break,
                 }
             }
             bus_event = bus_rx.recv() => {
                 match bus_event {
                     Ok(event) => {
                         handle_bus_event(
-                            &client,
-                            &record,
-                            &aggregator,
-                            &knobs,
-                            &base_url,
-                            &availability_topic,
+                            client,
+                            record,
+                            aggregator,
+                            knobs,
+                            base_url,
+                            availability_topic,
                             &mut zone_slugs,
                             &mut known_knob_ids,
                             &mut knob_slugs,
@@ -1030,20 +1193,20 @@ async fn run(
                             "MQTT publisher lagged behind the event bus; resyncing from the aggregator"
                         );
                         announce_all_zones(
-                            &client,
-                            &record,
-                            &aggregator,
-                            &base_url,
-                            &availability_topic,
+                            client,
+                            record,
+                            aggregator,
+                            base_url,
+                            availability_topic,
                             &mut zone_slugs,
                         )
                         .await;
                         announce_all_knobs(
-                            &client,
-                            &record,
-                            &knobs,
-                            &aggregator,
-                            &availability_topic,
+                            client,
+                            record,
+                            knobs,
+                            aggregator,
+                            availability_topic,
                             &mut known_knob_ids,
                             &mut knob_slugs,
                         )
@@ -1054,16 +1217,68 @@ async fn run(
             }
             _ = knob_tick.tick() => {
                 announce_all_knobs(
-                    &client,
-                    &record,
-                    &knobs,
-                    &aggregator,
-                    &availability_topic,
+                    client,
+                    record,
+                    knobs,
+                    aggregator,
+                    availability_topic,
                     &mut known_knob_ids,
                     &mut knob_slugs,
                 )
                 .await;
             }
         }
+    }
+}
+
+/// `rumqttc`'s text for a failed connection attempt, plus the likely fix
+/// where the raw text alone does not point at one.
+///
+/// A TLS handshake against a plain MQTT listener just reports
+/// "tls handshake eof", which reads like a broken broker rather than a
+/// ticked checkbox - and ticking "Use TLS" against port 1883 is exactly how
+/// people get there.
+fn describe_connection_error(error: &rumqttc::ConnectionError) -> String {
+    let raw = error.to_string();
+    match error {
+        rumqttc::ConnectionError::Tls(_) => format!(
+            "{raw} — is TLS enabled on this broker? Plain MQTT usually uses port 1883 without TLS"
+        ),
+        _ => raw,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tls_handshake_failure_suggests_checking_the_tls_setting() {
+        let error = rumqttc::ConnectionError::Tls(rumqttc::TlsError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "tls handshake eof",
+        )));
+        let described = describe_connection_error(&error);
+        assert!(
+            described.starts_with("TLS: I/O: tls handshake eof"),
+            "the raw reason stays first, got {described:?}"
+        );
+        assert!(
+            described.contains("is TLS enabled on this broker?")
+                && described.contains("1883 without TLS"),
+            "the likely fix has to be named, got {described:?}"
+        );
+    }
+
+    #[test]
+    fn other_failures_are_reported_verbatim() {
+        let error = rumqttc::ConnectionError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "Connection refused (os error 61)",
+        ));
+        assert_eq!(
+            describe_connection_error(&error),
+            "I/O: Connection refused (os error 61)"
+        );
     }
 }

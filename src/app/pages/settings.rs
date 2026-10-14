@@ -600,12 +600,36 @@ const MQTT_INFO_PANEL_CLOSED: &str = "absolute left-0 top-full z-20 mt-1 w-80 ma
 /// section would keep claiming whatever was true when the page loaded.
 const MQTT_STATUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How long to wait after saving broker settings before re-reading the
-/// status (#607). The connection has not been attempted yet at the moment
-/// the POST returns, so the immediate refresh can only ever say
-/// "connecting"; this second look is what turns into a verdict while the
-/// user is still watching.
-const MQTT_POST_SAVE_RECHECK: std::time::Duration = std::time::Duration::from_millis(1500);
+/// After Save, how often and how many times to re-read the status while
+/// waiting for the new broker settings to produce a verdict. Stops early on
+/// the first status that has one - see [`mqtt_status_settled`].
+const MQTT_POST_SAVE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const MQTT_POST_SAVE_POLL_ATTEMPTS: u32 = 15;
+
+/// Shown under the port when it is 8123: the port people copy out of their
+/// Home Assistant URL, which is the web UI, not the broker.
+pub(crate) const MQTT_HA_WEB_PORT_WARNING: &str =
+    "8123 is Home Assistant's web port. Mosquitto (MQTT) normally listens on 1883.";
+/// Shown when Use TLS is ticked against 1883, the plain-MQTT port.
+pub(crate) const MQTT_TLS_ON_PLAIN_PORT_WARNING: &str =
+    "Port 1883 is usually plain MQTT; TLS brokers normally use 8883.";
+
+/// Inline, non-blocking warnings for broker port/TLS combinations that are
+/// almost always a mistake. `port` is the field as typed.
+pub(crate) fn mqtt_port_warnings(port: &str, tls: bool) -> Vec<&'static str> {
+    match port.trim().parse::<u16>() {
+        Ok(8123) => vec![MQTT_HA_WEB_PORT_WARNING],
+        Ok(1883) if tls => vec![MQTT_TLS_ON_PLAIN_PORT_WARNING],
+        _ => Vec::new(),
+    }
+}
+
+/// Whether a status read after Save already says how the new settings went:
+/// connected, or a failure with its reason. Until then the post-save poll
+/// keeps looking.
+pub(crate) fn mqtt_status_settled(status: &MqttStatusResponse) -> bool {
+    status.is_connected() || status.last_error.is_some()
+}
 
 /// Whether *this browser* is talking to UHC over loopback. Drives which
 /// variant of the Spotify callback step (#570 follow-up) renders: a
@@ -1690,11 +1714,23 @@ pub fn Settings() -> Element {
                     mqtt_status.restart();
                     // The POST returns before the publisher has dialled the
                     // new broker, so that first refresh can only say
-                    // "connecting". Look again once there has been time to
-                    // succeed or fail (#607) - a typo'd host should produce
-                    // its explanation while the user is still on the button.
-                    dioxus_sdk_time::sleep(MQTT_POST_SAVE_RECHECK).await;
-                    mqtt_status.restart();
+                    // "connecting". Keep looking, briefly, until there is a
+                    // verdict (#607) - connected, or a reason it is not - so
+                    // a typo'd host produces its explanation, and a good one
+                    // its confirmation, while the user is still on the
+                    // button. The 5s background poll takes over after.
+                    for _ in 0..MQTT_POST_SAVE_POLL_ATTEMPTS {
+                        dioxus_sdk_time::sleep(MQTT_POST_SAVE_POLL_INTERVAL).await;
+                        let settled = mqtt_status
+                            .peek()
+                            .as_ref()
+                            .and_then(|status| status.as_ref())
+                            .is_some_and(mqtt_status_settled);
+                        if settled {
+                            break;
+                        }
+                        mqtt_status.restart();
+                    }
                 }
                 Err(error) => {
                     mqtt_action.set(ProviderActionState::Failed);
@@ -3443,6 +3479,13 @@ pub fn Settings() -> Element {
                             input { r#type: "checkbox", checked: mqtt_tls(), onchange: move |event| mqtt_tls.set(event.checked()) }
                             "Use TLS"
                         }
+                        // Non-blocking: these combinations are nearly always
+                        // a mistake, but Save still does what it is told.
+                        div { id: "mqtt-port-warnings", hidden: !mqtt_show_manual_form, role: "status",
+                            for warning in mqtt_port_warnings(&mqtt_port(), mqtt_tls()) {
+                                p { class: "mt-2 text-sm text-yellow-500", "⚠ {warning}" }
+                            }
+                        }
                         button { id: "mqtt-save-settings", r#type: "button", class: "btn btn-primary mt-5 min-h-11", hidden: !mqtt_show_manual_form, disabled: mqtt_action() == ProviderActionState::Loading, aria_busy: mqtt_action() == ProviderActionState::Loading, onclick: save_mqtt,
                             if mqtt_action() == ProviderActionState::Loading { "Saving…" } else { "Save and connect" }
                         }
@@ -3907,6 +3950,72 @@ mod tests {
             hide_knobs_page: false,
             hide_hqp_page: true,
             hide_lms_page: true,
+        }
+    }
+
+    mod mqtt_form {
+        use super::super::{
+            mqtt_port_warnings, mqtt_status_settled, MQTT_HA_WEB_PORT_WARNING,
+            MQTT_TLS_ON_PLAIN_PORT_WARNING,
+        };
+        use crate::app::api::MqttStatusResponse;
+
+        #[test]
+        fn home_assistants_web_port_is_flagged() {
+            assert_eq!(
+                mqtt_port_warnings("8123", false),
+                vec![MQTT_HA_WEB_PORT_WARNING]
+            );
+            assert_eq!(
+                mqtt_port_warnings(" 8123 ", true),
+                vec![MQTT_HA_WEB_PORT_WARNING]
+            );
+        }
+
+        #[test]
+        fn tls_on_the_plain_mqtt_port_is_flagged() {
+            assert_eq!(
+                mqtt_port_warnings("1883", true),
+                vec![MQTT_TLS_ON_PLAIN_PORT_WARNING]
+            );
+        }
+
+        #[test]
+        fn ordinary_combinations_are_left_alone() {
+            assert!(mqtt_port_warnings("1883", false).is_empty());
+            assert!(mqtt_port_warnings("8883", true).is_empty());
+            assert!(mqtt_port_warnings("8883", false).is_empty());
+            // Blank means the default for the TLS choice, which is right.
+            assert!(mqtt_port_warnings("", true).is_empty());
+            assert!(mqtt_port_warnings("", false).is_empty());
+            assert!(mqtt_port_warnings("not a port", true).is_empty());
+        }
+
+        fn status(connection: &str, last_error: Option<&str>) -> MqttStatusResponse {
+            MqttStatusResponse {
+                configured: true,
+                enabled: true,
+                running: connection != "disconnected",
+                connection: connection.to_string(),
+                last_error: last_error.map(str::to_string),
+                ..MqttStatusResponse::default()
+            }
+        }
+
+        #[test]
+        fn a_post_save_poll_stops_on_a_verdict() {
+            assert!(mqtt_status_settled(&status("connected", None)));
+            assert!(mqtt_status_settled(&status(
+                "connecting",
+                Some("I/O: Connection refused (os error 61)")
+            )));
+        }
+
+        #[test]
+        fn a_post_save_poll_keeps_going_without_one() {
+            assert!(!mqtt_status_settled(&status("connecting", None)));
+            // The old task is being swapped out: no task, no verdict yet.
+            assert!(!mqtt_status_settled(&status("disconnected", None)));
         }
     }
 
