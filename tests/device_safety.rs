@@ -956,3 +956,217 @@ async fn critical_shared_zone_control_routes_native_volume_to_linked_amplifier()
         DispatchOutcome::Refused(_)
     ));
 }
+
+/// Composition config keeps its existing persisted format and device-wide
+/// limits. Restarting without the amplifier must retain the owner and never
+/// restore a provider gain stage or switch a configured physical input.
+#[tokio::test]
+async fn critical_composition_config_survives_restart_without_device_fallback() {
+    let h = harness().await;
+    let front = MockMarantz::start().await;
+    h.attach(FRONT, "front", &front).await;
+    h.zone_ready("roon:living").await;
+    h.zone_ready("lms:kitchen").await;
+    h.state
+        .devices
+        .link("roon:living", id(FRONT).as_str(), Some("TV".into()))
+        .await
+        .unwrap();
+    h.link("lms:kitchen", FRONT).await;
+    h.state
+        .devices
+        .set_ceiling(id(FRONT).as_str(), Some(-30.0))
+        .await
+        .unwrap();
+    for zone_id in ["roon:living", "lms:kitchen"] {
+        let binding = h.state.devices.zone_binding(zone_id).await.unwrap();
+        assert_eq!(binding.volume_control().unwrap().max, -30.0);
+        assert_eq!(binding.link.device_id, id(FRONT));
+    }
+    let path = h._dir.path().join("device-links.json");
+    let saved = std::fs::read(&path).unwrap();
+    assert!(matches!(
+        h.state
+            .devices
+            .link("roon:living", id(FRONT).as_str(), Some("BOGUS".into()))
+            .await,
+        Err(unified_hifi_control::devices::service::DeviceError::UnknownInput { .. })
+    ));
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        saved,
+        "invalid config must not alter persisted ownership"
+    );
+    assert_eq!(
+        front.snapshot().await.input,
+        "MPLAY",
+        "a link records an input; it does not select it"
+    );
+    assert!(
+        front.snapshot().await.writes().is_empty(),
+        "config must never emit device commands"
+    );
+
+    let mut restarted = harness().await;
+    restarted.zone_ready("roon:living").await;
+    // Provider volume exists, but the restored link must mask it while the
+    // amplifier is absent. This fails a cache-only or provider-fallback patch.
+    let mut provider_zone = restarted
+        .state
+        .aggregator
+        .get_zone("roon:living")
+        .await
+        .unwrap();
+    provider_zone.volume_control = Some(unified_hifi_control::bus::VolumeControl {
+        value: 60.0,
+        min: 0.0,
+        max: 100.0,
+        step: 1.0,
+        is_muted: false,
+        scale: VolumeScale::Percentage,
+        output_id: Some("roon:fake-output".into()),
+    });
+    restarted.bus.publish(BusEvent::ZoneDiscovered {
+        zone: provider_zone,
+    });
+    restarted
+        .wait_for(|state| async move {
+            state
+                .aggregator
+                .get_zone("roon:living")
+                .await
+                .unwrap()
+                .volume_control
+                .is_some()
+        })
+        .await;
+    restarted.state.devices = Arc::new(DeviceService::new(
+        restarted.state.aggregator.clone(),
+        restarted.bus.clone(),
+        DeviceLinkStore::open(path.clone()),
+    ));
+    restarted.state.devices.load().await.unwrap();
+    let binding = restarted
+        .state
+        .devices
+        .zone_binding("roon:living")
+        .await
+        .unwrap();
+    assert_eq!(binding.link.device_id, id(FRONT));
+    assert_eq!(binding.link.source_id.as_deref(), Some("TV"));
+    assert!(binding.device.is_none());
+    assert!(binding.volume_control().is_none());
+    assert!(!binding.summary().present);
+    assert!(restarted
+        .state
+        .aggregator
+        .get_zone("roon:living")
+        .await
+        .unwrap()
+        .volume_control
+        .is_none());
+    assert_eq!(
+        restarted
+            .state
+            .aggregator
+            .has_volume_control("roon:living")
+            .await,
+        Some(false)
+    );
+    let capability = unified_hifi_control::mcp::capabilities::McpLinkedDevice::for_zone(
+        &restarted.state,
+        "roon:living",
+    )
+    .await
+    .unwrap();
+    assert!(!capability.present);
+    assert!(capability.capabilities.is_none());
+    assert!(restarted
+        .state
+        .devices
+        .control_action(
+            DeviceTarget::Zone("roon:living".into()),
+            "volume_set",
+            Some(&json!(-35.0))
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        saved,
+        "loading must not rewrite config"
+    );
+    restarted.state.devices.unlink("roon:living").await.unwrap();
+    assert!(restarted
+        .state
+        .devices
+        .zone_binding("roon:living")
+        .await
+        .is_none());
+    assert_eq!(
+        restarted
+            .state
+            .aggregator
+            .get_zone("roon:living")
+            .await
+            .unwrap()
+            .volume_control
+            .unwrap()
+            .value,
+        60.0
+    );
+}
+
+/// Native defaults must be identical whether a client addresses the zone or
+/// the hardware directly. Fails a surface-specific hardcoded one-unit step.
+#[tokio::test]
+async fn device_http_and_mcp_delegate_native_steps_to_device_service() {
+    let h = harness().await;
+    let front = MockMarantz::start().await;
+    h.attach(FRONT, "front", &front).await;
+    h.zone_ready("roon:living").await;
+    h.link("roon:living", FRONT).await;
+    unified_hifi_control::api::devices::device_control_handler(
+        State(h.state.clone()),
+        Json(unified_hifi_control::api::devices::DeviceControlRequest {
+            device_id: None,
+            zone_id: Some("roon:living".into()),
+            action: "volume_up".into(),
+            value: None,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(front.snapshot().await.level_db(), -39.0);
+    h.wait_for(|state| async move {
+        state
+            .aggregator
+            .get_device(&id(FRONT))
+            .await
+            .unwrap()
+            .volume
+            .value
+            == Some(-39.0)
+    })
+    .await;
+    let result = handle_devices(
+        &h.state,
+        HifiDevicesTool {
+            action: "control".into(),
+            device_id: Some(id(FRONT).to_string()),
+            zone_id: None,
+            source_id: None,
+            command: Some("volume_down".into()),
+            value: None,
+            input: None,
+            muted: None,
+            ceiling: None,
+            sections: None,
+            enabled: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    assert_eq!(front.snapshot().await.level_db(), -39.5);
+}

@@ -686,7 +686,6 @@ async fn control_linked_device(
     req: &KnobControlRequest,
 ) -> Option<Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)>> {
     crate::zone_control::dispatch_linked_device(
-        &state.aggregator,
         &state.devices,
         &req.zone_id,
         &req.action,

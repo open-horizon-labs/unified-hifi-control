@@ -16,8 +16,7 @@ use crate::bus::Command;
 use crate::knobs::routes::dispatch_hqplayer_action_via;
 
 use crate::devices::service::{
-    is_device_only_action, request_from_action, DeviceCommandReport, DeviceError, DeviceService,
-    DeviceTarget,
+    is_device_only_action, DeviceCommandReport, DeviceError, DeviceService, DeviceTarget,
 };
 
 /// A provider-neutral zone action; volume units remain explicit.
@@ -128,7 +127,7 @@ pub async fn dispatch(
     {
         return DispatchOutcome::Refused("volume must be finite".into());
     }
-    if let Some(result) = dispatch_linked_action(aggregator, devices, zone_id, &action).await {
+    if let Some(result) = dispatch_linked_action(devices, zone_id, &action).await {
         return match result {
             Ok(_) => DispatchOutcome::Sent,
             Err(error @ (DeviceError::Unconfirmed { .. } | DeviceError::Dispatch { .. })) => {
@@ -224,18 +223,13 @@ fn gateway_outcome(result: anyhow::Result<()>) -> DispatchOutcome {
 /// routing applies; an error on a linked zone must never fall back to it.
 /// Surface adapters translate their vocabulary but do not resolve links.
 pub async fn dispatch_linked_device(
-    aggregator: &ZoneAggregator,
     devices: &DeviceService,
     zone_id: &str,
     action: &str,
     value: Option<&serde_json::Value>,
 ) -> Option<Result<DeviceCommandReport, DeviceError>> {
-    // Unknown/provider actions do not require device state.
-    if matches!(request_from_action(action, value, 1.0), Ok(None)) {
-        return None;
-    }
-    let device_id = match devices.linked_device_id(zone_id).await {
-        Some(id) => id,
+    let binding = match devices.zone_binding(zone_id).await {
+        Some(binding) => binding,
         None if is_device_only_action(action) => {
             return Some(Err(DeviceError::NotLinked {
                 zone_id: zone_id.to_owned(),
@@ -243,40 +237,19 @@ pub async fn dispatch_linked_device(
         }
         None => return None,
     };
-    let device = aggregator.get_device(&device_id).await;
-    let default_step = device
-        .as_ref()
-        .map(|d| d.volume.step)
-        .filter(|s| s.is_finite() && *s > 0.0);
-    let needs_step = matches!(action, "volume_up" | "volume_down" | "vol_up" | "vol_down")
-        && value.and_then(serde_json::Value::as_f64).is_none();
-    if needs_step && default_step.is_none() {
-        return Some(Err(DeviceError::RangeUnknown {
-            device_id: device_id.to_string(),
-            detail: "no observed native volume step".into(),
-        }));
+    // A native action is pinned to the owner chosen for this dispatch. Device
+    // semantics and defaults are interpreted by DeviceService, not this router.
+    match devices
+        .control_action(DeviceTarget::Device(binding.link.device_id), action, value)
+        .await
+    {
+        Ok(Some(report)) => Some(Ok(report)),
+        Ok(None) => None,
+        Err(error) => Some(Err(error)),
     }
-    let request = match request_from_action(action, value, default_step.unwrap_or(1.0)) {
-        Ok(Some(request)) => request,
-        Ok(None) => return None,
-        Err(detail) => {
-            return Some(Err(DeviceError::InvalidValue {
-                parameter: "value",
-                detail,
-            }))
-        }
-    };
-    // Pin the owner resolved for this action rather than resolving the link
-    // again during dispatch, when a concurrent relink could change it.
-    Some(
-        devices
-            .control(DeviceTarget::Device(device_id), request)
-            .await,
-    )
 }
 
 async fn dispatch_linked_action(
-    aggregator: &ZoneAggregator,
     devices: &DeviceService,
     zone_id: &str,
     action: &Action,
@@ -288,38 +261,14 @@ async fn dispatch_linked_action(
         Action::VolumeDown => ("volume_down", None),
         Action::Mute(muted) => ("mute", Some(json!(muted))),
         Action::Volume(value) => {
-            let device_id = devices.linked_device_id(zone_id).await?;
-            let device = aggregator.get_device(&device_id).await;
-            let native = match device.as_ref().and_then(|d| d.volume_control()) {
-                Some(volume) if value.is_finite() => match volume.scale {
-                    crate::bus::VolumeScale::Percentage => *value,
-                    crate::bus::VolumeScale::Linear | crate::bus::VolumeScale::Steps => {
-                        f64::from(volume.min) + (value / 100.0) * f64::from(volume.max - volume.min)
-                    }
-                    _ => {
-                        return Some(Err(DeviceError::InvalidValue {
-                            parameter: "value",
-                            detail: "percentage volume is unavailable for this device scale".into(),
-                        }))
-                    }
-                },
-                _ => {
-                    return Some(Err(DeviceError::RangeUnknown {
-                        device_id: device_id.to_string(),
-                        detail: "no observed bounded volume range".into(),
-                    }))
-                }
-            };
+            let binding = devices.zone_binding(zone_id).await?;
             return Some(
                 devices
-                    .control(
-                        DeviceTarget::Device(device_id),
-                        crate::devices::service::DeviceRequest::VolumeAbsolute(native as f32),
-                    )
+                    .control_percentage(DeviceTarget::Device(binding.link.device_id), *value)
                     .await,
             );
         }
         _ => return None,
     };
-    dispatch_linked_device(aggregator, devices, zone_id, name, value.as_ref()).await
+    dispatch_linked_device(devices, zone_id, name, value.as_ref()).await
 }

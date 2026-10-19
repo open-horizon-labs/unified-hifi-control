@@ -30,7 +30,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use super::anomalies::{AnomalyJournal, AnomalyKind, DeviceAnomaly};
 use super::links::{DeviceLinkStore, DeviceLinksDocument, StoreError};
-use super::{Device, DeviceId, DeviceLink, DevicePower};
+use super::{Device, DeviceId, DeviceLink, DevicePower, ZoneDeviceBinding};
 use crate::aggregator::ZoneAggregator;
 use crate::bus::{BusEvent, SharedBus};
 
@@ -316,6 +316,9 @@ pub struct DeviceService {
     aggregator: Arc<ZoneAggregator>,
     bus: SharedBus,
     store: DeviceLinkStore,
+    // Serialize each persisted edit through its aggregator/journal installation.
+    // The store's file lock alone ends before the installed projection updates.
+    configuration_lock: Mutex<()>,
     drivers: RwLock<HashMap<&'static str, Arc<dyn DeviceDriver>>>,
     device_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     confirm_timeout: Duration,
@@ -328,6 +331,7 @@ impl DeviceService {
             aggregator,
             bus,
             store,
+            configuration_lock: Mutex::new(()),
             drivers: RwLock::new(HashMap::new()),
             device_locks: Mutex::new(HashMap::new()),
             confirm_timeout: DEFAULT_CONFIRM_TIMEOUT,
@@ -342,6 +346,7 @@ impl DeviceService {
 
     /// Turn mismatch recording on or off, persisting the choice. Off forgets everything recorded.
     pub async fn set_recording(&self, enabled: bool) -> Result<(), DeviceError> {
+        let _configuration = self.configuration_lock.lock().await;
         self.store
             .update(move |document| document.record_mismatches = enabled)
             .await?;
@@ -365,6 +370,7 @@ impl DeviceService {
     /// Install the persisted document into the aggregator. Call once at startup, after the
     /// aggregator is running.
     pub async fn load(&self) -> Result<(), DeviceError> {
+        let _configuration = self.configuration_lock.lock().await;
         let document = self.store.document().await?;
         self.install(document).await;
         Ok(())
@@ -421,6 +427,7 @@ impl DeviceService {
         device_id: &str,
         source_id: Option<String>,
     ) -> Result<DeviceLink, DeviceError> {
+        let _configuration = self.configuration_lock.lock().await;
         let device_id = DeviceId::parse(device_id).ok_or_else(|| DeviceError::InvalidValue {
             parameter: "device_id",
             detail: format!(
@@ -469,6 +476,7 @@ impl DeviceService {
 
     /// Remove a zone's link. Returns whether one existed.
     pub async fn unlink(&self, zone_id: &str) -> Result<bool, DeviceError> {
+        let _configuration = self.configuration_lock.lock().await;
         let existed = self.aggregator.get_device_link(zone_id).await.is_some();
         let zone = zone_id.to_string();
         let document = self
@@ -488,6 +496,7 @@ impl DeviceService {
         device_id: &str,
         ceiling: Option<f32>,
     ) -> Result<(), DeviceError> {
+        let _configuration = self.configuration_lock.lock().await;
         let device_id = DeviceId::parse(device_id).ok_or_else(|| DeviceError::UnknownDevice {
             device_id: device_id.to_string(),
         })?;
@@ -514,12 +523,112 @@ impl DeviceService {
     // Commands
     // =========================================================================
 
+    /// The installed composition configuration and observed device, read together.
+    /// Link/input validation and persistence stay in this service; this view is
+    /// always derived from the aggregator, never a second cached authority.
+    pub async fn zone_binding(&self, zone_id: &str) -> Option<ZoneDeviceBinding> {
+        self.aggregator.zone_device_binding(zone_id).await
+    }
+
+    async fn resolve_device(&self, target: DeviceTarget) -> Result<DeviceId, DeviceError> {
+        match target {
+            DeviceTarget::Device(device_id) => Ok(device_id),
+            DeviceTarget::Zone(zone_id) => self
+                .zone_binding(&zone_id)
+                .await
+                .map(|binding| binding.link.device_id)
+                .ok_or(DeviceError::NotLinked { zone_id }),
+        }
+    }
+
+    /// Decode a device action using the observed device's own native step.
+    /// `Ok(None)` means this vocabulary does not describe a device operation.
+    /// Surfaces remain responsible only for their response/error formatting.
+    pub async fn control_action(
+        &self,
+        target: DeviceTarget,
+        action: &str,
+        value: Option<&serde_json::Value>,
+    ) -> Result<Option<DeviceCommandReport>, DeviceError> {
+        if matches!(request_from_action(action, value, 1.0), Ok(None)) {
+            return Ok(None);
+        }
+        let device_id = self.resolve_device(target).await?;
+        let device = self.aggregator.get_device(&device_id).await;
+        let step = device
+            .as_ref()
+            .map(|device| device.volume.step)
+            .filter(|step| step.is_finite() && *step > 0.0);
+        let needs_step = matches!(action, "volume_up" | "volume_down" | "vol_up" | "vol_down")
+            && value.and_then(serde_json::Value::as_f64).is_none();
+        if needs_step && step.is_none() {
+            return Err(DeviceError::RangeUnknown {
+                device_id: device_id.to_string(),
+                detail: "no observed native volume step".into(),
+            });
+        }
+        let request =
+            request_from_action(action, value, step.unwrap_or(1.0)).map_err(|detail| {
+                DeviceError::InvalidValue {
+                    parameter: "value",
+                    detail,
+                }
+            })?;
+        let Some(request) = request else {
+            return Ok(None);
+        };
+        self.control(DeviceTarget::Device(device_id), request)
+            .await
+            .map(Some)
+    }
+
+    /// Convert a normalized client percentage only when the observed native
+    /// scale has a defined linear mapping. dB and unknown scales are refused.
+    pub async fn control_percentage(
+        &self,
+        target: DeviceTarget,
+        value: f64,
+    ) -> Result<DeviceCommandReport, DeviceError> {
+        if !value.is_finite() {
+            return Err(DeviceError::InvalidValue {
+                parameter: "value",
+                detail: "volume must be finite".into(),
+            });
+        }
+        let device_id = self.resolve_device(target).await?;
+        let volume = self
+            .aggregator
+            .get_device(&device_id)
+            .await
+            .and_then(|device| device.volume_control())
+            .ok_or_else(|| DeviceError::RangeUnknown {
+                device_id: device_id.to_string(),
+                detail: "no observed bounded volume range".into(),
+            })?;
+        let native = match volume.scale {
+            crate::bus::VolumeScale::Percentage => value,
+            crate::bus::VolumeScale::Linear | crate::bus::VolumeScale::Steps => {
+                f64::from(volume.min) + (value / 100.0) * f64::from(volume.max - volume.min)
+            }
+            _ => {
+                return Err(DeviceError::InvalidValue {
+                    parameter: "value",
+                    detail: "percentage volume is unavailable for this device scale".into(),
+                })
+            }
+        };
+        self.control(
+            DeviceTarget::Device(device_id),
+            DeviceRequest::VolumeAbsolute(native as f32),
+        )
+        .await
+    }
+
     /// Resolve the device a zone's surface controls, when the zone is linked.
     pub async fn linked_device_id(&self, zone_id: &str) -> Option<DeviceId> {
-        self.aggregator
-            .get_device_link(zone_id)
+        self.zone_binding(zone_id)
             .await
-            .map(|link| link.device_id)
+            .map(|binding| binding.link.device_id)
     }
 
     /// Carry out a request and wait for the device to confirm it. Outcomes that show the device
@@ -561,13 +670,7 @@ impl DeviceService {
         target: DeviceTarget,
         request: DeviceRequest,
     ) -> Result<DeviceCommandReport, DeviceError> {
-        let device_id = match target {
-            DeviceTarget::Zone(zone_id) => self
-                .linked_device_id(&zone_id)
-                .await
-                .ok_or(DeviceError::NotLinked { zone_id })?,
-            DeviceTarget::Device(device_id) => device_id,
-        };
+        let device_id = self.resolve_device(target).await?;
         let lock = self.device_lock(&device_id).await;
         let _serialised = lock.lock().await;
 

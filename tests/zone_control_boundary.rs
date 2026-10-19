@@ -21,3 +21,35 @@ fn surfaces_do_not_resolve_zone_device_links() {
         "MCP zone control must delegate link resolution"
     );
 }
+
+#[test]
+fn device_service_owns_native_action_interpretation() {
+    let router = include_str!("../src/zone_control.rs");
+    for scattered_policy in [
+        "request_from_action(",
+        ".volume.step",
+        "VolumeScale::",
+        "linked_device_id(",
+    ] {
+        assert!(
+            !router.contains(scattered_policy),
+            "shared router must delegate device interpretation: {scattered_policy}"
+        );
+    }
+    for (surface, text) in [
+        ("HTTP device control", include_str!("../src/api/devices.rs")),
+        (
+            "MCP device control",
+            include_str!("../src/mcp/tools/devices.rs"),
+        ),
+    ] {
+        assert!(
+            !text.contains("request_from_action("),
+            "{surface} must delegate native defaults and action parsing"
+        );
+        assert!(
+            !text.contains("linked_device_id("),
+            "{surface} must delegate composition lookup"
+        );
+    }
+}

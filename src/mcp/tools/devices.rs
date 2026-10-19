@@ -12,7 +12,7 @@
 
 use crate::api::devices::device_inventory;
 use crate::api::AppState;
-use crate::devices::service::{request_from_action, DeviceError, DeviceTarget, DEVICE_ACTIONS};
+use crate::devices::service::{DeviceError, DeviceTarget, DEVICE_ACTIONS};
 use crate::devices::{DeviceId, DEVICE_CONTROL_MATURITY};
 use crate::mcp::envelope::{Envelope, Refusal};
 use crate::mcp::tools::transport::HifiControlTool;
@@ -284,38 +284,13 @@ async fn control(
     command: &str,
     value: Option<&serde_json::Value>,
 ) -> Result<CallToolResult, CallToolError> {
-    let step = match &target {
-        DeviceTarget::Device(device_id) => state.aggregator.get_device(device_id).await,
-        DeviceTarget::Zone(zone_id) => match state.devices.linked_device_id(zone_id).await {
-            Some(device_id) => state.aggregator.get_device(&device_id).await,
-            None => None,
-        },
-    }
-    .map(|device| device.volume.step)
-    .filter(|step| *step > 0.0)
-    .unwrap_or(0.5);
-    let request = match request_from_action(command, value, step) {
-        Ok(Some(request)) => request,
-        Ok(None) => {
-            return env.refused(
-                format!("{command} is not a device command."),
-                Refusal::invalid_parameter(
-                    "command",
-                    DEVICE_ACTIONS,
-                    "Transport (play, pause, next...) belongs to the zone's provider: use \
-                     hifi_control.",
-                ),
-            )
-        }
-        Err(message) => {
-            return env.refused(
-                message.clone(),
-                Refusal::invalid_parameter("value", &[], message),
-            )
-        }
-    };
-    match state.devices.control(target, request).await {
-        Ok(report) => Ok(env.json_result(&report)),
+    match state.devices.control_action(target, command, value).await {
+        Ok(Some(report)) => Ok(env.json_result(&report)),
+        Ok(None) => env.refused(
+            format!("{command} is not a device command."),
+            Refusal::invalid_parameter("command", DEVICE_ACTIONS,
+                "Transport (play, pause, next...) belongs to the zone's provider: use hifi_control."),
+        ),
         Err(error) => refuse(env, error),
     }
 }
@@ -377,7 +352,6 @@ pub async fn linked_zone_volume(
     }
     let value = args.value.map(|v| json!(v));
     let result = crate::zone_control::dispatch_linked_device(
-        &state.aggregator,
         &state.devices,
         &args.zone_id,
         &args.action,

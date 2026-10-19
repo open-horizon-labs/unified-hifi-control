@@ -334,6 +334,25 @@ pub struct DeviceLink {
     pub source_id: Option<String>,
 }
 
+/// An ephemeral composition snapshot from one aggregator read. An absent
+/// device keeps the configured owner intact; it never restores provider gain.
+/// This is not a new device identity, persisted document, or state cache.
+#[derive(Debug, Clone)]
+pub struct ZoneDeviceBinding {
+    pub link: DeviceLink,
+    pub device: Option<Device>,
+}
+
+impl ZoneDeviceBinding {
+    pub fn volume_control(&self) -> Option<crate::bus::VolumeControl> {
+        self.device.as_ref().and_then(Device::volume_control)
+    }
+
+    pub fn summary(&self) -> LinkedDeviceSummary {
+        LinkedDeviceSummary::new(&self.link, self.device.as_ref())
+    }
+}
+
 /// The device facts a linked zone surfaces, flattened for zone payloads and SSE.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LinkedDeviceSummary {

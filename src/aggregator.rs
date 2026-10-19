@@ -17,7 +17,7 @@ use crate::bus::runtime::{
     ProjectionPayload, ProjectionUpdate,
 };
 use crate::bus::{BusEvent, NowPlaying, PrefixedZoneId, ProviderAccount, SharedBus, Zone};
-use crate::devices::{Device, DeviceId, DeviceLink, LinkedDeviceSummary};
+use crate::devices::{Device, DeviceId, DeviceLink, LinkedDeviceSummary, ZoneDeviceBinding};
 use crate::mcp::observation_history::PlaybackObservationHistory;
 
 fn observation_now() -> u64 {
@@ -92,23 +92,23 @@ impl AggregateState {
     /// owns the level, so until the device can bound one the zone publishes none (the knob shows
     /// "fixed") rather than steering a different gain stage than the user intends.
     fn effective_zone(&self, zone: &Zone) -> Zone {
-        let Some(link) = self.device_links.get(&zone.zone_id) else {
+        let Some(binding) = self.device_binding(&zone.zone_id) else {
             return zone.clone();
         };
         let mut effective = zone.clone();
-        effective.volume_control = self
-            .devices
-            .get(link.device_id.as_str())
-            .and_then(Device::volume_control);
+        effective.volume_control = binding.volume_control();
         effective
     }
 
+    fn device_binding(&self, zone_id: &str) -> Option<ZoneDeviceBinding> {
+        let link = self.device_links.get(zone_id)?.clone();
+        let device = self.devices.get(link.device_id.as_str()).cloned();
+        Some(ZoneDeviceBinding { link, device })
+    }
+
     fn linked_summary(&self, zone_id: &str) -> Option<LinkedDeviceSummary> {
-        let link = self.device_links.get(zone_id)?;
-        Some(LinkedDeviceSummary::new(
-            link,
-            self.devices.get(link.device_id.as_str()),
-        ))
+        self.device_binding(zone_id)
+            .map(|binding| binding.summary())
     }
 
     fn zones_linked_to(&self, device_id: &str) -> Vec<String> {
@@ -578,14 +578,8 @@ impl ZoneAggregator {
     pub async fn has_volume_control(&self, zone_id: &str) -> Option<bool> {
         let aggregate = self.state.read().await;
         let zone = aggregate.zones.get(zone_id)?;
-        if let Some(link) = aggregate.device_links.get(zone_id) {
-            return Some(
-                aggregate
-                    .devices
-                    .get(link.device_id.as_str())
-                    .and_then(Device::volume_control)
-                    .is_some(),
-            );
+        if let Some(binding) = aggregate.device_binding(zone_id) {
+            return Some(binding.volume_control().is_some());
         }
         Some(
             aggregate
@@ -629,6 +623,12 @@ impl ZoneAggregator {
             .collect();
         links.sort_by(|a, b| a.zone_id.cmp(&b.zone_id));
         links
+    }
+
+    /// Resolve the configured owner and its observation under one read lock,
+    /// so a concurrent relink cannot combine one device's identity with another's state.
+    pub async fn zone_device_binding(&self, zone_id: &str) -> Option<ZoneDeviceBinding> {
+        self.state.read().await.device_binding(zone_id)
     }
 
     /// The link for one zone.
@@ -1961,5 +1961,73 @@ mod tests {
             .await
             .expect("aggregator shutdown")
             .expect("aggregator task");
+    }
+}
+
+#[cfg(test)]
+mod device_configuration_order_tests {
+    use super::*;
+    use crate::devices::{links::DeviceLinkStore, service::DeviceService};
+
+    /// Persist/apply is one configuration operation. A later edit must not
+    /// save another document while the earlier one is waiting for projection.
+    /// This catches merely locking the file writer, which leaves installation
+    /// outside the configuration owner's serialization boundary.
+    #[tokio::test]
+    async fn device_configuration_edits_wait_for_prior_projection_install() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("device-links.json");
+        let bus = crate::bus::create_bus();
+        let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+        let service = Arc::new(DeviceService::new(
+            aggregator.clone(),
+            bus,
+            DeviceLinkStore::open(path.clone()),
+        ));
+        let projection_gate = aggregator.state.write().await;
+        let first = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .set_ceiling("marantz:FAKEA", Some(-30.0))
+                    .await
+                    .unwrap();
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let second = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .set_ceiling("marantz:FAKEB", Some(-40.0))
+                    .await
+                    .unwrap();
+            })
+        };
+        let persisted_ahead = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            loop {
+                let document: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                if document["devices"].get("marantz:FAKEB").is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        drop(projection_gate);
+        first.await.unwrap();
+        second.await.unwrap();
+        assert!(
+            !persisted_ahead,
+            "a second edit persisted while the previous edit was still waiting to install"
+        );
     }
 }
