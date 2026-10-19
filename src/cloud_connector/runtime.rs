@@ -3,8 +3,9 @@
 //! The relay is contacted over WSS only.  It sends a challenge first; the
 //! installation grant authenticates the HTTP upgrade and is then carried in
 //! the signed proof body so possession of the installation key is still
-//! required. The grant is never placed in a URL. All control dispatch goes through the existing semantic
-//! MQTT command router, which keeps the aggregator/command gateway boundary.
+//! required. The grant is never placed in a URL. Linked-device volume uses the
+//! device service for native units, limits and readback.
+//! Provider control uses the semantic MQTT command router and command gateway.
 
 use futures::{SinkExt, StreamExt};
 use sha2::{Digest as _, Sha256};
@@ -1052,6 +1053,53 @@ async fn dispatch(
             crate::mqtt::command::ParsedAction::VolumeNative(value)
         }
     };
+    // The projection exposes the linked amplifier's native volume, so dispatch
+    // must use that same authority rather than handing its dB value to the
+    // transport provider. Keep this after the projection/admission checks.
+    if matches!(
+        action,
+        crate::mqtt::command::ParsedAction::VolumeNative(_)
+            | crate::mqtt::command::ParsedAction::VolumeUp
+            | crate::mqtt::command::ParsedAction::VolumeDown
+    ) {
+        use crate::devices::service::{DeviceError, DeviceRequest, DeviceTarget};
+        if let Some(device_id) = state.devices.linked_device_id(provider_id).await {
+            let request = match action {
+                crate::mqtt::command::ParsedAction::VolumeNative(value) => {
+                    DeviceRequest::VolumeAbsolute(value as f32)
+                }
+                _ => {
+                    let Some(step) = state
+                        .aggregator
+                        .get_device(&device_id)
+                        .await
+                        .map(|device| device.volume.step)
+                        .filter(|step| step.is_finite() && *step > 0.0)
+                    else {
+                        return CommandOutcome::Rejected;
+                    };
+                    DeviceRequest::VolumeRelative(
+                        if matches!(action, crate::mqtt::command::ParsedAction::VolumeUp) {
+                            step
+                        } else {
+                            -step
+                        },
+                    )
+                }
+            };
+            return match state
+                .devices
+                .control(DeviceTarget::Zone(provider_id.to_owned()), request)
+                .await
+            {
+                Ok(_) => CommandOutcome::Executed,
+                Err(DeviceError::Unconfirmed { .. } | DeviceError::Dispatch { .. }) => {
+                    CommandOutcome::UnknownOutcome
+                }
+                Err(_) => CommandOutcome::Rejected,
+            };
+        }
+    }
     match crate::mqtt::command::dispatch(
         &state.adapter_registry,
         &state.aggregator,
@@ -1241,6 +1289,7 @@ fn websocket_upgrade_request(
 
 #[cfg(test)]
 mod tests {
+    include!("runtime_volume_tests.rs");
     use super::{
         request_session_grant_at, run_connection, session_grant_client, validate_challenge,
         websocket_upgrade_request, CommandLedger, ConnectionExit, ConnectionLifecycle,
