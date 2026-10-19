@@ -90,7 +90,9 @@ impl DeviceWork {
             return None;
         }
         if tokio::time::Instant::now() >= self.dispatch_by {
-            let _ = self.reply.send(Err(DISPATCH_EXPIRED.into()));
+            if self.reply.send(Err(DISPATCH_EXPIRED.into())).is_err() {
+                tracing::debug!("Expired device command caller disconnected before refusal");
+            }
             return None;
         }
         Some((self.operation, self.reply))

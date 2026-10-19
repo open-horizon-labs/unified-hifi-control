@@ -170,8 +170,8 @@ fn relative_step_clamped_prevents_wild_jumps() {
 // `tests/architecture_lint.rs::volume_values_use_safe_defaults` is the existing guard, and it could
 // not see the defect #328 found. Two reasons, both structural rather than accidental:
 //
-//   1. It walks `src/adapters` only. The routing surface that decides what level to write lives in
-//      `src/knobs/routes.rs` (`dispatch_hqplayer_action`, shared with MCP's `hifi_control` since #401).
+//   1. It walks `src/adapters` only. The shared provider policy that decides what level to write
+//      lives in `src/provider_control.rs` (used by HTTP, MCP, MQTT and HiPhi routing).
 //   2. It matches the literal `.value.unwrap_or(50.0)`. The real line read
 //      `value.and_then(|v| v.as_f64()).unwrap_or(50.0)` — same hazard, different spelling, no match.
 //
@@ -195,16 +195,16 @@ fn relative_step_clamped_prevents_wild_jumps() {
 /// which is now a thin wrapper with none of these arms in its own body.
 fn hqp_command_from_published_zone_body() -> String {
     let source = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/knobs/routes.rs"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/provider_control.rs"),
     )
-    .expect("read the routing surface");
+    .expect("read the shared provider command policy");
 
     let start = source.find("fn hqp_command_from_published_zone(").expect(
         "hqp_command_from_published_zone must exist: HQPlayer values are validated before bus dispatch",
     );
     let rest = &source[start..];
     let end = rest
-        .find("\nasync fn control_hqplayer(")
+        .find("\nfn quantise_db(")
         .expect("the function that follows hqp_command_from_published_zone must still follow it");
     rest[..end].to_string()
 }
