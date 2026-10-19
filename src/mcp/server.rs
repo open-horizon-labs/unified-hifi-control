@@ -64,17 +64,11 @@ pub fn server_details() -> InitializeResult {
         },
         meta: None,
         instructions: Some(
-            "Unified Hi-Fi Control MCP Server - Control Your Music System\n\n\
-            Use hifi_zones to list available zones, hifi_now_playing to see what's playing, \
-            hifi_control for playback control, hifi_search to find music, and hifi_play to play it.\n\n\
-            Spotify zones are existing Spotify Connect devices; UHC is a controller, not a Spotify receiver. \
-            Transport controls (play/pause/next/previous/volume) work for Spotify as well as the \
-            other routed adapters. Search, browse, queue inspection, playlists, and saved-library \
-            operations are provider-specific; hifi_capabilities is the source of truth for what is \
-            wired for each zone.\n\n\
-            To build a playlist where the provider supports it: call hifi_play multiple times with \
-            action='queue'. The first track can use action='play' to start playback, then subsequent \
-            tracks use action='queue' to add to the queue."
+            "Use hifi_zones for zone IDs and hifi_capabilities for provider/device support. \
+            Search or browse collections, then pass the returned ref to hifi_play_ref for exact playback. \
+            hifi_play searches and plays the first match; action=queue appends to the playback queue, not a saved playlist. \
+            For live stations, use hifi_collections action=favorites with media_type=radio; hifi_play action=radio starts Roon Radio. \
+            Spotify controls existing Connect devices. Apple Music requires a paired companion."
                 .into(),
         ),
         protocol_version: ProtocolVersion::V2025_11_25.into(),

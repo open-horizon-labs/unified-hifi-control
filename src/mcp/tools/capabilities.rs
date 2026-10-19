@@ -38,12 +38,12 @@ use serde::{Deserialize, Serialize};
 /// Discover what each zone's provider can and cannot do
 #[mcp_tool(
     name = "hifi_capabilities",
-    description = "Discover what a zone supports before acting on it. Every capability reports one of three states: 'supported' (a working path exists), 'unsupported' (the provider's protocol cannot do it - never retry), or 'not_implemented' (the provider can, UHC has not wired it yet - tracked_by names the issue). Omit zone_id for every zone and every provider. States are per provider, not per device: a fixed-volume output still reports volume as supported, so check has_volume_control alongside it.",
+    description = "Check support: supported = wired; unsupported = protocol limit, do not retry; not_implemented = UHC gap (tracked_by). Check has_volume_control separately for device volume.",
     read_only_hint = true
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiCapabilitiesTool {
-    /// A zone ID to narrow the report to (get from hifi_zones). Omit for all zones.
+    /// Zone ID; omit for all zones/providers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zone_id: Option<String>,
 }

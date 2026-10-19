@@ -1,34 +1,34 @@
 {
   "hifi_apple_music": {
-    "description": "Apple Music catalog, library, playlist, feedback, and bounded adaptation context through a paired native companion. Actions include catalog_search, library, playlists, playlist_tracks, recent, recommendations, favorites, queue_plan, queue_append, play_next, context, clear_feedback, playlist_create, playlist_update, playlist_add, playlist_remove, favorite_add/remove, and feedback. Feedback accepts explicit user signals only; skips and manual changes are not inferred as dislike. Apple authorization stays on the companion; operations are limited to documented MusicKit capabilities and may be refused when the companion or account cannot perform them. Use hifi_search/hifi_play for exact content selection and playback.",
+    "description": "Apple Music content via a paired companion; authorization stays on-device. For exact playback use hifi_search/hifi_play_ref. Feedback must be explicit; never infer dislike from skips.",
     "inputSchema": {
       "properties": {
         "action": {
-          "description": "Operation to perform.",
+          "description": "catalog_search, library, playlists, playlist_tracks, recent, recommendations, favorites, queue_plan, queue_append, play_next, context, clear_feedback, playlist_create, playlist_update, playlist_add, playlist_remove, favorite_add, favorite_remove, feedback.",
           "type": "string"
         },
         "confirm": {
-          "description": "Explicit confirmation for destructive account mutations.",
+          "description": "Explicit user confirmation; true required for account mutations, feedback, clear_feedback.",
           "nullable": true,
           "type": "boolean"
         },
         "description": {
-          "description": "Optional playlist description for playlist operations.",
+          "description": "Playlist description.",
           "nullable": true,
           "type": "string"
         },
         "id": {
-          "description": "Provider content or playlist identifier, held server-side where possible.",
+          "description": "Content/playlist ID; fallback ref for feedback/play_next.",
           "nullable": true,
           "type": "string"
         },
         "idempotency_key": {
-          "description": "Stable retry key required for Apple Music account mutations.",
+          "description": "Required retry key for companion account mutations; reuse on retry.",
           "nullable": true,
           "type": "string"
         },
         "items": {
-          "description": "Ordered short-lived opaque refs for queue_plan or queue_append.",
+          "description": "Ordered opaque search refs for queue_plan/queue_append.",
           "items": {
             "type": "string"
           },
@@ -36,23 +36,23 @@
           "type": "array"
         },
         "limit": {
-          "description": "Maximum number of entries to return.",
+          "description": "Maximum results.",
           "nullable": true,
           "type": "integer"
         },
         "name": {
-          "description": "Optional user-facing name/description for playlist operations.",
+          "description": "Playlist name.",
           "nullable": true,
           "type": "string"
         },
         "offset": {
-          "description": "Number of entries to skip for paged library, playlist, history, and\nrecommendation retrieval.",
+          "description": "Zero-based result offset.",
           "nullable": true,
           "type": "integer"
         },
         "precondition": {
           "additionalProperties": true,
-          "description": "Read-before-write revision or ownership precondition.",
+          "description": "Companion revision/ownership object from a prior read.",
           "nullable": true,
           "properties": {
             "playlist_version": {
@@ -63,37 +63,37 @@
           "type": "object"
         },
         "query": {
-          "description": "Search/query text.",
+          "description": "Search text.",
           "nullable": true,
           "type": "string"
         },
         "rating": {
-          "description": "Rating value from 1 through 5 when signal is rating.",
+          "description": "1-5; required for signal=rating.",
           "nullable": true,
           "type": "integer"
         },
         "reason": {
-          "description": "Optional human-provided reason for explicit feedback.",
+          "description": "User-provided feedback reason.",
           "nullable": true,
           "type": "string"
         },
         "signal": {
-          "description": "Explicit feedback signal: favorite, unfavorite, rating, skip,\nmore_like_this, or less_like_this.",
+          "description": "Explicit favorite, unfavorite, rating, skip, more_like_this, less_like_this.",
           "nullable": true,
           "type": "string"
         },
         "source": {
-          "description": "Provenance of the signal; feedback_record accepts user only for now.",
+          "description": "Feedback source: user (default and only accepted value).",
           "nullable": true,
           "type": "string"
         },
         "uri": {
-          "description": "Opaque Apple Music ref or provider URI for a content operation.",
+          "description": "Content URI; opaque search ref for feedback/play_next.",
           "nullable": true,
           "type": "string"
         },
         "zone_id": {
-          "description": "Optional target execution-owner zone.",
+          "description": "applemusic:<owner>; required except catalog_search.",
           "nullable": true,
           "type": "string"
         }
@@ -108,11 +108,11 @@
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "Discover what a zone supports before acting on it. Every capability reports one of three states: 'supported' (a working path exists), 'unsupported' (the provider's protocol cannot do it - never retry), or 'not_implemented' (the provider can, UHC has not wired it yet - tracked_by names the issue). Omit zone_id for every zone and every provider. States are per provider, not per device: a fixed-volume output still reports volume as supported, so check has_volume_control alongside it.",
+    "description": "Check support: supported = wired; unsupported = protocol limit, do not retry; not_implemented = UHC gap (tracked_by). Check has_volume_control separately for device volume.",
     "inputSchema": {
       "properties": {
         "zone_id": {
-          "description": "A zone ID to narrow the report to (get from hifi_zones). Omit for all zones.",
+          "description": "Zone ID; omit for all zones/providers.",
           "nullable": true,
           "type": "string"
         }
@@ -121,40 +121,40 @@
     }
   },
   "hifi_collections": {
-    "description": "Alpha capability: expect refinement across releases. Browse a provider library or list saved playlists and favorites. Results are paged with limit/offset. Navigable entries include a durable opaque location for canonical navigation and a short-lived path for MCP continuation; playable entries include a short-lived opaque ref for hifi_play_ref. Send location or path, never both. Implemented for Roon, LMS, and Music Assistant zones. Spotify and Apple Music are reachable via hifi_spotify and the Apple Music tools today, not yet through this one.",
+    "description": "Browse Roon, LMS, or Music Assistant libraries, playlists, favorites, and live radio. Use returned location/path to navigate and ref with hifi_play_ref to play. Spotify/Apple Music collections use their provider tools.",
     "inputSchema": {
       "properties": {
         "action": {
-          "description": "browse, playlists, or favorites.",
+          "description": "browse, playlists, favorites.",
           "type": "string"
         },
         "limit": {
-          "description": "Maximum entries to return (1-50; default 20).",
+          "description": "Results per page: 1-50, default 20.",
           "nullable": true,
           "type": "integer"
         },
         "location": {
-          "description": "Durable provider-neutral collection location returned by a preceding browse call.",
+          "description": "Durable browse location; omit when using path.",
           "nullable": true,
           "type": "string"
         },
         "media_type": {
-          "description": "Media type when listing favorites (tracks by default).",
+          "description": "radio for live stations (Roon: My Live Radio); favorites default to tracks.",
           "nullable": true,
           "type": "string"
         },
         "offset": {
-          "description": "Zero-based page offset (default 0).",
+          "description": "Zero-based offset; default 0.",
           "nullable": true,
           "type": "integer"
         },
         "path": {
-          "description": "Short-lived collection continuation returned by a preceding browse call.",
+          "description": "Short-lived browse continuation; omit when using location.",
           "nullable": true,
           "type": "string"
         },
         "zone_id": {
-          "description": "Zone ID whose provider library is queried.",
+          "description": "Library’s zone ID.",
           "type": "string"
         }
       },
@@ -166,20 +166,20 @@
     }
   },
   "hifi_control": {
-    "description": "Control playback and volume: play, pause, playpause (toggle), next, previous, repeat_off/repeat_context/repeat_track, shuffle_on/shuffle_off, volume_set, volume_up, volume_down, seek (value = position in seconds; Roon and HQPlayer zones support it, other providers refuse it, see hifi_capabilities). HQPlayer zones use the managed instance runtime and also support stop and mute.",
+    "description": "Control zone transport or volume. Check hifi_capabilities for provider support. Linked-zone volume controls the linked device.",
     "inputSchema": {
       "properties": {
         "action": {
-          "description": "Action: play, pause, playpause, next, previous, repeat_off, repeat_context, repeat_track, shuffle_on, shuffle_off, volume_set, volume_up, volume_down, or seek (Roon and HQPlayer zones). HQPlayer also accepts stop and mute.",
+          "description": "play, pause, playpause, next, previous, repeat_off, repeat_context, repeat_track, shuffle_on, shuffle_off, volume_set, volume_up, volume_down, seek. HQPlayer also: stop, mute. Seek: Roon/HQPlayer only.",
           "type": "string"
         },
         "value": {
-          "description": "For seek, the absolute position in seconds (required, finite and non-negative). For volume: 0-100 for normalized providers, or decimal dB for HQPlayer; relative amounts use the provider's scale.",
+          "description": "Seek: required finite, non-negative seconds. Volume_set: required; provider scale (0-100 or HQPlayer dB); linked devices use dB. Up/down default: 5, or linked-device step.",
           "nullable": true,
           "type": "number"
         },
         "zone_id": {
-          "description": "The zone ID to control",
+          "description": "Zone ID from hifi_zones.",
           "type": "string"
         }
       },
@@ -191,45 +191,45 @@
     }
   },
   "hifi_devices": {
-    "description": "Alpha capability: expect refinement across releases. Amplifiers and receivers (playback devices) that zones play through, separate from the music provider. action=list shows every device with its inputs, power, volume range and linked zones. action=links lists zone links. action=link connects a zone_id to the device_id it plays through (optionally source_id, the device input the zone arrives on); after linking, that zone's volume and hifi_control volume actions drive the device. action=unlink removes a zone's link. action=set_ceiling sets a device's maximum volume in dB (omit ceiling to clear); a ceiling only ever lowers the device's own limit. action=control sends command (power_on, power_off, power_toggle, select_input, volume_set, volume_up, volume_down, mute, unmute) to a device_id, or to the device a zone_id is linked to. Volume values are dB. Inputs never switch automatically: use select_input. A command succeeds only when the device confirms it. Spec mismatches: action=set_recording enabled=true opts in to recording device protocol mismatches locally (off by default, memory only); action=report device_id builds a redacted preview with a prefilled GitHub issue link the user opens and submits themselves (sections: environment, anomalies, device_state, excerpts); action=clear_report forgets a device's recordings. Nothing is ever sent automatically.",
+    "description": "Inspect amplifiers/receivers, link zones, or control power, input, and volume. Linking redirects zone volume to the device. Inputs switch only on select_input; success requires device confirmation. Diagnostics stay local; report returns a redacted preview for the user to submit.",
     "inputSchema": {
       "properties": {
         "action": {
-          "description": "list, links, link, unlink, set_ceiling, or control.",
+          "description": "list, links, link, unlink, set_ceiling, control, set_recording, report, clear_report.",
           "type": "string"
         },
         "ceiling": {
-          "description": "For set_ceiling: the maximum volume in dB. Omit to clear the ceiling.",
+          "description": "Maximum dB; omit to clear. Can only lower device limit.",
           "nullable": true,
           "type": "number"
         },
         "command": {
-          "description": "For control: power_on, power_off, power_toggle, select_input, volume_set, volume_up,\nvolume_down, mute, or unmute.",
+          "description": "For control: power_on, power_off, power_toggle, select_input, volume_set, volume_up, volume_down, mute, unmute.",
           "nullable": true,
           "type": "string"
         },
         "device_id": {
-          "description": "The device, e.g. marantz:0006781E0AB8 (from action=list).",
+          "description": "Required for link/set_ceiling/report; control: this or zone_id, never both.",
           "nullable": true,
           "type": "string"
         },
         "enabled": {
-          "description": "For set_recording: true to record device protocol mismatches locally, false to stop\n(and forget everything recorded).",
+          "description": "For set_recording: opt in to local recording (default off); false stops and forgets.",
           "nullable": true,
           "type": "boolean"
         },
         "input": {
-          "description": "For control select_input: the input id or its display name.",
+          "description": "For select_input: input ID or name.",
           "nullable": true,
           "type": "string"
         },
         "muted": {
-          "description": "For control mute: true or false. Omit to toggle.",
+          "description": "For mute: true/false; omit to toggle.",
           "nullable": true,
           "type": "boolean"
         },
         "sections": {
-          "description": "For report: section ids to include (environment, anomalies, device_state, excerpts).\nOmit for all but raw protocol excerpts.",
+          "description": "Report sections: environment, anomalies, device_state, excerpts. Default excludes excerpts.",
           "items": {
             "type": "string"
           },
@@ -237,17 +237,17 @@
           "type": "array"
         },
         "source_id": {
-          "description": "For link: the device input this zone arrives on (an input id from action=list).",
+          "description": "For link: device input ID from list.",
           "nullable": true,
           "type": "string"
         },
         "value": {
-          "description": "For control: dB level for volume_set, or dB step for volume_up/volume_down (defaults to\nthe device step).",
+          "description": "Control volume level/step in dB; relative default: device step.",
           "nullable": true,
           "type": "number"
         },
         "zone_id": {
-          "description": "A zone id (from hifi_zones). For link/unlink, the zone to (un)link; for control, the\nlinked zone whose device to control.",
+          "description": "Required for link/unlink; or linked control target.",
           "nullable": true,
           "type": "string"
         }
@@ -262,15 +262,15 @@
     "annotations": {
       "destructiveHint": true
     },
-    "description": "Load an HQPlayer Embedded configuration (will restart HQPlayer)",
+    "description": "Load a saved configuration and restart HQPlayer.",
     "inputSchema": {
       "properties": {
         "profile": {
-          "description": "Configuration name to load (get from hifi_hqplayer_profiles)",
+          "description": "Name from hifi_hqplayer_profiles.",
           "type": "string"
         },
         "zone_id": {
-          "description": "Optional direct HQPlayer zone (`hqplayer:<instance>`). Omit for the default instance.",
+          "description": "hqplayer:<instance>; omit for default instance.",
           "nullable": true,
           "type": "string"
         }
@@ -282,65 +282,65 @@
     }
   },
   "hifi_hqplayer_output_control": {
-    "description": "Mutate HQPlayer output routing on an exact instance: relay_configure, route_add, route_update, route_remove, select, stop, discover, import_preview, import_apply, setup_preview, setup_apply, setup_readback, or setup_rollback. Call hifi_hqplayer_outputs first for the current source_epoch/output_revision to echo back — every mutation except stop/discover/import_preview/setup_preview/setup_readback requires both.",
+    "description": "Configure HQPlayer output routing. Read hifi_hqplayer_outputs first; mutations require its source_epoch/output_revision except stop, discover, import_preview, setup_preview, and setup_readback.",
     "inputSchema": {
       "properties": {
         "action": {
-          "description": "One of: relay_configure, route_add, route_update, route_remove, select, stop, discover,\nimport_preview, import_apply, setup_preview, setup_apply, setup_readback, setup_rollback.",
+          "description": "relay_configure, route_add, route_update, route_remove, select, stop, discover, import_preview, import_apply, setup_preview, setup_apply, setup_readback, setup_rollback.",
           "type": "string"
         },
         "adapter_name": {
-          "description": "Name presented by this proxy as the NAA endpoint/DAC.",
+          "description": "Relay’s advertised NAA/DAC name.",
           "nullable": true,
           "type": "string"
         },
         "bind": {
-          "description": "Optional relay listen address. New relays default to a LAN listener with an automatically allocated port.",
+          "description": "Relay listen address; default LAN, automatic port.",
           "nullable": true,
           "type": "string"
         },
         "correlation_id": {
-          "description": "Caller-owned id. Reused with an identical request returns the same operation (no second\nside effect); reused with a different request is refused.",
+          "description": "Retry key: identical payload reuses operation; changed payload is refused.",
           "nullable": true,
           "type": "string"
         },
         "device_id": {
-          "description": "Optional DAC device identifier returned by read-through discovery.",
+          "description": "DAC ID returned by discovery.",
           "nullable": true,
           "type": "string"
         },
         "discovery_interface": {
-          "description": "Optional IPv4 interface for NAA multicast discovery; enabled LAN relays choose the interface automatically when omitted.",
+          "description": "IPv4 discovery interface; auto-selected for enabled LAN relays.",
           "nullable": true,
           "type": "string"
         },
         "discovery_port": {
-          "description": "Shared NAA discovery query port; defaults to 43210. Replies advertise each relay’s own TCP port.",
+          "description": "Discovery query port; default 43210.",
           "nullable": true,
           "type": "integer"
         },
         "enabled": {
-          "description": "Enable or disable the managed relay.",
+          "description": "Enable/disable relay.",
           "nullable": true,
           "type": "boolean"
         },
         "expected_output_revision": {
-          "description": "Expected output revision from the latest projection, used to reject stale commands.",
+          "description": "output_revision from latest hifi_hqplayer_outputs.",
           "nullable": true,
           "type": "integer"
         },
         "expected_source_epoch": {
-          "description": "Expected source epoch from the latest projection, used to reject stale commands.",
+          "description": "source_epoch from latest hifi_hqplayer_outputs.",
           "nullable": true,
           "type": "integer"
         },
         "host": {
-          "description": "NAA destination host or address.",
+          "description": "NAA destination host/address.",
           "nullable": true,
           "type": "string"
         },
         "hqp_allow": {
-          "description": "Optional HQPlayer source allowlist; empty accepts any reachable NAA peer.",
+          "description": "HQPlayer source allowlist; empty accepts any reachable NAA peer.",
           "items": {
             "type": "string"
           },
@@ -348,7 +348,7 @@
           "type": "array"
         },
         "name": {
-          "description": "Friendly route or relay name.",
+          "description": "Route or relay name.",
           "nullable": true,
           "type": "string"
         },
@@ -358,22 +358,22 @@
           "type": "integer"
         },
         "preview_id": {
-          "description": "Preview identity returned by a preview operation.",
+          "description": "ID returned by preview.",
           "nullable": true,
           "type": "string"
         },
         "route_id": {
-          "description": "Existing route id for update, remove, or select.",
+          "description": "Existing route ID for update/remove/select.",
           "nullable": true,
           "type": "string"
         },
         "routes_json": {
-          "description": "JSON route document for import preview/apply.",
+          "description": "JSON route document for import.",
           "nullable": true,
           "type": "string"
         },
         "zone_id": {
-          "description": "Exact HQPlayer instance zone id; no implicit default is used.",
+          "description": "Exact hqplayer:<instance>; no default.",
           "type": "string"
         }
       },
@@ -388,16 +388,16 @@
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "Read the committed HQPlayer output-routing document for an exact instance: relay availability, saved routes, the selected route, the current relay session and recent operations. Pass operation_id to read one operation record instead of the whole document.",
+    "description": "Read HQPlayer routes, relay state, revisions, and recent operations; operation_id selects one receipt.",
     "inputSchema": {
       "properties": {
         "operation_id": {
-          "description": "Read one operation record by id (from a prior write's receipt) instead of the projection.",
+          "description": "Receipt ID; omit for full routing state.",
           "nullable": true,
           "type": "string"
         },
         "zone_id": {
-          "description": "Exact HQPlayer zone id, e.g. \"hqplayer:living\". Required — there is no default-instance\nfallback for output routing.",
+          "description": "Exact hqplayer:<instance>; no default.",
           "type": "string"
         }
       },
@@ -411,11 +411,11 @@
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "List available HQPlayer Embedded configurations",
+    "description": "List saved HQPlayer configurations.",
     "inputSchema": {
       "properties": {
         "zone_id": {
-          "description": "Optional direct HQPlayer zone (`hqplayer:<instance>`). Omit for the default instance.",
+          "description": "hqplayer:<instance>; omit for default instance.",
           "nullable": true,
           "type": "string"
         }
@@ -424,19 +424,19 @@
     }
   },
   "hifi_hqplayer_set_pipeline": {
-    "description": "Change an immediate HQPlayer setting on an exact instance: mode, samplerate, filter1x, filterNx, shaper/dither, junk_filter, matrix_profile, convolution, adaptive_volume, repeat, or random. Call hifi_hqplayer_status first for current values and choices. This does not persist a profile.",
+    "description": "Change a live HQPlayer setting. Read hifi_hqplayer_status for choices first. Changes do not save a profile.",
     "inputSchema": {
       "properties": {
         "setting": {
-          "description": "Immediate setting to change; this does not persist an HQPlayer profile.",
+          "description": "mode, samplerate, filter1x, filterNx, shaper, dither, junk_filter, matrix_profile, convolution, adaptive_volume, repeat, random.",
           "type": "string"
         },
         "value": {
-          "description": "New value for the setting",
+          "description": "Value from hifi_hqplayer_status choices.",
           "type": "string"
         },
         "zone_id": {
-          "description": "Optional direct HQPlayer zone (`hqplayer:<instance>`). Omit for the default instance.",
+          "description": "hqplayer:<instance>; omit for default instance.",
           "nullable": true,
           "type": "string"
         }
@@ -452,11 +452,11 @@
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "Get HQPlayer Embedded status and current pipeline settings",
+    "description": "Read HQPlayer status, pipeline settings, and available choices.",
     "inputSchema": {
       "properties": {
         "zone_id": {
-          "description": "Optional direct HQPlayer zone (`hqplayer:<instance>`). Omit for the default instance.",
+          "description": "hqplayer:<instance>; omit for default instance.",
           "nullable": true,
           "type": "string"
         }
@@ -470,15 +470,15 @@
       "openWorldHint": true,
       "readOnlyHint": true
     },
-    "description": "Read source-attributed HiPhi Cloud context for the music playing in an explicit zone and language. Returns identity, catalog candidates, genres, and available source facts with provenance and attribution. The first read can be slow while upstream sources are fetched. Treat partial, ambiguous, unavailable, or stale results accordingly; never present ambiguous candidate facts as certain. Compare returned identity with the current selection. Requires optional Cloud pairing; read-only and never changes playback.",
+    "description": "Read HiPhi Cloud source facts with provenance and attribution for current music; requires Cloud pairing. The first read can be slow. Check identity and stale/partial results; never present ambiguous candidate facts as certain.",
     "inputSchema": {
       "properties": {
         "language": {
-          "description": "Supported wiki language code, for example en; required, with no default.",
+          "description": "Wiki language code, e.g. en; required, no default.",
           "type": "string"
         },
         "zone_id": {
-          "description": "Explicit prefixed zone ID from hifi_zones; no default zone is selected.",
+          "description": "Explicit zone ID; no default.",
           "type": "string"
         }
       },
@@ -493,11 +493,11 @@
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "Get current playback state for a zone (track, artist, album, play state, volume)",
+    "description": "Read a zone’s current track, playback state, and volume.",
     "inputSchema": {
       "properties": {
         "zone_id": {
-          "description": "The zone ID to query (get from hifi_zones)",
+          "description": "Zone ID from hifi_zones.",
           "type": "string"
         }
       },
@@ -508,25 +508,25 @@
     }
   },
   "hifi_play": {
-    "description": "Search and play music. Searches and plays or queues the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; Spotify supports play and queue for Spotify Connect zones. Apple Music play/queue uses a paired iPhone companion and owner-scoped opaque refs; physical validation remains tracked in #465. Music Assistant supports play and queue against its active player queue. To act on a specific hifi_search result rather than the first match for a title, use hifi_play_ref with that result's `ref` instead.",
+    "description": "Search and play or queue the first match. For an exact selection, use hifi_search then hifi_play_ref.",
     "inputSchema": {
       "properties": {
         "action": {
-          "description": "What to do: \"play\" (default), \"queue\", or \"radio\". radio is Roon-only.",
+          "description": "play (default), queue, radio (Roon Radio, not live stations).",
           "nullable": true,
           "type": "string"
         },
         "query": {
-          "description": "What to play (e.g., \"early Michael Jackson\", \"Dark Side of the Moon\")",
+          "description": "Music to search for. Plays the first match.",
           "type": "string"
         },
         "source": {
-          "description": "Where to search: \"library\" (default), \"tidal\", or \"qobuz\". Roon only; LMS searches all providers.",
+          "description": "Roon only: library (default), tidal, qobuz.",
           "nullable": true,
           "type": "string"
         },
         "zone_id": {
-          "description": "Zone ID to play on (get from hifi_zones)",
+          "description": "Playback zone ID.",
           "type": "string"
         }
       },
@@ -541,20 +541,20 @@
     "annotations": {
       "readOnlyHint": false
     },
-    "description": "Play or queue a specific hifi_search result using its `ref` — the opaque token returned alongside a result, not a title. Refs are short-lived; call hifi_search again if one expires. zone_id must belong to the same provider (Roon, LMS, Spotify, Music Assistant, or a paired Apple Music companion) the ref was minted for. Music Assistant refs support play and queue against its active player queue. Apple Music refs and play/queue use the paired iPhone companion; physical validation remains tracked in #465.",
+    "description": "Play an exact search/collection ref. If expired, search or browse again. Never invent or edit refs.",
     "inputSchema": {
       "properties": {
         "action": {
-          "description": "What to do: \"play\" (default), \"queue\", \"radio\" (Roon only), or \"next\" (LMS play-next only).",
+          "description": "play (default), queue, radio (Roon Radio), next (LMS only).",
           "nullable": true,
           "type": "string"
         },
         "ref": {
-          "description": "The opaque `ref` from a hifi_search result. Do not construct, guess, or edit one.",
+          "description": "Opaque ref returned by search or collections.",
           "type": "string"
         },
         "zone_id": {
-          "description": "Zone ID to play on (get from hifi_zones). Must be the same provider the ref was minted for.",
+          "description": "Target zone; same provider as ref, same owner for Apple Music.",
           "type": "string"
         }
       },
@@ -566,30 +566,30 @@
     }
   },
   "hifi_queue": {
-    "description": "Read or edit a playback queue. action='read' is the default. Music Assistant supports jump, reorder, remove, clear, and transfer against its active queue; each mutation returns a fresh queue readback. transfer (Alpha capability: expect refinement across releases) moves the active queue from zone_id to target_zone_id (both must be Music Assistant zones). Queue add is hifi_play action='queue'.",
+    "description": "Read a queue; edit Music Assistant queues with readback. Transfer requires two Music Assistant zones. Add items with hifi_play_ref or hifi_play action=queue.",
     "inputSchema": {
       "properties": {
         "action": {
-          "description": "read (default), jump, reorder, remove, clear, or transfer.",
+          "description": "read, jump, reorder, remove, clear, transfer.",
           "type": "string"
         },
         "item_id": {
-          "description": "Queue item id for jump, reorder, or remove.",
+          "description": "Required for jump/reorder/remove; ID from queue read.",
           "nullable": true,
           "type": "string"
         },
         "position": {
-          "description": "Target zero-based position for reorder.",
+          "description": "Required for reorder; zero-based destination.",
           "nullable": true,
           "type": "integer"
         },
         "target_zone_id": {
-          "description": "Destination zone ID for transfer. Must belong to the same provider as zone_id.",
+          "description": "Required for transfer; destination Music Assistant zone.",
           "nullable": true,
           "type": "string"
         },
         "zone_id": {
-          "description": "Zone ID from hifi_zones.",
+          "description": "Queue’s zone ID.",
           "type": "string"
         }
       },
@@ -604,20 +604,20 @@
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "Search for tracks, albums, or artists. Roon: searches Library, TIDAL, or Qobuz (use source param). LMS: searches all installed providers including streaming plugins. Spotify: searches the Spotify catalog for a Spotify Connect zone. Apple Music: searches through a paired iPhone companion and returns owner-scoped opaque refs; physical companion validation remains tracked in #465. Music Assistant searches its configured catalog for a Music Assistant zone. Each result may carry a short-lived `ref` token; hold it and pass it to hifi_play_ref to play or queue that exact result.",
+    "description": "Search a zone’s library or catalog. Returns short-lived refs for exact playback with hifi_play_ref. Omit zone_id to search Roon.",
     "inputSchema": {
       "properties": {
         "query": {
-          "description": "Search query (e.g., \"Hotel California\", \"Eagles\", \"jazz piano\")",
+          "description": "Track, album, artist, or search text.",
           "type": "string"
         },
         "source": {
-          "description": "Where to search: \"library\" (default), \"tidal\", or \"qobuz\". Roon only; LMS searches all providers.",
+          "description": "Roon only: library (default), tidal, qobuz.",
           "nullable": true,
           "type": "string"
         },
         "zone_id": {
-          "description": "Zone ID for context-aware results. Recommended for LMS (different players may have different sources).",
+          "description": "Target zone; omit for Roon. Required to route to other providers.",
           "nullable": true,
           "type": "string"
         }
@@ -629,15 +629,15 @@
     }
   },
   "hifi_spotify": {
-    "description": "Spotify personal-library access. Actions: playlists, playlist_tracks, saved_tracks, saved_tracks_check, saved_tracks_add/remove, create_playlist, update_playlist, playlist_add/replace/remove. Extended Quota apps configured with UHC_SPOTIFY_QUOTA_MODE=extended may also use browse_categories, browse_category_playlists, browse_featured_playlists, and browse_new_releases; those actions are unavailable by default because Spotify removed them from the February 2026 Development Mode API. Use hifi_search and hifi_play for catalog search, playback, and queue-add. The Web API can read/add to the active queue but cannot jump, reorder, remove, clear, or transfer queue contents. Transfer Playback selects one device; it is not multiroom synchronization. Playlist/library writes require the corresponding Spotify scopes.",
+    "description": "Spotify playlists and saved tracks; writes need matching scopes. Browse requires UHC_SPOTIFY_QUOTA_MODE=extended. Search/play with hifi_search/hifi_play_ref.",
     "inputSchema": {
       "properties": {
         "action": {
-          "description": "Operation to perform.",
+          "description": "playlists, playlist_tracks, saved_tracks, saved_tracks_check, saved_tracks_add, saved_tracks_remove, create_playlist, update_playlist, playlist_add, playlist_replace, playlist_remove; extended mode: browse_categories, browse_category_playlists, browse_featured_playlists, browse_new_releases.",
           "type": "string"
         },
         "category_id": {
-          "description": "Spotify browse category id. Extended Quota mode only.",
+          "description": "Category ID; extended browse only.",
           "nullable": true,
           "type": "string"
         },
@@ -647,7 +647,7 @@
           "type": "string"
         },
         "limit": {
-          "description": "Maximum number of entries to return.",
+          "description": "Maximum results.",
           "nullable": true,
           "type": "integer"
         },
@@ -657,22 +657,22 @@
           "type": "string"
         },
         "playlist_id": {
-          "description": "Playlist id for playlist_tracks, update_playlist, or playlist_add.",
+          "description": "Playlist ID for playlist reads/edits.",
           "nullable": true,
           "type": "string"
         },
         "public": {
-          "description": "Public visibility for create/update.",
+          "description": "Playlist visibility for create/update.",
           "nullable": true,
           "type": "boolean"
         },
         "track_id": {
-          "description": "Track id for saved-library membership or mutation.",
+          "description": "Track ID for saved-track operations.",
           "nullable": true,
           "type": "string"
         },
         "uri": {
-          "description": "Track URI for playlist_add.",
+          "description": "Track URI for playlist edits.",
           "nullable": true,
           "type": "string"
         }
@@ -687,32 +687,32 @@
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "Get overall bridge status (Roon connection, HQPlayer config)",
+    "description": "Read bridge connection status for Roon and HQPlayer.",
     "inputSchema": {
       "properties": {},
       "type": "object"
     }
   },
   "hifi_zone_group": {
-    "description": "Alpha capability: expect refinement across releases. Inspect or change multiroom zone groups for any provider that supports synchronised playback (Roon, LMS, Music Assistant). action=status is read-only: pass zone_id to scope it to one provider, or omit zone_id to aggregate every provider's groups (a provider that cannot be reached is reported in `errors` rather than failing the whole read). join and leave require confirm=true because grouping changes playback topology, and every zone id involved (leader plus every member) must belong to the same provider -- cross-provider groups are refused. Two provider-specific member conventions: Roon retires a grouped zone's own id and reports/accepts its members as roon:<output_id>; LMS sync groups are leaderless, so leader_zone_id there is UHC's stable-but-arbitrary pick of the first member id, not an LMS fact.",
+    "description": "Roon/LMS/Music Assistant sync groups. Join/leave require confirm=true and one provider. Roon members use roon:<output_id>; LMS leader_zone_id is a representative. Unreachable providers appear in errors.",
     "inputSchema": {
       "properties": {
         "action": {
-          "description": "status, join, or leave.",
+          "description": "status, join, leave.",
           "type": "string"
         },
         "confirm": {
-          "description": "Required true for topology-changing join and leave actions.",
+          "description": "Explicit user confirmation; true required for join/leave.",
           "nullable": true,
           "type": "boolean"
         },
         "leader_zone_id": {
-          "description": "Leader zone for join. Must be the same provider as every member_zone_id.",
+          "description": "Required for join; same provider as members.",
           "nullable": true,
           "type": "string"
         },
         "member_zone_ids": {
-          "description": "Member zones to add (join) or remove (leave). Must all share one\nprovider, matching leader_zone_id for join.",
+          "description": "Required for join/leave; one provider, matching leader for join.",
           "items": {
             "type": "string"
           },
@@ -720,7 +720,7 @@
           "type": "array"
         },
         "zone_id": {
-          "description": "Scopes action=status to one provider. Omit to aggregate every\nmultiroom-capable provider's groups.",
+          "description": "Status provider filter; omit for all providers.",
           "nullable": true,
           "type": "string"
         }
@@ -735,7 +735,7 @@
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "List all available playback zones (Roon, LMS, OpenHome, UPnP, HQPlayer, Apple Music, Spotify, Music Assistant)",
+    "description": "List playback zones and their IDs, state, and volume.",
     "inputSchema": {
       "properties": {},
       "type": "object"

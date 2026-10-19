@@ -64,60 +64,58 @@ fn apple_music_action_requires_owner(action: &str) -> bool {
 
 #[mcp_tool(
     name = "hifi_apple_music",
-    description = "Apple Music catalog, library, playlist, feedback, and bounded adaptation context through a paired native companion. Actions include catalog_search, library, playlists, playlist_tracks, recent, recommendations, favorites, queue_plan, queue_append, play_next, context, clear_feedback, playlist_create, playlist_update, playlist_add, playlist_remove, favorite_add/remove, and feedback. Feedback accepts explicit user signals only; skips and manual changes are not inferred as dislike. Apple authorization stays on the companion; operations are limited to documented MusicKit capabilities and may be refused when the companion or account cannot perform them. Use hifi_search/hifi_play for exact content selection and playback."
+    description = "Apple Music content via a paired companion; authorization stays on-device. For exact playback use hifi_search/hifi_play_ref. Feedback must be explicit; never infer dislike from skips."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiAppleMusicTool {
-    /// Operation to perform.
+    /// catalog_search, library, playlists, playlist_tracks, recent, recommendations, favorites, queue_plan, queue_append, play_next, context, clear_feedback, playlist_create, playlist_update, playlist_add, playlist_remove, favorite_add, favorite_remove, feedback.
     pub action: String,
-    /// Provider content or playlist identifier, held server-side where possible.
+    /// Content/playlist ID; fallback ref for feedback/play_next.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    /// Search/query text.
+    /// Search text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
-    /// Opaque Apple Music ref or provider URI for a content operation.
+    /// Content URI; opaque search ref for feedback/play_next.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
-    /// Optional target execution-owner zone.
+    /// applemusic:<owner>; required except catalog_search.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zone_id: Option<String>,
-    /// Optional user-facing name/description for playlist operations.
+    /// Playlist name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Optional playlist description for playlist operations.
+    /// Playlist description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Explicit confirmation for destructive account mutations.
+    /// Explicit user confirmation; true required for account mutations, feedback, clear_feedback.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confirm: Option<bool>,
-    /// Stable retry key required for Apple Music account mutations.
+    /// Required retry key for companion account mutations; reuse on retry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
-    /// Read-before-write revision or ownership precondition.
+    /// Companion revision/ownership object from a prior read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub precondition: Option<AppleMusicPrecondition>,
-    /// Maximum number of entries to return.
+    /// Maximum results.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
-    /// Number of entries to skip for paged library, playlist, history, and
-    /// recommendation retrieval.
+    /// Zero-based result offset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offset: Option<u32>,
-    /// Ordered short-lived opaque refs for queue_plan or queue_append.
+    /// Ordered opaque search refs for queue_plan/queue_append.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub items: Option<Vec<String>>,
-    /// Explicit feedback signal: favorite, unfavorite, rating, skip,
-    /// more_like_this, or less_like_this.
+    /// Explicit favorite, unfavorite, rating, skip, more_like_this, less_like_this.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signal: Option<String>,
-    /// Rating value from 1 through 5 when signal is rating.
+    /// 1-5; required for signal=rating.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rating: Option<u8>,
-    /// Optional human-provided reason for explicit feedback.
+    /// User-provided feedback reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// Provenance of the signal; feedback_record accepts user only for now.
+    /// Feedback source: user (default and only accepted value).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }

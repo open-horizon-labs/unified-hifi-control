@@ -77,17 +77,17 @@ const SPOTIFY_SEARCH_LIMIT: usize = 10;
 /// Search for music
 #[mcp_tool(
     name = "hifi_search",
-    description = "Search for tracks, albums, or artists. Roon: searches Library, TIDAL, or Qobuz (use source param). LMS: searches all installed providers including streaming plugins. Spotify: searches the Spotify catalog for a Spotify Connect zone. Apple Music: searches through a paired iPhone companion and returns owner-scoped opaque refs; physical companion validation remains tracked in #465. Music Assistant searches its configured catalog for a Music Assistant zone. Each result may carry a short-lived `ref` token; hold it and pass it to hifi_play_ref to play or queue that exact result.",
+    description = "Search a zone’s library or catalog. Returns short-lived refs for exact playback with hifi_play_ref. Omit zone_id to search Roon.",
     read_only_hint = true
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiSearchTool {
-    /// Search query (e.g., "Hotel California", "Eagles", "jazz piano")
+    /// Track, album, artist, or search text.
     pub query: String,
-    /// Zone ID for context-aware results. Recommended for LMS (different players may have different sources).
+    /// Target zone; omit for Roon. Required to route to other providers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zone_id: Option<String>,
-    /// Where to search: "library" (default), "tidal", or "qobuz". Roon only; LMS searches all providers.
+    /// Roon only: library (default), tidal, qobuz.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }
@@ -95,18 +95,18 @@ pub struct HifiSearchTool {
 /// Search and play music in one command
 #[mcp_tool(
     name = "hifi_play",
-    description = "Search and play music. Searches and plays or queues the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; Spotify supports play and queue for Spotify Connect zones. Apple Music play/queue uses a paired iPhone companion and owner-scoped opaque refs; physical validation remains tracked in #465. Music Assistant supports play and queue against its active player queue. To act on a specific hifi_search result rather than the first match for a title, use hifi_play_ref with that result's `ref` instead."
+    description = "Search and play or queue the first match. For an exact selection, use hifi_search then hifi_play_ref."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiPlayTool {
-    /// What to play (e.g., "early Michael Jackson", "Dark Side of the Moon")
+    /// Music to search for. Plays the first match.
     pub query: String,
-    /// Zone ID to play on (get from hifi_zones)
+    /// Playback zone ID.
     pub zone_id: String,
-    /// Where to search: "library" (default), "tidal", or "qobuz". Roon only; LMS searches all providers.
+    /// Roon only: library (default), tidal, qobuz.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// What to do: "play" (default), "queue", or "radio". radio is Roon-only.
+    /// play (default), queue, radio (Roon Radio, not live stations).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
 }
@@ -114,17 +114,17 @@ pub struct HifiPlayTool {
 /// Play, queue, or start radio from a specific `hifi_search` result (#396)
 #[mcp_tool(
     name = "hifi_play_ref",
-    description = "Play or queue a specific hifi_search result using its `ref` — the opaque token returned alongside a result, not a title. Refs are short-lived; call hifi_search again if one expires. zone_id must belong to the same provider (Roon, LMS, Spotify, Music Assistant, or a paired Apple Music companion) the ref was minted for. Music Assistant refs support play and queue against its active player queue. Apple Music refs and play/queue use the paired iPhone companion; physical validation remains tracked in #465.",
+    description = "Play an exact search/collection ref. If expired, search or browse again. Never invent or edit refs.",
     read_only_hint = false
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiPlayRefTool {
-    /// The opaque `ref` from a hifi_search result. Do not construct, guess, or edit one.
+    /// Opaque ref returned by search or collections.
     #[serde(rename = "ref")]
     pub r#ref: String,
-    /// Zone ID to play on (get from hifi_zones). Must be the same provider the ref was minted for.
+    /// Target zone; same provider as ref, same owner for Apple Music.
     pub zone_id: String,
-    /// What to do: "play" (default), "queue", "radio" (Roon only), or "next" (LMS play-next only).
+    /// play (default), queue, radio (Roon Radio), next (LMS only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
 }

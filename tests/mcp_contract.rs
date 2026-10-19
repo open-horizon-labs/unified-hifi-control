@@ -942,6 +942,18 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
     ),
 ];
 
+/// Keep discovery affordable for clients that send the whole catalog to a model.
+/// The pre-compression catalog was about 24.5 KB; preserve a reduction of 30%+.
+#[test]
+fn tool_catalog_stays_within_the_discovery_budget() {
+    let catalog = serde_json::to_vec(&mcp::tools::list_tools(true)).unwrap();
+    assert!(
+        catalog.len() <= 17_000,
+        "tool catalog is {} bytes; keep it within 17,000 bytes by removing duplicated guidance",
+        catalog.len()
+    );
+}
+
 #[test]
 fn apple_music_precondition_is_an_object_and_preserves_companion_fields() {
     use unified_hifi_control::mcp::tools::HifiAppleMusicTool;

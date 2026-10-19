@@ -76,15 +76,15 @@ use serde::{Deserialize, Serialize};
 /// Control playback across the shared adapters, including direct HQPlayer zones.
 #[mcp_tool(
     name = "hifi_control",
-    description = "Control playback and volume: play, pause, playpause (toggle), next, previous, repeat_off/repeat_context/repeat_track, shuffle_on/shuffle_off, volume_set, volume_up, volume_down, seek (value = position in seconds; Roon and HQPlayer zones support it, other providers refuse it, see hifi_capabilities). HQPlayer zones use the managed instance runtime and also support stop and mute."
+    description = "Control zone transport or volume. Check hifi_capabilities for provider support. Linked-zone volume controls the linked device."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiControlTool {
-    /// The zone ID to control
+    /// Zone ID from hifi_zones.
     pub zone_id: String,
-    /// Action: play, pause, playpause, next, previous, repeat_off, repeat_context, repeat_track, shuffle_on, shuffle_off, volume_set, volume_up, volume_down, or seek (Roon and HQPlayer zones). HQPlayer also accepts stop and mute.
+    /// play, pause, playpause, next, previous, repeat_off, repeat_context, repeat_track, shuffle_on, shuffle_off, volume_set, volume_up, volume_down, seek. HQPlayer also: stop, mute. Seek: Roon/HQPlayer only.
     pub action: String,
-    /// For seek, the absolute position in seconds (required, finite and non-negative). For volume: 0-100 for normalized providers, or decimal dB for HQPlayer; relative amounts use the provider's scale.
+    /// Seek: required finite, non-negative seconds. Volume_set: required; provider scale (0-100 or HQPlayer dB); linked devices use dB. Up/down default: 5, or linked-device step.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<f64>,
 }
