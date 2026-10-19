@@ -188,6 +188,7 @@ pub struct MqttPublisher {
     bus: SharedBus,
     aggregator: Arc<ZoneAggregator>,
     adapter_registry: Arc<AdapterRegistry>,
+    devices: Arc<crate::devices::service::DeviceService>,
     knobs: KnobStore,
     base_url: std::sync::RwLock<String>,
     runtime: Mutex<Runtime>,
@@ -257,12 +258,14 @@ impl MqttPublisher {
         bus: SharedBus,
         aggregator: Arc<ZoneAggregator>,
         adapter_registry: Arc<AdapterRegistry>,
+        devices: Arc<crate::devices::service::DeviceService>,
         knobs: KnobStore,
     ) -> Self {
         Self {
             bus,
             aggregator,
             adapter_registry,
+            devices,
             knobs,
             base_url: std::sync::RwLock::new(String::new()),
             runtime: Mutex::new(Runtime::default()),
@@ -367,6 +370,7 @@ impl MqttPublisher {
             self.bus.clone(),
             self.aggregator.clone(),
             self.adapter_registry.clone(),
+            self.devices.clone(),
             self.knobs.clone(),
             self.reliable_commands_snapshot(),
             self.base_url_snapshot(),
@@ -790,6 +794,7 @@ async fn handle_incoming_publish(
     record: &MqttCredentialRecord,
     adapter_registry: &Arc<AdapterRegistry>,
     aggregator: &ZoneAggregator,
+    devices: &crate::devices::service::DeviceService,
     reliable_commands: Option<&CommandGateway>,
     knobs: &KnobStore,
     zone_slugs: &HashMap<String, String>,
@@ -833,6 +838,7 @@ async fn handle_incoming_publish(
     match command::dispatch(
         adapter_registry,
         aggregator,
+        devices,
         reliable_commands,
         zone_id,
         parsed,
@@ -840,6 +846,9 @@ async fn handle_incoming_publish(
     .await
     {
         command::DispatchOutcome::Sent => {}
+        command::DispatchOutcome::Unknown(error) => {
+            tracing::warn!(zone_id, error, "MQTT command outcome unconfirmed");
+        }
         command::DispatchOutcome::Refused(error) => {
             tracing::warn!(zone_id, error, "MQTT command refused");
         }
@@ -881,6 +890,7 @@ async fn run(
     bus: SharedBus,
     aggregator: Arc<ZoneAggregator>,
     adapter_registry: Arc<AdapterRegistry>,
+    devices: Arc<crate::devices::service::DeviceService>,
     knobs: KnobStore,
     reliable_commands: Option<CommandGateway>,
     base_url: String,
@@ -912,6 +922,7 @@ async fn run(
             &bus,
             &aggregator,
             &adapter_registry,
+            &devices,
             &knobs,
             reliable_commands.as_ref(),
             &base_url,
@@ -1044,6 +1055,7 @@ async fn publish_loop(
     bus: &SharedBus,
     aggregator: &Arc<ZoneAggregator>,
     adapter_registry: &Arc<AdapterRegistry>,
+    devices: &crate::devices::service::DeviceService,
     knobs: &KnobStore,
     reliable_commands: Option<&CommandGateway>,
     base_url: &str,
@@ -1159,6 +1171,7 @@ async fn publish_loop(
                             record,
                             adapter_registry,
                             aggregator,
+                            devices,
                             reliable_commands,
                             knobs,
                             &zone_slugs,

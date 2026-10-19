@@ -860,3 +860,99 @@ async fn critical_mismatches_are_captured_only_when_opted_in_and_previewed_redac
     h.state.devices.set_recording(false).await.unwrap();
     assert!(journal.counts().is_empty());
 }
+
+/// CRITICAL: moving a connector-specific branch into another client module
+/// would still leave callers selecting the wrong gain stage. Exercise shared
+/// zone control directly against two real mock protocol adapters.
+#[tokio::test]
+async fn critical_shared_zone_control_routes_native_volume_to_linked_amplifier() {
+    use unified_hifi_control::zone_control::{dispatch, Action, DispatchOutcome};
+    let h = harness().await;
+    let front = MockMarantz::start().await;
+    let bedroom = MockMarantz::start().await;
+    h.attach(FRONT, "front", &front).await;
+    h.attach(BEDROOM, "bedroom", &bedroom).await;
+    h.zone_ready("roon:living").await;
+    h.link("roon:living", FRONT).await;
+    h.state
+        .devices
+        .set_ceiling(id(FRONT).as_str(), Some(-30.0))
+        .await
+        .unwrap();
+    for (action, expected) in [
+        (Action::VolumeNative(-44.5), -44.5),
+        (Action::VolumeUp, -44.0),
+        (Action::VolumeDown, -44.5),
+        (Action::VolumeNative(-10.0), -30.0),
+    ] {
+        assert_eq!(
+            dispatch(
+                &h.state.adapter_registry,
+                &h.state.aggregator,
+                &h.state.devices,
+                None,
+                "roon:living",
+                action
+            )
+            .await,
+            DispatchOutcome::Sent
+        );
+        assert_eq!(front.snapshot().await.level_db(), expected);
+        h.wait_for(|state| async move {
+            state
+                .aggregator
+                .get_device(&id(FRONT))
+                .await
+                .unwrap()
+                .volume
+                .value
+                == Some(expected)
+        })
+        .await;
+        assert_eq!(
+            bedroom.snapshot().await.level_db(),
+            -39.5,
+            "the other amplifier must never move"
+        );
+    }
+    // MQTT's percentage vocabulary must never be mistaken for native dB.
+    assert!(matches!(
+        dispatch(
+            &h.state.adapter_registry,
+            &h.state.aggregator,
+            &h.state.devices,
+            None,
+            "roon:living",
+            Action::Volume(50.0)
+        )
+        .await,
+        DispatchOutcome::Refused(_)
+    ));
+    assert_eq!(front.snapshot().await.level_db(), -30.0);
+    assert_eq!(
+        dispatch(
+            &h.state.adapter_registry,
+            &h.state.aggregator,
+            &h.state.devices,
+            None,
+            "roon:living",
+            Action::Mute(true)
+        )
+        .await,
+        DispatchOutcome::Sent
+    );
+    // Disconnected provider transport must fail at its provider, not become
+    // an amplifier operation merely because a device link exists.
+    assert!(matches!(
+        dispatch(
+            &h.state.adapter_registry,
+            &h.state.aggregator,
+            &h.state.devices,
+            None,
+            "roon:living",
+            Action::Next
+        )
+        .await,
+        DispatchOutcome::Refused(_)
+    ));
+}

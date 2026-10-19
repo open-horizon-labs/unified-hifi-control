@@ -375,7 +375,15 @@ pub async fn linked_zone_volume(
     ) {
         return None;
     }
-    state.devices.linked_device_id(&args.zone_id).await?;
+    let value = args.value.map(|v| json!(v));
+    let result = crate::zone_control::dispatch_linked_device(
+        &state.aggregator,
+        &state.devices,
+        &args.zone_id,
+        &args.action,
+        value.as_ref(),
+    )
+    .await?;
     let operation = match args.action.as_str() {
         "volume_set" => "volume_absolute",
         _ => "volume_relative",
@@ -383,14 +391,8 @@ pub async fn linked_zone_volume(
     let env = Envelope::write("hifi_control", operation)
         .param("zone_id", args.zone_id.clone())
         .param_opt("value", args.value);
-    Some(
-        control(
-            state,
-            env,
-            DeviceTarget::Zone(args.zone_id.clone()),
-            &args.action,
-            args.value.map(|v| json!(v)).as_ref(),
-        )
-        .await,
-    )
+    Some(match result {
+        Ok(report) => Ok(env.json_result(&report)),
+        Err(error) => refuse(env, error),
+    })
 }

@@ -84,3 +84,7 @@ pub mod producers;
 // The single decision point for zone-list membership and order (see module docs).
 #[cfg(feature = "server")]
 pub mod zone_list;
+
+// Capability ownership for commands to composed zones.
+#[cfg(feature = "server")]
+pub mod zone_control;

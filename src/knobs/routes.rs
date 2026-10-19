@@ -685,46 +685,18 @@ async fn control_linked_device(
     state: &AppState,
     req: &KnobControlRequest,
 ) -> Option<Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)>> {
-    use crate::devices::service::{
-        is_device_only_action, request_from_action, DeviceError, DeviceTarget,
-    };
-    let Some(device_id) = state.devices.linked_device_id(&req.zone_id).await else {
-        if is_device_only_action(&req.action) {
-            return Some(Err(crate::api::devices::device_error_response(
-                DeviceError::NotLinked {
-                    zone_id: req.zone_id.clone(),
-                },
-            )));
-        }
-        return None;
-    };
-    let step = state
-        .aggregator
-        .get_device(&device_id)
-        .await
-        .map(|device| device.volume.step)
-        .filter(|step| *step > 0.0)
-        .unwrap_or(0.5);
-    let request = match request_from_action(&req.action, req.value.as_ref(), step) {
-        Ok(Some(request)) => request,
-        Ok(None) => return None,
-        Err(message) => {
-            return Some(Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": message, "error_code": "INVALID_VALUE"})),
-            )))
-        }
-    };
-    Some(
-        match state
-            .devices
-            .control(DeviceTarget::Zone(req.zone_id.clone()), request)
-            .await
-        {
-            Ok(report) => Ok(Json(serde_json::json!({"ok": true, "result": report}))),
-            Err(error) => Err(crate::api::devices::device_error_response(error)),
-        },
+    crate::zone_control::dispatch_linked_device(
+        &state.aggregator,
+        &state.devices,
+        &req.zone_id,
+        &req.action,
+        req.value.as_ref(),
     )
+    .await
+    .map(|result| match result {
+        Ok(report) => Ok(Json(serde_json::json!({"ok": true, "result": report}))),
+        Err(error) => Err(crate::api::devices::device_error_response(error)),
+    })
 }
 
 /// Control request body

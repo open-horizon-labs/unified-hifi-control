@@ -3,9 +3,8 @@
 //! The relay is contacted over WSS only.  It sends a challenge first; the
 //! installation grant authenticates the HTTP upgrade and is then carried in
 //! the signed proof body so possession of the installation key is still
-//! required. The grant is never placed in a URL. Linked-device volume uses the
-//! device service for native units, limits and readback.
-//! Provider control uses the semantic MQTT command router and command gateway.
+//! required. The grant is never placed in a URL. Admitted actions go through
+//! shared zone control, which resolves device and provider capability ownership.
 
 use futures::{SinkExt, StreamExt};
 use sha2::{Digest as _, Sha256};
@@ -1027,94 +1026,49 @@ async fn dispatch(
     let action = match payload.action {
         super::protocol::CommandAction::PlayPause => {
             if store.state(&payload.zone_handle) == Some("playing") {
-                crate::mqtt::command::ParsedAction::Pause
+                crate::zone_control::Action::Pause
             } else {
-                crate::mqtt::command::ParsedAction::Play
+                crate::zone_control::Action::Play
             }
         }
-        super::protocol::CommandAction::Next => crate::mqtt::command::ParsedAction::Next,
-        super::protocol::CommandAction::Previous => crate::mqtt::command::ParsedAction::Previous,
+        super::protocol::CommandAction::Next => crate::zone_control::Action::Next,
+        super::protocol::CommandAction::Previous => crate::zone_control::Action::Previous,
         super::protocol::CommandAction::VolumeUp => {
             if !store.supports_relative_volume(&payload.zone_handle) {
                 return CommandOutcome::Rejected;
             }
-            crate::mqtt::command::ParsedAction::VolumeUp
+            crate::zone_control::Action::VolumeUp
         }
         super::protocol::CommandAction::VolumeDown => {
             if !store.supports_relative_volume(&payload.zone_handle) {
                 return CommandOutcome::Rejected;
             }
-            crate::mqtt::command::ParsedAction::VolumeDown
+            crate::zone_control::Action::VolumeDown
         }
         super::protocol::CommandAction::VolumeAbsolute { value } => {
             if !store.accepts_absolute_volume(&payload.zone_handle, value) {
                 return CommandOutcome::Rejected;
             }
-            crate::mqtt::command::ParsedAction::VolumeNative(value)
+            crate::zone_control::Action::VolumeNative(value)
         }
     };
-    // The projection exposes the linked amplifier's native volume, so dispatch
-    // must use that same authority rather than handing its dB value to the
-    // transport provider. Keep this after the projection/admission checks.
-    if matches!(
-        action,
-        crate::mqtt::command::ParsedAction::VolumeNative(_)
-            | crate::mqtt::command::ParsedAction::VolumeUp
-            | crate::mqtt::command::ParsedAction::VolumeDown
-    ) {
-        use crate::devices::service::{DeviceError, DeviceRequest, DeviceTarget};
-        if let Some(device_id) = state.devices.linked_device_id(provider_id).await {
-            let request = match action {
-                crate::mqtt::command::ParsedAction::VolumeNative(value) => {
-                    DeviceRequest::VolumeAbsolute(value as f32)
-                }
-                _ => {
-                    let Some(step) = state
-                        .aggregator
-                        .get_device(&device_id)
-                        .await
-                        .map(|device| device.volume.step)
-                        .filter(|step| step.is_finite() && *step > 0.0)
-                    else {
-                        return CommandOutcome::Rejected;
-                    };
-                    DeviceRequest::VolumeRelative(
-                        if matches!(action, crate::mqtt::command::ParsedAction::VolumeUp) {
-                            step
-                        } else {
-                            -step
-                        },
-                    )
-                }
-            };
-            return match state
-                .devices
-                .control(DeviceTarget::Zone(provider_id.to_owned()), request)
-                .await
-            {
-                Ok(_) => CommandOutcome::Executed,
-                Err(DeviceError::Unconfirmed { .. } | DeviceError::Dispatch { .. }) => {
-                    CommandOutcome::UnknownOutcome
-                }
-                Err(_) => CommandOutcome::Rejected,
-            };
-        }
-    }
-    match crate::mqtt::command::dispatch(
+    match crate::zone_control::dispatch(
         &state.adapter_registry,
         &state.aggregator,
+        &state.devices,
         state.reliable_commands.as_ref(),
         provider_id,
         action,
     )
     .await
     {
-        crate::mqtt::command::DispatchOutcome::Sent => CommandOutcome::Executed,
-        crate::mqtt::command::DispatchOutcome::Refused(reason) if reason.contains("busy") => {
+        crate::zone_control::DispatchOutcome::Sent => CommandOutcome::Executed,
+        crate::zone_control::DispatchOutcome::Unknown(_) => CommandOutcome::UnknownOutcome,
+        crate::zone_control::DispatchOutcome::Refused(reason) if reason.contains("busy") => {
             CommandOutcome::Busy
         }
-        crate::mqtt::command::DispatchOutcome::Refused(_) => CommandOutcome::Rejected,
-        crate::mqtt::command::DispatchOutcome::Unsupported(_) => CommandOutcome::Forbidden,
+        crate::zone_control::DispatchOutcome::Refused(_) => CommandOutcome::Rejected,
+        crate::zone_control::DispatchOutcome::Unsupported(_) => CommandOutcome::Forbidden,
     }
 }
 

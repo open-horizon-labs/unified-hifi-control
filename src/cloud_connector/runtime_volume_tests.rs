@@ -232,6 +232,72 @@ mod linked_volume {
                 Some(&DeviceOperation::SetVolume(-44.5))
             );
         }
+        if confirm {
+            // MQTT percentages are inverted only for scales that publish a
+            // linear normalization. They must never become dB or be rounded
+            // through the transport adapter's integer convention.
+            state
+                .aggregator
+                .install_device_configuration(
+                    vec![DeviceLink {
+                        zone_id: "spotify:fake-streamer".into(),
+                        device_id: device.device_id.clone(),
+                        source_id: None,
+                    }],
+                    Default::default(),
+                )
+                .await;
+            for (scale, max, step, expected) in [
+                (VolumeScale::Percentage, 100.0, 1.0, 25.0),
+                (VolumeScale::Linear, 1.0, 0.01, 0.25),
+                (VolumeScale::Steps, 160.0, 1.0, 40.0),
+            ] {
+                let update = {
+                    let mut device = amp.device.lock().unwrap();
+                    device.volume.scale = scale;
+                    device.volume.min = 0.0;
+                    device.volume.hardware_max = Some(max);
+                    device.volume.value = Some(0.0);
+                    device.volume.step = step;
+                    device.revision += 1;
+                    device.clone()
+                };
+                let revision = update.revision;
+                state.bus.publish(BusEvent::DeviceObserved {
+                    device: Box::new(update),
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while state
+                        .aggregator
+                        .get_device(&device.device_id)
+                        .await
+                        .unwrap()
+                        .revision
+                        < revision
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    crate::zone_control::dispatch(
+                        &state.adapter_registry,
+                        &state.aggregator,
+                        &state.devices,
+                        None,
+                        "spotify:fake-streamer",
+                        crate::zone_control::Action::Volume(25.0),
+                    )
+                    .await,
+                    crate::zone_control::DispatchOutcome::Sent
+                );
+                assert_eq!(
+                    amp.operations.lock().unwrap().last(),
+                    Some(&DeviceOperation::SetVolume(expected))
+                );
+            }
+        }
         // A missing driver cannot fall back to the provider, even when its
         // registry would accept the command and report success.
         state.devices = Arc::new(DeviceService::new(

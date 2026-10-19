@@ -365,10 +365,16 @@ impl AppState {
     ) -> Self {
         let hqp_images: Arc<dyn HqpImageSource> = hqp_instances.clone();
         let adapter_registry = Arc::new(AdapterRegistry::default());
+        let devices = Arc::new(crate::devices::service::DeviceService::new(
+            aggregator.clone(),
+            bus.clone(),
+            crate::devices::links::DeviceLinkStore::open_default(),
+        ));
         let mqtt = Arc::new(crate::mqtt::MqttPublisher::new(
             bus.clone(),
             aggregator.clone(),
             adapter_registry.clone(),
+            devices.clone(),
             knobs.clone(),
         ));
         let provider_auth = Arc::new(provider_auth::ProviderAuthState::default());
@@ -377,11 +383,6 @@ impl AppState {
         // too, instead of relying solely on the manual stop / OAuth
         // completion / lifetime-cap paths.
         provider_auth.bind_shutdown(shutdown.clone());
-        let devices = Arc::new(crate::devices::service::DeviceService::new(
-            aggregator.clone(),
-            bus.clone(),
-            crate::devices::links::DeviceLinkStore::open_default(),
-        ));
         Self {
             roon,
             hqplayer,
