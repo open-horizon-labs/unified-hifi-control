@@ -394,6 +394,17 @@ jobs:
   # ALWAYS RUN: Lint, Test, Web Assets, Linux x64
   # =============================================================================
 
+  lms-feed-automerge-test:
+    name: LMS feed auto-merge contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Test API-only feed merge behavior
+        run: node --test tests/lms_feed_automerge.test.cjs
+
   lint:
     name: Lint
     runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name
@@ -2408,27 +2419,19 @@ jobs:
             lms-plugin/repo.xml
             lms-plugin/install.xml
 
-      - name: Enable auto-merge
+      - name: Merge feed PR when ready
         if: steps.create-pr.outputs.pull-request-number
         uses: actions/github-script@v8
+        env:
+          LMS_FEED_PR: ${{ steps.create-pr.outputs.pull-request-number }}
+          LMS_FEED_BRANCH: chore/lms-update
         with:
           script: |
-            const number = Number('${{ steps.create-pr.outputs.pull-request-number }}');
-            const { data: pullRequest } = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: number,
+            await require('./.github/scripts/lms-feed-auto-merge.cjs')({
+              github, context,
+              number: Number(process.env.LMS_FEED_PR),
+              branch: process.env.LMS_FEED_BRANCH,
             });
-            await github.graphql(`
-              mutation EnableAutoMerge($pullRequestId: ID!) {
-                enablePullRequestAutoMerge(input: {
-                  pullRequestId: $pullRequestId,
-                  mergeMethod: SQUASH
-                }) {
-                  pullRequest { number }
-                }
-              }
-            `, { pullRequestId: pullRequest.data.node_id });
 
   # The beta counterpart of update-repo-xml.
   #
@@ -2497,11 +2500,19 @@ jobs:
           base: v4
           add-paths: lms-plugin/repo-beta.xml
 
-      - name: Enable auto-merge
+      - name: Merge feed PR when ready
         if: steps.create-pr.outputs.pull-request-number
+        uses: actions/github-script@v8
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh pr merge ${{ steps.create-pr.outputs.pull-request-number }} --squash --auto
+          LMS_FEED_PR: ${{ steps.create-pr.outputs.pull-request-number }}
+          LMS_FEED_BRANCH: chore/lms-beta-feed
+        with:
+          script: |
+            await require('./.github/scripts/lms-feed-auto-merge.cjs')({
+              github, context,
+              number: Number(process.env.LMS_FEED_PR),
+              branch: process.env.LMS_FEED_BRANCH,
+            });
 
   publish-aur:
     name: Publish to AUR
