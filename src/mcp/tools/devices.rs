@@ -321,7 +321,8 @@ fn refuse(env: Envelope, error: DeviceError) -> Result<CallToolResult, CallToolE
         DeviceError::InvalidValue { parameter, .. } => {
             Refusal::invalid_parameter(parameter, &[], text.clone())
         }
-        DeviceError::RangeUnknown { .. }
+        DeviceError::Expired { .. }
+        | DeviceError::RangeUnknown { .. }
         | DeviceError::DeviceUnavailable { .. }
         | DeviceError::Store(_)
         | DeviceError::NoDriver { .. }

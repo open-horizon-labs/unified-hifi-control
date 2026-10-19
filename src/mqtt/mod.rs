@@ -846,6 +846,9 @@ async fn handle_incoming_publish(
     .await
     {
         command::DispatchOutcome::Sent => {}
+        command::DispatchOutcome::Expired => {
+            tracing::warn!(zone_id, "MQTT command expired before dispatch");
+        }
         command::DispatchOutcome::Unknown(error) => {
             tracing::warn!(zone_id, error, "MQTT command outcome unconfirmed");
         }

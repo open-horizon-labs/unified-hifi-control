@@ -7,13 +7,14 @@ use std::sync::Arc;
 
 use crate::adapters::{AdapterCommand, AdapterCommandResponse};
 use crate::aggregator::ZoneAggregator;
-use crate::api::{
-    dispatch_lms_runtime_command_via, dispatch_openhome_runtime_command_via,
-    dispatch_roon_runtime_command_via, dispatch_upnp_runtime_command_via, AdapterRegistry,
-};
+use crate::api::AdapterRegistry;
 use crate::bus::runtime::CommandGateway;
 use crate::bus::Command;
-use crate::knobs::routes::dispatch_hqplayer_action_via;
+use crate::provider_control::dispatch_hqplayer_action_via;
+use crate::provider_control::{
+    dispatch_lms_runtime_command_via, dispatch_openhome_runtime_command_via,
+    dispatch_roon_runtime_command_via, dispatch_upnp_runtime_command_via,
+};
 
 use crate::devices::service::{
     is_device_only_action, DeviceCommandReport, DeviceError, DeviceService, DeviceTarget,
@@ -105,6 +106,7 @@ impl Action {
 #[derive(Debug, PartialEq)]
 pub enum DispatchOutcome {
     Sent,
+    Expired,
     /// Native dispatch was attempted but its outcome could not be confirmed.
     Unknown(String),
     /// The owning provider (adapter or gateway endpoint) rejected the command.
@@ -123,6 +125,28 @@ pub async fn dispatch(
     zone_id: &str,
     action: Action,
 ) -> DispatchOutcome {
+    crate::command_dispatch::local(dispatch_unscoped(
+        adapter_registry,
+        aggregator,
+        devices,
+        reliable_commands,
+        zone_id,
+        action,
+    ))
+    .await
+}
+
+async fn dispatch_unscoped(
+    adapter_registry: &Arc<AdapterRegistry>,
+    aggregator: &ZoneAggregator,
+    devices: &DeviceService,
+    reliable_commands: Option<&CommandGateway>,
+    zone_id: &str,
+    action: Action,
+) -> DispatchOutcome {
+    if tokio::time::Instant::now() >= crate::command_dispatch::deadline() {
+        return DispatchOutcome::Expired;
+    }
     if matches!(&action, Action::Volume(value) | Action::VolumeNative(value) if !value.is_finite())
     {
         return DispatchOutcome::Refused("volume must be finite".into());
@@ -130,6 +154,7 @@ pub async fn dispatch(
     if let Some(result) = dispatch_linked_action(devices, zone_id, &action).await {
         return match result {
             Ok(_) => DispatchOutcome::Sent,
+            Err(DeviceError::Expired { .. }) => DispatchOutcome::Expired,
             Err(error @ (DeviceError::Unconfirmed { .. } | DeviceError::Dispatch { .. })) => {
                 DispatchOutcome::Unknown(error.to_string())
             }
@@ -140,6 +165,9 @@ pub async fn dispatch(
         return DispatchOutcome::Unsupported("zone id has no provider prefix".to_string());
     };
 
+    if tokio::time::Instant::now() >= crate::command_dispatch::deadline() {
+        return DispatchOutcome::Expired;
+    }
     if adapter_registry.has_adapter(prefix).await {
         let command = action.into_adapter_command();
         return match adapter_registry.command(prefix, zone_id, command).await {
@@ -203,6 +231,9 @@ pub async fn dispatch(
             .await
             {
                 Ok(()) => DispatchOutcome::Sent,
+                Err(error) if error.message() == crate::command_dispatch::EXPIRED_MESSAGE => {
+                    DispatchOutcome::Expired
+                }
                 Err(error) => DispatchOutcome::Refused(error.message().to_string()),
             }
         }
@@ -215,6 +246,9 @@ pub async fn dispatch(
 fn gateway_outcome(result: anyhow::Result<()>) -> DispatchOutcome {
     match result {
         Ok(()) => DispatchOutcome::Sent,
+        Err(error) if error.is::<crate::command_dispatch::DispatchExpired>() => {
+            DispatchOutcome::Expired
+        }
         Err(error) => DispatchOutcome::Refused(error.to_string()),
     }
 }

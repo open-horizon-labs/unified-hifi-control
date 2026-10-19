@@ -42,16 +42,7 @@ pub struct ZoneStatePayload {
 /// converted. Other scales report no volume, and the HA `number` entity
 /// simply keeps its last retained value.
 fn normalized_volume(zone: &Zone) -> Option<f64> {
-    let volume = zone.volume_control.as_ref()?;
-    use crate::bus::VolumeScale;
-    match volume.scale {
-        VolumeScale::Percentage => Some(volume.value as f64),
-        VolumeScale::Linear | VolumeScale::Steps => {
-            let span = (volume.max - volume.min).max(f32::EPSILON);
-            Some((((volume.value - volume.min) / span) * 100.0) as f64)
-        }
-        VolumeScale::Decibel | VolumeScale::Unknown => None,
-    }
+    crate::volume::percentage(zone.volume_control.as_ref()?)
 }
 
 /// Build the retained state payload for one zone.

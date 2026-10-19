@@ -88,3 +88,10 @@ pub mod zone_list;
 // Capability ownership for commands to composed zones.
 #[cfg(feature = "server")]
 pub mod zone_control;
+
+#[cfg(feature = "server")]
+pub mod command_dispatch;
+#[cfg(feature = "server")]
+pub(crate) mod provider_control;
+#[cfg(feature = "server")]
+pub mod volume;

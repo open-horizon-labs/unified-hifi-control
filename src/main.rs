@@ -531,19 +531,7 @@ mod server {
                 devices::links::DeviceLinkStore::open_default()
                     .document()
                     .await
-                    .map(|document| {
-                        let mut manual = document.manual_devices;
-                        // Legacy bare hosts are Denon/Marantz.
-                        manual.extend(document.manual_hosts.into_iter().map(|host| {
-                            devices::links::ManualDevice {
-                                family: "denonavr".to_string(),
-                                host,
-                                port: None,
-                                mac: None,
-                            }
-                        }));
-                        manual
-                    })
+                    .map(devices::links::DeviceLinksDocument::discovery_devices)
                     .unwrap_or_default(),
             )
             .await;

@@ -53,3 +53,25 @@ fn device_service_owns_native_action_interpretation() {
         );
     }
 }
+
+#[test]
+fn shared_policy_does_not_depend_on_client_implementations() {
+    let router = include_str!("../src/zone_control.rs");
+    assert!(!router.contains("crate::knobs::routes"));
+    let provider = include_str!("../src/provider_control.rs");
+    assert!(!provider.contains("use crate::api"));
+    assert!(!provider.contains("use crate::knobs"));
+    let mqtt = include_str!("../src/mqtt/state.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert!(
+        !mqtt.contains("VolumeScale::"),
+        "client percentage conversion belongs to the shared volume model"
+    );
+    let main = include_str!("../src/main.rs");
+    assert!(
+        !main.contains("document.manual_hosts"),
+        "discovery config interpretation belongs to its configuration owner"
+    );
+}

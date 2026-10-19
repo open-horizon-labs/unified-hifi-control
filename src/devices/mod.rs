@@ -294,6 +294,9 @@ impl Device {
     /// `max` is the effective maximum — the hardware limit lowered by the user's ceiling — so no
     /// client that respects the published range can even request a level above the ceiling.
     pub fn volume_control(&self) -> Option<crate::bus::VolumeControl> {
+        if !self.capabilities.volume.supported {
+            return None;
+        }
         let value = self.volume.value?;
         let max = self.volume.effective_max()?;
         if !(self.volume.min.is_finite() && max.is_finite() && self.volume.min < max) {

@@ -1126,7 +1126,7 @@ async fn device_http_and_mcp_delegate_native_steps_to_device_service() {
     h.attach(FRONT, "front", &front).await;
     h.zone_ready("roon:living").await;
     h.link("roon:living", FRONT).await;
-    unified_hifi_control::api::devices::device_control_handler(
+    let _ = unified_hifi_control::api::devices::device_control_handler(
         State(h.state.clone()),
         Json(unified_hifi_control::api::devices::DeviceControlRequest {
             device_id: None,
@@ -1169,4 +1169,25 @@ async fn device_http_and_mcp_delegate_native_steps_to_device_service() {
     .unwrap();
     assert_ne!(result.is_error, Some(true), "{result:?}");
     assert_eq!(front.snapshot().await.level_db(), -39.5);
+}
+
+/// Device workers run in separate tasks; the service's task-local lifetime
+/// must cross that queue explicitly rather than disappear on native dispatch.
+#[tokio::test]
+async fn critical_expired_native_worker_command_never_reaches_marantz() {
+    use unified_hifi_control::devices::service::{DeviceDriver, DeviceOperation};
+    let h = harness().await;
+    let front = MockMarantz::start().await;
+    h.attach(FRONT, "front", &front).await;
+    let result = unified_hifi_control::command_dispatch::until(
+        tokio::time::Instant::now(),
+        h.adapter
+            .execute(&id(FRONT), DeviceOperation::SetVolume(-30.0)),
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(
+        front.snapshot().await.writes().is_empty(),
+        "an expired worker message performed native I/O"
+    );
 }
