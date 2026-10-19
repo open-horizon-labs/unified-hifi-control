@@ -276,6 +276,28 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "_lifecycle_guard",
         "HQPlayer manager lifecycle mutations must be serialized",
     ),
+    // Persist and install form one configuration transaction. Releasing this lease between
+    // them lets a later edit persist before the earlier projection installs. Lock order is
+    // configuration -> store (released on return) -> aggregator; neither reacquires configuration.
+    (
+        "devices/service.rs",
+        "_configuration",
+        "Device configuration persistence and projection installation must stay ordered",
+    ),
+    // These regression fixtures deliberately hold a device lease while awaiting an admission
+    // timeout. They never await a successful acquisition of the blocked lease.
+    (
+        "devices/service.rs",
+        "_admission_test_blocker",
+        "Admission tests must hold the device lease until a waiting command expires",
+    ),
+    // This regression fixture blocks projection installation while observing that another edit
+    // cannot persist ahead of it. It releases the gate before joining the configuration tasks.
+    (
+        "aggregator.rs",
+        "_configuration_test_projection_gate",
+        "Configuration ordering test deliberately blocks projection installation",
+    ),
     // One command per playback device (#774): a relative step must resolve against the previous
     // step's *readback*, so the per-device async mutex is held across dispatch and confirmation.
     // Lock order: it is the outermost lock on that path; the aggregator RwLock and driver channel

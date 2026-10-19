@@ -1984,7 +1984,7 @@ mod device_configuration_order_tests {
             bus,
             DeviceLinkStore::open(path.clone()),
         ));
-        let projection_gate = aggregator.state.write().await;
+        let _configuration_test_projection_gate = aggregator.state.write().await;
         let first = {
             let service = service.clone();
             tokio::spawn(async move {
@@ -2022,7 +2022,7 @@ mod device_configuration_order_tests {
         })
         .await
         .is_ok();
-        drop(projection_gate);
+        drop(_configuration_test_projection_gate);
         first.await.unwrap();
         second.await.unwrap();
         assert!(

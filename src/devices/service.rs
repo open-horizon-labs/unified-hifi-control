@@ -360,6 +360,8 @@ pub struct DeviceService {
     store: DeviceLinkStore,
     // Serialize each persisted edit through its aggregator/journal installation.
     // The store's file lock alone ends before the installed projection updates.
+    // Lock order: configuration -> store (released on return) -> aggregator.
+    // Store and aggregator operations never reacquire the configuration lock.
     configuration_lock: Mutex<()>,
     drivers: RwLock<HashMap<&'static str, Arc<dyn DeviceDriver>>>,
     device_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -1378,7 +1380,7 @@ mod admission_regressions {
         );
         let id = DeviceId::new("marantz", "FAKEADMISSION").unwrap();
         let lock = service.device_lock(&id).await;
-        let _blocked = lock.lock().await;
+        let _admission_test_blocker = lock.lock().await;
         let result = tokio::time::timeout(
             Duration::from_secs(4),
             service.control(DeviceTarget::Device(id), DeviceRequest::PowerOn),
@@ -1467,7 +1469,7 @@ mod caller_deadline_tests {
         );
         let id = DeviceId::new("marantz", "FAKEDEADLINE").unwrap();
         let lock = service.device_lock(&id).await;
-        let blocked = lock.lock().await;
+        let _admission_test_blocker = lock.lock().await;
         let by = tokio::time::Instant::now() + Duration::from_millis(20);
         let result = tokio::time::timeout(
             Duration::from_secs(1),
@@ -1479,6 +1481,6 @@ mod caller_deadline_tests {
         .await
         .unwrap();
         assert!(matches!(result, Err(DeviceError::Expired { .. })));
-        drop(blocked);
+        drop(_admission_test_blocker);
     }
 }
