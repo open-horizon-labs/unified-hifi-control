@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::AppState;
-use crate::devices::service::{request_from_action, DeviceError, DeviceTarget, DEVICE_ACTIONS};
+use crate::devices::service::{DeviceError, DeviceTarget, DEVICE_ACTIONS};
 use crate::devices::{Device, DeviceId, DEVICE_CONTROL_MATURITY};
 
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
@@ -259,20 +259,11 @@ pub async fn device_control_handler(
         (None, Some(zone_id)) => DeviceTarget::Zone(zone_id.clone()),
         _ => return Err(bad_request("pass exactly one of device_id or zone_id")),
     };
-    // "+"/"−" without a magnitude move one of the device's own steps (0.5 dB on a Marantz,
-    // 1% on a WiiM), as the knob and MCP paths already do.
-    let step = match &target {
-        DeviceTarget::Device(device_id) => state.aggregator.get_device(device_id).await,
-        DeviceTarget::Zone(zone_id) => match state.devices.linked_device_id(zone_id).await {
-            Some(device_id) => state.aggregator.get_device(&device_id).await,
-            None => None,
-        },
-    }
-    .map(|device| device.volume.step)
-    .filter(|step| *step > 0.0)
-    .unwrap_or(0.5);
-    let device_request = request_from_action(&request.action, request.value.as_ref(), step)
-        .map_err(bad_request)?
+    let report = state
+        .devices
+        .control_action(target, &request.action, request.value.as_ref())
+        .await
+        .map_err(device_error_response)?
         .ok_or_else(|| {
             bad_request(format!(
                 "unknown device action {}; accepted: {}",
@@ -280,11 +271,6 @@ pub async fn device_control_handler(
                 DEVICE_ACTIONS.join(", ")
             ))
         })?;
-    let report = state
-        .devices
-        .control(target, device_request)
-        .await
-        .map_err(device_error_response)?;
     Ok(Json(json!({ "ok": true, "result": report })))
 }
 

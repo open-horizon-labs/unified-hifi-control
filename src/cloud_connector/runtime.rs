@@ -3,8 +3,8 @@
 //! The relay is contacted over WSS only.  It sends a challenge first; the
 //! installation grant authenticates the HTTP upgrade and is then carried in
 //! the signed proof body so possession of the installation key is still
-//! required. The grant is never placed in a URL. All control dispatch goes through the existing semantic
-//! MQTT command router, which keeps the aggregator/command gateway boundary.
+//! required. The grant is never placed in a URL. Admitted actions go through
+//! shared zone control, which resolves device and provider capability ownership.
 
 use futures::{SinkExt, StreamExt};
 use sha2::{Digest as _, Sha256};
@@ -776,7 +776,15 @@ where
                                 Err(LedgerError::Conflict) => CommandOutcome::Forbidden,
                                 Ok(None) if ledger.is_full() => CommandOutcome::Busy,
                                 Ok(None) => {
-                                    let outcome = dispatch(state, store, &verified.payload).await;
+                                    let remaining_ms =
+                                        command.expires_at.saturating_sub(now_ms()).max(0) as u64;
+                                    let dispatch_by = tokio::time::Instant::now()
+                                        + std::time::Duration::from_millis(remaining_ms);
+                                    let outcome = crate::command_dispatch::until(
+                                        dispatch_by,
+                                        dispatch(state, store, &verified.payload),
+                                    )
+                                    .await;
                                     newly_executed = outcome == CommandOutcome::Executed;
                                     if ledger
                                         .record_command_at(
@@ -1010,6 +1018,9 @@ async fn dispatch(
     store: &StateStore,
     payload: &super::protocol::CommandPayload,
 ) -> CommandOutcome {
+    if tokio::time::Instant::now() >= crate::command_dispatch::deadline() {
+        return CommandOutcome::Expired;
+    }
     let now = u64::try_from(now_ms()).unwrap_or_default();
     let Some(epoch) = store.latest().map(|projection| projection.epoch) else {
         return CommandOutcome::StaleState;
@@ -1026,47 +1037,50 @@ async fn dispatch(
     let action = match payload.action {
         super::protocol::CommandAction::PlayPause => {
             if store.state(&payload.zone_handle) == Some("playing") {
-                crate::mqtt::command::ParsedAction::Pause
+                crate::zone_control::Action::Pause
             } else {
-                crate::mqtt::command::ParsedAction::Play
+                crate::zone_control::Action::Play
             }
         }
-        super::protocol::CommandAction::Next => crate::mqtt::command::ParsedAction::Next,
-        super::protocol::CommandAction::Previous => crate::mqtt::command::ParsedAction::Previous,
+        super::protocol::CommandAction::Next => crate::zone_control::Action::Next,
+        super::protocol::CommandAction::Previous => crate::zone_control::Action::Previous,
         super::protocol::CommandAction::VolumeUp => {
             if !store.supports_relative_volume(&payload.zone_handle) {
                 return CommandOutcome::Rejected;
             }
-            crate::mqtt::command::ParsedAction::VolumeUp
+            crate::zone_control::Action::VolumeUp
         }
         super::protocol::CommandAction::VolumeDown => {
             if !store.supports_relative_volume(&payload.zone_handle) {
                 return CommandOutcome::Rejected;
             }
-            crate::mqtt::command::ParsedAction::VolumeDown
+            crate::zone_control::Action::VolumeDown
         }
         super::protocol::CommandAction::VolumeAbsolute { value } => {
             if !store.accepts_absolute_volume(&payload.zone_handle, value) {
                 return CommandOutcome::Rejected;
             }
-            crate::mqtt::command::ParsedAction::VolumeNative(value)
+            crate::zone_control::Action::VolumeNative(value)
         }
     };
-    match crate::mqtt::command::dispatch(
+    match crate::zone_control::dispatch(
         &state.adapter_registry,
         &state.aggregator,
+        &state.devices,
         state.reliable_commands.as_ref(),
         provider_id,
         action,
     )
     .await
     {
-        crate::mqtt::command::DispatchOutcome::Sent => CommandOutcome::Executed,
-        crate::mqtt::command::DispatchOutcome::Refused(reason) if reason.contains("busy") => {
+        crate::zone_control::DispatchOutcome::Sent => CommandOutcome::Executed,
+        crate::zone_control::DispatchOutcome::Expired => CommandOutcome::Expired,
+        crate::zone_control::DispatchOutcome::Unknown(_) => CommandOutcome::UnknownOutcome,
+        crate::zone_control::DispatchOutcome::Refused(reason) if reason.contains("busy") => {
             CommandOutcome::Busy
         }
-        crate::mqtt::command::DispatchOutcome::Refused(_) => CommandOutcome::Rejected,
-        crate::mqtt::command::DispatchOutcome::Unsupported(_) => CommandOutcome::Forbidden,
+        crate::zone_control::DispatchOutcome::Refused(_) => CommandOutcome::Rejected,
+        crate::zone_control::DispatchOutcome::Unsupported(_) => CommandOutcome::Forbidden,
     }
 }
 
@@ -1241,6 +1255,25 @@ fn websocket_upgrade_request(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn expired_dispatch_context_is_not_renewed_by_connector_admission() {
+        let state = empty_app_state().await;
+        let store = StateStore::default();
+        let outcome = crate::command_dispatch::until(
+            tokio::time::Instant::now(),
+            super::dispatch(
+                &state,
+                &store,
+                &CommandPayload {
+                    zone_handle: "zone_fake_expired".into(),
+                    action: CommandAction::VolumeUp,
+                },
+            ),
+        )
+        .await;
+        assert_eq!(outcome, super::CommandOutcome::Expired);
+    }
+    include!("runtime_volume_tests.rs");
     use super::{
         request_session_grant_at, run_connection, session_grant_client, validate_challenge,
         websocket_upgrade_request, CommandLedger, ConnectionExit, ConnectionLifecycle,

@@ -294,6 +294,9 @@ impl Device {
     /// `max` is the effective maximum — the hardware limit lowered by the user's ceiling — so no
     /// client that respects the published range can even request a level above the ceiling.
     pub fn volume_control(&self) -> Option<crate::bus::VolumeControl> {
+        if !self.capabilities.volume.supported {
+            return None;
+        }
         let value = self.volume.value?;
         let max = self.volume.effective_max()?;
         if !(self.volume.min.is_finite() && max.is_finite() && self.volume.min < max) {
@@ -332,6 +335,25 @@ pub struct DeviceLink {
     /// input automatically (decision D2); it tells a surface which linked zone is audible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
+}
+
+/// An ephemeral composition snapshot from one aggregator read. An absent
+/// device keeps the configured owner intact; it never restores provider gain.
+/// This is not a new device identity, persisted document, or state cache.
+#[derive(Debug, Clone)]
+pub struct ZoneDeviceBinding {
+    pub link: DeviceLink,
+    pub device: Option<Device>,
+}
+
+impl ZoneDeviceBinding {
+    pub fn volume_control(&self) -> Option<crate::bus::VolumeControl> {
+        self.device.as_ref().and_then(Device::volume_control)
+    }
+
+    pub fn summary(&self) -> LinkedDeviceSummary {
+        LinkedDeviceSummary::new(&self.link, self.device.as_ref())
+    }
 }
 
 /// The device facts a linked zone surfaces, flattened for zone payloads and SSE.

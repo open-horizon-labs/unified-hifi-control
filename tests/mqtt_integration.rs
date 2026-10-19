@@ -86,6 +86,24 @@ fn isolated_knob_store() -> KnobStore {
     KnobStore::new()
 }
 
+fn isolated_device_service(
+    bus: &unified_hifi_control::bus::SharedBus,
+    aggregator: &Arc<ZoneAggregator>,
+) -> Arc<unified_hifi_control::devices::service::DeviceService> {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    let directory = DIR.get_or_init(|| tempfile::tempdir().expect("device test directory"));
+    Arc::new(unified_hifi_control::devices::service::DeviceService::new(
+        aggregator.clone(),
+        bus.clone(),
+        unified_hifi_control::devices::links::DeviceLinkStore::open(
+            directory
+                .path()
+                .join(format!("{}.json", uuid::Uuid::new_v4())),
+        ),
+    ))
+}
+
 /// Bind an ephemeral port and hand its number back for `rumqttd`'s config,
 /// which does its own binding. The listener is dropped immediately before
 /// the broker binds - the same "ask the OS for a free port" pattern
@@ -401,6 +419,7 @@ async fn discovers_publishes_state_and_routes_commands_over_a_real_broker() {
         bus.clone(),
         aggregator.clone(),
         adapter_registry.clone(),
+        isolated_device_service(&bus, &aggregator),
         isolated_knob_store(),
     ));
     publisher.set_base_url("http://uhc.test:8088".to_string());
@@ -619,6 +638,7 @@ async fn tolerates_an_unreachable_broker() {
         bus.clone(),
         aggregator.clone(),
         adapter_registry,
+        isolated_device_service(&bus, &aggregator),
         isolated_knob_store(),
     );
     publisher
@@ -699,6 +719,7 @@ async fn a_reachable_broker_is_reported_as_connected() {
         bus.clone(),
         aggregator.clone(),
         Arc::new(AdapterRegistry::default()),
+        isolated_device_service(&bus, &aggregator),
         isolated_knob_store(),
     );
     publisher
@@ -759,6 +780,7 @@ async fn a_connection_that_dies_stops_being_reported_as_connected() {
         bus.clone(),
         aggregator.clone(),
         Arc::new(AdapterRegistry::default()),
+        isolated_device_service(&bus, &aggregator),
         isolated_knob_store(),
     );
     publisher
@@ -875,6 +897,7 @@ async fn mqtt_command_for_a_legacy_zone_routes_through_the_command_gateway_to_lm
         bus.clone(),
         aggregator.clone(),
         adapter_registry,
+        isolated_device_service(&bus, &aggregator),
         isolated_knob_store(),
     ));
     // Attach the gateway before enabling: `restart()` only snapshots it when the publisher task
@@ -1008,6 +1031,7 @@ async fn knob_discovery_state_and_zone_select_round_trip_over_a_real_broker() {
         bus.clone(),
         aggregator.clone(),
         adapter_registry,
+        isolated_device_service(&bus, &aggregator),
         knobs.clone(),
     ));
     publisher.set_base_url("http://uhc.test:8088".to_string());
@@ -1168,6 +1192,7 @@ async fn publisher_with_running_aggregator() -> (
         bus.clone(),
         aggregator.clone(),
         Arc::new(AdapterRegistry::default()),
+        isolated_device_service(&bus, &aggregator),
         isolated_knob_store(),
     );
     (publisher, bus, aggregator)

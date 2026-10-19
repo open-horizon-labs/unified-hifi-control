@@ -128,10 +128,7 @@ fn now_ms() -> u64 {
 }
 
 enum UnitCommand {
-    Execute {
-        operation: DeviceOperation,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
+    Execute(crate::devices::service::DeviceWork),
     Rehost(Endpoint),
 }
 
@@ -474,7 +471,9 @@ impl DeviceDriver for StreamMagicAdapter {
         let (reply, response) = oneshot::channel();
         tokio::time::timeout(
             WRITE_TIMEOUT,
-            commands.send(UnitCommand::Execute { operation, reply }),
+            commands.send(UnitCommand::Execute(
+                crate::devices::service::DeviceWork::new(operation, reply),
+            )),
         )
         .await
         .map_err(|_| "the unit's session is busy".to_string())?
@@ -662,7 +661,8 @@ impl Unit {
                             next_connect = Instant::now();
                             self.publish();
                         }
-                        UnitCommand::Execute { operation, reply } => {
+                        UnitCommand::Execute(work) => {
+                            let Some((operation, reply)) = work.begin_dispatch() else { continue; };
                             let result = self.execute(&mut ws, &operation).await;
                             if ws.is_none() {
                                 self.state.session_lost("session closed during a command".to_string());

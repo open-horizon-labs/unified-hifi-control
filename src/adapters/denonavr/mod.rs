@@ -169,10 +169,7 @@ fn now_ms() -> u64 {
 }
 
 enum UnitCommand {
-    Execute {
-        operation: DeviceOperation,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
+    Execute(crate::devices::service::DeviceWork),
     Rehost(String),
 }
 
@@ -509,7 +506,9 @@ impl DeviceDriver for DenonAvrAdapter {
         let (reply, response) = oneshot::channel();
         tokio::time::timeout(
             WRITE_TIMEOUT,
-            commands.send(UnitCommand::Execute { operation, reply }),
+            commands.send(UnitCommand::Execute(
+                crate::devices::service::DeviceWork::new(operation, reply),
+            )),
         )
         .await
         .map_err(|_| "the unit's session is busy".to_string())?
@@ -643,7 +642,8 @@ impl Unit {
                             telnet = None;
                             next_connect = Instant::now();
                         }
-                        UnitCommand::Execute { operation, reply } => {
+                        UnitCommand::Execute(work) => {
+                            let Some((operation, reply)) = work.begin_dispatch() else { continue; };
                             let used_http = telnet.is_none();
                             let result = self.execute(&mut telnet, &operation).await;
                             let sent = result.is_ok();

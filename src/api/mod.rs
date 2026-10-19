@@ -13,10 +13,7 @@ use crate::adapters::{
     Startable,
 };
 use crate::aggregator::{HqpSnapshotPresence, ZoneAggregator};
-use crate::bus::runtime::{
-    CommandDeadlines, CommandGateway, CommandLane, CommandRequest, CommandStatus,
-    HqpRuntimeCommand, RuntimeCommand,
-};
+use crate::bus::runtime::{CommandGateway, HqpRuntimeCommand};
 use crate::bus::{Command, HqpImageSource, PrefixedZoneId, ProviderAccount, SharedBus};
 use crate::coordinator::AdapterCoordinator;
 use crate::knobs::KnobStore;
@@ -365,10 +362,16 @@ impl AppState {
     ) -> Self {
         let hqp_images: Arc<dyn HqpImageSource> = hqp_instances.clone();
         let adapter_registry = Arc::new(AdapterRegistry::default());
+        let devices = Arc::new(crate::devices::service::DeviceService::new(
+            aggregator.clone(),
+            bus.clone(),
+            crate::devices::links::DeviceLinkStore::open_default(),
+        ));
         let mqtt = Arc::new(crate::mqtt::MqttPublisher::new(
             bus.clone(),
             aggregator.clone(),
             adapter_registry.clone(),
+            devices.clone(),
             knobs.clone(),
         ));
         let provider_auth = Arc::new(provider_auth::ProviderAuthState::default());
@@ -377,11 +380,6 @@ impl AppState {
         // too, instead of relying solely on the manual stop / OAuth
         // completion / lifetime-cap paths.
         provider_auth.bind_shutdown(shutdown.clone());
-        let devices = Arc::new(crate::devices::service::DeviceService::new(
-            aggregator.clone(),
-            bus.clone(),
-            crate::devices::links::DeviceLinkStore::open_default(),
-        ));
         Self {
             roon,
             hqplayer,
@@ -1083,54 +1081,6 @@ pub(crate) async fn dispatch_lms_runtime_command(
     dispatch_lms_runtime_command_via(state.reliable_commands.as_ref(), zone_id, command).await
 }
 
-/// Same routing and readback wait as [`dispatch_lms_runtime_command`], parameterized directly over
-/// the reliable command gateway so callers without a full `AppState` - MQTT's inbound command
-/// router (#529) - reuse the identical dispatch path HTTP/knob/MCP use.
-pub(crate) async fn dispatch_lms_runtime_command_via(
-    gateway: Option<&CommandGateway>,
-    zone_id: &str,
-    command: Command,
-) -> anyhow::Result<()> {
-    let target = PrefixedZoneId::lms(zone_id.strip_prefix("lms:").unwrap_or(zone_id));
-    let Some(gateway) = gateway else {
-        // Compatibility-only construction used by older embedders and contract fixtures. There is
-        // no direct adapter fallback: preserve the established actionable error while refusing
-        // native I/O outside the reliable runtime.
-        return Err(anyhow::anyhow!("LMS host not configured"));
-    };
-    if !gateway.has_endpoint(&target) {
-        return Err(anyhow::anyhow!("LMS command endpoint is not available"));
-    }
-    let now = tokio::time::Instant::now();
-    let mut ticket = gateway
-        .submit(CommandRequest {
-            target,
-            command: RuntimeCommand::Control(command),
-            correlation_id: None,
-            lane: CommandLane::Interactive,
-            deadlines: CommandDeadlines {
-                dispatch_by: now + Duration::from_secs(3),
-                confirm_by: now + Duration::from_secs(15),
-            },
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("LMS command admission failed: {error:?}"))?;
-    match ticket.wait_for_observable_result().await {
-        CommandStatus::Confirmed { .. } => Ok(()),
-        CommandStatus::Failed { detail } | CommandStatus::NotDispatched { detail } => {
-            Err(anyhow::anyhow!(detail))
-        }
-        CommandStatus::Indeterminate => Err(anyhow::anyhow!(
-            "LMS accepted the command but did not publish a verified readback in time"
-        )),
-        CommandStatus::Queued | CommandStatus::Dispatched | CommandStatus::AwaitingProjection => {
-            Err(anyhow::anyhow!(
-                "LMS command stopped without a terminal result"
-            ))
-        }
-    }
-}
-
 /// Route an OpenHome transport/volume action through the reliable endpoint.
 /// Public request and response shapes stay frozen; the command is successful
 /// only after the endpoint commits an exact-device Zone readback.
@@ -1140,27 +1090,6 @@ pub(crate) async fn dispatch_openhome_runtime_command(
     command: Command,
 ) -> anyhow::Result<()> {
     dispatch_openhome_runtime_command_via(state.reliable_commands.as_ref(), zone_id, command).await
-}
-
-/// Same routing as [`dispatch_openhome_runtime_command`], parameterized directly over the reliable
-/// command gateway so callers without a full `AppState` - MQTT's inbound command router (#529) -
-/// reuse the identical dispatch path HTTP/knob/MCP use.
-pub(crate) async fn dispatch_openhome_runtime_command_via(
-    gateway: Option<&CommandGateway>,
-    zone_id: &str,
-    command: Command,
-) -> anyhow::Result<()> {
-    if gateway.is_none() {
-        let raw_id = zone_id.strip_prefix("openhome:").unwrap_or(zone_id);
-        return Err(anyhow::anyhow!("Device not found: {raw_id}"));
-    }
-    dispatch_provider_runtime_command(
-        gateway,
-        PrefixedZoneId::openhome(zone_id.strip_prefix("openhome:").unwrap_or(zone_id)),
-        command,
-        "OpenHome",
-    )
-    .await
 }
 
 /// Route a UPnP transport/volume action through the reliable endpoint. Public
@@ -1174,30 +1103,6 @@ pub(crate) async fn dispatch_upnp_runtime_command(
     dispatch_upnp_runtime_command_via(state.reliable_commands.as_ref(), zone_id, command).await
 }
 
-/// Same routing as [`dispatch_upnp_runtime_command`], parameterized directly over the reliable
-/// command gateway so callers without a full `AppState` - MQTT's inbound command router (#529) -
-/// reuse the identical dispatch path HTTP/knob/MCP use.
-pub(crate) async fn dispatch_upnp_runtime_command_via(
-    gateway: Option<&CommandGateway>,
-    zone_id: &str,
-    command: Command,
-) -> anyhow::Result<()> {
-    // Standalone API/MCP fixtures intentionally compose no runtime. Preserve
-    // the frozen adapter-shaped refusal without doing native I/O outside the
-    // composed server's reliable endpoint.
-    if gateway.is_none() {
-        let raw_id = zone_id.strip_prefix("upnp:").unwrap_or(zone_id);
-        return Err(anyhow::anyhow!("Renderer not found: {raw_id}"));
-    }
-    dispatch_provider_runtime_command(
-        gateway,
-        PrefixedZoneId::upnp(zone_id.strip_prefix("upnp:").unwrap_or(zone_id)),
-        command,
-        "UPnP",
-    )
-    .await
-}
-
 /// Route a Roon transport/volume action through the reliable endpoint. Roon confirms through its
 /// authoritative Core callback rather than a synthetic synchronous readback.
 pub(crate) async fn dispatch_roon_runtime_command(
@@ -1206,72 +1111,6 @@ pub(crate) async fn dispatch_roon_runtime_command(
     command: Command,
 ) -> anyhow::Result<()> {
     dispatch_roon_runtime_command_via(state.reliable_commands.as_ref(), zone_id, command).await
-}
-
-/// Same routing as [`dispatch_roon_runtime_command`], parameterized directly over the reliable
-/// command gateway so callers without a full `AppState` - MQTT's inbound command router (#529) -
-/// reuse the identical dispatch path HTTP/knob/MCP use.
-pub(crate) async fn dispatch_roon_runtime_command_via(
-    gateway: Option<&CommandGateway>,
-    zone_id: &str,
-    command: Command,
-) -> anyhow::Result<()> {
-    if gateway.is_none() {
-        return Err(anyhow::anyhow!("Not connected to Roon"));
-    }
-    dispatch_provider_runtime_command(
-        gateway,
-        PrefixedZoneId::roon(zone_id.strip_prefix("roon:").unwrap_or(zone_id)),
-        command,
-        "Roon",
-    )
-    .await
-}
-
-async fn dispatch_provider_runtime_command(
-    gateway: Option<&CommandGateway>,
-    target: PrefixedZoneId,
-    command: Command,
-    provider: &str,
-) -> anyhow::Result<()> {
-    let Some(gateway) = gateway else {
-        return Err(anyhow::anyhow!(
-            "{provider} reliable command runtime is unavailable"
-        ));
-    };
-    if !gateway.has_endpoint(&target) {
-        return Err(anyhow::anyhow!(
-            "{provider} command endpoint is not available"
-        ));
-    }
-    let now = tokio::time::Instant::now();
-    let mut ticket = gateway
-        .submit(CommandRequest {
-            target,
-            command: RuntimeCommand::Control(command),
-            correlation_id: None,
-            lane: CommandLane::Interactive,
-            deadlines: CommandDeadlines {
-                dispatch_by: now + Duration::from_secs(3),
-                confirm_by: now + Duration::from_secs(15),
-            },
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("{provider} command admission failed: {error:?}"))?;
-    match ticket.wait_for_observable_result().await {
-        CommandStatus::Confirmed { .. } => Ok(()),
-        CommandStatus::Failed { detail } | CommandStatus::NotDispatched { detail } => {
-            Err(anyhow::anyhow!(detail))
-        }
-        CommandStatus::Indeterminate => Err(anyhow::anyhow!(
-            "{provider} accepted the command but did not publish a verified readback in time"
-        )),
-        CommandStatus::Queued | CommandStatus::Dispatched | CommandStatus::AwaitingProjection => {
-            Err(anyhow::anyhow!(
-                "{provider} command stopped without a terminal result"
-            ))
-        }
-    }
 }
 
 /// Normalize OpenHome/UPnP's shared transport and integer volume vocabulary at
@@ -5803,3 +5642,11 @@ mod tests {
         );
     }
 }
+
+pub(crate) use crate::provider_control::dispatch_lms_runtime_command_via;
+
+pub(crate) use crate::provider_control::dispatch_openhome_runtime_command_via;
+
+pub(crate) use crate::provider_control::dispatch_upnp_runtime_command_via;
+
+pub(crate) use crate::provider_control::dispatch_roon_runtime_command_via;

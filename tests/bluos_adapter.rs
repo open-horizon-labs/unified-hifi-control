@@ -522,10 +522,13 @@ async fn power_requests_error_and_send_nothing() {
     let id = h.attach(&mock).await;
     for request in [DeviceRequest::PowerOn, DeviceRequest::PowerOff] {
         match h.control(&id, request).await {
-            Err(DeviceError::Dispatch { detail, .. }) => {
+            Err(DeviceError::InvalidValue {
+                parameter: "action",
+                detail,
+            }) => {
                 assert!(detail.contains("not supported"), "{detail}")
             }
-            other => panic!("expected a dispatch refusal, got {other:?}"),
+            other => panic!("expected capability admission refusal, got {other:?}"),
         }
     }
     // Power toggle has no direction when power is unknown.

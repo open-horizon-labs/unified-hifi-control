@@ -385,6 +385,9 @@ impl DeviceDriver for HomeAssistantDevices {
             ),
         };
         let url = format!("{}/services/media_player/{service}", endpoint.rest);
+        if tokio::time::Instant::now() >= crate::command_dispatch::deadline() {
+            return Err(crate::devices::service::DISPATCH_EXPIRED.into());
+        }
         let response = self
             .http
             .post(&url)

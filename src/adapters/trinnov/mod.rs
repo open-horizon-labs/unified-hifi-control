@@ -155,10 +155,7 @@ fn default_wol_target() -> SocketAddr {
 }
 
 enum UnitCommand {
-    Execute {
-        operation: DeviceOperation,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
+    Execute(crate::devices::service::DeviceWork),
 }
 
 struct UnitHandle {
@@ -390,7 +387,9 @@ impl DeviceDriver for TrinnovAdapter {
         let (reply, response) = oneshot::channel();
         tokio::time::timeout(
             WRITE_TIMEOUT,
-            commands.send(UnitCommand::Execute { operation, reply }),
+            commands.send(UnitCommand::Execute(
+                crate::devices::service::DeviceWork::new(operation, reply),
+            )),
         )
         .await
         .map_err(|_| "the unit's session is busy".to_string())?
@@ -528,7 +527,8 @@ impl Unit {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 command = commands.recv() => {
-                    let Some(UnitCommand::Execute { operation, reply }) = command else { break };
+                    let Some(UnitCommand::Execute(work)) = command else { break };
+                    let Some((operation, reply)) = work.begin_dispatch() else { continue; };
                     let outcome = self
                         .execute(&mut stream, &mut buffer, &operation, &mut next_connect, &mut backoff, &mut wake_until)
                         .await;
