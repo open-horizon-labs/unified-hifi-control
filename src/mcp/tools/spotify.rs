@@ -13,16 +13,16 @@ use serde_json::json;
 
 #[mcp_tool(
     name = "hifi_spotify",
-    description = "Spotify personal-library access. Actions: playlists, playlist_tracks, saved_tracks, saved_tracks_check, saved_tracks_add/remove, create_playlist, update_playlist, playlist_add/replace/remove. Extended Quota apps configured with UHC_SPOTIFY_QUOTA_MODE=extended may also use browse_categories, browse_category_playlists, browse_featured_playlists, and browse_new_releases; those actions are unavailable by default because Spotify removed them from the February 2026 Development Mode API. Use hifi_search and hifi_play for catalog search, playback, and queue-add. The Web API can read/add to the active queue but cannot jump, reorder, remove, clear, or transfer queue contents. Transfer Playback selects one device; it is not multiroom synchronization. Playlist/library writes require the corresponding Spotify scopes."
+    description = "Spotify playlists and saved tracks; writes need matching scopes. Browse requires Extended Quota (UHC_SPOTIFY_QUOTA_MODE=extended); unavailable in Development Mode. Search/play with hifi_search/hifi_play_ref."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiSpotifyTool {
-    /// Operation to perform.
+    /// playlists, playlist_tracks, saved_tracks, saved_tracks_check, saved_tracks_add, saved_tracks_remove, create_playlist, update_playlist, playlist_add, playlist_replace, playlist_remove; extended mode: browse_categories, browse_category_playlists, browse_featured_playlists, browse_new_releases.
     pub action: String,
-    /// Playlist id for playlist_tracks, update_playlist, or playlist_add.
+    /// Playlist ID for playlist reads/edits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub playlist_id: Option<String>,
-    /// Spotify browse category id. Extended Quota mode only.
+    /// Category ID; extended browse only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category_id: Option<String>,
     /// Playlist name for create/update.
@@ -31,16 +31,16 @@ pub struct HifiSpotifyTool {
     /// Playlist description for create/update.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Track URI for playlist_add.
+    /// Track URI for playlist edits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
-    /// Track id for saved-library membership or mutation.
+    /// Track ID for saved-track operations.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub track_id: Option<String>,
-    /// Public visibility for create/update.
+    /// Playlist visibility for create/update.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public: Option<bool>,
-    /// Maximum number of entries to return.
+    /// Maximum results.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }

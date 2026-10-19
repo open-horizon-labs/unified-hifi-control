@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// Get overall bridge status
 #[mcp_tool(
     name = "hifi_status",
-    description = "Get overall bridge status (Roon connection, HQPlayer config)",
+    description = "Read bridge connection status for Roon and HQPlayer.",
     read_only_hint = true
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]

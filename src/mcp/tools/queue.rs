@@ -14,22 +14,22 @@ use super::spotify::refusal_for_spotify_error;
 
 #[mcp_tool(
     name = "hifi_queue",
-    description = "Read or edit a playback queue. action='read' is the default. Music Assistant supports jump, reorder, remove, clear, and transfer against its active queue; each mutation returns a fresh queue readback. transfer (Alpha capability: expect refinement across releases) moves the active queue from zone_id to target_zone_id (both must be Music Assistant zones). Queue add is hifi_play action='queue'."
+    description = "Read a queue; edit Music Assistant queues with readback. Transfer requires two Music Assistant zones. Add items with hifi_play_ref or hifi_play action=queue."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiQueueTool {
-    /// Zone ID from hifi_zones.
+    /// Queue’s zone ID.
     pub zone_id: String,
-    /// read (default), jump, reorder, remove, clear, or transfer.
+    /// read, jump, reorder, remove, clear, transfer.
     #[serde(default = "default_action")]
     pub action: String,
-    /// Queue item id for jump, reorder, or remove.
+    /// Required for jump/reorder/remove; ID from queue read.
     #[serde(default)]
     pub item_id: Option<String>,
-    /// Target zero-based position for reorder.
+    /// Required for reorder; zero-based destination.
     #[serde(default)]
     pub position: Option<i64>,
-    /// Destination zone ID for transfer. Must belong to the same provider as zone_id.
+    /// Required for transfer; destination Music Assistant zone.
     #[serde(default)]
     pub target_zone_id: Option<String>,
 }

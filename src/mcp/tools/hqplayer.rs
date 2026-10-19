@@ -28,53 +28,53 @@ use std::sync::Arc;
 /// Get HQPlayer status
 #[mcp_tool(
     name = "hifi_hqplayer_status",
-    description = "Get HQPlayer Embedded status and current pipeline settings",
+    description = "Read HQPlayer status, pipeline settings, and available choices.",
     read_only_hint = true
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiHqplayerStatusTool {
-    /// Optional direct HQPlayer zone (`hqplayer:<instance>`). Omit for the default instance.
+    /// hqplayer:<instance>; omit for default instance.
     pub zone_id: Option<String>,
 }
 
 /// List HQPlayer profiles
 #[mcp_tool(
     name = "hifi_hqplayer_profiles",
-    description = "List available HQPlayer Embedded configurations",
+    description = "List saved HQPlayer configurations.",
     read_only_hint = true
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiHqplayerProfilesTool {
-    /// Optional direct HQPlayer zone (`hqplayer:<instance>`). Omit for the default instance.
+    /// hqplayer:<instance>; omit for default instance.
     pub zone_id: Option<String>,
 }
 
 /// Load an HQPlayer profile
 #[mcp_tool(
     name = "hifi_hqplayer_load_profile",
-    description = "Load an HQPlayer Embedded configuration (will restart HQPlayer)",
+    description = "Load a saved configuration and restart HQPlayer.",
     destructive_hint = true
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiHqplayerLoadProfileTool {
-    /// Configuration name to load (get from hifi_hqplayer_profiles)
+    /// Name from hifi_hqplayer_profiles.
     pub profile: String,
-    /// Optional direct HQPlayer zone (`hqplayer:<instance>`). Omit for the default instance.
+    /// hqplayer:<instance>; omit for default instance.
     pub zone_id: Option<String>,
 }
 
 /// Change an HQPlayer pipeline setting
 #[mcp_tool(
     name = "hifi_hqplayer_set_pipeline",
-    description = "Change an immediate HQPlayer setting on an exact instance: mode, samplerate, filter1x, filterNx, shaper/dither, junk_filter, matrix_profile, convolution, adaptive_volume, repeat, or random. Call hifi_hqplayer_status first for current values and choices. This does not persist a profile."
+    description = "Change a live HQPlayer setting. Read hifi_hqplayer_status for choices first. Changes do not save a profile."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiHqplayerSetPipelineTool {
-    /// Immediate setting to change; this does not persist an HQPlayer profile.
+    /// mode, samplerate, filter1x, filterNx, shaper, dither, junk_filter, matrix_profile, convolution, adaptive_volume, repeat, random.
     pub setting: String,
-    /// New value for the setting
+    /// Value from hifi_hqplayer_status choices.
     pub value: String,
-    /// Optional direct HQPlayer zone (`hqplayer:<instance>`). Omit for the default instance.
+    /// hqplayer:<instance>; omit for default instance.
     pub zone_id: Option<String>,
 }
 

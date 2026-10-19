@@ -94,36 +94,22 @@ fn multiroom_target(zone_id: &str) -> Option<ZoneTarget> {
 
 #[mcp_tool(
     name = "hifi_zone_group",
-    description = "Alpha capability: expect refinement across releases. Inspect or change \
-                    multiroom zone groups for any provider that supports \
-                    synchronised playback (Roon, LMS, Music Assistant). action=status is \
-                    read-only: pass zone_id to scope it to one provider, or omit zone_id to \
-                    aggregate every provider's groups (a provider that cannot be reached is \
-                    reported in `errors` rather than failing the whole read). join and leave \
-                    require confirm=true because grouping changes playback topology, and every \
-                    zone id involved (leader plus every member) must belong to the same \
-                    provider -- cross-provider groups are refused. Two provider-specific member \
-                    conventions: Roon retires a grouped zone's own id and reports/accepts its \
-                    members as roon:<output_id>; LMS sync groups are leaderless, so \
-                    leader_zone_id there is UHC's stable-but-arbitrary pick of the first member \
-                    id, not an LMS fact."
+    description = "Roon/LMS/Music Assistant sync groups. Join/leave require confirm=true and one provider. Roon members use roon:<output_id>; LMS leader_zone_id is a representative. Unreachable providers appear in errors."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiZoneGroupTool {
-    /// status, join, or leave.
+    /// status, join, leave.
     pub action: String,
-    /// Scopes action=status to one provider. Omit to aggregate every
-    /// multiroom-capable provider's groups.
+    /// Status provider filter; omit for all providers.
     #[serde(default)]
     pub zone_id: Option<String>,
-    /// Leader zone for join. Must be the same provider as every member_zone_id.
+    /// Required for join; same provider as members.
     #[serde(default)]
     pub leader_zone_id: Option<String>,
-    /// Member zones to add (join) or remove (leave). Must all share one
-    /// provider, matching leader_zone_id for join.
+    /// Required for join/leave; one provider, matching leader for join.
     #[serde(default)]
     pub member_zone_ids: Option<Vec<String>>,
-    /// Required true for topology-changing join and leave actions.
+    /// Explicit user confirmation; true required for join/leave.
     #[serde(default)]
     pub confirm: Option<bool>,
 }

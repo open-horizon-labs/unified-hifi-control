@@ -25,62 +25,59 @@ use serde_json::{json, Map, Value};
 /// Read the committed HQPlayer output-routing document
 #[mcp_tool(
     name = "hifi_hqplayer_outputs",
-    description = "Read the committed HQPlayer output-routing document for an exact instance: relay availability, saved routes, the selected route, the current relay session and recent operations. Pass operation_id to read one operation record instead of the whole document.",
+    description = "Read HQPlayer routes, relay state, revisions, and recent operations; operation_id selects one receipt.",
     read_only_hint = true
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiHqplayerOutputsTool {
-    /// Exact HQPlayer zone id, e.g. "hqplayer:living". Required — there is no default-instance
-    /// fallback for output routing.
+    /// Exact hqplayer:<instance>; no default.
     pub zone_id: String,
-    /// Read one operation record by id (from a prior write's receipt) instead of the projection.
+    /// Receipt ID; omit for full routing state.
     pub operation_id: Option<String>,
 }
 
 /// Mutate HQPlayer output routing
 #[mcp_tool(
     name = "hifi_hqplayer_output_control",
-    description = "Mutate HQPlayer output routing on an exact instance: relay_configure, route_add, route_update, route_remove, select, stop, discover, import_preview, import_apply, setup_preview, setup_apply, setup_readback, or setup_rollback. Call hifi_hqplayer_outputs first for the current source_epoch/output_revision to echo back — every mutation except stop/discover/import_preview/setup_preview/setup_readback requires both."
+    description = "Configure HQPlayer output routing. Read hifi_hqplayer_outputs first; mutations require its source_epoch/output_revision except stop, discover, import_preview, setup_preview, and setup_readback."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiHqplayerOutputControlTool {
-    /// Exact HQPlayer instance zone id; no implicit default is used.
+    /// Exact hqplayer:<instance>; no default.
     pub zone_id: String,
-    /// One of: relay_configure, route_add, route_update, route_remove, select, stop, discover,
-    /// import_preview, import_apply, setup_preview, setup_apply, setup_readback, setup_rollback.
+    /// relay_configure, route_add, route_update, route_remove, select, stop, discover, import_preview, import_apply, setup_preview, setup_apply, setup_readback, setup_rollback.
     pub action: String,
-    /// Caller-owned id. Reused with an identical request returns the same operation (no second
-    /// side effect); reused with a different request is refused.
+    /// Retry key: identical payload reuses operation; changed payload is refused.
     pub correlation_id: Option<String>,
-    /// Expected source epoch from the latest projection, used to reject stale commands.
+    /// source_epoch from latest hifi_hqplayer_outputs.
     pub expected_source_epoch: Option<u64>,
-    /// Expected output revision from the latest projection, used to reject stale commands.
+    /// output_revision from latest hifi_hqplayer_outputs.
     pub expected_output_revision: Option<u64>,
-    /// Existing route id for update, remove, or select.
+    /// Existing route ID for update/remove/select.
     pub route_id: Option<String>,
-    /// Friendly route or relay name.
+    /// Route or relay name.
     pub name: Option<String>,
-    /// NAA destination host or address.
+    /// NAA destination host/address.
     pub host: Option<String>,
     /// NAA destination TCP port.
     pub port: Option<u16>,
-    /// Optional DAC device identifier returned by read-through discovery.
+    /// DAC ID returned by discovery.
     pub device_id: Option<String>,
-    /// JSON route document for import preview/apply.
+    /// JSON route document for import.
     pub routes_json: Option<String>,
-    /// Preview identity returned by a preview operation.
+    /// ID returned by preview.
     pub preview_id: Option<String>,
-    /// Enable or disable the managed relay.
+    /// Enable/disable relay.
     pub enabled: Option<bool>,
-    /// Optional relay listen address. New relays default to a LAN listener with an automatically allocated port.
+    /// Relay listen address; default LAN, automatic port.
     pub bind: Option<String>,
-    /// Optional HQPlayer source allowlist; empty accepts any reachable NAA peer.
+    /// HQPlayer source allowlist; empty accepts any reachable NAA peer.
     pub hqp_allow: Option<Vec<String>>,
-    /// Optional IPv4 interface for NAA multicast discovery; enabled LAN relays choose the interface automatically when omitted.
+    /// IPv4 discovery interface; auto-selected for enabled LAN relays.
     pub discovery_interface: Option<String>,
-    /// Shared NAA discovery query port; defaults to 43210. Replies advertise each relay’s own TCP port.
+    /// Discovery query port; default 43210.
     pub discovery_port: Option<u16>,
-    /// Name presented by this proxy as the NAA endpoint/DAC.
+    /// Relay’s advertised NAA/DAC name.
     pub adapter_name: Option<String>,
 }
 
