@@ -13,6 +13,34 @@ use rust_mcp_sdk::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+/// Companion-owned read-before-write state. Keep object fields intact when
+/// forwarding: revision and ownership details belong to the companion protocol.
+///
+/// The SDK derive maps `serde_json::Value` to the invalid type "unknown".
+/// A named object with an explicit schema keeps the entire tool catalog usable
+/// by clients such as Gemini, even when they are calling an unrelated tool.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct AppleMusicPrecondition(pub serde_json::Map<String, serde_json::Value>);
+
+impl AppleMusicPrecondition {
+    pub fn json_schema() -> serde_json::Map<String, serde_json::Value> {
+        json!({
+            "type": "object",
+            "properties": {
+                "playlist_version": {
+                    "type": "integer",
+                    "description": "Playlist revision returned by a prior companion read."
+                }
+            },
+            "additionalProperties": true
+        })
+        .as_object()
+        .expect("precondition schema is an object")
+        .clone()
+    }
+}
+
 /// Content reads and account mutations are scoped to one Apple execution
 /// owner. Catalog search is the sole provider-global operation; every other
 /// provider request must name the companion whose account/session is used.
@@ -68,7 +96,7 @@ pub struct HifiAppleMusicTool {
     pub idempotency_key: Option<String>,
     /// Read-before-write revision or ownership precondition.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub precondition: Option<serde_json::Value>,
+    pub precondition: Option<AppleMusicPrecondition>,
     /// Maximum number of entries to return.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,

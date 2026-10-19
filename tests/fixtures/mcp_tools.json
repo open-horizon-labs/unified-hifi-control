@@ -51,9 +51,16 @@
           "type": "integer"
         },
         "precondition": {
+          "additionalProperties": true,
           "description": "Read-before-write revision or ownership precondition.",
           "nullable": true,
-          "type": "unknown"
+          "properties": {
+            "playlist_version": {
+              "description": "Playlist revision returned by a prior companion read.",
+              "type": "integer"
+            }
+          },
+          "type": "object"
         },
         "query": {
           "description": "Search/query text.",

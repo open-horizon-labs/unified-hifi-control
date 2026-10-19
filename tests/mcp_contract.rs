@@ -942,6 +942,47 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
     ),
 ];
 
+#[test]
+fn apple_music_precondition_is_an_object_and_preserves_companion_fields() {
+    use unified_hifi_control::mcp::tools::HifiAppleMusicTool;
+
+    let precondition = json!({
+        "playlist_version": 3,
+        "owner_revision": {"owner": "companion-a", "revision": "opaque"}
+    });
+    let args: HifiAppleMusicTool = serde_json::from_value(json!({
+        "action": "playlist_update",
+        "precondition": precondition
+    }))
+    .expect("existing companion precondition object must be accepted");
+    assert_eq!(
+        serde_json::to_value(args).unwrap()["precondition"],
+        precondition
+    );
+    for invalid in [json!("version-3"), json!(3), json!([]), json!(true)] {
+        assert!(
+            serde_json::from_value::<HifiAppleMusicTool>(json!({
+                "action": "playlist_update", "precondition": invalid
+            }))
+            .is_err(),
+            "precondition must be an object, got {invalid}"
+        );
+    }
+    for args in [
+        json!({"action": "library"}),
+        json!({"action": "library", "precondition": null}),
+    ] {
+        assert!(serde_json::from_value::<HifiAppleMusicTool>(args)
+            .unwrap()
+            .precondition
+            .is_none());
+    }
+    let schema = HifiAppleMusicTool::json_schema();
+    let spec = &schema["properties"]["precondition"];
+    assert_eq!(spec["type"], "object");
+    assert_eq!(spec["properties"]["playlist_version"]["type"], "integer");
+}
+
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
 async fn every_input_schema_is_structurally_valid_json_schema() {
@@ -988,6 +1029,25 @@ async fn every_input_schema_is_structurally_valid_json_schema() {
                     || spec.contains_key("enum"),
                 "{name}.{prop}: property must declare type/enum/$ref/anyOf/oneOf/allOf, got {spec:?}"
             );
+            // A made-up type such as the SDK's fallback "unknown" can make
+            // Gemini reject the entire catalog, even for unrelated tools (#830).
+            if let Some(kind) = spec.get("type") {
+                const JSON_SCHEMA_TYPES: &[&str] = &[
+                    "null", "boolean", "object", "array", "number", "integer", "string",
+                ];
+                let kinds = match kind {
+                    Value::String(_) => vec![kind],
+                    Value::Array(kinds) => kinds.iter().collect(),
+                    _ => panic!("{name}.{prop}: invalid JSON Schema type {kind}"),
+                };
+                for kind in kinds {
+                    assert!(
+                        kind.as_str()
+                            .is_some_and(|kind| JSON_SCHEMA_TYPES.contains(&kind)),
+                        "{name}.{prop}: unrecognized JSON Schema type {kind}"
+                    );
+                }
+            }
             // Descriptions are what the model reads to fill the parameter in.
             assert!(
                 spec.get("description")
