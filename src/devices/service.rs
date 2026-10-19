@@ -30,7 +30,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use super::anomalies::{AnomalyJournal, AnomalyKind, DeviceAnomaly};
 use super::links::{DeviceLinkStore, DeviceLinksDocument, StoreError};
-use super::{Device, DeviceId, DeviceLink, DevicePower};
+use super::{Device, DeviceId, DeviceLink, DevicePower, ZoneDeviceBinding};
 use crate::aggregator::ZoneAggregator;
 use crate::bus::{BusEvent, SharedBus};
 
@@ -59,6 +59,44 @@ pub trait DeviceDriver: Send + Sync {
 
     async fn execute(&self, device_id: &DeviceId, operation: DeviceOperation)
         -> Result<(), String>;
+}
+
+/// A queued native operation keeps its caller's lifetime across worker tasks.
+/// Dropped callers and expired work never acquire a native-dispatch permit.
+pub(crate) struct DeviceWork {
+    operation: DeviceOperation,
+    reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    dispatch_by: tokio::time::Instant,
+}
+pub(crate) const DISPATCH_EXPIRED: &str = "device_command_expired";
+impl DeviceWork {
+    pub(crate) fn new(
+        operation: DeviceOperation,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) -> Self {
+        Self {
+            operation,
+            reply,
+            dispatch_by: crate::command_dispatch::deadline(),
+        }
+    }
+    pub(crate) fn begin_dispatch(
+        self,
+    ) -> Option<(
+        DeviceOperation,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    )> {
+        if self.reply.is_closed() {
+            return None;
+        }
+        if tokio::time::Instant::now() >= self.dispatch_by {
+            if self.reply.send(Err(DISPATCH_EXPIRED.into())).is_err() {
+                tracing::debug!("Expired device command caller disconnected before refusal");
+            }
+            return None;
+        }
+        Some((self.operation, self.reply))
+    }
 }
 
 /// What a caller asked for, in surface-neutral terms.
@@ -194,6 +232,8 @@ pub struct DeviceCommandReport {
 /// Why a device request was not carried out. Each variant names a different caller action.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeviceError {
+    /// No native I/O began before the request dispatch lifetime ended.
+    Expired { device_id: String },
     /// The zone has no device link. Link it, or control the zone's provider instead.
     NotLinked { zone_id: String },
     /// No such device is linked or observed.
@@ -231,7 +271,7 @@ impl DeviceError {
         match self {
             Self::NotLinked { .. } => "DEVICE_NOT_LINKED",
             Self::UnknownDevice { .. } => "DEVICE_NOT_FOUND",
-            Self::DeviceUnavailable { .. } => "DEVICE_UNAVAILABLE",
+            Self::DeviceUnavailable { .. } | Self::Expired { .. } => "DEVICE_UNAVAILABLE",
             Self::RangeUnknown { .. } => "DEVICE_RANGE_UNKNOWN",
             Self::InvalidValue { .. } => "INVALID_VALUE",
             Self::UnknownInput { .. } => "DEVICE_INPUT_UNKNOWN",
@@ -251,7 +291,10 @@ impl DeviceError {
             | Self::UnknownInput { .. }
             | Self::RangeUnknown { .. } => 400,
             Self::UnknownDevice { .. } | Self::UnknownZone { .. } => 404,
-            Self::DeviceUnavailable { .. } | Self::NoDriver { .. } | Self::Store(_) => 503,
+            Self::DeviceUnavailable { .. }
+            | Self::Expired { .. }
+            | Self::NoDriver { .. }
+            | Self::Store(_) => 503,
             Self::Dispatch { .. } => 502,
             Self::Unconfirmed { .. } => 504,
         }
@@ -261,6 +304,7 @@ impl DeviceError {
 impl std::fmt::Display for DeviceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Expired { device_id } => write!(f, "device {device_id} command expired before dispatch"),
             Self::NotLinked { zone_id } => write!(f, "zone {zone_id} is not linked to a device"),
             Self::UnknownDevice { device_id } => write!(f, "no device {device_id}"),
             Self::DeviceUnavailable { device_id, detail } => {
@@ -316,6 +360,11 @@ pub struct DeviceService {
     aggregator: Arc<ZoneAggregator>,
     bus: SharedBus,
     store: DeviceLinkStore,
+    // Serialize each persisted edit through its aggregator/journal installation.
+    // The store's file lock alone ends before the installed projection updates.
+    // Lock order: configuration -> store (released on return) -> aggregator.
+    // Store and aggregator operations never reacquire the configuration lock.
+    configuration_lock: Mutex<()>,
     drivers: RwLock<HashMap<&'static str, Arc<dyn DeviceDriver>>>,
     device_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     confirm_timeout: Duration,
@@ -328,6 +377,7 @@ impl DeviceService {
             aggregator,
             bus,
             store,
+            configuration_lock: Mutex::new(()),
             drivers: RwLock::new(HashMap::new()),
             device_locks: Mutex::new(HashMap::new()),
             confirm_timeout: DEFAULT_CONFIRM_TIMEOUT,
@@ -342,6 +392,7 @@ impl DeviceService {
 
     /// Turn mismatch recording on or off, persisting the choice. Off forgets everything recorded.
     pub async fn set_recording(&self, enabled: bool) -> Result<(), DeviceError> {
+        let _configuration = self.configuration_lock.lock().await;
         self.store
             .update(move |document| document.record_mismatches = enabled)
             .await?;
@@ -365,6 +416,7 @@ impl DeviceService {
     /// Install the persisted document into the aggregator. Call once at startup, after the
     /// aggregator is running.
     pub async fn load(&self) -> Result<(), DeviceError> {
+        let _configuration = self.configuration_lock.lock().await;
         let document = self.store.document().await?;
         self.install(document).await;
         Ok(())
@@ -421,6 +473,7 @@ impl DeviceService {
         device_id: &str,
         source_id: Option<String>,
     ) -> Result<DeviceLink, DeviceError> {
+        let _configuration = self.configuration_lock.lock().await;
         let device_id = DeviceId::parse(device_id).ok_or_else(|| DeviceError::InvalidValue {
             parameter: "device_id",
             detail: format!(
@@ -469,6 +522,7 @@ impl DeviceService {
 
     /// Remove a zone's link. Returns whether one existed.
     pub async fn unlink(&self, zone_id: &str) -> Result<bool, DeviceError> {
+        let _configuration = self.configuration_lock.lock().await;
         let existed = self.aggregator.get_device_link(zone_id).await.is_some();
         let zone = zone_id.to_string();
         let document = self
@@ -488,6 +542,7 @@ impl DeviceService {
         device_id: &str,
         ceiling: Option<f32>,
     ) -> Result<(), DeviceError> {
+        let _configuration = self.configuration_lock.lock().await;
         let device_id = DeviceId::parse(device_id).ok_or_else(|| DeviceError::UnknownDevice {
             device_id: device_id.to_string(),
         })?;
@@ -514,17 +569,135 @@ impl DeviceService {
     // Commands
     // =========================================================================
 
+    /// The installed composition configuration and observed device, read together.
+    /// Link/input validation and persistence stay in this service; this view is
+    /// always derived from the aggregator, never a second cached authority.
+    pub async fn zone_binding(&self, zone_id: &str) -> Option<ZoneDeviceBinding> {
+        self.aggregator.zone_device_binding(zone_id).await
+    }
+
+    async fn resolve_device(&self, target: DeviceTarget) -> Result<DeviceId, DeviceError> {
+        match target {
+            DeviceTarget::Device(device_id) => Ok(device_id),
+            DeviceTarget::Zone(zone_id) => self
+                .zone_binding(&zone_id)
+                .await
+                .map(|binding| binding.link.device_id)
+                .ok_or(DeviceError::NotLinked { zone_id }),
+        }
+    }
+
+    /// Decode a device action using the observed device's own native step.
+    /// `Ok(None)` means this vocabulary does not describe a device operation.
+    /// Surfaces remain responsible only for their response/error formatting.
+    pub async fn control_action(
+        &self,
+        target: DeviceTarget,
+        action: &str,
+        value: Option<&serde_json::Value>,
+    ) -> Result<Option<DeviceCommandReport>, DeviceError> {
+        crate::command_dispatch::local(self.control_action_unscoped(target, action, value)).await
+    }
+
+    async fn control_action_unscoped(
+        &self,
+        target: DeviceTarget,
+        action: &str,
+        value: Option<&serde_json::Value>,
+    ) -> Result<Option<DeviceCommandReport>, DeviceError> {
+        if matches!(request_from_action(action, value, 1.0), Ok(None)) {
+            return Ok(None);
+        }
+        let device_id = self.resolve_device(target).await?;
+        let device = self.aggregator.get_device(&device_id).await;
+        let step = device
+            .as_ref()
+            .map(|device| device.volume.step)
+            .filter(|step| step.is_finite() && *step > 0.0);
+        let needs_step = matches!(action, "volume_up" | "volume_down" | "vol_up" | "vol_down")
+            && value.and_then(serde_json::Value::as_f64).is_none();
+        if needs_step && step.is_none() {
+            return Err(DeviceError::RangeUnknown {
+                device_id: device_id.to_string(),
+                detail: "no observed native volume step".into(),
+            });
+        }
+        let request =
+            request_from_action(action, value, step.unwrap_or(1.0)).map_err(|detail| {
+                DeviceError::InvalidValue {
+                    parameter: "value",
+                    detail,
+                }
+            })?;
+        let Some(request) = request else {
+            return Ok(None);
+        };
+        self.control(DeviceTarget::Device(device_id), request)
+            .await
+            .map(Some)
+    }
+
+    /// Convert a normalized client percentage only when the observed native
+    /// scale has a defined linear mapping. dB and unknown scales are refused.
+    pub async fn control_percentage(
+        &self,
+        target: DeviceTarget,
+        value: f64,
+    ) -> Result<DeviceCommandReport, DeviceError> {
+        crate::command_dispatch::local(self.control_percentage_unscoped(target, value)).await
+    }
+
+    async fn control_percentage_unscoped(
+        &self,
+        target: DeviceTarget,
+        value: f64,
+    ) -> Result<DeviceCommandReport, DeviceError> {
+        if !value.is_finite() {
+            return Err(DeviceError::InvalidValue {
+                parameter: "value",
+                detail: "volume must be finite".into(),
+            });
+        }
+        let device_id = self.resolve_device(target).await?;
+        let volume = self
+            .aggregator
+            .get_device(&device_id)
+            .await
+            .and_then(|device| device.volume_control())
+            .ok_or_else(|| DeviceError::RangeUnknown {
+                device_id: device_id.to_string(),
+                detail: "no observed bounded volume range".into(),
+            })?;
+        let native =
+            crate::volume::native(&volume, value).ok_or_else(|| DeviceError::InvalidValue {
+                parameter: "value",
+                detail: "percentage volume is unavailable for this device scale".into(),
+            })?;
+        self.control(
+            DeviceTarget::Device(device_id),
+            DeviceRequest::VolumeAbsolute(native as f32),
+        )
+        .await
+    }
+
     /// Resolve the device a zone's surface controls, when the zone is linked.
     pub async fn linked_device_id(&self, zone_id: &str) -> Option<DeviceId> {
-        self.aggregator
-            .get_device_link(zone_id)
+        self.zone_binding(zone_id)
             .await
-            .map(|link| link.device_id)
+            .map(|binding| binding.link.device_id)
     }
 
     /// Carry out a request and wait for the device to confirm it. Outcomes that show the device
     /// disagreeing with the implementation are recorded in the mismatch journal (when enabled).
     pub async fn control(
+        &self,
+        target: DeviceTarget,
+        request: DeviceRequest,
+    ) -> Result<DeviceCommandReport, DeviceError> {
+        crate::command_dispatch::local(self.control_unscoped(target, request)).await
+    }
+
+    async fn control_unscoped(
         &self,
         target: DeviceTarget,
         request: DeviceRequest,
@@ -561,15 +734,15 @@ impl DeviceService {
         target: DeviceTarget,
         request: DeviceRequest,
     ) -> Result<DeviceCommandReport, DeviceError> {
-        let device_id = match target {
-            DeviceTarget::Zone(zone_id) => self
-                .linked_device_id(&zone_id)
-                .await
-                .ok_or(DeviceError::NotLinked { zone_id })?,
-            DeviceTarget::Device(device_id) => device_id,
-        };
+        let device_id = self.resolve_device(target).await?;
         let lock = self.device_lock(&device_id).await;
-        let _serialised = lock.lock().await;
+        let dispatch_by = crate::command_dispatch::deadline();
+        let expired = || DeviceError::Expired {
+            device_id: device_id.to_string(),
+        };
+        let _serialised = tokio::time::timeout_at(dispatch_by, lock.lock())
+            .await
+            .map_err(|_| expired())?;
 
         let device = self
             .aggregator
@@ -593,18 +766,30 @@ impl DeviceService {
 
         let plan = plan(&device, &request)?;
 
+        if tokio::time::Instant::now() >= dispatch_by {
+            return Err(expired());
+        }
+        let deadline = tokio::time::Instant::now() + self.confirm_timeout;
         // Subscribe before dispatch: the readback may arrive before `execute` returns.
         let mut events = self.bus.subscribe();
         let revision_at_dispatch = device.revision;
-        driver
-            .execute(&device_id, plan.operation.clone())
+        tokio::time::timeout_at(deadline, driver.execute(&device_id, plan.operation.clone()))
             .await
-            .map_err(|detail| DeviceError::Dispatch {
+            .map_err(|_| DeviceError::Unconfirmed {
                 device_id: device_id.to_string(),
-                detail,
+                detail: "native dispatch did not finish within the confirmation budget".into(),
+            })?
+            .map_err(|detail| {
+                if detail == DISPATCH_EXPIRED {
+                    expired()
+                } else {
+                    DeviceError::Dispatch {
+                        device_id: device_id.to_string(),
+                        detail,
+                    }
+                }
             })?;
 
-        let deadline = tokio::time::Instant::now() + self.confirm_timeout;
         let mut latest_readback: Option<Device> = None;
         loop {
             let event = tokio::time::timeout_at(deadline, events.recv()).await;
@@ -741,6 +926,35 @@ fn describe(device: &Device, operation: &DeviceOperation) -> String {
 /// Resolve a request against observed state. Pure, so every safety rule is unit-testable.
 fn plan(device: &Device, request: &DeviceRequest) -> Result<Plan, DeviceError> {
     let device_id = device.device_id.to_string();
+    let capability = match request {
+        DeviceRequest::VolumeAbsolute(_) | DeviceRequest::VolumeRelative(_) => {
+            &device.capabilities.volume
+        }
+        DeviceRequest::Mute(_) | DeviceRequest::MuteToggle => &device.capabilities.mute,
+        DeviceRequest::PowerOn | DeviceRequest::PowerOff | DeviceRequest::PowerToggle => {
+            &device.capabilities.power
+        }
+        DeviceRequest::SelectInput(_) => &device.capabilities.input_select,
+    };
+    if !capability.supported {
+        if matches!(
+            request,
+            DeviceRequest::VolumeAbsolute(_) | DeviceRequest::VolumeRelative(_)
+        ) {
+            return Err(DeviceError::RangeUnknown {
+                device_id: device_id.clone(),
+                detail: "volume is not supported by this device".into(),
+            });
+        }
+        return Err(DeviceError::InvalidValue {
+            parameter: "action",
+            detail: format!(
+                "{} is not supported by this device: {}",
+                request.label(),
+                capability.detail
+            ),
+        });
+    }
     let volume_plan = |target_db: f32| -> Result<Plan, DeviceError> {
         let max = device
             .volume
@@ -1149,5 +1363,126 @@ mod tests {
         let resolved = plan(&amp, &DeviceRequest::PowerOn).unwrap();
         assert_eq!(resolved.operation, DeviceOperation::PowerOn);
         assert_eq!(resolved.sent_volume, None);
+    }
+}
+
+#[cfg(test)]
+mod admission_regressions {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_device_action_has_a_bounded_dispatch_lifetime() {
+        let directory = tempfile::tempdir().unwrap();
+        let bus = crate::bus::create_bus();
+        let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+        let service = DeviceService::new(
+            aggregator,
+            bus,
+            DeviceLinkStore::open(directory.path().join("links.json")),
+        );
+        let id = DeviceId::new("marantz", "FAKEADMISSION").unwrap();
+        let lock = service.device_lock(&id).await;
+        let _admission_test_blocker = lock.lock().await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(4),
+            service.control(DeviceTarget::Device(id), DeviceRequest::PowerOn),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "device admission must expire instead of waiting indefinitely"
+        );
+    }
+
+    #[test]
+    fn unsupported_capabilities_are_refused_before_driver_dispatch() {
+        let mut device = super::tests::device(Some(-40.0), Some(-10.0));
+        device.capabilities.power.supported = false;
+        assert!(plan(&device, &DeviceRequest::PowerOn).is_err());
+    }
+}
+
+#[cfg(test)]
+mod worker_lifetime_tests {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn expired_and_cancelled_native_work_never_gets_a_dispatch_permit() {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        let work = crate::command_dispatch::until(
+            tokio::time::Instant::now() + Duration::from_millis(10),
+            async { DeviceWork::new(DeviceOperation::PowerOn, reply) },
+        )
+        .await;
+        tokio::time::advance(Duration::from_millis(11)).await;
+        assert!(work.begin_dispatch().is_none());
+        assert_eq!(result.await.unwrap(), Err(DISPATCH_EXPIRED.into()));
+        let (reply, result) = tokio::sync::oneshot::channel();
+        let work = DeviceWork::new(DeviceOperation::PowerOn, reply);
+        drop(result);
+        assert!(work.begin_dispatch().is_none());
+        let (reply, result) = tokio::sync::oneshot::channel();
+        let (operation, reply) = DeviceWork::new(DeviceOperation::PowerOn, reply)
+            .begin_dispatch()
+            .unwrap();
+        assert_eq!(operation, DeviceOperation::PowerOn);
+        reply.send(Ok(())).unwrap();
+        assert_eq!(result.await.unwrap(), Ok(()));
+    }
+    #[test]
+    fn every_device_capability_is_checked_before_planning_and_projection() {
+        let mut device = super::tests::device(Some(-40.0), Some(-10.0));
+        device.capabilities.volume.supported = false;
+        device.capabilities.mute.supported = false;
+        device.capabilities.power.supported = false;
+        device.capabilities.input_select.supported = false;
+        assert!(device.volume_control().is_none());
+        for request in [
+            DeviceRequest::VolumeAbsolute(-45.0),
+            DeviceRequest::VolumeRelative(0.5),
+            DeviceRequest::Mute(true),
+            DeviceRequest::MuteToggle,
+            DeviceRequest::PowerOn,
+            DeviceRequest::PowerOff,
+            DeviceRequest::PowerToggle,
+            DeviceRequest::SelectInput("TV".into()),
+        ] {
+            assert!(matches!(
+                plan(&device, &request),
+                Err(DeviceError::InvalidValue {
+                    parameter: "action",
+                    ..
+                } | DeviceError::RangeUnknown { .. })
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod caller_deadline_tests {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn caller_authority_expiry_bounds_device_lock_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let bus = crate::bus::create_bus();
+        let service = DeviceService::new(
+            Arc::new(ZoneAggregator::new(bus.clone())),
+            bus,
+            DeviceLinkStore::open(directory.path().join("links.json")),
+        );
+        let id = DeviceId::new("marantz", "FAKEDEADLINE").unwrap();
+        let lock = service.device_lock(&id).await;
+        let _admission_test_blocker = lock.lock().await;
+        let by = tokio::time::Instant::now() + Duration::from_millis(20);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::command_dispatch::until(
+                by,
+                service.control(DeviceTarget::Device(id), DeviceRequest::PowerOn),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(DeviceError::Expired { .. })));
+        drop(_admission_test_blocker);
     }
 }

@@ -169,10 +169,7 @@ fn now_ms() -> u64 {
 }
 
 enum UnitCommand {
-    Execute {
-        operation: DeviceOperation,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
+    Execute(crate::devices::service::DeviceWork),
     Rehost(String),
 }
 
@@ -558,7 +555,9 @@ impl DeviceDriver for LyngdorfAdapter {
         let (reply, response) = oneshot::channel();
         tokio::time::timeout(
             WRITE_TIMEOUT,
-            commands.send(UnitCommand::Execute { operation, reply }),
+            commands.send(UnitCommand::Execute(
+                crate::devices::service::DeviceWork::new(operation, reply),
+            )),
         )
         .await
         .map_err(|_| "the unit's session is busy".to_string())?
@@ -649,7 +648,8 @@ impl Unit {
                             buffer.clear();
                             next_connect = Instant::now();
                         }
-                        UnitCommand::Execute { operation, reply } => {
+                        UnitCommand::Execute(work) => {
+                            let Some((operation, reply)) = work.begin_dispatch() else { continue; };
                             let result = self.execute(&mut stream, &operation).await;
                             if reply.send(result).is_err() {
                                 tracing::debug!(device_id = %self.device_id, "command caller went away before the reply");

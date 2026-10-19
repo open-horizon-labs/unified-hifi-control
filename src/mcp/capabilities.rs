@@ -913,10 +913,10 @@ pub struct McpLinkedDevice {
 impl McpLinkedDevice {
     /// The linked device for one zone, or `None` when the zone has no link.
     pub async fn for_zone(state: &crate::api::AppState, zone_id: &str) -> Option<Self> {
-        let link = state.aggregator.get_device_link(zone_id).await?;
-        let device = state.aggregator.get_device(&link.device_id).await;
+        let binding = state.devices.zone_binding(zone_id).await?;
+        let device = binding.device;
         Some(Self {
-            device_id: link.device_id.to_string(),
+            device_id: binding.link.device_id.to_string(),
             maturity: crate::devices::DEVICE_CONTROL_MATURITY.to_string(),
             present: device.is_some(),
             capabilities: device.map(|device| device.capabilities),

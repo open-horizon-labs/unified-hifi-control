@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 /// List all available playback zones
 #[mcp_tool(
     name = "hifi_zones",
-    description = "List all available playback zones (Roon, LMS, OpenHome, UPnP, HQPlayer, Apple Music, Spotify, Music Assistant)",
+    description = "List playback zones and their IDs, state, and volume.",
     read_only_hint = true
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -39,12 +39,12 @@ pub struct HifiZonesTool {}
 /// Get current playback state for a zone
 #[mcp_tool(
     name = "hifi_now_playing",
-    description = "Get current playback state for a zone (track, artist, album, play state, volume)",
+    description = "Read a zone’s current track, playback state, and volume.",
     read_only_hint = true
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiNowPlayingTool {
-    /// The zone ID to query (get from hifi_zones)
+    /// Zone ID from hifi_zones.
     pub zone_id: String,
 }
 

@@ -68,6 +68,18 @@ pub struct ManualDevice {
 }
 
 impl DeviceLinksDocument {
+    /// Interpret legacy discovery configuration at its owner, preserving order
+    /// and the existing Denon/Marantz meaning of bare hosts.
+    pub fn discovery_devices(mut self) -> Vec<ManualDevice> {
+        self.manual_devices
+            .extend(self.manual_hosts.into_iter().map(|host| ManualDevice {
+                family: "denonavr".into(),
+                host,
+                port: None,
+                mac: None,
+            }));
+        self.manual_devices
+    }
     fn empty() -> Self {
         Self {
             version: DEVICE_LINKS_VERSION,
@@ -303,5 +315,24 @@ mod tests {
             document.devices[&DeviceId::parse("marantz:0006781E2AB9").unwrap()].volume_ceiling,
             Some(-30.0)
         );
+    }
+}
+
+#[cfg(test)]
+mod discovery_configuration_tests {
+    use super::*;
+    #[test]
+    fn typed_discovery_and_legacy_hosts_preserve_family_identity_and_order() {
+        let document: DeviceLinksDocument = serde_json::from_value(serde_json::json!({
+            "version":1, "manual_devices":[{"family":"trinnov","host":"192.0.2.1","port":44100,"mac":"FA:00:00:00:00:01"}],
+            "manual_hosts":["192.0.2.2"]
+        })).unwrap();
+        let devices = document.discovery_devices();
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].family, "trinnov");
+        assert_eq!(devices[0].port, Some(44100));
+        assert_eq!(devices[1].family, "denonavr");
+        assert_eq!(devices[1].host, "192.0.2.2");
+        assert_eq!(devices[1].port, None);
     }
 }

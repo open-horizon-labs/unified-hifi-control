@@ -99,27 +99,27 @@ pub fn collections_tabs_for_zone(zone_id: &str) -> Vec<&'static str> {
 
 #[mcp_tool(
     name = "hifi_collections",
-    description = "Alpha capability: expect refinement across releases. Browse a provider library or list saved playlists and favorites. Results are paged with limit/offset. Navigable entries include a durable opaque location for canonical navigation and a short-lived path for MCP continuation; playable entries include a short-lived opaque ref for hifi_play_ref. Send location or path, never both. Implemented for Roon, LMS, and Music Assistant zones. Spotify and Apple Music are reachable via hifi_spotify and the Apple Music tools today, not yet through this one."
+    description = "Browse Roon, LMS, or Music Assistant libraries, playlists, favorites, and live radio. Use returned location/path to navigate and ref with hifi_play_ref to play. Spotify/Apple Music collections use their provider tools."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiCollectionsTool {
-    /// Zone ID whose provider library is queried.
+    /// Library’s zone ID.
     pub zone_id: String,
-    /// browse, playlists, or favorites.
+    /// browse, playlists, favorites.
     pub action: String,
-    /// Short-lived collection continuation returned by a preceding browse call.
+    /// Short-lived browse continuation; omit when using location.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// Durable provider-neutral collection location returned by a preceding browse call.
+    /// Durable browse location; omit when using path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
-    /// Media type when listing favorites (tracks by default).
+    /// radio for live stations (Roon: My Live Radio); favorites default to tracks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
-    /// Maximum entries to return (1-50; default 20).
+    /// Results per page: 1-50, default 20.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
-    /// Zero-based page offset (default 0).
+    /// Zero-based offset; default 0.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offset: Option<u32>,
 }

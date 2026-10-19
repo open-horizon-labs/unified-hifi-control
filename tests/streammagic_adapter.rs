@@ -576,8 +576,7 @@ async fn fixed_output_units_report_volume_unsupported_and_refuse_writes() {
     // Mute and power are still honest.
     assert!(device.capabilities.mute.supported);
 
-    // Through the service the request reaches the driver (an absolute level needs no current
-    // value), and the driver refuses before any frame is built.
+    // The service refuses the unsupported capability before dispatching to the driver.
     h.service
         .set_ceiling(device_id.as_str(), Some(50.0))
         .await
@@ -587,7 +586,7 @@ async fn fixed_output_units_report_volume_unsupported_and_refuse_writes() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&error, DeviceError::Dispatch { detail, .. } if detail.contains("not supported")),
+        matches!(&error, DeviceError::RangeUnknown { detail, .. } if detail.contains("not supported")),
         "{error:?}"
     );
 

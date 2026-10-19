@@ -12,7 +12,7 @@
 
 use crate::api::devices::device_inventory;
 use crate::api::AppState;
-use crate::devices::service::{request_from_action, DeviceError, DeviceTarget, DEVICE_ACTIONS};
+use crate::devices::service::{DeviceError, DeviceTarget, DEVICE_ACTIONS};
 use crate::devices::{DeviceId, DEVICE_CONTROL_MATURITY};
 use crate::mcp::envelope::{Envelope, Refusal};
 use crate::mcp::tools::transport::HifiControlTool;
@@ -37,63 +37,40 @@ const ACTIONS: &[&str] = &[
 
 #[mcp_tool(
     name = "hifi_devices",
-    description = "Alpha capability: expect refinement across releases. Amplifiers and receivers \
-                    (playback devices) that zones play through, separate from the music provider. \
-                    action=list shows every device with its inputs, power, volume range and linked \
-                    zones. action=links lists zone links. action=link connects a zone_id to the \
-                    device_id it plays through (optionally source_id, the device input the zone \
-                    arrives on); after linking, that zone's volume and hifi_control volume actions \
-                    drive the device. action=unlink removes a zone's link. action=set_ceiling sets \
-                    a device's maximum volume in dB (omit ceiling to clear); a ceiling only ever \
-                    lowers the device's own limit. action=control sends command (power_on, \
-                    power_off, power_toggle, select_input, volume_set, volume_up, volume_down, \
-                    mute, unmute) to a device_id, or to the device a zone_id is linked to. Volume \
-                    values are dB. Inputs never switch automatically: use select_input. A command \
-                    succeeds only when the device confirms it. Spec \
-                    mismatches: action=set_recording enabled=true opts in to recording device \
-                    protocol mismatches locally (off by default, memory only); action=report \
-                    device_id builds a redacted preview with a prefilled GitHub issue link the \
-                    user opens and submits themselves (sections: environment, anomalies, \
-                    device_state, excerpts); action=clear_report forgets a device's recordings. \
-                    Nothing is ever sent automatically."
+    description = "Inspect amplifiers/receivers, link zones, or control power, input, and volume. Linking redirects zone volume to the device. Inputs switch only on select_input; success requires device confirmation. Diagnostics stay local; report returns a redacted preview for the user to submit."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiDevicesTool {
-    /// list, links, link, unlink, set_ceiling, or control.
+    /// list, links, link, unlink, set_ceiling, control, set_recording, report, clear_report.
     pub action: String,
-    /// The device, e.g. marantz:0006781E0AB8 (from action=list).
+    /// Required for link/set_ceiling/report; control: this or zone_id, never both.
     #[serde(default)]
     pub device_id: Option<String>,
-    /// A zone id (from hifi_zones). For link/unlink, the zone to (un)link; for control, the
-    /// linked zone whose device to control.
+    /// Required for link/unlink; or linked control target.
     #[serde(default)]
     pub zone_id: Option<String>,
-    /// For link: the device input this zone arrives on (an input id from action=list).
+    /// For link: device input ID from list.
     #[serde(default)]
     pub source_id: Option<String>,
-    /// For control: power_on, power_off, power_toggle, select_input, volume_set, volume_up,
-    /// volume_down, mute, or unmute.
+    /// For control: power_on, power_off, power_toggle, select_input, volume_set, volume_up, volume_down, mute, unmute.
     #[serde(default)]
     pub command: Option<String>,
-    /// For control: dB level for volume_set, or dB step for volume_up/volume_down (defaults to
-    /// the device step).
+    /// Control volume level/step in dB; relative default: device step.
     #[serde(default)]
     pub value: Option<f64>,
-    /// For control select_input: the input id or its display name.
+    /// For select_input: input ID or name.
     #[serde(default)]
     pub input: Option<String>,
-    /// For control mute: true or false. Omit to toggle.
+    /// For mute: true/false; omit to toggle.
     #[serde(default)]
     pub muted: Option<bool>,
-    /// For set_ceiling: the maximum volume in dB. Omit to clear the ceiling.
+    /// Maximum dB; omit to clear. Can only lower device limit.
     #[serde(default)]
     pub ceiling: Option<f64>,
-    /// For set_recording: true to record device protocol mismatches locally, false to stop
-    /// (and forget everything recorded).
+    /// For set_recording: opt in to local recording (default off); false stops and forgets.
     #[serde(default)]
     pub enabled: Option<bool>,
-    /// For report: section ids to include (environment, anomalies, device_state, excerpts).
-    /// Omit for all but raw protocol excerpts.
+    /// Report sections: environment, anomalies, device_state, excerpts. Default excludes excerpts.
     #[serde(default)]
     pub sections: Option<Vec<String>>,
 }
@@ -284,38 +261,13 @@ async fn control(
     command: &str,
     value: Option<&serde_json::Value>,
 ) -> Result<CallToolResult, CallToolError> {
-    let step = match &target {
-        DeviceTarget::Device(device_id) => state.aggregator.get_device(device_id).await,
-        DeviceTarget::Zone(zone_id) => match state.devices.linked_device_id(zone_id).await {
-            Some(device_id) => state.aggregator.get_device(&device_id).await,
-            None => None,
-        },
-    }
-    .map(|device| device.volume.step)
-    .filter(|step| *step > 0.0)
-    .unwrap_or(0.5);
-    let request = match request_from_action(command, value, step) {
-        Ok(Some(request)) => request,
-        Ok(None) => {
-            return env.refused(
-                format!("{command} is not a device command."),
-                Refusal::invalid_parameter(
-                    "command",
-                    DEVICE_ACTIONS,
-                    "Transport (play, pause, next...) belongs to the zone's provider: use \
-                     hifi_control.",
-                ),
-            )
-        }
-        Err(message) => {
-            return env.refused(
-                message.clone(),
-                Refusal::invalid_parameter("value", &[], message),
-            )
-        }
-    };
-    match state.devices.control(target, request).await {
-        Ok(report) => Ok(env.json_result(&report)),
+    match state.devices.control_action(target, command, value).await {
+        Ok(Some(report)) => Ok(env.json_result(&report)),
+        Ok(None) => env.refused(
+            format!("{command} is not a device command."),
+            Refusal::invalid_parameter("command", DEVICE_ACTIONS,
+                "Transport (play, pause, next...) belongs to the zone's provider: use hifi_control."),
+        ),
         Err(error) => refuse(env, error),
     }
 }
@@ -346,7 +298,8 @@ fn refuse(env: Envelope, error: DeviceError) -> Result<CallToolResult, CallToolE
         DeviceError::InvalidValue { parameter, .. } => {
             Refusal::invalid_parameter(parameter, &[], text.clone())
         }
-        DeviceError::RangeUnknown { .. }
+        DeviceError::Expired { .. }
+        | DeviceError::RangeUnknown { .. }
         | DeviceError::DeviceUnavailable { .. }
         | DeviceError::Store(_)
         | DeviceError::NoDriver { .. }
@@ -375,7 +328,14 @@ pub async fn linked_zone_volume(
     ) {
         return None;
     }
-    state.devices.linked_device_id(&args.zone_id).await?;
+    let value = args.value.map(|v| json!(v));
+    let result = crate::zone_control::dispatch_linked_device(
+        &state.devices,
+        &args.zone_id,
+        &args.action,
+        value.as_ref(),
+    )
+    .await?;
     let operation = match args.action.as_str() {
         "volume_set" => "volume_absolute",
         _ => "volume_relative",
@@ -383,14 +343,8 @@ pub async fn linked_zone_volume(
     let env = Envelope::write("hifi_control", operation)
         .param("zone_id", args.zone_id.clone())
         .param_opt("value", args.value);
-    Some(
-        control(
-            state,
-            env,
-            DeviceTarget::Zone(args.zone_id.clone()),
-            &args.action,
-            args.value.map(|v| json!(v)).as_ref(),
-        )
-        .await,
-    )
+    Some(match result {
+        Ok(report) => Ok(env.json_result(&report)),
+        Err(error) => refuse(env, error),
+    })
 }

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 #[mcp_tool(
     name = "hifi_music_details",
-    description = "Read source-attributed HiPhi Cloud context for the music playing in an explicit zone and language. Returns identity, catalog candidates, genres, and available source facts with provenance and attribution. The first read can be slow while upstream sources are fetched. Treat partial, ambiguous, unavailable, or stale results accordingly; never present ambiguous candidate facts as certain. Compare returned identity with the current selection. Requires optional Cloud pairing; read-only and never changes playback.",
+    description = "Read HiPhi Cloud source facts with provenance and attribution for current music; requires Cloud pairing. The first read can be slow. Check identity and stale/partial results; never present ambiguous candidate facts as certain.",
     read_only_hint = true,
     destructive_hint = false,
     open_world_hint = true
@@ -20,9 +20,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HifiMusicDetailsTool {
-    /// Explicit prefixed zone ID from hifi_zones; no default zone is selected.
+    /// Explicit zone ID; no default.
     pub zone_id: String,
-    /// Supported wiki language code, for example en; required, with no default.
+    /// Wiki language code, e.g. en; required, no default.
     pub language: String,
 }
 
