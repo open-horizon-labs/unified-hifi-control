@@ -13,7 +13,7 @@ use serde_json::json;
 
 #[mcp_tool(
     name = "hifi_spotify",
-    description = "Spotify playlists and saved tracks; writes need matching scopes. Browse requires UHC_SPOTIFY_QUOTA_MODE=extended. Search/play with hifi_search/hifi_play_ref."
+    description = "Spotify playlists and saved tracks; writes need matching scopes. Browse requires Extended Quota (UHC_SPOTIFY_QUOTA_MODE=extended); unavailable in Development Mode. Search/play with hifi_search/hifi_play_ref."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiSpotifyTool {

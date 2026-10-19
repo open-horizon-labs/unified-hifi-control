@@ -25,19 +25,19 @@ pub struct AppleMusicPrecondition(pub serde_json::Map<String, serde_json::Value>
 
 impl AppleMusicPrecondition {
     pub fn json_schema() -> serde_json::Map<String, serde_json::Value> {
-        json!({
-            "type": "object",
-            "properties": {
-                "playlist_version": {
-                    "type": "integer",
-                    "description": "Playlist revision returned by a prior companion read."
-                }
-            },
-            "additionalProperties": true
-        })
-        .as_object()
-        .expect("precondition schema is an object")
-        .clone()
+        serde_json::Map::from_iter([
+            ("type".into(), json!("object")),
+            (
+                "properties".into(),
+                json!({
+                    "playlist_version": {
+                        "type": "integer",
+                        "description": "Playlist revision returned by a prior companion read."
+                    }
+                }),
+            ),
+            ("additionalProperties".into(), json!(true)),
+        ])
     }
 }
 
