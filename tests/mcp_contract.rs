@@ -1211,20 +1211,15 @@ async fn get_and_delete_are_wired_and_session_aware() {
         "DELETE with a valid session must succeed, got {status}"
     );
 
-    // An unknown session id is refused, and GET and DELETE refuse it
-    // *differently*. Unlike POST, neither has an auto-recovery path.
-    //
-    // GET answering 500 rather than 404 is arguably wrong — a stale SSE
-    // reconnect is a client-side condition, not a server fault — but it is
-    // today's behavior, and #394 records rather than corrects. Recorded here so
-    // that if a later issue fixes it, the change is visible instead of incidental.
+    // Unknown or expired sessions are client recovery conditions, not 500.
+    // POST auto-recovery remains covered separately.
     let (status, _) = app
         .request(Method::DELETE, Some("never-initialized-session"))
         .await;
     assert_eq!(
         status,
         axum::http::StatusCode::NOT_FOUND,
-        "DELETE with an unknown session returns 404 today"
+        "DELETE with an unknown session returns 404"
     );
 
     let (status, _) = app
@@ -1232,9 +1227,8 @@ async fn get_and_delete_are_wired_and_session_aware() {
         .await;
     assert_eq!(
         status,
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        "GET with an unknown session returns 500 today (see the note above: \
-         recorded, not endorsed)"
+        axum::http::StatusCode::NOT_FOUND,
+        "GET with an unknown session must return 404 so clients can reinitialize"
     );
 
     // The methods really are routed: axum answers an unrouted method with 405,
