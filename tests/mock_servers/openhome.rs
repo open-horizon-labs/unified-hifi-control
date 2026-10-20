@@ -27,6 +27,7 @@ pub struct MockOpenHomeState {
     pub state: String, // Playing, Paused, Stopped
     pub volume: u32,   // 0-100
     pub muted: bool,
+    pub track_uri: String,
     pub track_title: String,
     pub track_artist: String,
     pub track_album: String,
@@ -43,6 +44,7 @@ impl Default for MockOpenHomeState {
             state: "Stopped".to_string(),
             volume: 50,
             muted: false,
+            track_uri: "http://example.test/live".to_string(),
             track_title: String::new(),
             track_artist: String::new(),
             track_album: String::new(),
@@ -354,12 +356,12 @@ async fn handle_info(
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
   <s:Body>
     <u:TrackResponse xmlns:u="urn:av-openhome-org:service:Info:1">
-      <Uri></Uri>
+      <Uri>{}</Uri>
       <Metadata>{}</Metadata>
     </u:TrackResponse>
   </s:Body>
 </s:Envelope>"#,
-            metadata
+            state_guard.track_uri, metadata
         )
     } else {
         return Response::builder()

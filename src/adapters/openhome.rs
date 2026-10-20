@@ -798,6 +798,41 @@ impl OpenHomeAdapter {
         tracing::info!("OpenHome adapter stopped");
     }
 
+    /// Exercise SSDP registration plus the real polling path without multicast.
+    #[doc(hidden)]
+    pub async fn probe_device_for_test(&self, uuid: &str, location: &str) -> anyhow::Result<()> {
+        {
+            let mut state = self.state.write().await;
+            state
+                .devices
+                .entry(uuid.to_string())
+                .or_insert_with(|| OpenHomeDevice {
+                    uuid: uuid.to_string(),
+                    name: "Test OpenHome".to_string(),
+                    manufacturer: None,
+                    model: None,
+                    location: location.to_string(),
+                    state: "stopped".to_string(),
+                    volume: None,
+                    muted: false,
+                    volume_max: None,
+                    volume_steps: None,
+                    track_info: None,
+                    last_seen: std::time::Instant::now(),
+                    last_track_uri: None,
+                });
+        }
+        Self::poll_device(
+            &self.state,
+            &self.bus,
+            &self.http,
+            uuid,
+            location,
+            self.runtime_bridge.clone(),
+        )
+        .await
+    }
+
     /// Get adapter status
     pub async fn get_status(&self) -> OpenHomeStatus {
         let state = self.state.read().await;
