@@ -93,13 +93,13 @@ pub fn project_config_form(page: &str) -> ConfigFormObs {
         let self_closing = matches!(event, Ok(quick_xml::events::Event::Empty(_)));
         match event {
             Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_lowercase();
+                let tag = e.name().as_ref().to_lowercase();
                 let attrs: BTreeMap<String, String> = e
                     .attributes()
                     .filter_map(Result::ok)
                     .map(|a| {
                         (
-                            String::from_utf8_lossy(a.key.as_ref()).to_lowercase(),
+                            a.key.as_ref().to_lowercase(),
                             a.normalized_value(quick_xml::XmlVersion::Explicit1_0)
                                 .map(|v| v.into_owned())
                                 .unwrap_or_default(),
@@ -150,14 +150,9 @@ pub fn project_config_form(page: &str) -> ConfigFormObs {
             Ok(quick_xml::events::Event::Text(t)) => {
                 // The only element text kept anywhere: an option's label, inside the profile select.
                 if let Some(value) = pending_option.take() {
-                    let label = t
-                        .xml10_content()
-                        .ok()
-                        .and_then(|decoded| {
-                            quick_xml::escape::unescape(&decoded)
-                                .ok()
-                                .map(|value| value.trim().to_string())
-                        })
+                    let decoded = t.xml10_content();
+                    let label = quick_xml::escape::unescape(&decoded)
+                        .map(|value| value.trim().to_string())
                         .unwrap_or_default();
                     if value.is_empty() && label == "[default]" {
                         obs.offers_default = true;
@@ -175,7 +170,7 @@ pub fn project_config_form(page: &str) -> ConfigFormObs {
                 }
             }
             Ok(quick_xml::events::Event::End(e)) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_lowercase();
+                let tag = e.name().as_ref().to_lowercase();
                 // `<option value="Night"></option>` carries no text node either, so the `Text` handler
                 // never ran and the value is still parked. Flushing it here is the other half of the
                 // self-closing case: unconditionally clearing `pending_option` on any end tag is what

@@ -215,7 +215,7 @@ pub fn has_child(document: &str, child: &str) -> bool {
     loop {
         match reader.read_event() {
             Ok(quick_xml::events::Event::Start(e)) => {
-                if depth == 1 && String::from_utf8_lossy(e.name().as_ref()) == child {
+                if depth == 1 && e.name().as_ref() == child {
                     return true;
                 }
                 depth += 1;
@@ -224,7 +224,7 @@ pub fn has_child(document: &str, child: &str) -> bool {
             // it just occupies the level it appears at. This is the shape the real `metadata` child
             // takes, so it must be measured, not skipped.
             Ok(quick_xml::events::Event::Empty(e)) => {
-                if depth == 1 && String::from_utf8_lossy(e.name().as_ref()) == child {
+                if depth == 1 && e.name().as_ref() == child {
                     return true;
                 }
             }
@@ -246,18 +246,16 @@ pub fn child_attrs(document: &str, child: &str) -> Vec<Vec<(String, String)>> {
     loop {
         match reader.read_event() {
             Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
-                if String::from_utf8_lossy(e.name().as_ref()) == child {
+                if e.name().as_ref() == child {
                     out.push(
                         e.attributes()
                             .filter_map(Result::ok)
                             .map(|a| {
-                                let name = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+                                let name = a.key.as_ref().to_owned();
                                 let value = a
                                     .normalized_value(quick_xml::XmlVersion::Explicit1_0)
                                     .map(|v| v.into_owned())
-                                    .unwrap_or_else(|_| {
-                                        framing::decode_entities(&String::from_utf8_lossy(&a.value))
-                                    });
+                                    .unwrap_or_else(|_| framing::decode_entities(&a.value));
                                 (name, value)
                             })
                             .collect(),
@@ -291,13 +289,11 @@ fn element_attrs(fragment: &str) -> Vec<(String, String)> {
                     .attributes()
                     .filter_map(Result::ok)
                     .map(|a| {
-                        let name = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+                        let name = a.key.as_ref().to_owned();
                         let value = a
                             .normalized_value(quick_xml::XmlVersion::Explicit1_0)
                             .map(|v| v.into_owned())
-                            .unwrap_or_else(|_| {
-                                framing::decode_entities(&String::from_utf8_lossy(&a.value))
-                            });
+                            .unwrap_or_else(|_| framing::decode_entities(&a.value));
                         (name, value)
                     })
                     .collect();
@@ -383,20 +379,15 @@ pub fn sanitize(document: &str) -> String {
                     suppress_depth -= 1;
                 } else {
                     out.push_str("</");
-                    out.push_str(&String::from_utf8_lossy(e.name().as_ref()));
+                    out.push_str(e.name().as_ref());
                     out.push('>');
                 }
             }
             Ok(quick_xml::events::Event::Text(t)) => {
                 if suppress_depth == 0 {
-                    let text = t
-                        .xml10_content()
-                        .ok()
-                        .and_then(|decoded| {
-                            quick_xml::escape::unescape(&decoded)
-                                .ok()
-                                .map(|value| value.into_owned())
-                        })
+                    let decoded = t.xml10_content();
+                    let text = quick_xml::escape::unescape(&decoded)
+                        .map(|value| value.into_owned())
                         .unwrap_or_default();
                     // Belt and braces: text that itself looks like a credential line goes too.
                     if is_sensitive(&text) {
@@ -428,17 +419,16 @@ pub fn sanitize(document: &str) -> String {
 /// One definition covering both `Start` and `Empty`: the check was duplicated in the two arms, which
 /// is the same drift risk as the three copies of the marker list.
 fn is_hostile_tag(e: &quick_xml::events::BytesStart<'_>) -> bool {
-    if is_sensitive(&String::from_utf8_lossy(e.name().as_ref())) {
+    if is_sensitive(e.name().as_ref()) {
         return true;
     }
     e.attributes().filter_map(Result::ok).any(|a| {
-        let key = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+        let key = a.key.as_ref().to_owned();
         // `type="hidden"` specifically, rather than "hidden" appearing in any attribute value: an
         // unrelated `status="Hidden"` would otherwise cost a whole element of evidence for nothing.
         // Secret-*named* attributes are already covered by `is_sensitive` on the key.
         is_sensitive(&key)
-            || (key.eq_ignore_ascii_case("type")
-                && String::from_utf8_lossy(a.value.as_ref()).eq_ignore_ascii_case("hidden"))
+            || (key.eq_ignore_ascii_case("type") && a.value.as_ref().eq_ignore_ascii_case("hidden"))
     })
 }
 
@@ -456,13 +446,13 @@ fn is_hostile_tag(e: &quick_xml::events::BytesStart<'_>) -> bool {
 /// happens only after that check has passed, so decoding can never become a way for a credential to
 /// come back out re-encoded.
 fn render_start(e: &quick_xml::events::BytesStart<'_>) -> String {
-    let mut out = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+    let mut out = e.name().as_ref().to_owned();
     for a in e.attributes().filter_map(Result::ok) {
-        let key = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+        let key = a.key.as_ref().to_owned();
         let value = a
             .normalized_value(quick_xml::XmlVersion::Explicit1_0)
             .map(|v| v.into_owned())
-            .unwrap_or_else(|_| framing::decode_entities(&String::from_utf8_lossy(&a.value)));
+            .unwrap_or_else(|_| framing::decode_entities(&a.value));
         if is_sensitive(&key) || is_sensitive(&value) {
             continue;
         }
