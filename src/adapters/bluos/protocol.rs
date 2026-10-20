@@ -56,12 +56,12 @@ pub fn parse_nodes(xml: &str) -> Result<Vec<Node>, String> {
     let mut open: Vec<usize> = Vec::new();
     let element = |start: &quick_xml::events::BytesStart<'_>| -> Result<Node, String> {
         let mut node = Node {
-            name: String::from_utf8_lossy(start.local_name().as_ref()).to_string(),
+            name: start.local_name().as_ref().to_owned(),
             ..Node::default()
         };
         for attribute in start.attributes() {
             let attribute = attribute.map_err(|e| format!("bad attribute: {e}"))?;
-            let key = String::from_utf8_lossy(attribute.key.local_name().as_ref()).to_string();
+            let key = attribute.key.local_name().as_ref().to_owned();
             let value = attribute
                 .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map_err(|e| format!("bad attribute value: {e}"))?
@@ -82,8 +82,7 @@ pub fn parse_nodes(xml: &str) -> Result<Vec<Node>, String> {
             }
             Event::Text(text) => {
                 if let Some(index) = open.last() {
-                    let text = text.decode().map_err(|e| format!("bad text: {e}"))?;
-                    nodes[*index].text.push_str(&text);
+                    nodes[*index].text.push_str(text.as_ref());
                 }
             }
             Event::Eof => break,
