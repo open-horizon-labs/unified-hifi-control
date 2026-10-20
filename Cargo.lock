@@ -6350,7 +6350,7 @@ dependencies = [
  "reqwest",
  "resvg",
  "roon-api",
- "roxmltree 0.20.0",
+ "roxmltree 0.21.1",
  "rumqttc",
  "rumqttd",
  "rust-embed",

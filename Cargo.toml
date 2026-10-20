@@ -176,7 +176,7 @@ ed25519-dalek = { version = "2.2", features = ["rand_core"], optional = true }
 # NAA relay core for HQPlayer output routing (server only). roxmltree gives byte ranges for
 # exact in-place control-line splicing; socket2 replaces the PoC's libc setsockopt calls because
 # this crate denies unsafe code.
-roxmltree = { version = "0.20", optional = true }
+roxmltree = { version = "0.21", optional = true }
 socket2 = { version = "0.6", features = ["all"], optional = true }
 
 # ============ WEB-ONLY DEPENDENCIES ============
