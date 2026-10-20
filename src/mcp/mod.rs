@@ -33,6 +33,7 @@
 //! UPDATE_MCP_FIXTURES=1 cargo test --test mcp_contract
 //! ```
 
+pub mod baselines;
 pub mod capabilities;
 pub mod collection_locations;
 pub mod envelope;

@@ -54,18 +54,12 @@
 //! [`read_resource`] does not re-check settings, matching how a HQPlayer tool
 //! called directly (unlisted) still executes.
 //!
-//! # `listChanged`: best-effort, wired off the events the aggregator already
-//! consumes
+//! # `listChanged`
 //!
-//! [`spawn_list_changed_notifier`] subscribes to the same bus
-//! [`crate::aggregator::ZoneAggregator`] already consumes and sends
-//! `notifications/resources/list_changed` on any event that changes the *set*
-//! of zones (`ZoneDiscovered`, `ZoneRemoved`, `ZonesFlushed`) — not on every
-//! `NowPlayingChanged`, which would be noise for a signal that only means "the
-//! zone list changed, re-list". This is genuinely best-effort: with
-//! `event_store: None` (`src/mcp/mod.rs`), a client with no open GET/SSE stream
-//! simply does not receive it, and there is no replay. That is why `subscribe`
-//! is not advertised at all — see [`crate::mcp::server::server_details`].
+//! The notifier compares the advertised list with each session's last served
+//! snapshot. One pending invalidation suppresses repeated hints until re-listing.
+//! A periodic reconciliation covers bus/aggregate scheduling races and settings
+//! edited directly on disk. Idle sessions expire; re-listing starts a fresh notifier.
 //!
 //! # Reading an unknown or stale URI
 //!
@@ -75,8 +69,10 @@
 //! (`-32002`), carrying the offending URI in `data` so a client can log which
 //! one it asked for.
 
-use crate::api::AppState;
+use crate::aggregator::ZoneAggregator;
+use crate::api::{AppSettings, AppState};
 use crate::bus::{BusEvent, SharedBus};
+use crate::mcp::baselines::{list_fingerprint, McpResourceBaselines};
 use crate::mcp::tools::{hqplayer, status, zones};
 use rust_mcp_sdk::{
     schema::{ReadResourceContent, ReadResourceResult, Resource, RpcError, TextResourceContents},
@@ -176,9 +172,21 @@ fn zone_resource(zone_id: &str, zone_name: &str) -> Resource {
 ///
 /// `hqplayer_enabled` gates the two HQPlayer resources exactly as
 /// [`crate::mcp::tools::list_tools`] gates the four HQPlayer tools; the caller
-/// (`HifiMcpHandler::handle_list_resources_request`) supplies it from the same
-/// `load_app_settings()` read.
+/// can override this flag for compatibility with existing callers.
 pub async fn list_resources(state: &AppState, hqplayer_enabled: bool) -> Vec<Resource> {
+    let mut settings = crate::api::load_app_settings();
+    settings.adapters.hqplayer = hqplayer_enabled;
+    list_resources_for_aggregator(&state.aggregator, &settings).await
+}
+
+/// The `resources/list` builder, for callers that hold the aggregator without a
+/// whole `AppState` (the `list_changed` notifier, #833). The single source of
+/// truth for what the server advertises — the notifier diffs against this exact
+/// output so the advertisement and the notification can never disagree.
+pub(crate) async fn list_resources_for_aggregator(
+    aggregator: &ZoneAggregator,
+    settings: &AppSettings,
+) -> Vec<Resource> {
     let mut resources = vec![
         Resource {
             annotations: None,
@@ -214,11 +222,11 @@ pub async fn list_resources(state: &AppState, hqplayer_enabled: bool) -> Vec<Res
 
     // Same visibility policy as `hifi_zones` -- a hidden zone must not reappear as a resource.
     // Reading `state.aggregator.get_zones()` here would leak exactly what the user hid.
-    for zone in crate::zone_list::visible_zones(state).await {
+    for zone in crate::zone_list::visible_zones_from(aggregator, settings).await {
         resources.push(zone_resource(&zone.zone_id, &zone.zone_name));
     }
 
-    if hqplayer_enabled {
+    if settings.adapters.hqplayer {
         resources.push(Resource {
             annotations: None,
             description: Some(
@@ -286,8 +294,8 @@ pub async fn read_resource(state: &AppState, uri: &str) -> Result<ReadResourceRe
     })
 }
 
-/// Whether a bus event changes the *set* of zones, and therefore what
-/// `resources/list` would return next.
+/// Events that may change advertised membership or metadata. They prompt a
+/// comparison; receiving one does not itself establish a listing change.
 ///
 /// `NowPlayingChanged`, `VolumeChanged` and friends change a resource's
 /// *contents*, not the *list* — and since `subscribe` is not advertised, this
@@ -299,53 +307,77 @@ fn changes_the_zone_list(event: &BusEvent) -> bool {
         BusEvent::ZoneDiscovered { .. }
             | BusEvent::ZoneRemoved { .. }
             | BusEvent::ZonesFlushed { .. }
+            | BusEvent::ZoneUpdated { .. }
     )
 }
 
-/// Best-effort `notifications/resources/list_changed`, for one session.
-///
-/// Spawned from [`crate::mcp::handler::HifiMcpHandler::on_initialized`], which
-/// fires once per session with that session's own `runtime` — so this
-/// subscribes to the bus once per connected client and stops when sending to
-/// that client starts failing (session torn down, stream gone), or when the
-/// server itself shuts down (`shutdown`, the same [`CancellationToken`] every
-/// other background loop in this crate selects on — see
-/// `tests/spawn_cancellation_lint.rs`, which fails a `tokio::spawn` loop with no
-/// cancellation arm).
-///
-/// This is deliberately best-effort and undocumented as anything stronger: with
-/// `event_store: None`, a client with no open GET/SSE stream never receives
-/// this notification and there is no way to replay it later. A client that
-/// wants to be sure it has the current zone list should still call
-/// `resources/list` itself; this notification is only ever a hint to do so
-/// sooner.
+/// Best-effort invalidation for one session generation. Entries and tasks expire
+/// after idle TTL; capacity eviction also stops old tasks on the next tick.
+/// A returning session re-lists to obtain the full snapshot and rearm observation.
 pub fn spawn_list_changed_notifier(
     bus: SharedBus,
     runtime: Arc<dyn McpServer>,
+    aggregator: Arc<ZoneAggregator>,
+    baselines: Arc<McpResourceBaselines>,
+    session_id: String,
+    generation: u64,
     shutdown: CancellationToken,
 ) {
     let mut rx = bus.subscribe();
     tokio::spawn(async move {
+        let mut reconcile = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut retry_after = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
+                _ = reconcile.tick() => {},
                 event = rx.recv() => match event {
-                    Ok(event) if changes_the_zone_list(&event) => {
-                        if runtime.notify_resource_list_changed(None).await.is_err() {
-                            // The client's stream is gone (or never existed); best-effort
-                            // means giving up quietly rather than looping forever against
-                            // a session nothing is listening on.
-                            break;
-                        }
-                    }
+                    Ok(event) if changes_the_zone_list(&event) => {},
                     Ok(_) => continue,
-                    // Missed events under load: keep going, the next one may still
-                    // matter. A closed bus means the server is shutting down.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
             }
+            let revision_before = {
+                let mut baseline = baselines.inner.lock().await;
+                if !baseline.active(&session_id, generation) {
+                    break;
+                }
+                baseline.revision(&session_id)
+            };
+            if revision_before.is_none() || tokio::time::Instant::now() < retry_after {
+                continue;
+            }
+            let settings = crate::api::load_app_settings();
+            let current = list_resources_for_aggregator(&aggregator, &settings).await;
+            let mut baseline = baselines.inner.lock().await;
+            if !baseline.active(&session_id, generation) {
+                break;
+            }
+            // Discard snapshots built while a client re-listed.
+            if baseline.revision(&session_id) != revision_before {
+                continue;
+            }
+            if baseline.needs_notification(&session_id, &list_fingerprint(&current)) {
+                let revision = baseline.claim(&session_id);
+                drop(baseline);
+                // A transport may disappear or block. Bound the send and retain
+                // the served baseline so reconnect can recover on a later tick.
+                let sent = tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    result = tokio::time::timeout(std::time::Duration::from_secs(2), runtime.notify_resource_list_changed(None)) => matches!(result, Ok(Ok(()))),
+                };
+                if !sent {
+                    retry_after = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+                    baselines
+                        .inner
+                        .lock()
+                        .await
+                        .send_failed(&session_id, generation, revision);
+                }
+            }
         }
+        baselines.inner.lock().await.remove(&session_id, generation);
     });
 }
 

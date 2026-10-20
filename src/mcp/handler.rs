@@ -32,19 +32,6 @@ impl HifiMcpHandler {
 
 #[async_trait]
 impl ServerHandler for HifiMcpHandler {
-    /// Fires once per session, when the client sends `notifications/initialized`
-    /// — the SDK hands us that session's own `runtime` here, which is the only
-    /// place a per-session background notifier can be started. See
-    /// [`crate::mcp::resources::spawn_list_changed_notifier`] for what this
-    /// notifier does and does not promise.
-    async fn on_initialized(&self, runtime: Arc<dyn McpServer>) {
-        crate::mcp::resources::spawn_list_changed_notifier(
-            self.state.bus.clone(),
-            runtime,
-            self.state.shutdown.clone(),
-        );
-    }
-
     async fn handle_list_tools_request(
         &self,
         _params: Option<PaginatedRequestParams>,
@@ -147,17 +134,33 @@ impl ServerHandler for HifiMcpHandler {
     async fn handle_list_resources_request(
         &self,
         _params: Option<PaginatedRequestParams>,
-        _runtime: Arc<dyn McpServer>,
+        runtime: Arc<dyn McpServer>,
     ) -> Result<ListResourcesResult, RpcError> {
         let settings = load_app_settings();
+        let resources =
+            crate::mcp::resources::list_resources_for_aggregator(&self.state.aggregator, &settings)
+                .await;
+        if let Some(session_id) = runtime.session_id() {
+            let mut baselines = self.state.mcp_resource_baselines.inner.lock().await;
+            if let Some(generation) = baselines.served(
+                &session_id,
+                crate::mcp::baselines::list_fingerprint(&resources),
+            ) {
+                crate::mcp::resources::spawn_list_changed_notifier(
+                    self.state.bus.clone(),
+                    runtime,
+                    self.state.aggregator.clone(),
+                    self.state.mcp_resource_baselines.clone(),
+                    session_id,
+                    generation,
+                    self.state.shutdown.clone(),
+                );
+            }
+        }
         Ok(ListResourcesResult {
             meta: None,
             next_cursor: None,
-            resources: crate::mcp::resources::list_resources(
-                &self.state,
-                settings.adapters.hqplayer,
-            )
-            .await,
+            resources,
         })
     }
 
