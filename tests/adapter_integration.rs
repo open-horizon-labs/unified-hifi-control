@@ -611,27 +611,26 @@ mod mock_server_tests {
     }
 
     #[tokio::test]
-    async fn hqp_mock_responds_to_getinfo() {
+    #[serial_test::serial(lms_config)]
+    async fn hqp_mock_accepts_real_adapter_handshake() {
         let mock = MockHqpServer::start().await;
-
-        // Use reqwest to test the mock directly (not through adapter)
-        // because HQP adapter uses a complex TCP protocol
-        let mut stream = tokio::net::TcpStream::connect(mock.addr()).await.unwrap();
-
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        stream
-            .write_all(b"<?xml version=\"1.0\"?>\n")
+        let (bus, _rx) = test_bus();
+        let adapter = HqpAdapter::new(bus);
+        adapter
+            .configure(
+                mock.addr().ip().to_string(),
+                Some(mock.addr().port()),
+                None,
+                None,
+                None,
+            )
+            .await;
+        timeout(Duration::from_secs(5), adapter.connect())
             .await
-            .unwrap();
-        stream.write_all(b"<GetInfo/>\n").await.unwrap();
-
-        let mut response = vec![0u8; 1024];
-        let n = stream.read(&mut response).await.unwrap();
-        let response = String::from_utf8_lossy(&response[..n]);
-
-        assert!(response.contains("MockHQPlayer"));
-        assert!(response.contains("version=\"5.0.0\""));
-
+            .expect("adapter handshake must complete")
+            .expect("mock must accept actual adapter framing");
+        assert!(adapter.get_status().await.connected);
+        adapter.disconnect().await;
         mock.stop().await;
     }
 
