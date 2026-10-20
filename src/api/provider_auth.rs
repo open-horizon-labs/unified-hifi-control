@@ -14,7 +14,6 @@ use crate::api::credentials::{
     EncryptedCredentialStore, MusicAssistantCredentialRecord, MusicAssistantCredentialStore,
     SpotifyCredentialRecord,
 };
-use crate::api::spotify_tunnel::{SpotifyTunnelManager, TunnelStatusResponse};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -32,7 +31,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
 
 use super::AppState;
 
@@ -50,11 +48,6 @@ pub struct ProviderAuthState {
     oauth: Arc<RwLock<Option<Arc<SpotifyOAuthConfig>>>>,
     musicassistant: Arc<RwLock<Option<Arc<ReconfigurableMusicAssistant>>>>,
     musicassistant_credentials: Option<Arc<MusicAssistantCredentialStore>>,
-    /// Temporary HTTPS tunnel for the Spotify OAuth callback (#538).
-    pub spotify_tunnel: Arc<SpotifyTunnelManager>,
-    /// The separate, loopback-only listener published by the built-in SSH
-    /// tunnel.  This is intentionally never the main UHC listener's port.
-    callback_port: Arc<std::sync::OnceLock<u16>>,
 }
 
 #[derive(Clone)]
@@ -90,8 +83,6 @@ impl Default for ProviderAuthState {
             oauth: Arc::new(RwLock::new(oauth)),
             musicassistant: Arc::new(RwLock::new(None)),
             musicassistant_credentials,
-            spotify_tunnel: Arc::new(SpotifyTunnelManager::default()),
-            callback_port: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -113,29 +104,7 @@ impl ProviderAuthState {
             musicassistant_credentials: MusicAssistantCredentialStore::from_env()
                 .ok()
                 .map(Arc::new),
-            spotify_tunnel: Arc::new(SpotifyTunnelManager::default()),
-            callback_port: Arc::new(std::sync::OnceLock::new()),
         }
-    }
-
-    /// Wires the server's graceful-shutdown token into the Spotify tunnel
-    /// manager so a leftover tunnel process is killed on shutdown too, not
-    /// just on the user-facing stop paths. Called once from `AppState::new`.
-    pub fn bind_shutdown(&self, token: CancellationToken) {
-        self.spotify_tunnel.bind_shutdown(token);
-    }
-
-    /// Records the dedicated callback listener's ephemeral loopback port at
-    /// boot.  There is deliberately no Host, environment, or main-listener
-    /// fallback: losing this binding must fail closed rather than publishing
-    /// UHC's complete LAN router.
-    pub fn bind_callback_port(&self, port: u16) {
-        let _ = self.callback_port.set(port);
-    }
-
-    /// The only port the built-in tunnel may forward to.
-    pub fn callback_port(&self) -> Option<u16> {
-        self.callback_port.get().copied()
     }
 
     /// Construct provider auth with an explicit Music Assistant credential
@@ -758,26 +727,7 @@ pub async fn oauth_callback(
     Query(query): Query<OAuthCallbackQuery>,
 ) -> Response {
     let machine = query.format.as_deref() == Some("json");
-    let is_spotify = provider == "spotify";
     let result = oauth_callback_json(State(state.clone()), Path(provider), Query(query)).await;
-    // The tunnel exists only to carry this one callback across the public
-    // internet; once a real in-flight attempt has concluded (whether Spotify
-    // accepted or rejected it), there is nothing left for it to do. Two
-    // hard-won rules from #592 apply, though:
-    //
-    // 1. Never stop the tunnel inline before responding -- this response
-    //    (and the settings page it redirects the browser to) travels back
-    //    through the tunnel, so an inline stop resets the very connection
-    //    carrying the "success" redirect. Teardown is deferred by a grace
-    //    period instead.
-    // 2. Only tear down for a request that matched a real pending attempt.
-    //    A request with an unknown `state` (an internet scanner probing the
-    //    public URL, a stale link, a user double-checking the address) must
-    //    not be able to kill the tunnel while the user is still working
-    //    through Spotify's dashboard.
-    if is_spotify {
-        stop_tunnel_after_concluded_callback(&state, &result);
-    }
     match result {
         Ok(Json(response)) if machine => Json(response).into_response(),
         Ok(Json(_)) => Redirect::to("/settings?spotify=connected").into_response(),
@@ -787,52 +737,6 @@ pub async fn oauth_callback(
             urlencoding::encode(error.code)
         ))
         .into_response(),
-    }
-}
-
-/// The handler mounted only on the callback-only loopback listener used by
-/// the built-in SSH tunnel.  It deliberately does not redirect to `/settings`:
-/// that page belongs to the main LAN listener and must remain unreachable from
-/// the internet-facing tunnel.  The page is bounded and contains no OAuth
-/// values, credential data, provider response, or request parameters.
-pub(crate) async fn spotify_tunnel_callback(
-    State(state): State<AppState>,
-    Query(query): Query<OAuthCallbackQuery>,
-) -> Response {
-    let result = oauth_callback_json(
-        State(state.clone()),
-        Path("spotify".to_string()),
-        Query(query),
-    )
-    .await;
-    stop_tunnel_after_concluded_callback(&state, &result);
-    match result {
-        Ok(_) => (
-            StatusCode::OK,
-            "Spotify authorization completed. Return to UHC.",
-        )
-            .into_response(),
-        Err((status, _)) => (
-            status,
-            "Spotify authorization could not be completed. Return to UHC and try again.",
-        )
-            .into_response(),
-    }
-}
-
-fn stop_tunnel_after_concluded_callback(
-    state: &AppState,
-    result: &Result<Json<ProviderAuthResponse>, (StatusCode, Json<ErrorBody>)>,
-) {
-    let concluded = match result {
-        Ok(_) => true,
-        Err((_, Json(body))) => body.code != "invalid_state",
-    };
-    if concluded {
-        state
-            .provider_auth
-            .spotify_tunnel
-            .stop_after(crate::api::spotify_tunnel::TUNNEL_CALLBACK_GRACE);
     }
 }
 
@@ -1119,39 +1023,6 @@ pub async fn oauth_revoke(
     }))
 }
 
-/// POST /api/providers/spotify/tunnel/start - Start (or report the existing)
-/// temporary HTTPS tunnel to the separate callback-only listener.
-pub async fn spotify_tunnel_start(State(state): State<AppState>) -> Json<TunnelStatusResponse> {
-    let status = match state.provider_auth.callback_port() {
-        Some(port) => state.provider_auth.spotify_tunnel.start(port).await,
-        None => state
-            .provider_auth
-            .spotify_tunnel
-            .fail_closed(
-                "Spotify callback listener is unavailable; restart UHC before opening a tunnel.",
-            )
-            .await,
-    };
-    Json(status.into())
-}
-
-/// GET /api/providers/spotify/tunnel/status - Current tunnel phase, without
-/// starting or stopping anything.
-pub async fn spotify_tunnel_status(State(state): State<AppState>) -> Json<TunnelStatusResponse> {
-    let status = state.provider_auth.spotify_tunnel.status().await;
-    Json(status.into())
-}
-
-/// POST /api/providers/spotify/tunnel/stop - Stop the tunnel, if any, and
-/// return to idle. Also called automatically when the OAuth callback
-/// completes; exposed here for a manual "Stop tunnel" action and so a user
-/// who abandons the flow does not have to wait for the lifetime cap.
-pub async fn spotify_tunnel_stop(State(state): State<AppState>) -> Json<TunnelStatusResponse> {
-    state.provider_auth.spotify_tunnel.stop().await;
-    let status = state.provider_auth.spotify_tunnel.status().await;
-    Json(status.into())
-}
-
 fn spotify_oauth_config(
     credentials: Option<&Arc<EncryptedCredentialStore>>,
 ) -> anyhow::Result<SpotifyOAuthConfig> {
@@ -1394,7 +1265,6 @@ fn error(status: StatusCode, message: &str, code: &'static str) -> (StatusCode, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::spotify_tunnel::TunnelStatus;
     use axum::{
         body::{to_bytes, Body},
         extract::State,
@@ -1660,344 +1530,6 @@ mod tests {
                 Some("stored-secret".to_string())
             ),
             Some("replacement".to_string())
-        );
-    }
-
-    // ----- #592: tunnel/OAuth interplay ---------------------------------
-
-    use crate::api::spotify_tunnel::{
-        TunnelLaunchError, TunnelLauncher, TunnelProcess, TunnelProcessEvent, TunnelProviderKind,
-    };
-    use axum::http::Method;
-    use tower::ServiceExt;
-
-    /// A tunnel process that "prints" one URL line and then idles until
-    /// killed, like a healthy long-lived `ssh -R` child.
-    struct StaticUrlProcess {
-        line: Option<String>,
-        idle: Arc<tokio::sync::Notify>,
-    }
-
-    #[async_trait::async_trait]
-    impl TunnelProcess for StaticUrlProcess {
-        async fn next_event(&mut self) -> TunnelProcessEvent {
-            if let Some(line) = self.line.take() {
-                return TunnelProcessEvent::Line(line);
-            }
-            self.idle.notified().await;
-            TunnelProcessEvent::Exited {
-                stderr_tail: String::new(),
-            }
-        }
-
-        fn kill(&mut self) {
-            self.idle.notify_waiters();
-        }
-    }
-
-    struct StaticUrlLauncher(String);
-
-    #[async_trait::async_trait]
-    impl TunnelLauncher for StaticUrlLauncher {
-        async fn launch(
-            &self,
-            _provider: TunnelProviderKind,
-            _port: u16,
-        ) -> Result<Box<dyn TunnelProcess>, TunnelLaunchError> {
-            Ok(Box::new(StaticUrlProcess {
-                line: Some(self.0.clone()),
-                idle: Arc::new(tokio::sync::Notify::new()),
-            }))
-        }
-    }
-
-    /// Captures the actual loopback target passed to `ssh -R`; a correct
-    /// callback router is not enough if startup can still point SSH at UHC's
-    /// broad main listener.
-    struct RecordingTunnelLauncher {
-        url: String,
-        ports: Arc<Mutex<Vec<u16>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl TunnelLauncher for RecordingTunnelLauncher {
-        async fn launch(
-            &self,
-            _provider: TunnelProviderKind,
-            port: u16,
-        ) -> Result<Box<dyn TunnelProcess>, TunnelLaunchError> {
-            self.ports.lock().unwrap().push(port);
-            Ok(Box::new(StaticUrlProcess {
-                line: Some(self.url.clone()),
-                idle: Arc::new(tokio::sync::Notify::new()),
-            }))
-        }
-    }
-
-    /// AppState whose Spotify OAuth config is saved with `saved_redirect`
-    /// and whose tunnel manager launches a scripted tunnel that reports
-    /// `tunnel_url`. The returned tempdir keeps the credential store alive.
-    async fn tunnel_test_state(
-        saved_redirect: &str,
-        tunnel_url: &str,
-    ) -> (AppState, tempfile::TempDir) {
-        let dir = tempdir().expect("tempdir");
-        let store =
-            EncryptedCredentialStore::new(dir.path().join("spotify-credentials.enc"), [7_u8; 32]);
-        store
-            .save_record(&SpotifyCredentialRecord {
-                token: None,
-                client_id: "0123456789abcdef0123456789abcdef".to_string(),
-                client_secret: Some("shhh".to_string()),
-                redirect_uri: saved_redirect.to_string(),
-            })
-            .expect("save spotify record");
-        let mut provider_auth = ProviderAuthState::with_credential_store(store);
-        provider_auth.spotify_tunnel = Arc::new(SpotifyTunnelManager::with_launcher(Arc::new(
-            StaticUrlLauncher(tunnel_url.to_string()),
-        )));
-
-        let bus = crate::bus::create_bus();
-        let roon = Arc::new(crate::adapters::roon::RoonAdapter::new_disconnected(
-            bus.clone(),
-        ));
-        let hqp_instances = Arc::new(crate::adapters::hqplayer::HqpInstanceManager::new(
-            bus.clone(),
-        ));
-        let hqplayer = hqp_instances.get_default().await;
-        let hqp_zone_links = Arc::new(crate::adapters::hqplayer::HqpZoneLinkService::new(
-            hqp_instances.clone(),
-        ));
-        let lms = Arc::new(crate::adapters::lms::LmsAdapter::new(bus.clone()));
-        let openhome = Arc::new(crate::adapters::openhome::OpenHomeAdapter::new(bus.clone()));
-        let upnp = Arc::new(crate::adapters::upnp::UPnPAdapter::new(bus.clone()));
-        let aggregator = Arc::new(crate::aggregator::ZoneAggregator::new(bus.clone()));
-        let coordinator = Arc::new(crate::coordinator::AdapterCoordinator::new(bus.clone()));
-        let mut state = AppState::new(
-            roon,
-            hqplayer,
-            hqp_instances,
-            hqp_zone_links,
-            lms,
-            openhome,
-            upnp,
-            crate::knobs::KnobStore::new(),
-            bus,
-            aggregator,
-            coordinator,
-            Vec::new(),
-            std::time::Instant::now(),
-            CancellationToken::new(),
-        );
-        state.provider_auth = Arc::new(provider_auth);
-        (state, dir)
-    }
-
-    async fn start_tunnel_and_wait_active(state: &AppState) {
-        state.provider_auth.spotify_tunnel.start(8088).await;
-        for _ in 0..200 {
-            if matches!(
-                state.provider_auth.spotify_tunnel.status().await,
-                TunnelStatus::Active { .. }
-            ) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!(
-            "tunnel did not become active; last status: {:?}",
-            state.provider_auth.spotify_tunnel.status().await
-        );
-    }
-
-    const TUNNEL_A: &str = "https://aaaaa-1-2-3-4.run.pinggy-free.link";
-
-    fn callback_of(tunnel: &str) -> String {
-        format!("{tunnel}/api/providers/spotify/oauth/callback")
-    }
-
-    /// #641: the public SSH reverse tunnel must terminate at a different,
-    /// default-deny listener.  This list intentionally spans reads, writes,
-    /// controller/bootstrap routes, provider authority, MCP, and legacy
-    /// routes: controller auth may be disabled on a LAN install, so it cannot
-    /// be the thing preventing these from becoming internet reachable.
-    #[tokio::test]
-    async fn callback_only_listener_rejects_every_non_callback_uhc_route() {
-        let (state, _dir) = tunnel_test_state(&callback_of(TUNNEL_A), TUNNEL_A).await;
-        let app = crate::api::spotify_callback_listener::router(state);
-
-        let liveness = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/healthz")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(liveness.status(), StatusCode::NO_CONTENT);
-
-        let callback = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/providers/spotify/oauth/callback?state=unknown")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(callback.status(), StatusCode::BAD_REQUEST);
-
-        for (method, path) in [
-            (Method::GET, "/zones"),
-            (Method::GET, "/now_playing"),
-            (Method::POST, "/control"),
-            (Method::POST, "/mcp"),
-            (Method::POST, "/api/controller/bootstrap"),
-            (Method::GET, "/api/controller/status"),
-            (Method::POST, "/api/providers/spotify/configure"),
-            (Method::POST, "/api/providers/spotify/oauth/revoke"),
-            (Method::GET, "/api/providers/spotify/tunnel/status"),
-            (Method::GET, "/api/bridges/applemusic/status"),
-            (Method::GET, "/roon/status"),
-            (Method::GET, "/knob/now_playing"),
-        ] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(method)
-                        .uri(path)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                response.status(),
-                StatusCode::NOT_FOUND,
-                "{path} must be absent from the callback listener"
-            );
-        }
-
-        let wrong_method = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/providers/spotify/oauth/callback")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
-    }
-
-    /// Exercise the socket which `ssh -R` actually targets, rather than only
-    /// the in-process router.  The listener is bound to an ephemeral IPv4
-    /// loopback port and must expose exactly the same default-deny surface.
-    #[tokio::test]
-    async fn callback_only_listener_denies_main_routes_over_its_bound_socket() {
-        let (state, _dir) = tunnel_test_state(&callback_of(TUNNEL_A), TUNNEL_A).await;
-        let shutdown = CancellationToken::new();
-        let port = crate::api::spotify_callback_listener::spawn(state, shutdown.clone())
-            .await
-            .expect("callback listener starts");
-        let client = reqwest::Client::new();
-        let origin = format!("http://127.0.0.1:{port}");
-
-        let liveness = client
-            .get(format!("{origin}/healthz"))
-            .send()
-            .await
-            .expect("loopback liveness response");
-        assert_eq!(liveness.status(), StatusCode::NO_CONTENT);
-
-        for path in [
-            "/status",
-            "/zones",
-            "/api/providers/spotify/tunnel/status",
-            "/api/bridges/applemusic/status",
-            "/mcp",
-        ] {
-            let response = client
-                .get(format!("{origin}{path}"))
-                .send()
-                .await
-                .expect("loopback denial response");
-            assert_eq!(
-                response.status(),
-                StatusCode::NOT_FOUND,
-                "{path} must not be served on the tunnel socket"
-            );
-        }
-        shutdown.cancel();
-    }
-
-    #[tokio::test]
-    async fn tunnel_start_uses_only_the_callback_listener_port() {
-        let (mut state, _dir) = tunnel_test_state(&callback_of(TUNNEL_A), TUNNEL_A).await;
-        let ports = Arc::new(Mutex::new(Vec::new()));
-        // Preserve the configured state from the fixture and replace only its
-        // process launcher, avoiding every real-network path.
-        let mut auth = (*state.provider_auth).clone();
-        auth.spotify_tunnel = Arc::new(SpotifyTunnelManager::with_launcher(Arc::new(
-            RecordingTunnelLauncher {
-                url: TUNNEL_A.to_string(),
-                ports: ports.clone(),
-            },
-        )));
-        auth.bind_callback_port(19_417);
-        state.provider_auth = Arc::new(auth);
-
-        let _ = spotify_tunnel_start(State(state.clone())).await;
-        start_tunnel_and_wait_active(&state).await;
-        assert_eq!(*ports.lock().unwrap(), vec![19_417]);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn oauth_start_requires_a_paired_hiphi_installation_even_if_a_legacy_tunnel_is_live() {
-        let (state, _dir) = tunnel_test_state(&callback_of(TUNNEL_A), TUNNEL_A).await;
-        start_tunnel_and_wait_active(&state).await;
-        let error = oauth_start(State(state), Path("spotify".to_string()))
-            .await
-            .expect_err("a temporary callback tunnel must not bypass cloud pairing");
-        assert_eq!(error.0, StatusCode::PRECONDITION_REQUIRED);
-        assert_eq!(error.1 .0.code, "hiphi_cloud_required");
-    }
-
-    /// #592: a random probe of the public callback URL (internet scanner,
-    /// stale link, user double-checking the address) must not tear the
-    /// tunnel down while the user is still working in Spotify's dashboard.
-    #[tokio::test]
-    async fn callback_probe_with_unknown_state_leaves_the_tunnel_running() {
-        let (state, _dir) = tunnel_test_state(&callback_of(TUNNEL_A), TUNNEL_A).await;
-        start_tunnel_and_wait_active(&state).await;
-        let response = oauth_callback(
-            State(state.clone()),
-            Path("spotify".to_string()),
-            Query(OAuthCallbackQuery {
-                code: Some("whatever".to_string()),
-                state: "not-a-real-state-token".to_string(),
-                error: None,
-                error_description: None,
-                format: Some("json".to_string()),
-            }),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            matches!(
-                state.provider_auth.spotify_tunnel.status().await,
-                TunnelStatus::Active { .. }
-            ),
-            "an unknown-state probe must not kill the tunnel"
         );
     }
 }

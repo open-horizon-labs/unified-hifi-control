@@ -50,8 +50,6 @@ pub mod mqtt_bootstrap;
 pub mod mqtt_settings;
 pub mod music_details;
 pub mod provider_auth;
-pub mod spotify_callback_listener;
-pub mod spotify_tunnel;
 
 const MAX_REMOTE_ARTWORK_BYTES: usize = 10 * 1024 * 1024;
 
@@ -379,7 +377,6 @@ impl AppState {
         // server's own shutdown token in so a graceful shutdown kills it
         // too, instead of relying solely on the manual stop / OAuth
         // completion / lifetime-cap paths.
-        provider_auth.bind_shutdown(shutdown.clone());
         Self {
             roon,
             hqplayer,
