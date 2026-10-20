@@ -350,6 +350,9 @@ pub fn spawn_list_changed_notifier(
             }
             let settings = crate::api::load_app_settings();
             let current = list_resources_for_aggregator(&aggregator, &settings).await;
+            let Some(fingerprint) = list_fingerprint(&current) else {
+                continue;
+            };
             let mut baseline = baselines.inner.lock().await;
             if !baseline.active(&session_id, generation) {
                 break;
@@ -358,8 +361,10 @@ pub fn spawn_list_changed_notifier(
             if baseline.revision(&session_id) != revision_before {
                 continue;
             }
-            if baseline.needs_notification(&session_id, &list_fingerprint(&current)) {
-                let revision = baseline.claim(&session_id);
+            if baseline.needs_notification(&session_id, &fingerprint) {
+                let Some(revision) = baseline.claim(&session_id) else {
+                    continue;
+                };
                 drop(baseline);
                 // A transport may disappear or block. Bound the send and retain
                 // the served baseline so reconnect can recover on a later tick.
@@ -380,6 +385,9 @@ pub fn spawn_list_changed_notifier(
         baselines.inner.lock().await.remove(&session_id, generation);
     });
 }
+
+#[cfg(test)]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod tests {

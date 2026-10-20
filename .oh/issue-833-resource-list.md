@@ -40,3 +40,19 @@ Review / dissent: Sol requested atomic claims, revision checks, bounded sends an
 entry/task lifetimes, coherent settings reads, and transport-level regression tests.
 These are execution criteria. The reported Gemini SSE disconnect remains unproven
 and needs the reporter's client versions and timestamped transport logs.
+
+Risk checks:
+- False invalidations: the unchanged-projection wire test fails on unmodified v4.
+- Independent clients and refresh rearming: real two-session/SSE contract coverage.
+- Membership, rename, visibility and provider settings: full-list wire assertions.
+- Lost/early bus wakeups and settings edits: periodic comparison, not event payloads,
+  determines the advertisement; the wire test also edits settings without events.
+- Retry storm, blocked sends, shutdown, expiry and eviction/replacement races:
+  controlled-runtime tests exercise the production notifier loop with paused time.
+- Delayed failure after a newer serve: revision-state regression test.
+- False-negative notification tests: persistent SSE parser retains duplicates and
+  incomplete frames, with its own regression test.
+
+Sol's final review/dissent verdict: Continue / Proceed, no remaining blocking
+findings. Keep this scoped to invalidation correctness; a shared task scheduler or
+SDK session-store redesign is not needed to resolve #833.

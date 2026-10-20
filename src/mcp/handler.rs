@@ -140,12 +140,12 @@ impl ServerHandler for HifiMcpHandler {
         let resources =
             crate::mcp::resources::list_resources_for_aggregator(&self.state.aggregator, &settings)
                 .await;
-        if let Some(session_id) = runtime.session_id() {
+        if let (Some(session_id), Some(fingerprint)) = (
+            runtime.session_id(),
+            crate::mcp::baselines::list_fingerprint(&resources),
+        ) {
             let mut baselines = self.state.mcp_resource_baselines.inner.lock().await;
-            if let Some(generation) = baselines.served(
-                &session_id,
-                crate::mcp::baselines::list_fingerprint(&resources),
-            ) {
+            if let Some(generation) = baselines.served(&session_id, fingerprint) {
                 crate::mcp::resources::spawn_list_changed_notifier(
                     self.state.bus.clone(),
                     runtime,

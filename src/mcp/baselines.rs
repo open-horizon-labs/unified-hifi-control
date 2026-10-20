@@ -86,10 +86,10 @@ impl Baselines {
             .get(session)
             .is_some_and(|e| !e.invalidated && e.served != current)
     }
-    pub(crate) fn claim(&mut self, session: &str) -> u64 {
-        let entry = self.entries.get_mut(session).expect("active baseline");
+    pub(crate) fn claim(&mut self, session: &str) -> Option<u64> {
+        let entry = self.entries.get_mut(session)?;
         entry.invalidated = true;
-        entry.revision
+        Some(entry.revision)
     }
     pub(crate) fn send_failed(&mut self, session: &str, generation: u64, revision: u64) {
         if let Some(entry) = self.entries.get_mut(session) {
@@ -109,8 +109,12 @@ impl Baselines {
     }
 }
 
-pub fn list_fingerprint(resources: &[Resource]) -> String {
-    serde_json::to_string(resources).expect("resource advertisements serialize")
+pub fn list_fingerprint(resources: &[Resource]) -> Option<String> {
+    serde_json::to_string(resources)
+        .map_err(|error| {
+            tracing::warn!(%error, "Cannot compare MCP resource advertisements");
+        })
+        .ok()
 }
 
 #[cfg(test)]
@@ -123,7 +127,7 @@ mod tests {
         store.served("b", "new".into());
         assert!(store.needs_notification("a", "new"));
         assert!(!store.needs_notification("b", "new"));
-        store.claim("a");
+        assert!(store.claim("a").is_some());
         assert!(!store.needs_notification("a", "new"));
         assert!(!store.needs_notification("a", "third"));
         assert_eq!(store.entries["a"].served, "old");
@@ -156,9 +160,9 @@ mod race_tests {
     fn late_send_failure_cannot_rearm_a_newer_served_snapshot() {
         let mut store = Baselines::default();
         let generation = store.served("s", "a".into()).unwrap();
-        let revision = store.claim("s");
+        let revision = store.claim("s").unwrap();
         store.served("s", "b".into());
-        store.claim("s");
+        assert!(store.claim("s").is_some());
         store.send_failed("s", generation, revision);
         assert!(!store.needs_notification("s", "c"));
         assert_eq!(store.entries["s"].served, "b");
