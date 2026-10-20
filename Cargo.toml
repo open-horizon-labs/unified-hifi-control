@@ -15,6 +15,7 @@ server = [
     "dioxus/server",
     "dep:axum",
     "dep:tokio",
+    "dep:chacha20poly1305",
     "dep:tower",
     "dep:tower-http",
     "dep:roon-api",
@@ -101,8 +102,9 @@ async-trait = "0.1.92"
 # Base64 (shared)
 base64 = "0.23.1"
 
-# Authenticated encryption for provider credentials at rest
-chacha20poly1305 = "0.11"
+# Authenticated encryption for server-side provider credentials at rest.
+# Keep native entropy dependencies out of the browser feature graph.
+chacha20poly1305 = { version = "0.11", optional = true }
 
 # Dioxus UI primitives (shared - needed for SSR and client hydration)
 dioxus-primitives = { git = "https://github.com/DioxusLabs/components", version = "0.0.1", default-features = false, features = ["router"] }
