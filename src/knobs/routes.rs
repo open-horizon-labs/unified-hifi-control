@@ -228,7 +228,8 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
 pub struct NowPlayingQuery {
     pub zone_id: Option<String>,
     pub knob_id: Option<String>,
-    pub battery_level: Option<u8>,
+    /// Battery-less firmware reports -1; only 0..=100 reaches stored status.
+    pub battery_level: Option<i32>,
     pub battery_charging: Option<String>,
 }
 
@@ -332,7 +333,10 @@ pub async fn knob_now_playing_handler(
             )
             .await;
         volume_step_override = knob.config.volume_step_override;
-        let battery_level = params.battery_level.filter(|&level| level <= 100);
+        let battery_level = params
+            .battery_level
+            .filter(|level| (0..=100).contains(level))
+            .map(|level| level as u8);
         let battery_charging = params
             .battery_charging
             .as_ref()
