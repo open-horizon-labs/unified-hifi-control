@@ -64,7 +64,6 @@ WORKDIR /app
 # Install runtime dependencies (minimal - using rustls, no OpenSSL needed)
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    openssh-client \
     libvips-tools \
     && rm -rf /var/lib/apt/lists/*
 

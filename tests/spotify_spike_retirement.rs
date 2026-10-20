@@ -35,11 +35,13 @@ fn ssh_relay_spike_is_absent_not_merely_hidden() {
             );
         }
     }
-    let docker = std::fs::read_to_string(root.join("Dockerfile.release")).unwrap();
-    assert!(
-        !docker.contains("openssh-client"),
-        "do not ship SSH just for the retired spike"
-    );
+    for file in ["Dockerfile", "Dockerfile.ci", "Dockerfile.release"] {
+        let docker = std::fs::read_to_string(root.join(file)).unwrap();
+        assert!(
+            !docker.contains("openssh-client"),
+            "{file} must not ship SSH for the retired spike"
+        );
+    }
 }
 
 #[test]
