@@ -102,7 +102,7 @@ async-trait = "0.1.92"
 base64 = "0.22.1"
 
 # Authenticated encryption for provider credentials at rest
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 
 # Dioxus UI primitives (shared - needed for SSR and client hydration)
 dioxus-primitives = { git = "https://github.com/DioxusLabs/components", version = "0.0.1", default-features = false, features = ["router"] }
