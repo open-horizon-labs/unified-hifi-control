@@ -403,7 +403,7 @@ pub fn sanitize(document: &str) -> String {
             Ok(quick_xml::events::Event::GeneralRef(reference)) => {
                 if suppress_depth == 0 {
                     out.push('&');
-                    out.push_str(&reference.decode().unwrap_or_default());
+                    out.push_str(reference.as_ref());
                     out.push(';');
                 }
             }

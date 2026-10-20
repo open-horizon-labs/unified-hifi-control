@@ -4038,7 +4038,7 @@ fn the_sanitiser_emits_a_document_that_still_reparses() {
                 );
             }
             Ok(quick_xml::events::Event::GeneralRef(reference)) => {
-                let encoded = format!("&{};", reference.decode().expect("reference must decode"));
+                let encoded = format!("&{};", reference.as_ref());
                 text.push_str(
                     &quick_xml::escape::unescape(&encoded)
                         .expect("reference must unescape after sanitising"),
@@ -6584,7 +6584,7 @@ fn the_sanitiser_normalizes_entity_spelling_but_preserves_attribute_meaning() {
                 break e
                     .attributes()
                     .filter_map(Result::ok)
-                    .find(|a| a.key.as_ref() == b"song")
+                    .find(|a| a.key.as_ref() == "song")
                     .expect("song attribute")
                     .normalized_value(quick_xml::XmlVersion::Explicit1_0)
                     .expect("normalized value reparses")
