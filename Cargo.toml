@@ -82,7 +82,7 @@ urlencoding = "2"
 url = "2"
 
 # XML parsing (shared)
-quick-xml = { version = "0.41", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 
 # Logging (shared - tracing works in WASM)
 tracing = "0.1"
