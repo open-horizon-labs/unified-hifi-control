@@ -569,20 +569,11 @@ mod server {
             // The store refuses writes and keeps the file; device control continues unlinked.
             tracing::error!("Device links not loaded: {error}");
         }
-        // The SSH reverse tunnel receives a separate, loopback-only callback
-        // listener.  It must never forward to this main UHC listener: the
-        // latter intentionally serves many LAN routes that are not safe to
-        // publish merely because Spotify needs one callback (#641).
-        let spotify_callback_port =
-            api::spotify_callback_listener::spawn(state.clone(), shutdown_token.clone()).await?;
-        state
-            .provider_auth
-            .bind_callback_port(spotify_callback_port);
         if let Some(bootstrap_token) = state.controller_auth.take_bootstrap_secret().await {
             tracing::info!(
                 "UHC controller bootstrap token (display once; do not put it in a tunnel URL): {}. \
                  Paste it into the \"Owner setup required\" prompt shown the first time you save \
-                 provider settings (e.g. Spotify) or click Get an HTTPS address in Settings.",
+                 provider settings (e.g. Spotify) in Settings.",
                 bootstrap_token
             );
         }
@@ -922,9 +913,6 @@ mod server {
         let api_oauth_revoke = api::provider_auth::oauth_revoke;
         let api_provider_configure = api::provider_auth::configure_provider;
         let api_spotify_account = api::spotify_account_handler;
-        let api_spotify_tunnel_start = api::provider_auth::spotify_tunnel_start;
-        let api_spotify_tunnel_status = api::provider_auth::spotify_tunnel_status;
-        let api_spotify_tunnel_stop = api::provider_auth::spotify_tunnel_stop;
         let api_musicassistant_status = api::provider_auth::musicassistant_status;
         let api_bridge_pair = api::apple_bridge::pair;
         let api_bridge_discover_pairing = api::apple_bridge::discover_pairing;
@@ -968,9 +956,6 @@ mod server {
             .route("/api/providers/{provider}/oauth/revoke", post(api_oauth_revoke))
             .route("/api/providers/{provider}/configure", post(api_provider_configure))
             .route("/api/providers/spotify/account", get(api_spotify_account))
-            .route("/api/providers/spotify/tunnel/start", post(api_spotify_tunnel_start))
-            .route("/api/providers/spotify/tunnel/status", get(api_spotify_tunnel_status))
-            .route("/api/providers/spotify/tunnel/stop", post(api_spotify_tunnel_stop))
             .route("/api/providers/musicassistant/status", get(api_musicassistant_status))
             // MQTT/Home Assistant discovery publisher settings (#508)
             .route("/api/mqtt/status", get(api_mqtt_status))
