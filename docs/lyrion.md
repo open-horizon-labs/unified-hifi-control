@@ -131,12 +131,11 @@ Two things to know before extending the string:
 
 - **`A` returns several keys, not one.** Which keys depends on the roles present on
   the track, so treat it as a set.
-- **`artwork_track_id` requires `J`, which this adapter does not request.** The
-  artwork fallback chain in `get_player_status` reads `coverid` → `artwork_track_id`
-  → `id`, so its middle arm is currently unreachable and artwork falls through to
-  the track's own `id`. Adding `J` costs nothing on the wire but changes
-  `image_key` for tracks with no `coverid`, and `image_key` is client-visible — so
-  it is deliberately left alone rather than changed as a side effect. See #407.
+- **`artwork_track_id` requires `J`, which this adapter does not request.**
+  The artwork fallback uses `coverid` → `id`; the unreachable middle arm was
+  removed in #415. Adding `J` would change client-visible artwork identifiers
+  for tracks without a `coverid` and needs separate provider/client evidence.
+  The existing query and artwork identifier policy are unchanged.
 
 ### `mixer volume` is negative while muted
 

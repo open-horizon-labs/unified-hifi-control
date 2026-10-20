@@ -632,15 +632,10 @@ impl LmsRpc {
             }
         }
 
-        // NOTE (#407): the artwork_track_id arm never fires, because
-        // artwork_track_id is tag `J` and the tags string above does not request
-        // it - so artwork falls through to the track's own `id`. Adding `J` is
-        // free on the wire but would change image_key values for tracks with no
-        // coverid, and image_key is client-visible, so it is left alone here and
-        // flagged for #401/#403 rather than changed inside a defect fix.
+        // Only requested artwork fields participate: preserve coverid -> id.
+        // Adding J for album artwork is a separate, client-visible policy change.
         let artwork_id = playlist_loop
             .get("coverid")
-            .or_else(|| playlist_loop.get("artwork_track_id"))
             .or_else(|| playlist_loop.get("id"))
             .and_then(|v| {
                 // Try string first, then try numeric conversion
@@ -677,10 +672,8 @@ impl LmsRpc {
                 .get("playlist_tracks")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32,
-            playlist_cur_index: result
-                .get("playlist_cur_index")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as u32),
+            playlist_cur_index: lms_i64(result.get("playlist_cur_index"))
+                .and_then(|index| u32::try_from(index).ok()),
             time: result.get("time").and_then(|v| v.as_f64()).unwrap_or(0.0),
             duration: playlist_loop
                 .get("duration")
