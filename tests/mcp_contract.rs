@@ -7839,3 +7839,231 @@ async fn music_details_both_transports_refuse_late_context_for_changed_music() {
     }
     task.abort();
 }
+
+// #833: exercise the real session transport, including the quiet period that
+// distinguishes an unchanged listing from a merely throttled false hint.
+struct ResourceStream {
+    body: Body,
+    pending: String,
+}
+
+async fn resource_stream(app: &TestApp, session: &str) -> ResourceStream {
+    // SDK retirement is detected by its keep-alive, not immediately by Body drop.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let response = app
+                .router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/mcp")
+                        .header(header::ACCEPT, "text/event-stream")
+                        .header(MCP_SESSION_ID_HEADER, session)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if response.status() == axum::http::StatusCode::CONFLICT {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+            assert!(
+                response.status().is_success(),
+                "SSE status {}",
+                response.status()
+            );
+            return ResourceStream {
+                body: response.into_body(),
+                pending: String::new(),
+            };
+        }
+    })
+    .await
+    .expect("old SSE transport must be retired before reopening")
+}
+fn take_resource_hint(pending: &mut String) -> Option<Value> {
+    while let Some(end) = pending.find('\n') {
+        let line: String = pending.drain(..=end).collect();
+        if let Some(data) = line.strip_prefix("data:") {
+            if let Ok(value) = serde_json::from_str::<Value>(data.trim()) {
+                if value["method"] == "notifications/resources/list_changed" {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn resource_hint(stream: &mut ResourceStream, wait: Duration) -> Option<Value> {
+    use http_body_util::BodyExt;
+    tokio::time::timeout(wait, async {
+        loop {
+            if let Some(value) = take_resource_hint(&mut stream.pending) {
+                return value;
+            }
+            let frame = stream
+                .body
+                .frame()
+                .await
+                .expect("notification stream remains open")
+                .unwrap();
+            if let Ok(data) = frame.into_data() {
+                stream.pending.push_str(&String::from_utf8_lossy(&data));
+            }
+        }
+    })
+    .await
+    .ok()
+}
+
+#[test]
+fn resource_hint_parser_preserves_duplicates_and_partial_frames() {
+    let hint = "data: {\"method\":\"notifications/resources/list_changed\"}\n\n";
+    let mut pending = format!("{hint}{hint}data: {{");
+    assert!(take_resource_hint(&mut pending).is_some());
+    assert!(take_resource_hint(&mut pending).is_some());
+    assert!(take_resource_hint(&mut pending).is_none());
+    assert_eq!(pending, "data: {");
+    pending.push_str("\"method\":\"notifications/resources/list_changed\"}\n");
+    assert!(take_resource_hint(&mut pending).is_some());
+}
+async fn session_resource_list(app: &TestApp, session: &str) -> Value {
+    let (_, response) = app
+        .post(
+            Some(session),
+            json!({"jsonrpc":"2.0","id":833,"method":"resources/list"}),
+        )
+        .await;
+    response.unwrap()["result"].clone()
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn resource_list_notifications_follow_each_sessions_served_snapshot() {
+    use unified_hifi_control::bus::BusEvent;
+    let _settings = SettingsFixture::with_hqplayer(false);
+    let bus = create_bus();
+    let state = build_state_with_bus(bus.clone(), None, None).await;
+    let aggregator = state.aggregator.clone();
+    let running = tokio::spawn(async move { aggregator.run().await });
+    seed_zone(&bus, &state, "roon:kitchen", "Kitchen").await;
+    let app = TestApp::with_state(state.clone());
+    let (a, _) = app.initialize().await;
+    let mut stream_a = resource_stream(&app, &a).await;
+    let original = session_resource_list(&app, &a).await;
+    for i in 1..=18 {
+        let mut zone = state.aggregator.get_zone("roon:kitchen").await.unwrap();
+        zone.last_updated = i;
+        zone.state = unified_hifi_control::bus::PlaybackState::Playing;
+        bus.publish(BusEvent::ZoneDiscovered { zone });
+    }
+    // More than one reconciliation interval: timing suppression alone fails.
+    assert!(resource_hint(&mut stream_a, Duration::from_millis(1200))
+        .await
+        .is_none());
+    assert_eq!(session_resource_list(&app, &a).await, original);
+
+    seed_zone(&bus, &state, "roon:study", "Study").await;
+    assert!(resource_hint(&mut stream_a, Duration::from_secs(3))
+        .await
+        .is_some());
+    // Client A has not re-listed: content updates and further discovery coalesce.
+    seed_zone(&bus, &state, "roon:attic", "Attic").await;
+    assert!(resource_hint(&mut stream_a, Duration::from_millis(1100))
+        .await
+        .is_none());
+    let (b, _) = app.initialize().await;
+    let mut stream_b = resource_stream(&app, &b).await;
+    let fresh_b = session_resource_list(&app, &b).await;
+    assert_eq!(fresh_b["resources"].as_array().unwrap().len(), 5);
+    assert!(resource_hint(&mut stream_b, Duration::from_millis(1100))
+        .await
+        .is_none());
+    assert_eq!(session_resource_list(&app, &a).await, fresh_b);
+
+    // Provider rename preserves membership but changes advertised metadata.
+    let mut renamed = state.aggregator.get_zone("roon:kitchen").await.unwrap();
+    renamed.zone_name = "New Kitchen".into();
+    bus.publish(BusEvent::ZoneDiscovered { zone: renamed });
+    assert!(resource_hint(&mut stream_a, Duration::from_secs(3))
+        .await
+        .is_some());
+    assert!(resource_hint(&mut stream_b, Duration::from_secs(3))
+        .await
+        .is_some());
+    let renamed_list = session_resource_list(&app, &a).await;
+    assert!(renamed_list["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["title"] == "Now playing: New Kitchen"));
+
+    // Policy changes without bus events (bind-mounted settings edits) still reconcile.
+    let settings_path = _settings._dir.path().join("app-settings.json");
+    let mut settings: Value =
+        serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+    settings["hidden_zones"] = json!(["roon:study"]);
+    settings["adapters"]["hqplayer"] = json!(true);
+    std::fs::write(&settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert!(resource_hint(&mut stream_a, Duration::from_secs(3))
+        .await
+        .is_some());
+    let policy_list = session_resource_list(&app, &a).await;
+    assert!(!policy_list["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["uri"] == "hifi://zones/roon:study"));
+    assert!(policy_list["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["uri"] == "hifi://hqplayer/status"));
+
+    bus.publish(BusEvent::ZoneRemoved {
+        zone_id: unified_hifi_control::bus::PrefixedZoneId::roon("attic"),
+    });
+    assert!(resource_hint(&mut stream_a, Duration::from_secs(3))
+        .await
+        .is_some());
+    assert_eq!(
+        session_resource_list(&app, &a).await["resources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    // Dropping a stream does not delete the logical session. Re-listing returns
+    // the complete current set and the same notifier can use a reopened stream.
+    drop(stream_a);
+    assert_eq!(
+        session_resource_list(&app, &a).await["resources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    settings["hidden_zones"] = json!([]);
+    std::fs::write(&settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+    let mut reopened = resource_stream(&app, &a).await;
+    // No replay is promised: returning clients fetch the complete current set.
+    assert_eq!(
+        session_resource_list(&app, &a).await["resources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
+    settings["adapters"]["hqplayer"] = json!(false);
+    std::fs::write(&settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert!(resource_hint(&mut reopened, Duration::from_secs(3))
+        .await
+        .is_some());
+    let recovered = session_resource_list(&app, &a).await;
+    assert_eq!(recovered["resources"].as_array().unwrap().len(), 4);
+    state.shutdown.cancel();
+    bus.publish(BusEvent::ShuttingDown { reason: None });
+    running.await.unwrap();
+}

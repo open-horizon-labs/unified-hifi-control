@@ -299,6 +299,8 @@ pub struct AppState {
     /// constructor parameter -- like `sse_connections` above -- so every
     /// existing `AppState::new` call site is untouched by this addition.
     pub mcp_refs: crate::mcp::refs::RefTable,
+    /// Bounded per-session served resource lists and pending invalidations (#833).
+    pub mcp_resource_baselines: Arc<crate::mcp::baselines::McpResourceBaselines>,
     /// Durable provider-private collection identities behind canonical
     /// `/library/<source>/<view>/loc_…` URLs. Unlike `mcp_refs`, these survive
     /// process and provider-session restarts.
@@ -406,6 +408,7 @@ impl AppState {
             shutdown,
             sse_connections: Arc::new(AtomicUsize::new(0)),
             mcp_refs: crate::mcp::refs::RefTable::new(),
+            mcp_resource_baselines: Arc::new(crate::mcp::baselines::McpResourceBaselines::default()),
             collection_locations:
                 crate::mcp::collection_locations::CollectionLocationStore::default(),
             collection_location_keys: std::sync::Arc::new(
