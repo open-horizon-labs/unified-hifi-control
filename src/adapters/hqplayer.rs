@@ -331,17 +331,15 @@ pub mod framing {
             match reader.read_event() {
                 Ok(Event::Start(e)) => {
                     start.get_or_insert(before);
-                    open.push(String::from_utf8_lossy(e.name().as_ref()).into_owned());
+                    open.push(e.name().as_ref().to_owned());
                 }
                 Ok(Event::End(e)) => {
                     let name = e.name();
-                    let closing = String::from_utf8_lossy(name.as_ref());
+                    let closing = name.as_ref();
                     match open.pop() {
                         // Depth counting alone accepts `<State …></Status>`: one element opened and
                         // one closed. Comparing names is what makes that a rejection.
-                        Some(expected) if expected.as_str() != closing.as_ref() => {
-                            return Scan::Malformed
-                        }
+                        Some(expected) if expected.as_str() != closing => return Scan::Malformed,
                         // A closing tag with nothing open: the leftover tail of a document that a
                         // previous read truncated. Never a valid document on its own.
                         None => return Scan::Malformed,
@@ -643,7 +641,7 @@ pub mod framing {
         loop {
             match reader.read_event() {
                 Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                    return Some(String::from_utf8_lossy(e.name().as_ref()).into_owned())
+                    return Some(e.name().as_ref().to_owned())
                 }
                 Ok(Event::Eof) | Err(_) => return None,
                 Ok(_) => {}

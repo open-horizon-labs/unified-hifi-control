@@ -112,9 +112,12 @@ impl EncryptedCredentialStore {
         let ciphertext = URL_SAFE_NO_PAD
             .decode(envelope.ciphertext)
             .context("Spotify credential ciphertext is invalid")?;
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
+        let cipher = ChaCha20Poly1305::new(&Key::from(self.key));
         let plaintext = cipher
-            .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext.as_ref())
+            .decrypt(
+                &Nonce::try_from(nonce_bytes.as_slice())?,
+                ciphertext.as_ref(),
+            )
             .map_err(|_| anyhow!("Spotify credential decryption failed"))?;
         serde_json::from_slice(&plaintext)
             .map_err(|error| anyhow!("Spotify credential payload is invalid: {error}"))
@@ -146,9 +149,9 @@ impl EncryptedCredentialStore {
         let plaintext = serde_json::to_vec(record).context("serialize Spotify credentials")?;
         let mut nonce_bytes = [0_u8; NONCE_BYTES];
         OsRng.fill_bytes(&mut nonce_bytes);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
+        let cipher = ChaCha20Poly1305::new(&Key::from(self.key));
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_ref())
+            .encrypt(&Nonce::from(nonce_bytes), plaintext.as_ref())
             .map_err(|_| anyhow!("encrypt Spotify credentials"))?;
         let envelope = EncryptedEnvelope {
             version: 1,
@@ -272,8 +275,8 @@ impl MusicAssistantCredentialStore {
         let ciphertext = URL_SAFE_NO_PAD
             .decode(envelope.ciphertext)
             .context("Music Assistant credential ciphertext is invalid")?;
-        let plaintext = ChaCha20Poly1305::new(Key::from_slice(&self.key))
-            .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+        let plaintext = ChaCha20Poly1305::new(&Key::from(self.key))
+            .decrypt(&Nonce::try_from(nonce.as_slice())?, ciphertext.as_ref())
             .map_err(|_| anyhow!("Music Assistant credential decryption failed"))?;
         serde_json::from_slice(&plaintext)
             .map_err(|error| anyhow!("Music Assistant credential payload is invalid: {error}"))
@@ -289,8 +292,8 @@ impl MusicAssistantCredentialStore {
             serde_json::to_vec(record).context("serialize Music Assistant credentials")?;
         let mut nonce = [0_u8; NONCE_BYTES];
         OsRng.fill_bytes(&mut nonce);
-        let ciphertext = ChaCha20Poly1305::new(Key::from_slice(&self.key))
-            .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
+        let ciphertext = ChaCha20Poly1305::new(&Key::from(self.key))
+            .encrypt(&Nonce::from(nonce), plaintext.as_ref())
             .map_err(|_| anyhow!("encrypt Music Assistant credentials"))?;
         let encoded = serde_json::to_vec(&EncryptedEnvelope {
             version: 1,
@@ -447,8 +450,8 @@ impl MqttCredentialStore {
         let ciphertext = URL_SAFE_NO_PAD
             .decode(envelope.ciphertext)
             .context("MQTT credential ciphertext is invalid")?;
-        let plaintext = ChaCha20Poly1305::new(Key::from_slice(&self.key))
-            .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+        let plaintext = ChaCha20Poly1305::new(&Key::from(self.key))
+            .decrypt(&Nonce::try_from(nonce.as_slice())?, ciphertext.as_ref())
             .map_err(|_| anyhow!("MQTT credential decryption failed"))?;
         serde_json::from_slice(&plaintext)
             .map_err(|error| anyhow!("MQTT credential payload is invalid: {error}"))
@@ -463,8 +466,8 @@ impl MqttCredentialStore {
         let plaintext = serde_json::to_vec(record).context("serialize MQTT credentials")?;
         let mut nonce = [0_u8; NONCE_BYTES];
         OsRng.fill_bytes(&mut nonce);
-        let ciphertext = ChaCha20Poly1305::new(Key::from_slice(&self.key))
-            .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
+        let ciphertext = ChaCha20Poly1305::new(&Key::from(self.key))
+            .encrypt(&Nonce::from(nonce), plaintext.as_ref())
             .map_err(|_| anyhow!("encrypt MQTT credentials"))?;
         let encoded = serde_json::to_vec(&EncryptedEnvelope {
             version: 1,
@@ -557,8 +560,8 @@ impl AppleBridgeCredentialStore {
         if nonce.len() != NONCE_BYTES {
             return Err(anyhow!("Apple bridge nonce has an invalid length"));
         }
-        let plaintext = ChaCha20Poly1305::new(Key::from_slice(&self.key))
-            .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+        let plaintext = ChaCha20Poly1305::new(&Key::from(self.key))
+            .decrypt(&Nonce::try_from(nonce.as_slice())?, ciphertext.as_ref())
             .map_err(|_| anyhow!("Apple bridge credential decryption failed"))?;
         serde_json::from_slice(&plaintext)
             .map_err(|error| anyhow!("Apple bridge credential payload is invalid: {error}"))
@@ -574,8 +577,8 @@ impl AppleBridgeCredentialStore {
             serde_json::to_vec(records).context("serialize Apple bridge credentials")?;
         let mut nonce = [0_u8; NONCE_BYTES];
         OsRng.fill_bytes(&mut nonce);
-        let ciphertext = ChaCha20Poly1305::new(Key::from_slice(&self.key))
-            .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
+        let ciphertext = ChaCha20Poly1305::new(&Key::from(self.key))
+            .encrypt(&Nonce::from(nonce), plaintext.as_ref())
             .map_err(|_| anyhow!("encrypt Apple bridge credentials"))?;
         let envelope = EncryptedEnvelope {
             version: 1,
