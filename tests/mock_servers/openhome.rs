@@ -73,8 +73,11 @@ impl MockOpenHomeDevice {
         let app = Router::new()
             .route("/description.xml", get(handle_description))
             .route("/Transport/control", post(handle_transport))
+            .route("/Transport", post(handle_transport))
             .route("/Volume/control", post(handle_volume))
+            .route("/Volume", post(handle_volume))
             .route("/Info/control", post(handle_info))
+            .route("/Info", post(handle_info))
             .with_state(state.clone());
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
