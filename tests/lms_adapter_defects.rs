@@ -828,9 +828,8 @@ fn docs_tag_legend_matches_recorded_response() {
         track.get("albumartist").is_some() || track.get("trackartist").is_some(),
         "tag `A` yields per-role contributor keys such as albumartist/trackartist"
     );
-    // `J` (artwork_track_id) is not requested either — which is why the
-    // artwork_track_id fallback in get_player_status is dead. Documented, not
-    // silently changed: see the PR body.
+    // J is deliberately not requested: #415 removes the unreachable fallback
+    // rather than changing client-visible artwork identifiers.
     assert!(
         track.get("artwork_track_id").is_none(),
         "tags:aAdltKc does not request `J`, so artwork_track_id is never present"
@@ -902,4 +901,22 @@ fn fixtures_are_recorded_not_authored() {
         counted.load(Ordering::Relaxed) >= 8,
         "expected the recorded LMS fixture set to be present"
     );
+}
+
+#[tokio::test]
+#[serial_test::serial(lms_config)]
+async fn status_preserves_recorded_string_playlist_index() {
+    clear_lms_config();
+    let server = ReplayServer::start("players_no_playerprefs", "status_tags_aAdltKc", None).await;
+    let (bus, _rx) = test_bus();
+    let adapter = configured_adapter(bus, server.addr()).await;
+    let player = adapter.get_player_status("fixture-player").await.unwrap();
+    assert_eq!(
+        player.playlist_cur_index,
+        Some(0),
+        "live LMS emits the index as a string"
+    );
+    assert_eq!(player.artwork_track_id.as_deref(), Some("1"));
+    assert_eq!(player.coverid.as_deref(), Some("1"));
+    server.stop();
 }
