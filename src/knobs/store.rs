@@ -14,7 +14,10 @@ use std::fs;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::config::{get_config_file_path, read_config_file};
+use crate::config::{get_config_dir, get_config_file_path};
+use anyhow::{Context, Result};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 const KNOBS_FILE: &str = "knobs.json";
 
@@ -154,6 +157,8 @@ fn compute_sha(config: &KnobConfig, name: &str) -> String {
 #[derive(Clone)]
 pub struct KnobStore {
     knobs: Arc<RwLock<HashMap<String, Knob>>>,
+    path: Arc<PathBuf>,
+    load_failed: bool,
 }
 
 impl Default for KnobStore {
@@ -166,38 +171,128 @@ impl KnobStore {
     /// Create new store, loading existing knobs from disk
     /// Issue #76: Uses config subdirectory for knobs.json
     pub fn new() -> Self {
-        let knobs = Self::load_from_disk();
+        // Resolve once: a running store must never switch storage directories.
+        let path = get_config_file_path(KNOBS_FILE);
+        let loaded = Self::load_from_disk(&path, &get_config_dir().join(KNOBS_FILE));
+        let load_failed = loaded.is_err();
+        let knobs = loaded.unwrap_or_else(|error| {
+            tracing::error!(path = %path.display(), %error,
+                "Controller settings could not be loaded; refusing writes and default registration. Restore the file/access and restart the bridge");
+            HashMap::new()
+        });
+        tracing::info!(path = %path.display(), controllers = knobs.len(), load_failed,
+            "Controller settings storage initialized");
         Self {
             knobs: Arc::new(RwLock::new(knobs)),
+            path: Arc::new(path),
+            load_failed,
         }
     }
 
-    /// Load knobs from disk with backwards-compatible fallback
-    /// Issue #76: Uses read_config_file to check subdir first, fall back to root
-    fn load_from_disk() -> HashMap<String, Knob> {
-        // read_config_file checks subdir first, falls back to root for legacy files
-        if let Some(content) = read_config_file(KNOBS_FILE) {
-            if let Ok(knobs) = serde_json::from_str(&content) {
-                return knobs;
+    fn load_from_disk(path: &Path, legacy: &Path) -> Result<HashMap<String, Knob>> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => match fs::read(legacy) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(HashMap::new());
+                }
+                Err(error) => return Err(error).context("read legacy controller settings"),
+            },
+            Err(error) => return Err(error).context("read controller settings"),
+        };
+        serde_json::from_slice(&bytes).map_err(|error| {
+            // Never include configuration contents in diagnostics.
+            anyhow::anyhow!(
+                "invalid controller settings JSON at line {}, column {}",
+                error.line(),
+                error.column()
+            )
+        })
+    }
+
+    fn ensure_loaded(&self) -> Result<()> {
+        anyhow::ensure!(!self.load_failed,
+            "controller settings were not loaded; restore storage access/file and restart the bridge");
+        Ok(())
+    }
+
+    /// Called under the store's exclusive lock, so snapshots cannot overtake
+    /// each other. A same-directory temporary file keeps the previous record
+    /// intact until a complete, synced replacement can be atomically renamed.
+    fn save_to_disk(
+        &self,
+        current: &mut HashMap<String, Knob>,
+        candidate: HashMap<String, Knob>,
+    ) -> Result<()> {
+        self.save_with_sync(current, candidate, |_parent| {
+            #[cfg(unix)]
+            fs::File::open(_parent)?.sync_all()?;
+            Ok(())
+        })
+    }
+
+    fn save_with_sync(
+        &self,
+        current: &mut HashMap<String, Knob>,
+        candidate: HashMap<String, Knob>,
+        sync_directory: impl Fn(&Path) -> Result<()>,
+    ) -> Result<()> {
+        let result = (|| -> Result<()> {
+            self.ensure_loaded()?;
+            let parent = self
+                .path
+                .parent()
+                .context("controller settings path has no parent")?;
+            fs::create_dir_all(parent).context("create controller settings directory")?;
+            // Repeat ancestor syncs on retries too: an earlier attempt may have
+            // created a directory but failed to commit its entry. Settings writes
+            // are infrequent; avoid a second state machine for pending syncs.
+            #[cfg(unix)]
+            {
+                let mut ancestor = parent.parent();
+                while let Some(directory) = ancestor {
+                    let directory = if directory.as_os_str().is_empty() {
+                        Path::new(".")
+                    } else {
+                        directory
+                    };
+                    fs::File::open(directory)?
+                        .sync_all()
+                        .context("sync controller settings ancestor directory")?;
+                    ancestor = if directory == Path::new(".") {
+                        None
+                    } else {
+                        directory.parent()
+                    };
+                }
             }
+            let json =
+                serde_json::to_vec_pretty(&candidate).context("encode controller settings")?;
+            let mut temporary = tempfile::NamedTempFile::new_in(parent)
+                .context("create controller settings replacement")?;
+            temporary
+                .write_all(&json)
+                .context("write controller settings replacement")?;
+            temporary
+                .as_file()
+                .sync_all()
+                .context("sync controller settings replacement")?;
+            temporary
+                .persist(self.path.as_ref())
+                .map_err(|error| error.error)
+                .context("replace controller settings")?;
+            // Rename installed this snapshot even if the following durability check
+            // fails. Keep memory aligned; report the uncertain durability to callers.
+            *current = candidate;
+            sync_directory(parent).context("sync controller settings directory")?;
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            tracing::error!(path = %self.path.display(), error = %format!("{error:#}"),
+                "Controller settings were not durably saved; check directory, permissions and disk space");
         }
-        HashMap::new()
-    }
-
-    /// Save knobs to disk in the config subdirectory
-    /// Issue #76: Always writes to unified-hifi/ subdirectory
-    async fn save_to_disk(&self) {
-        let knobs = self.knobs.read().await;
-        let path = get_config_file_path(KNOBS_FILE);
-
-        // Ensure directory exists
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-
-        if let Ok(json) = serde_json::to_string_pretty(&*knobs) {
-            let _ = fs::write(path, json);
-        }
+        result
     }
 
     /// Get knob by ID
@@ -207,7 +302,7 @@ impl KnobStore {
     }
 
     /// Legacy requests keep the device identity previously observed from explicit headers.
-    pub async fn get_or_create(&self, knob_id: &str, version: Option<&str>) -> Knob {
+    pub async fn get_or_create(&self, knob_id: &str, version: Option<&str>) -> Result<Knob> {
         self.get_or_create_with_device_type(knob_id, version, None)
             .await
     }
@@ -218,10 +313,13 @@ impl KnobStore {
         knob_id: &str,
         version: Option<&str>,
         device_type: Option<&str>,
-    ) -> Knob {
+    ) -> Result<Knob> {
+        self.ensure_loaded()?;
         let identity = device_type.and_then(crate::firmware_catalog::FirmwareTarget::parse);
         let mut knobs = self.knobs.write().await;
         if let Some(knob) = knobs.get_mut(knob_id) {
+            let old_version = knob.version.clone();
+            let old_identity = knob.device_type.clone();
             knob.last_seen = Utc::now();
             if let Some(v) = version {
                 knob.version = Some(v.to_string());
@@ -230,9 +328,14 @@ impl KnobStore {
                 knob.device_type = target.slug().to_string();
             }
             let result = knob.clone();
-            drop(knobs);
-            self.save_to_disk().await;
-            return result;
+            let identity_changed = old_version != knob.version || old_identity != knob.device_type;
+            // Routine polls remain memory-only. Persist newly observed identity,
+            // without preventing service of a known config on storage failure.
+            if identity_changed {
+                let candidate = knobs.clone();
+                let _ = self.save_to_disk(&mut knobs, candidate);
+            }
+            return Ok(result);
         }
         // Identity must not silently rewrite a user's power/display configuration.
         let config = KnobConfig::default();
@@ -248,11 +351,11 @@ impl KnobStore {
             config_sha,
             status: KnobStatus::default(),
         };
-        knobs.insert(knob_id.to_string(), knob.clone());
-        drop(knobs);
-        self.save_to_disk().await;
+        let mut candidate = knobs.clone();
+        candidate.insert(knob_id.to_string(), knob.clone());
+        self.save_to_disk(&mut knobs, candidate)?;
         tracing::info!("Created new knob: {}", knob_id);
-        knob
+        Ok(knob)
     }
 
     /// Update knob status (battery, zone, IP)
@@ -275,15 +378,21 @@ impl KnobStore {
             knob.last_seen = Utc::now();
         }
 
-        drop(knobs);
-        self.save_to_disk().await;
+        // Runtime telemetry is intentionally volatile, not a durable settings change.
     }
 
     /// Update knob configuration
-    pub async fn update_config(&self, knob_id: &str, updates: KnobConfigUpdate) -> Option<Knob> {
+    pub async fn update_config(
+        &self,
+        knob_id: &str,
+        updates: KnobConfigUpdate,
+    ) -> Result<Option<Knob>> {
+        self.ensure_loaded()?;
         let mut knobs = self.knobs.write().await;
-
-        let knob = knobs.get_mut(knob_id)?;
+        let mut candidate = knobs.clone();
+        let Some(knob) = candidate.get_mut(knob_id) else {
+            return Ok(None);
+        };
 
         if let Some(name) = updates.name {
             knob.name = name;
@@ -340,15 +449,14 @@ impl KnobStore {
         knob.last_seen = Utc::now();
 
         let result = knob.clone();
-        drop(knobs);
-        self.save_to_disk().await;
+        self.save_to_disk(&mut knobs, candidate)?;
 
         tracing::info!(
             "Updated knob config: {} (sha: {})",
             knob_id,
             result.config_sha
         );
-        Some(result)
+        Ok(Some(result))
     }
 
     /// List all registered knobs
@@ -387,16 +495,16 @@ impl KnobStore {
     /// Remove a registered knob entirely. Returns `true` if a knob with this
     /// id existed. Callers (e.g. the MQTT publisher) are responsible for
     /// retracting any Home Assistant discovery configs they published for it.
-    pub async fn remove(&self, knob_id: &str) -> bool {
-        let removed = {
-            let mut knobs = self.knobs.write().await;
-            knobs.remove(knob_id).is_some()
-        };
-        if removed {
-            self.save_to_disk().await;
-            tracing::info!("Removed knob: {}", knob_id);
+    pub async fn remove(&self, knob_id: &str) -> Result<bool> {
+        self.ensure_loaded()?;
+        let mut knobs = self.knobs.write().await;
+        let mut candidate = knobs.clone();
+        if candidate.remove(knob_id).is_none() {
+            return Ok(false);
         }
-        removed
+        self.save_to_disk(&mut knobs, candidate)?;
+        tracing::info!("Removed knob: {}", knob_id);
+        Ok(true)
     }
 }
 
@@ -442,4 +550,59 @@ pub struct KnobSummary {
     pub last_seen: DateTime<Utc>,
     pub version: Option<String>,
     pub status: KnobStatus,
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[test]
+    fn relative_storage_path_supports_new_directory_entries() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let relative = directory
+            .path()
+            .strip_prefix(std::env::current_dir().unwrap())
+            .unwrap();
+        assert!(relative.is_relative());
+        let store = KnobStore {
+            knobs: Arc::new(RwLock::new(HashMap::new())),
+            path: Arc::new(relative.join("new/nested/knobs.json")),
+            load_failed: false,
+        };
+        store
+            .save_to_disk(&mut HashMap::new(), HashMap::new())
+            .unwrap();
+        assert_eq!(fs::read(store.path.as_ref()).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn failed_directory_sync_keeps_memory_aligned_with_installed_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = KnobStore {
+            knobs: Arc::new(RwLock::new(HashMap::new())),
+            path: Arc::new(directory.path().join("knobs.json")),
+            load_failed: false,
+        };
+        let mut current = HashMap::new();
+        let candidate = HashMap::from([(
+            "dial".into(),
+            Knob {
+                device_type: "knob".into(),
+                name: "Installed".into(),
+                last_seen: Utc::now(),
+                version: None,
+                config: KnobConfig::default(),
+                config_sha: "test".into(),
+                status: KnobStatus::default(),
+            },
+        )]);
+        let result = store.save_with_sync(&mut current, candidate, |_| {
+            anyhow::bail!("injected post-rename directory sync failure")
+        });
+        assert!(result.is_err());
+        let disk: HashMap<String, Knob> =
+            serde_json::from_slice(&fs::read(store.path.as_ref()).unwrap()).unwrap();
+        assert_eq!(current["dial"].name, disk["dial"].name);
+        assert_eq!(current["dial"].name, "Installed");
+    }
 }
