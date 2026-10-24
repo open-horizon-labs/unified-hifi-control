@@ -44,6 +44,7 @@ server = [
     "dep:rustls",
     "dep:ed25519-dalek",
     "dep:uuid",
+    "dep:chacha20poly1305",
     "dep:rustix",
 ]
 # UHC-owned NAA relay for HQPlayer output routing. Server builds include it by default; use
@@ -102,7 +103,7 @@ async-trait = "0.1.92"
 base64 = "0.23.1"
 
 # Authenticated encryption for provider credentials at rest
-chacha20poly1305 = "0.11"
+chacha20poly1305 = { version = "0.11", optional = true }
 
 # Dioxus UI primitives (shared - needed for SSR and client hydration)
 dioxus-primitives = { git = "https://github.com/DioxusLabs/components", version = "0.0.1", default-features = false, features = ["router"] }
