@@ -405,7 +405,7 @@ fn artwork_attention_runtime_is_shipped_and_exercised_in_workspace_ci() {
     for name in ["Dockerfile.release", "Dockerfile.ci"] {
         let source = fs::read_to_string(root.join(name)).unwrap();
         assert!(
-            source.contains("apk add --no-cache ca-certificates openssh-client vips-tools"),
+            source.contains("apk add --no-cache ca-certificates vips-tools"),
             "{name} needs vips at runtime"
         );
     }

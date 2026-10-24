@@ -15,6 +15,7 @@ server = [
     "dioxus/server",
     "dep:axum",
     "dep:tokio",
+    "dep:chacha20poly1305",
     "dep:tower",
     "dep:tower-http",
     "dep:roon-api",
@@ -82,7 +83,7 @@ urlencoding = "2"
 url = "2"
 
 # XML parsing (shared)
-quick-xml = { version = "0.41", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 
 # Logging (shared - tracing works in WASM)
 tracing = "0.1"
@@ -101,8 +102,9 @@ async-trait = "0.1.92"
 # Base64 (shared)
 base64 = "0.23.1"
 
-# Authenticated encryption for provider credentials at rest
-chacha20poly1305 = "0.11"
+# Authenticated encryption for server-side provider credentials at rest.
+# Keep native entropy dependencies out of the browser feature graph.
+chacha20poly1305 = { version = "0.11", optional = true }
 
 # Dioxus UI primitives (shared - needed for SSR and client hydration)
 dioxus-primitives = { git = "https://github.com/DioxusLabs/components", version = "0.0.1", default-features = false, features = ["router"] }
@@ -112,7 +114,7 @@ dioxus-primitives = { git = "https://github.com/DioxusLabs/components", version 
 
 # Web framework (server only)
 axum = { version = "0.8", features = ["macros"], optional = true }
-tokio = { version = "1", features = ["full"], optional = true }
+tokio = { version = "1.54", features = ["full"], optional = true }
 tower = { version = "0.5", optional = true }
 tower-http = { version = "0.7", features = ["cors", "compression-gzip", "trace"], optional = true }
 
@@ -176,7 +178,7 @@ ed25519-dalek = { version = "2.2", features = ["rand_core"], optional = true }
 # NAA relay core for HQPlayer output routing (server only). roxmltree gives byte ranges for
 # exact in-place control-line splicing; socket2 replaces the PoC's libc setsockopt calls because
 # this crate denies unsafe code.
-roxmltree = { version = "0.20", optional = true }
+roxmltree = { version = "0.21", optional = true }
 socket2 = { version = "0.6", features = ["all"], optional = true }
 
 # ============ WEB-ONLY DEPENDENCIES ============
@@ -235,7 +237,7 @@ tempfile = "3"
 # In-process MQTT broker for tests/mqtt_integration.rs (issue #508). Pure-Rust,
 # embeddable, and wire-compatible with the `rumqttc` client used by the publisher -
 # this is the "mock/in-process broker" the issue's acceptance criteria calls for.
-rumqttd = { version = "0.19", default-features = false }
+rumqttd = { version = "0.20", default-features = false }
 
 [profile.dev]
 # Keep file/line backtraces without full variable and type debug information.

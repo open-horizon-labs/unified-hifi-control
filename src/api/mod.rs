@@ -50,8 +50,6 @@ pub mod mqtt_bootstrap;
 pub mod mqtt_settings;
 pub mod music_details;
 pub mod provider_auth;
-pub mod spotify_callback_listener;
-pub mod spotify_tunnel;
 
 const MAX_REMOTE_ARTWORK_BYTES: usize = 10 * 1024 * 1024;
 
@@ -299,6 +297,8 @@ pub struct AppState {
     /// constructor parameter -- like `sse_connections` above -- so every
     /// existing `AppState::new` call site is untouched by this addition.
     pub mcp_refs: crate::mcp::refs::RefTable,
+    /// Bounded per-session served resource lists and pending invalidations (#833).
+    pub mcp_resource_baselines: Arc<crate::mcp::baselines::McpResourceBaselines>,
     /// Durable provider-private collection identities behind canonical
     /// `/library/<source>/<view>/loc_…` URLs. Unlike `mcp_refs`, these survive
     /// process and provider-session restarts.
@@ -379,7 +379,6 @@ impl AppState {
         // server's own shutdown token in so a graceful shutdown kills it
         // too, instead of relying solely on the manual stop / OAuth
         // completion / lifetime-cap paths.
-        provider_auth.bind_shutdown(shutdown.clone());
         Self {
             roon,
             hqplayer,
@@ -406,6 +405,7 @@ impl AppState {
             shutdown,
             sse_connections: Arc::new(AtomicUsize::new(0)),
             mcp_refs: crate::mcp::refs::RefTable::new(),
+            mcp_resource_baselines: Arc::new(crate::mcp::baselines::McpResourceBaselines::default()),
             collection_locations:
                 crate::mcp::collection_locations::CollectionLocationStore::default(),
             collection_location_keys: std::sync::Arc::new(

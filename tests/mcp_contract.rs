@@ -1211,20 +1211,15 @@ async fn get_and_delete_are_wired_and_session_aware() {
         "DELETE with a valid session must succeed, got {status}"
     );
 
-    // An unknown session id is refused, and GET and DELETE refuse it
-    // *differently*. Unlike POST, neither has an auto-recovery path.
-    //
-    // GET answering 500 rather than 404 is arguably wrong — a stale SSE
-    // reconnect is a client-side condition, not a server fault — but it is
-    // today's behavior, and #394 records rather than corrects. Recorded here so
-    // that if a later issue fixes it, the change is visible instead of incidental.
+    // Unknown or expired sessions are client recovery conditions, not 500.
+    // POST auto-recovery remains covered separately.
     let (status, _) = app
         .request(Method::DELETE, Some("never-initialized-session"))
         .await;
     assert_eq!(
         status,
         axum::http::StatusCode::NOT_FOUND,
-        "DELETE with an unknown session returns 404 today"
+        "DELETE with an unknown session returns 404"
     );
 
     let (status, _) = app
@@ -1232,9 +1227,8 @@ async fn get_and_delete_are_wired_and_session_aware() {
         .await;
     assert_eq!(
         status,
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        "GET with an unknown session returns 500 today (see the note above: \
-         recorded, not endorsed)"
+        axum::http::StatusCode::NOT_FOUND,
+        "GET with an unknown session must return 404 so clients can reinitialize"
     );
 
     // The methods really are routed: axum answers an unrouted method with 405,
@@ -7838,4 +7832,484 @@ async fn music_details_both_transports_refuse_late_context_for_changed_music() {
         }
     }
     task.abort();
+}
+
+// #833: exercise the real session transport, including the quiet period that
+// distinguishes an unchanged listing from a merely throttled false hint.
+struct ResourceStream {
+    body: Body,
+    pending: String,
+}
+
+async fn resource_stream(app: &TestApp, session: &str) -> ResourceStream {
+    // SDK retirement is detected by its keep-alive, not immediately by Body drop.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let response = app
+                .router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/mcp")
+                        .header(header::ACCEPT, "text/event-stream")
+                        .header(MCP_SESSION_ID_HEADER, session)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if response.status() == axum::http::StatusCode::CONFLICT {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+            assert!(
+                response.status().is_success(),
+                "SSE status {}",
+                response.status()
+            );
+            return ResourceStream {
+                body: response.into_body(),
+                pending: String::new(),
+            };
+        }
+    })
+    .await
+    .expect("old SSE transport must be retired before reopening")
+}
+fn take_resource_hint(pending: &mut String) -> Option<Value> {
+    while let Some(end) = pending.find('\n') {
+        let line: String = pending.drain(..=end).collect();
+        if let Some(data) = line.strip_prefix("data:") {
+            if let Ok(value) = serde_json::from_str::<Value>(data.trim()) {
+                if value["method"] == "notifications/resources/list_changed" {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn resource_hint(stream: &mut ResourceStream, wait: Duration) -> Option<Value> {
+    use http_body_util::BodyExt;
+    tokio::time::timeout(wait, async {
+        loop {
+            if let Some(value) = take_resource_hint(&mut stream.pending) {
+                return value;
+            }
+            let frame = stream
+                .body
+                .frame()
+                .await
+                .expect("notification stream remains open")
+                .unwrap();
+            if let Ok(data) = frame.into_data() {
+                stream.pending.push_str(&String::from_utf8_lossy(&data));
+            }
+        }
+    })
+    .await
+    .ok()
+}
+
+#[test]
+fn resource_hint_parser_preserves_duplicates_and_partial_frames() {
+    let hint = "data: {\"method\":\"notifications/resources/list_changed\"}\n\n";
+    let mut pending = format!("{hint}{hint}data: {{");
+    assert!(take_resource_hint(&mut pending).is_some());
+    assert!(take_resource_hint(&mut pending).is_some());
+    assert!(take_resource_hint(&mut pending).is_none());
+    assert_eq!(pending, "data: {");
+    pending.push_str("\"method\":\"notifications/resources/list_changed\"}\n");
+    assert!(take_resource_hint(&mut pending).is_some());
+}
+async fn session_resource_list(app: &TestApp, session: &str) -> Value {
+    let (_, response) = app
+        .post(
+            Some(session),
+            json!({"jsonrpc":"2.0","id":833,"method":"resources/list"}),
+        )
+        .await;
+    response.unwrap()["result"].clone()
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn resource_list_notifications_follow_each_sessions_served_snapshot() {
+    use unified_hifi_control::bus::BusEvent;
+    let _settings = SettingsFixture::with_hqplayer(false);
+    let bus = create_bus();
+    let state = build_state_with_bus(bus.clone(), None, None).await;
+    let aggregator = state.aggregator.clone();
+    let running = tokio::spawn(async move { aggregator.run().await });
+    seed_zone(&bus, &state, "roon:kitchen", "Kitchen").await;
+    let app = TestApp::with_state(state.clone());
+    let (a, _) = app.initialize().await;
+    let mut stream_a = resource_stream(&app, &a).await;
+    let original = session_resource_list(&app, &a).await;
+    for i in 1..=18 {
+        let mut zone = state.aggregator.get_zone("roon:kitchen").await.unwrap();
+        zone.last_updated = i;
+        zone.state = unified_hifi_control::bus::PlaybackState::Playing;
+        bus.publish(BusEvent::ZoneDiscovered { zone });
+    }
+    // More than one reconciliation interval: timing suppression alone fails.
+    assert!(resource_hint(&mut stream_a, Duration::from_millis(1200))
+        .await
+        .is_none());
+    assert_eq!(session_resource_list(&app, &a).await, original);
+
+    seed_zone(&bus, &state, "roon:study", "Study").await;
+    assert!(resource_hint(&mut stream_a, Duration::from_secs(3))
+        .await
+        .is_some());
+    // Client A has not re-listed: content updates and further discovery coalesce.
+    seed_zone(&bus, &state, "roon:attic", "Attic").await;
+    assert!(resource_hint(&mut stream_a, Duration::from_millis(1100))
+        .await
+        .is_none());
+    let (b, _) = app.initialize().await;
+    let mut stream_b = resource_stream(&app, &b).await;
+    let fresh_b = session_resource_list(&app, &b).await;
+    assert_eq!(fresh_b["resources"].as_array().unwrap().len(), 5);
+    assert!(resource_hint(&mut stream_b, Duration::from_millis(1100))
+        .await
+        .is_none());
+    assert_eq!(session_resource_list(&app, &a).await, fresh_b);
+
+    // Provider rename preserves membership but changes advertised metadata.
+    let mut renamed = state.aggregator.get_zone("roon:kitchen").await.unwrap();
+    renamed.zone_name = "New Kitchen".into();
+    bus.publish(BusEvent::ZoneDiscovered { zone: renamed });
+    assert!(resource_hint(&mut stream_a, Duration::from_secs(3))
+        .await
+        .is_some());
+    assert!(resource_hint(&mut stream_b, Duration::from_secs(3))
+        .await
+        .is_some());
+    let renamed_list = session_resource_list(&app, &a).await;
+    assert!(renamed_list["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["title"] == "Now playing: New Kitchen"));
+
+    // Policy changes without bus events (bind-mounted settings edits) still reconcile.
+    let settings_path = _settings._dir.path().join("app-settings.json");
+    let mut settings: Value =
+        serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+    settings["hidden_zones"] = json!(["roon:study"]);
+    settings["adapters"]["hqplayer"] = json!(true);
+    std::fs::write(&settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert!(resource_hint(&mut stream_a, Duration::from_secs(3))
+        .await
+        .is_some());
+    let policy_list = session_resource_list(&app, &a).await;
+    assert!(!policy_list["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["uri"] == "hifi://zones/roon:study"));
+    assert!(policy_list["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["uri"] == "hifi://hqplayer/status"));
+
+    bus.publish(BusEvent::ZoneRemoved {
+        zone_id: unified_hifi_control::bus::PrefixedZoneId::roon("attic"),
+    });
+    assert!(resource_hint(&mut stream_a, Duration::from_secs(3))
+        .await
+        .is_some());
+    assert_eq!(
+        session_resource_list(&app, &a).await["resources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    // Dropping a stream does not delete the logical session. Re-listing returns
+    // the complete current set and the same notifier can use a reopened stream.
+    drop(stream_a);
+    assert_eq!(
+        session_resource_list(&app, &a).await["resources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    settings["hidden_zones"] = json!([]);
+    std::fs::write(&settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+    let mut reopened = resource_stream(&app, &a).await;
+    // No replay is promised: returning clients fetch the complete current set.
+    assert_eq!(
+        session_resource_list(&app, &a).await["resources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
+    settings["adapters"]["hqplayer"] = json!(false);
+    std::fs::write(&settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert!(resource_hint(&mut reopened, Duration::from_secs(3))
+        .await
+        .is_some());
+    let recovered = session_resource_list(&app, &a).await;
+    assert_eq!(recovered["resources"].as_array().unwrap().len(), 4);
+    state.shutdown.cancel();
+    bus.publish(BusEvent::ShuttingDown { reason: None });
+    running.await.unwrap();
+}
+
+// Shared controller contract: a browse-only client can discover supported
+// collections, follow opaque locations, and play the collection (not track 1).
+// Provider fixtures retain their native wire shape; only client assertions are shared.
+async fn contract_browse(
+    app: &TestApp,
+    zone: &str,
+    location: Option<&str>,
+    limit: u32,
+    offset: u32,
+) -> Value {
+    let result = app
+        .call_tool(
+            "hifi_collections",
+            json!({
+                "zone_id":zone,"action":"browse","location":location,"limit":limit,"offset":offset
+            }),
+        )
+        .await;
+    assert_eq!(
+        result["structuredContent"]["outcome"], "ok",
+        "{zone}: {result}"
+    );
+    serde_json::from_str(&result_text(&result)).expect("collection page")
+}
+
+async fn contract_root(app: &TestApp, zone: &str) -> Vec<Value> {
+    let mut rows = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = contract_browse(app, zone, None, 1, offset).await;
+        assert!(
+            page["items"].as_array().unwrap().len() <= 1,
+            "page limit: {page}"
+        );
+        rows.extend(page["items"].as_array().unwrap().iter().cloned());
+        match page["next_offset"].as_u64() {
+            Some(next) => {
+                assert!(
+                    next > offset as u64 && next < 100,
+                    "pagination must advance: {page}"
+                );
+                offset = next as u32;
+            }
+            None => break,
+        }
+    }
+    rows
+}
+
+fn contract_location<'a>(rows: &'a [Value], title: &str) -> &'a str {
+    let row = rows
+        .iter()
+        .find(|row| row["title"] == title)
+        .unwrap_or_else(|| {
+            panic!("supported collection {title} is unreachable from browse root: {rows:?}")
+        });
+    let location = row["location"]
+        .as_str()
+        .expect("navigable collection requires location");
+    assert!(location.starts_with("loc_"));
+    location
+}
+
+async fn contract_playlist(
+    app: &TestApp,
+    zone: &str,
+    root: &[Value],
+    title: &str,
+    browsable: bool,
+) -> Value {
+    let page = contract_browse(app, zone, Some(contract_location(root, "Playlists")), 12, 0).await;
+    let row = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["title"] == title)
+        .expect("saved playlist");
+    let token = row["ref"]
+        .as_str()
+        .expect("saved playlist must expose whole-collection playback ref");
+    assert!(token.starts_with("ref_"));
+    if browsable {
+        let location = row["location"]
+            .as_str()
+            .expect("playable collection must retain Open");
+        assert_ne!(location, token);
+        let tracks = contract_browse(app, zone, Some(location), 12, 0).await;
+        assert!(tracks["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|track| track["title"] == "First Track"));
+    }
+    let played = app
+        .call_tool(
+            "hifi_play_ref",
+            json!({"zone_id":zone,"ref":token,"action":"play"}),
+        )
+        .await;
+    assert_eq!(
+        played["structuredContent"]["outcome"], "accepted",
+        "{played}"
+    );
+    played
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn shared_collection_contract_lms() {
+    let h = LmsHarness::start().await;
+    h.mock.set_library_playlists(vec![(77, "Evening")]).await;
+    h.mock
+        .set_playlist_tracks(
+            77,
+            vec![
+                (42, "First Track", Some("Artist")),
+                (43, "Second Track", Some("Artist")),
+            ],
+        )
+        .await;
+    h.mock
+        .set_favorites(vec![("Favorite", "https://example.test/favorite")])
+        .await;
+    let zone = h.zone_id();
+    let root = contract_root(&h.app, &zone).await;
+    contract_playlist(&h.app, &zone, &root, "Evening", true).await;
+    assert!(h
+        .mock
+        .write_commands(LmsHarness::PLAYER_ID)
+        .await
+        .contains(&vec![
+            "playlistcontrol".into(),
+            "cmd:load".into(),
+            "playlist_id:77".into()
+        ]));
+    let favorites = contract_browse(
+        &h.app,
+        &zone,
+        Some(contract_location(&root, "Favorites")),
+        12,
+        0,
+    )
+    .await;
+    assert!(favorites["items"][0]["ref"].as_str().is_some());
+    let radio = contract_browse(
+        &h.app,
+        &zone,
+        Some(contract_location(&root, "Radio")),
+        12,
+        0,
+    )
+    .await;
+    assert!(radio["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["title"] == "Local Radio"));
+    h.stop().await;
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn shared_collection_contract_musicassistant() {
+    let (app, mock, server) = musicassistant_mcp_app().await;
+    let zone = "musicassistant:group-child";
+    let root = contract_root(&app, zone).await;
+    contract_playlist(&app, zone, &root, "Sunday Morning", false).await;
+    let favorites = contract_browse(
+        &app,
+        zone,
+        Some(contract_location(&root, "Favorites")),
+        12,
+        0,
+    )
+    .await;
+    assert_eq!(favorites["items"][0]["title"], "My Favorite Track");
+    assert!(favorites["items"][0]["ref"].as_str().is_some());
+    let radio = contract_browse(&app, zone, Some(contract_location(&root, "Radio")), 12, 0).await;
+    assert_eq!(radio["items"][0]["title"], "My Favorite Station");
+    assert!(mock
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r["command"] == "player_queues/play_media"
+            && r["args"]["media"] == "library://playlist/7"));
+    server.abort();
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn shared_collection_contract_roon() {
+    use mock_servers::roon_core::{playlist_live, FakeItem, FakeLibrary, FakeRoonCore};
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![
+        FakeItem::list("Playlists").with_children(vec![playlist_live(
+            "Evening",
+            &[("First Track", "Artist"), ("Second Track", "Artist")],
+        )]),
+        FakeItem::list("My Live Radio"),
+    ];
+    let core = FakeRoonCore::start_with(library).await;
+    let app = roon_mcp_app(&core).await;
+    let zone = "roon:zone_1";
+    let root = contract_root(&app, zone).await;
+    let played = contract_playlist(&app, zone, &root, "Evening", true).await;
+    assert!(
+        result_text(&played).contains("Play Playlist"),
+        "must target playlist action, not a track: {played}"
+    );
+    contract_location(&root, "My Live Radio");
+    assert!(!root.iter().any(|r| r["title"] == "Favorites"));
+    let favorites = app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id":zone,"action":"favorites"}),
+        )
+        .await;
+    assert_ne!(favorites["structuredContent"]["outcome"], "ok");
+    core.stop().await;
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn shared_collection_contract_unwired_providers_are_explicit() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+    for zone in [
+        "spotify:player",
+        "applemusic:player",
+        "openhome:player",
+        "upnp:player",
+        "hqplayer:player",
+    ] {
+        assert!(
+            unified_hifi_control::mcp::tools::collections::collections_tabs_for_zone(zone)
+                .is_empty(),
+            "{zone} must not advertise a working shared browser"
+        );
+        let result = app
+            .call_tool(
+                "hifi_collections",
+                json!({"zone_id":zone,"action":"browse"}),
+            )
+            .await;
+        assert_ne!(
+            result["structuredContent"]["outcome"], "ok",
+            "unsupported browsing must not fabricate a successful empty library: {zone}: {result}"
+        );
+    }
 }

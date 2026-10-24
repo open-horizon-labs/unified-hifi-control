@@ -526,6 +526,63 @@ mod knob_client {
         );
     }
 
+    /// Battery-less firmware sends -1; playback must still reach the display.
+    #[tokio::test]
+    async fn unavailable_battery_does_not_hide_a_playing_zone() {
+        let (app, state) = create_test_app_with_state().await;
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let aggregator = state.aggregator.clone();
+        let task = tokio::spawn(async move { aggregator.run_with_ready(ready_tx).await });
+        ready_rx.await.unwrap();
+        let zone = serde_json::from_value(json!({
+            "zone_id": "fixture:battery", "zone_name": "Battery fixture",
+            "source": "fixture", "state": "playing", "volume_control": null,
+            "now_playing": null, "is_controllable": true, "is_seekable": false,
+            "last_updated": 0, "is_play_allowed": true, "is_pause_allowed": true,
+            "is_next_allowed": true, "is_previous_allowed": true
+        }))
+        .unwrap();
+        state
+            .bus
+            .publish(unified_hifi_control::bus::BusEvent::ZoneDiscovered { zone });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while state.aggregator.get_zone("fixture:battery").await.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        for (index, level) in [
+            Some(-1),
+            None,
+            Some(0),
+            Some(100),
+            Some(101),
+            Some(256),
+            Some(-2),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("battery-regression-{index}");
+            let battery = level
+                .map(|v| format!("&battery_level={v}"))
+                .unwrap_or_default();
+            let path = format!(
+                "/now_playing?zone_id=fixture:battery&knob_id={id}&battery_charging=0{battery}"
+            );
+            let (status, body) = get_request(&app, &path).await;
+            assert_eq!(status, StatusCode::OK, "level {level:?}: {body}");
+            let response: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(response["is_playing"], true, "level {level:?}");
+            let knob = state.knobs.get(&id).await.unwrap();
+            let expected = level.filter(|v| (0..=100).contains(v)).map(|v| v as u8);
+            assert_eq!(knob.status.battery_level, expected, "level {level:?}");
+        }
+        task.abort();
+    }
+
     /// Test: GET /now_playing response structure
     /// Node.js returns: line1, line2, line3, is_playing, volume, volume_type, etc.
     /// NOT: title, artist, state (these are internal field names)

@@ -1,3 +1,19 @@
+## Changes in beta.8
+
+- Play and queue complete LMS saved playlists from collection rows. Stale playlist handles are checked before the queue is changed.
+- Make supported collections reachable to browse-only controllers: retain Roon Playlists at the browse root, add Music Assistant Playlists/Favorites/Radio shortcuts, and expose LMS Favorites and Radio.
+- Add LMS Albums A-Z and Artists A-Z menus using the server's own alphabetical index. Letter paging stops at the chosen letter's boundary and respects provider ordering.
+- Preserve knob sleep and other settings atomically across bridge restarts, and report persistence failures instead of silently accepting lost settings.
+- Accept LMS playlist indices encoded as strings. Refresh OpenHome radio metadata even when the stream URI stays the same.
+- Reduce redundant MCP resource-list notifications and return the correct response for expired SSE sessions.
+- Update dependencies and their API integrations, including Tokio 1.54; keep server credential encryption out of the browser build. Remove the obsolete Spotify OAuth relay spike.
+
+Pair with **HiPhi firmware v2.8.0-alpha.3** for text library lists, Open/Play/Queue actions, visible volume feedback from artwork mode, and defensive playback/transport handling.
+
+The shared collection contract is exercised against Roon, LMS and Music Assistant adapters. It follows paginated opaque browse locations and checks whole-collection playback targets. Unsupported shared-browser providers remain explicit. Roon Favorites and non-LMS letter menus are not added; nested LMS Favorites folders remain outside this release.
+
+This is a beta candidate. Exact packaged artifacts and live playback still need qualification before promotion to stable.
+
 ## Installation
 
 ### Docker

@@ -33,6 +33,7 @@
 //! UPDATE_MCP_FIXTURES=1 cargo test --test mcp_contract
 //! ```
 
+pub mod baselines;
 pub mod capabilities;
 pub mod collection_locations;
 pub mod envelope;
@@ -94,6 +95,12 @@ pub async fn handle_mcp_get(
         Ok(res) => {
             let (parts, body) = res.into_parts();
             axum::response::Response::from_parts(parts, Body::new(body))
+        }
+        // The SDK reports a vanished SSE session as a typed transport error.
+        // Match it here rather than prechecking the store (which races teardown)
+        // or disguising unrelated server failures as client errors.
+        Err(rust_mcp_sdk::mcp_server::error::TransportServerError::SessionIdInvalid(_)) => {
+            (axum::http::StatusCode::NOT_FOUND, "MCP session not found").into_response()
         }
         // Response builder with valid status/body cannot fail
         #[allow(clippy::unwrap_used)]

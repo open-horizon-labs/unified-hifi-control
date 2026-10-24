@@ -2627,13 +2627,9 @@ impl RoonAdapter {
                 if item.title == "Settings" {
                     continue;
                 }
-                // #573 defect 4: the root's "Playlists" node duplicates the
-                // dedicated Playlists tab (`collections_playlists` enters
-                // the same node by name), so the Browse tab hides it rather
-                // than offering the same list twice.
-                if item.title == "Playlists" {
-                    continue;
-                }
+                // Browse-only controllers have no separate Playlists tab.
+                // Keep native music nodes here; tab-specific presentation
+                // must not remove shared navigation paths.
             }
             // #545 / #573 defect 1: verb rows ("Play Playlist", "Play
             // Album", "Shuffle", ...) are the implementation detail

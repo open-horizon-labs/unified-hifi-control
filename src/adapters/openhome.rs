@@ -71,6 +71,8 @@ pub struct OpenHomeDevice {
     pub last_seen: std::time::Instant,
     #[serde(skip)]
     pub last_track_uri: Option<String>,
+    #[serde(skip)]
+    pub last_track_metadata: Option<String>,
 }
 
 /// Track metadata from an OpenHome device.
@@ -407,6 +409,7 @@ impl OpenHomeAdapter {
                             track_info: None,
                             last_seen: std::time::Instant::now(),
                             last_track_uri: None,
+                            last_track_metadata: None,
                         };
 
                         s.devices.insert(uuid.clone(), device);
@@ -702,9 +705,13 @@ impl OpenHomeAdapter {
 
             let mut s = state.write().await;
             if let Some(device) = s.devices.get_mut(uuid) {
-                // Only parse if URI changed
-                if uri.as_ref() != device.last_track_uri.as_ref() {
+                // Streams can change tracks without changing their session URI.
+                // Compare raw metadata so identical polls still avoid parsing.
+                if uri.as_ref() != device.last_track_uri.as_ref()
+                    || metadata.as_ref() != device.last_track_metadata.as_ref()
+                {
                     device.last_track_uri = uri;
+                    device.last_track_metadata = metadata.clone();
 
                     if let Some(meta) = metadata {
                         // Decode HTML entities and parse DIDL-Lite
@@ -796,6 +803,42 @@ impl OpenHomeAdapter {
         state.running = false;
         state.devices.clear();
         tracing::info!("OpenHome adapter stopped");
+    }
+
+    /// Exercise SSDP registration plus the real polling path without multicast.
+    #[doc(hidden)]
+    pub async fn probe_device_for_test(&self, uuid: &str, location: &str) -> anyhow::Result<()> {
+        {
+            let mut state = self.state.write().await;
+            state
+                .devices
+                .entry(uuid.to_string())
+                .or_insert_with(|| OpenHomeDevice {
+                    uuid: uuid.to_string(),
+                    name: "Test OpenHome".to_string(),
+                    manufacturer: None,
+                    model: None,
+                    location: location.to_string(),
+                    state: "stopped".to_string(),
+                    volume: None,
+                    muted: false,
+                    volume_max: None,
+                    volume_steps: None,
+                    track_info: None,
+                    last_seen: std::time::Instant::now(),
+                    last_track_uri: None,
+                    last_track_metadata: None,
+                });
+        }
+        Self::poll_device(
+            &self.state,
+            &self.bus,
+            &self.http,
+            uuid,
+            location,
+            self.runtime_bridge.clone(),
+        )
+        .await
     }
 
     /// Get adapter status

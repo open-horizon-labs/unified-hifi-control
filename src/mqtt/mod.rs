@@ -815,6 +815,12 @@ async fn handle_incoming_publish(
         };
         match knob_command::dispatch(knobs, knob_id, parsed).await {
             knob_command::DispatchOutcome::Applied => {}
+            knob_command::DispatchOutcome::StorageFailure => {
+                tracing::warn!(
+                    knob_id,
+                    "MQTT knob command refused: settings could not be durably saved"
+                );
+            }
             knob_command::DispatchOutcome::KnobNotFound => {
                 tracing::warn!(knob_id, "MQTT knob command refused: knob not found");
             }
