@@ -905,6 +905,25 @@ async fn handle_jsonrpc(
                 .collect();
             json!({ "count": all.len(), "playlists_loop": page })
         }
+        // Replay the recorded LMS radio-directory shape; honor native paging.
+        "radios" => {
+            let recorded: Value =
+                serde_json::from_str(include_str!("../fixtures/lms/collections_radios_root.json"))
+                    .unwrap();
+            let mut result = recorded["result"].clone();
+            let (offset, count) = paging(commands, 1);
+            result["radioss_loop"] = Value::Array(
+                result["radioss_loop"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .skip(offset)
+                    .take(count)
+                    .cloned()
+                    .collect(),
+            );
+            result
+        }
         // #531: `["favorites", "items", <start>, <count>]`.
         "favorites" if commands.get(1).and_then(Value::as_str) == Some("items") => {
             let (offset, count) = paging(commands, 2);

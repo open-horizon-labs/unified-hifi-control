@@ -7839,3 +7839,255 @@ async fn music_details_both_transports_refuse_late_context_for_changed_music() {
     }
     task.abort();
 }
+
+// Shared controller contract: a browse-only client can discover supported
+// collections, follow opaque locations, and play the collection (not track 1).
+// Provider fixtures retain their native wire shape; only client assertions are shared.
+async fn contract_browse(
+    app: &TestApp,
+    zone: &str,
+    location: Option<&str>,
+    limit: u32,
+    offset: u32,
+) -> Value {
+    let result = app
+        .call_tool(
+            "hifi_collections",
+            json!({
+                "zone_id":zone,"action":"browse","location":location,"limit":limit,"offset":offset
+            }),
+        )
+        .await;
+    assert_eq!(
+        result["structuredContent"]["outcome"], "ok",
+        "{zone}: {result}"
+    );
+    serde_json::from_str(&result_text(&result)).expect("collection page")
+}
+
+async fn contract_root(app: &TestApp, zone: &str) -> Vec<Value> {
+    let mut rows = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = contract_browse(app, zone, None, 1, offset).await;
+        assert!(
+            page["items"].as_array().unwrap().len() <= 1,
+            "page limit: {page}"
+        );
+        rows.extend(page["items"].as_array().unwrap().iter().cloned());
+        match page["next_offset"].as_u64() {
+            Some(next) => {
+                assert!(
+                    next > offset as u64 && next < 100,
+                    "pagination must advance: {page}"
+                );
+                offset = next as u32;
+            }
+            None => break,
+        }
+    }
+    rows
+}
+
+fn contract_location<'a>(rows: &'a [Value], title: &str) -> &'a str {
+    let row = rows
+        .iter()
+        .find(|row| row["title"] == title)
+        .unwrap_or_else(|| {
+            panic!("supported collection {title} is unreachable from browse root: {rows:?}")
+        });
+    let location = row["location"]
+        .as_str()
+        .expect("navigable collection requires location");
+    assert!(location.starts_with("loc_"));
+    location
+}
+
+async fn contract_playlist(
+    app: &TestApp,
+    zone: &str,
+    root: &[Value],
+    title: &str,
+    browsable: bool,
+) -> Value {
+    let page = contract_browse(app, zone, Some(contract_location(root, "Playlists")), 12, 0).await;
+    let row = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["title"] == title)
+        .expect("saved playlist");
+    let token = row["ref"]
+        .as_str()
+        .expect("saved playlist must expose whole-collection playback ref");
+    assert!(token.starts_with("ref_"));
+    if browsable {
+        let location = row["location"]
+            .as_str()
+            .expect("playable collection must retain Open");
+        assert_ne!(location, token);
+        let tracks = contract_browse(app, zone, Some(location), 12, 0).await;
+        assert!(tracks["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|track| track["title"] == "First Track"));
+    }
+    let played = app
+        .call_tool(
+            "hifi_play_ref",
+            json!({"zone_id":zone,"ref":token,"action":"play"}),
+        )
+        .await;
+    assert_eq!(
+        played["structuredContent"]["outcome"], "accepted",
+        "{played}"
+    );
+    played
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn shared_collection_contract_lms() {
+    let h = LmsHarness::start().await;
+    h.mock.set_library_playlists(vec![(77, "Evening")]).await;
+    h.mock
+        .set_playlist_tracks(
+            77,
+            vec![
+                (42, "First Track", Some("Artist")),
+                (43, "Second Track", Some("Artist")),
+            ],
+        )
+        .await;
+    h.mock
+        .set_favorites(vec![("Favorite", "https://example.test/favorite")])
+        .await;
+    let zone = h.zone_id();
+    let root = contract_root(&h.app, &zone).await;
+    contract_playlist(&h.app, &zone, &root, "Evening", true).await;
+    assert!(h
+        .mock
+        .write_commands(LmsHarness::PLAYER_ID)
+        .await
+        .contains(&vec![
+            "playlistcontrol".into(),
+            "cmd:load".into(),
+            "playlist_id:77".into()
+        ]));
+    let favorites = contract_browse(
+        &h.app,
+        &zone,
+        Some(contract_location(&root, "Favorites")),
+        12,
+        0,
+    )
+    .await;
+    assert!(favorites["items"][0]["ref"].as_str().is_some());
+    let radio = contract_browse(
+        &h.app,
+        &zone,
+        Some(contract_location(&root, "Radio")),
+        12,
+        0,
+    )
+    .await;
+    assert!(radio["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["title"] == "Local Radio"));
+    h.stop().await;
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn shared_collection_contract_musicassistant() {
+    let (app, mock, server) = musicassistant_mcp_app().await;
+    let zone = "musicassistant:group-child";
+    let root = contract_root(&app, zone).await;
+    contract_playlist(&app, zone, &root, "Sunday Morning", false).await;
+    let favorites = contract_browse(
+        &app,
+        zone,
+        Some(contract_location(&root, "Favorites")),
+        12,
+        0,
+    )
+    .await;
+    assert_eq!(favorites["items"][0]["title"], "My Favorite Track");
+    assert!(favorites["items"][0]["ref"].as_str().is_some());
+    let radio = contract_browse(&app, zone, Some(contract_location(&root, "Radio")), 12, 0).await;
+    assert_eq!(radio["items"][0]["title"], "My Favorite Station");
+    assert!(mock
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r["command"] == "player_queues/play_media"
+            && r["args"]["media"] == "library://playlist/7"));
+    server.abort();
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn shared_collection_contract_roon() {
+    use mock_servers::roon_core::{playlist_live, FakeItem, FakeLibrary, FakeRoonCore};
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![
+        FakeItem::list("Playlists").with_children(vec![playlist_live(
+            "Evening",
+            &[("First Track", "Artist"), ("Second Track", "Artist")],
+        )]),
+        FakeItem::list("My Live Radio"),
+    ];
+    let core = FakeRoonCore::start_with(library).await;
+    let app = roon_mcp_app(&core).await;
+    let zone = "roon:zone_1";
+    let root = contract_root(&app, zone).await;
+    let played = contract_playlist(&app, zone, &root, "Evening", true).await;
+    assert!(
+        result_text(&played).contains("Play Playlist"),
+        "must target playlist action, not a track: {played}"
+    );
+    contract_location(&root, "My Live Radio");
+    assert!(!root.iter().any(|r| r["title"] == "Favorites"));
+    let favorites = app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id":zone,"action":"favorites"}),
+        )
+        .await;
+    assert_ne!(favorites["structuredContent"]["outcome"], "ok");
+    core.stop().await;
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn shared_collection_contract_unwired_providers_are_explicit() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+    for zone in [
+        "spotify:player",
+        "applemusic:player",
+        "openhome:player",
+        "upnp:player",
+        "hqplayer:player",
+    ] {
+        assert!(
+            unified_hifi_control::mcp::tools::collections::collections_tabs_for_zone(zone)
+                .is_empty(),
+            "{zone} must not advertise a working shared browser"
+        );
+        let result = app
+            .call_tool(
+                "hifi_collections",
+                json!({"zone_id":zone,"action":"browse"}),
+            )
+            .await;
+        assert_ne!(
+            result["structuredContent"]["outcome"], "ok",
+            "unsupported browsing must not fabricate a successful empty library: {zone}: {result}"
+        );
+    }
+}
