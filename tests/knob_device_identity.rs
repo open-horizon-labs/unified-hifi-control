@@ -89,14 +89,15 @@ async fn controller_identity_is_canonical_persistent_and_never_erased_by_legacy_
     let previous = std::env::var_os("UHC_CONFIG_DIR");
     std::env::set_var("UHC_CONFIG_DIR", temporary.path());
     let store = KnobStore::new();
-    let legacy = store.get_or_create("legacy", Some("2.5.2")).await;
+    let legacy = store.get_or_create("legacy", Some("2.5.2")).await.unwrap();
     assert_eq!(
         serde_json::to_value(&legacy).unwrap()["device_type"],
         "knob"
     );
     let frame = store
         .get_or_create_with_device_type("frame", Some("2.7.0-alpha.5"), Some("hiphi-frame"))
-        .await;
+        .await
+        .unwrap();
     let sha = frame.config_sha.clone();
     assert_eq!(
         serde_json::to_value(&frame).unwrap()["device_type"],
@@ -105,7 +106,8 @@ async fn controller_identity_is_canonical_persistent_and_never_erased_by_legacy_
     for identity in [None, Some("frmae"), Some("../dial"), Some("")] {
         let preserved = store
             .get_or_create_with_device_type("frame", None, identity)
-            .await;
+            .await
+            .unwrap();
         assert_eq!(
             serde_json::to_value(&preserved).unwrap()["device_type"],
             "frame"
@@ -117,7 +119,8 @@ async fn controller_identity_is_canonical_persistent_and_never_erased_by_legacy_
     }
     let m5 = store
         .get_or_create_with_device_type("m5", None, Some("hiphi-dial-beta"))
-        .await;
+        .await
+        .unwrap();
     assert_eq!(serde_json::to_value(&m5).unwrap()["device_type"], "m5dial");
     let restored = KnobStore::new();
     let summaries = serde_json::to_value(restored.list().await).unwrap();

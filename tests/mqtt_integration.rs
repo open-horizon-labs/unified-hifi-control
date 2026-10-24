@@ -1009,7 +1009,7 @@ async fn knob_discovery_state_and_zone_select_round_trip_over_a_real_broker() {
     let knobs = isolated_knob_store();
 
     let knob_id = "knobtest1";
-    knobs.get_or_create(knob_id, Some("1.2.3")).await;
+    knobs.get_or_create(knob_id, Some("1.2.3")).await.unwrap();
     knobs
         .update_status(
             knob_id,
@@ -1156,7 +1156,10 @@ async fn knob_discovery_state_and_zone_select_round_trip_over_a_real_broker() {
     let _ = reassigned_state;
 
     // --- Retraction: removing the knob clears its retained discovery config. ---
-    assert!(knobs.remove(knob_id).await, "knob should have existed");
+    assert!(
+        knobs.remove(knob_id).await.unwrap(),
+        "knob should have existed"
+    );
     let retraction = wait_for_publish(&mut observer_loop, Duration::from_secs(15), |publish| {
         publish.topic.contains(knob_id)
             && publish.topic.contains("/sensor/")

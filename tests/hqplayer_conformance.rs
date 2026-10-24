@@ -4031,16 +4031,14 @@ fn the_sanitiser_emits_a_document_that_still_reparses() {
     loop {
         match reader.read_event() {
             Ok(quick_xml::events::Event::Text(t)) => {
-                let decoded = t
-                    .xml10_content()
-                    .expect("text must decode after sanitising");
+                let decoded = t.xml10_content();
                 text.push_str(
                     &quick_xml::escape::unescape(&decoded)
                         .expect("text must unescape after sanitising"),
                 );
             }
             Ok(quick_xml::events::Event::GeneralRef(reference)) => {
-                let encoded = format!("&{};", reference.decode().expect("reference must decode"));
+                let encoded = format!("&{};", reference.as_ref());
                 text.push_str(
                     &quick_xml::escape::unescape(&encoded)
                         .expect("reference must unescape after sanitising"),
@@ -6536,7 +6534,7 @@ fn the_sanitiser_escapes_attribute_values_so_the_artifact_still_reparses() {
                         panic!("sanitised attribute no longer parses: {e}\noutput was: {clean}")
                     });
                     values.push((
-                        String::from_utf8_lossy(a.key.as_ref()).into_owned(),
+                        a.key.as_ref().to_owned(),
                         a.normalized_value(quick_xml::XmlVersion::Explicit1_0)
                             .unwrap_or_else(|e| {
                                 panic!("sanitised value no longer unescapes: {e}\nfrom: {clean}")
@@ -6586,7 +6584,7 @@ fn the_sanitiser_normalizes_entity_spelling_but_preserves_attribute_meaning() {
                 break e
                     .attributes()
                     .filter_map(Result::ok)
-                    .find(|a| a.key.as_ref() == b"song")
+                    .find(|a| a.key.as_ref() == "song")
                     .expect("song attribute")
                     .normalized_value(quick_xml::XmlVersion::Explicit1_0)
                     .expect("normalized value reparses")

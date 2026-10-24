@@ -1662,10 +1662,8 @@ async fn roon_collections_content_classifies_playlist_and_tracks_correctly() {
     let core = FakeRoonCore::start_with(library).await;
     let adapter = connected(&core).await;
 
-    // List playlists (the root's "Playlists" node is hidden from
-    // `collections_browse` since #573 defect 4 -- the dedicated
-    // `collections_playlists` operation is the way in), then browse into
-    // the playlist itself.
+    // The dedicated tab remains another way to list playlists, then browse
+    // into the playlist itself; browse-only clients use the root node.
     let playlists_level = adapter
         .content(
             "collections_playlists",
@@ -2141,11 +2139,10 @@ async fn roon_collections_library_node_lists_its_real_children() {
     core.stop().await;
 }
 
-/// #573 defect 4: the collection root hides the "Playlists" node (the
-/// dedicated tab lists the same node) -- `collections_playlists` still
-/// reaches it by name.
+/// Browse-only clients and tabbed clients must both reach saved playlists.
+/// Hiding the root node for a web tab made it unreachable to the knob.
 #[tokio::test]
-async fn roon_collections_root_hides_the_playlists_node_but_the_tab_still_works() {
+async fn roon_collections_root_keeps_playlists_and_the_tab_still_works() {
     let mut library = FakeLibrary::standard();
     library.root_items = vec![
         FakeItem::list("Library"),
@@ -2172,8 +2169,8 @@ async fn roon_collections_root_hides_the_playlists_node_but_the_tab_still_works(
         .collect();
     assert_eq!(
         titles,
-        vec!["Local Library", "My Live Radio"],
-        "the root must hide Playlists (dedicated tab) and rename Library"
+        vec!["Local Library", "Playlists", "My Live Radio"],
+        "the root must keep Playlists reachable and rename Library"
     );
 
     let playlists = adapter

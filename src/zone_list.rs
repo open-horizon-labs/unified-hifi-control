@@ -29,6 +29,7 @@
 //! does not touch. Hiding declutters; it does not deauthorise. Making "hidden" mean "unreachable"
 //! would silently break working knob and assistant setups on upgrade.
 
+use crate::aggregator::ZoneAggregator;
 use crate::api::{AppSettings, AppState};
 use crate::bus::Zone;
 use std::cmp::Ordering;
@@ -39,9 +40,14 @@ use std::collections::{HashMap, HashSet};
 /// Applies, in order: the adapter enable filter, the per-zone hide list, then a deterministic sort.
 /// This is what every zone list uses.
 pub async fn visible_zones(state: &AppState) -> Vec<Zone> {
-    let settings = crate::api::load_app_settings();
-    let zones = state.aggregator.get_zones().await;
-    apply_zone_list_policy(zones, &settings)
+    visible_zones_from(&state.aggregator, &crate::api::load_app_settings()).await
+}
+
+/// [`visible_zones`] for callers that hold the aggregator but not a whole
+/// `AppState` (the MCP resource-list code paths, #833).
+pub async fn visible_zones_from(aggregator: &ZoneAggregator, settings: &AppSettings) -> Vec<Zone> {
+    let zones = aggregator.get_zones().await;
+    apply_zone_list_policy(zones, settings)
 }
 
 /// Every zone the user *could* be offered, hidden ones included, in the same stable order.

@@ -33,6 +33,17 @@ use crate::bus::{Command, VolumeControl};
 use crate::knobs::image::placeholder_svg;
 use crate::knobs::store::{KnobConfigUpdate, KnobStatusUpdate};
 
+/// Keep the existing JSON error shape; never report volatile settings as saved.
+fn knob_persistence_error(error: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
+    tracing::warn!(%error, "Controller configuration request failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(
+            serde_json::json!({"error": "controller settings could not be saved or loaded; check bridge logs"}),
+        ),
+    )
+}
+
 /// Extract knob ID from headers or query params
 fn extract_knob_id(headers: &HeaderMap, query_knob_id: Option<&str>) -> Option<String> {
     headers
@@ -143,7 +154,7 @@ pub struct ZonesResponse {
 pub async fn knob_zones_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Json<ZonesResponse> {
+) -> Result<Json<ZonesResponse>, (StatusCode, Json<serde_json::Value>)> {
     if let Some(id) = extract_knob_id(&headers, None) {
         state
             .knobs
@@ -152,10 +163,11 @@ pub async fn knob_zones_handler(
                 extract_knob_version(&headers).as_deref(),
                 extract_device_type(&headers),
             )
-            .await;
+            .await
+            .map_err(knob_persistence_error)?;
     }
     let zones = get_all_zones_internal(&state).await;
-    Json(ZonesResponse { zones })
+    Ok(Json(ZonesResponse { zones }))
 }
 
 /// Helper to aggregate zones from aggregator (public for UI module).
@@ -228,7 +240,8 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
 pub struct NowPlayingQuery {
     pub zone_id: Option<String>,
     pub knob_id: Option<String>,
-    pub battery_level: Option<u8>,
+    /// Battery-less firmware reports -1; only 0..=100 reaches stored status.
+    pub battery_level: Option<i32>,
     pub battery_charging: Option<String>,
 }
 
@@ -330,9 +343,13 @@ pub async fn knob_now_playing_handler(
                 knob_version.as_deref(),
                 extract_device_type(&headers),
             )
-            .await;
+            .await
+            .map_err(knob_persistence_error)?;
         volume_step_override = knob.config.volume_step_override;
-        let battery_level = params.battery_level.filter(|&level| level <= 100);
+        let battery_level = params
+            .battery_level
+            .filter(|level| (0..=100).contains(level))
+            .map(|level| level as u8);
         let battery_charging = params
             .battery_charging
             .as_ref()
@@ -716,7 +733,8 @@ pub async fn knob_control_handler(
                 extract_knob_version(&headers).as_deref(),
                 extract_device_type(&headers),
             )
-            .await;
+            .await
+            .map_err(knob_persistence_error)?;
     }
     // A zone linked to an amplifier (#774, alpha): its volume, mute, power and input belong to the
     // device, so they are resolved here, before prefix routing could hand them to the provider.
@@ -1219,6 +1237,7 @@ pub async fn knob_config_handler(
                 extract_device_type(&headers),
             )
             .await
+            .map_err(knob_persistence_error)?
     } else {
         knob
     };
@@ -1260,6 +1279,7 @@ pub async fn knob_config_update_handler(
         .knobs
         .update_config(&knob_id, updates)
         .await
+        .map_err(knob_persistence_error)?
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
@@ -1288,7 +1308,12 @@ pub async fn knob_remove_handler(
     State(state): State<AppState>,
     axum::extract::Path(knob_id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if state.knobs.remove(&knob_id).await {
+    if state
+        .knobs
+        .remove(&knob_id)
+        .await
+        .map_err(knob_persistence_error)?
+    {
         Ok(Json(serde_json::json!({ "ok": true })))
     } else {
         Err((
@@ -1310,7 +1335,8 @@ pub async fn knob_config_by_path_handler(
     let knob = state
         .knobs
         .get_or_create_with_device_type(&knob_id, version.as_deref(), extract_device_type(&headers))
-        .await;
+        .await
+        .map_err(knob_persistence_error)?;
 
     // Build config response matching Node.js format
     let mut config = serde_json::to_value(&knob.config).unwrap_or_default();
@@ -1335,6 +1361,7 @@ pub async fn knob_config_update_by_path_handler(
         .knobs
         .update_config(&knob_id, updates)
         .await
+        .map_err(knob_persistence_error)?
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,

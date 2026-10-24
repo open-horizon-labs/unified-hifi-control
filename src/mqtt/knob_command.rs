@@ -50,6 +50,7 @@ pub fn parse_action(action: &str, payload: &str) -> Option<ParsedKnobAction> {
 pub enum DispatchOutcome {
     Applied,
     KnobNotFound,
+    StorageFailure,
 }
 
 /// Apply one parsed action to `knob_id` through `KnobStore::update_config`.
@@ -69,8 +70,9 @@ pub async fn dispatch(
         },
     };
     match knobs.update_config(knob_id, update).await {
-        Some(_) => DispatchOutcome::Applied,
-        None => DispatchOutcome::KnobNotFound,
+        Ok(Some(_)) => DispatchOutcome::Applied,
+        Ok(None) => DispatchOutcome::KnobNotFound,
+        Err(_) => DispatchOutcome::StorageFailure,
     }
 }
 

@@ -5,11 +5,8 @@ FROM ghcr.io/linuxcontainers/alpine:3.20
 
 WORKDIR /app
 
-# ca-certificates for HTTPS; openssh-client because the guided Spotify setup
-# opens its HTTPS callback tunnel by running `ssh -R` (see
-# src/api/spotify_tunnel.rs). Without it that flow dies telling a container
-# user to "install the OpenSSH client", which they cannot act on.
-RUN apk add --no-cache ca-certificates openssh-client vips-tools
+# HTTPS trust roots and artwork processing; Spotify auth uses HiPhi routing.
+RUN apk add --no-cache ca-certificates vips-tools
 
 # Copy pre-built binary (web assets are embedded)
 COPY dist/unified-hifi-control /app/

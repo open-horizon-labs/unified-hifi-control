@@ -1433,3 +1433,42 @@ async fn a_rejected_cached_pair_re_walks_once_and_retries_in_place() {
         "the fresh pair must have been cached by the re-walk"
     );
 }
+
+/// #862: the firmware uses browse rows' optional ref for the whole playlist.
+#[tokio::test]
+async fn lms_saved_playlist_ref_plays_and_queues_all_tracks_and_refuses_deleted_playlist() {
+    let mock = MockLmsServer::start().await;
+    mock.add_player(LMS_PLAYER, "Living Room").await;
+    mock.set_library_playlists(vec![(42, "Evening")]).await;
+    let lms = connected_lms(&mock).await;
+    let state = app_state_with_lms(lms.clone()).await;
+    state.adapter_registry.register_library("lms", lms).await;
+    let zone_id = format!("lms:{LMS_PLAYER}");
+    let mut args = collections_args(None, 0);
+    args.zone_id = zone_id.clone();
+    args.action = "playlists".into();
+    let result = handle_collections(&state, args).await;
+    assert_eq!(outcome_of(&result), "ok", "{}", text_of(&result));
+    let page = collection_page_of(&result);
+    assert!(page["items"][0]["location"].as_str().is_some());
+    let token = page["items"][0]["ref"]
+        .as_str()
+        .expect("playlist must be playable");
+    for (action, cmd) in [(None, "cmd:load"), (Some("queue"), "cmd:add")] {
+        mock.clear_commands().await;
+        let result = handle_play_ref(&state, play_ref_args(token, &zone_id, action)).await;
+        assert_eq!(outcome_of(&result), "accepted", "{}", text_of(&result));
+        assert!(mock.write_commands(LMS_PLAYER).await.contains(&vec![
+            "playlistcontrol".into(),
+            cmd.into(),
+            "playlist_id:42".into()
+        ]));
+    }
+    mock.set_library_playlists(vec![]).await;
+    mock.clear_commands().await;
+    let result = handle_play_ref(&state, play_ref_args(token, &zone_id, None)).await;
+    assert_ne!(outcome_of(&result), "accepted");
+    assert!(mock.write_commands(LMS_PLAYER).await.is_empty());
+    mock.stop().await;
+    lms_stop(&state).await;
+}
