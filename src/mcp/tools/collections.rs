@@ -557,8 +557,8 @@ async fn handle_lms(
         // A navigable row carries `path` (another collection to browse); a
         // playable leaf carries either `kind`+`id` (a durable LMS entity --
         // `LmsPlayTarget::Library`) or `url` (a favorite, which LMS gives no
-        // durable id for -- `LmsPlayTarget::Url`). At most one of the three
-        // is ever present on one row.
+        // durable id for -- `LmsPlayTarget::Url`). Saved playlists carry both
+        // a browse location and a whole-collection playback ref.
         let (path, location) = match item.get("path").and_then(Value::as_str) {
             Some(provider_path) => {
                 let target =
@@ -588,6 +588,15 @@ async fn handle_lms(
             item.get("id").and_then(Value::as_i64),
             item.get("url").and_then(Value::as_str),
         ) {
+            (Some("playlist"), Some(id), _) if id > 0 => Some(
+                state
+                    .mcp_refs
+                    .mint(RefTarget::Lms {
+                        target: crate::adapters::lms::LmsPlayTarget::SavedPlaylist { id },
+                        title: title.clone(),
+                    })
+                    .await,
+            ),
             (Some("track"), Some(id), _) => Some(
                 state
                     .mcp_refs
