@@ -1478,6 +1478,20 @@ impl LibraryAdapter for MusicAssistantAdapter {
 
 impl MusicAssistantAdapter {
     async fn collections_content(&self, operation: &str, params: &Value) -> Result<Value> {
+        // These paths stay behind opaque collection locations. They let a
+        // browse-only controller reach the same collections as tabbed clients.
+        let path = params.get("path").and_then(Value::as_str).unwrap_or("root");
+        let browse_radio = operation == "collections_browse" && path == "uhc:radio";
+        let operation = if operation == "collections_browse" {
+            match path {
+                "uhc:playlists" => "collections_playlists",
+                "uhc:favorites" | "uhc:radio" => "collections_favorites",
+                _ => operation,
+            }
+        } else {
+            operation
+        };
+        let at_root = operation == "collections_browse" && path == "root";
         let limit = params
             .get("limit")
             .and_then(Value::as_u64)
@@ -1485,19 +1499,20 @@ impl MusicAssistantAdapter {
             .clamp(1, 50);
         let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0);
         let (command, args) = match operation {
-            "collections_browse" => (
-                "music/browse",
-                json!({"path": params.get("path").and_then(Value::as_str).unwrap_or("root")}),
-            ),
+            "collections_browse" => ("music/browse", json!({"path": path})),
             "collections_playlists" => (
                 "music/playlists/library_items",
                 json!({"limit": limit, "offset": offset}),
             ),
             "collections_favorites" => {
-                let media_type = params
-                    .get("media_type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("tracks");
+                let media_type = if browse_radio {
+                    "radio"
+                } else {
+                    params
+                        .get("media_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tracks")
+                };
                 if !matches!(
                     media_type,
                     "tracks"
@@ -1532,10 +1547,17 @@ impl MusicAssistantAdapter {
                 ))
             }
         };
-        let raw: Value = self.command(command, Some(args)).await?;
+        let mut raw: Value = self.command(command, Some(args)).await?;
         let raw_items = raw
-            .as_array()
+            .as_array_mut()
             .ok_or_else(|| anyhow!("Music Assistant collection response was not a list"))?;
+        if at_root {
+            raw_items.extend([
+                json!({"name":"Playlists","path":"uhc:playlists"}),
+                json!({"name":"Favorites","path":"uhc:favorites"}),
+                json!({"name":"Radio","path":"uhc:radio"}),
+            ]);
+        }
         // `library_items` applies offset/limit server-side. `music/browse`
         // does not expose paging, so page that one locally without leaking MA's
         // provider path format through the MCP response.

@@ -2198,6 +2198,7 @@ impl LmsAdapter {
                 ("Artists", "artists"),
                 ("Playlists", "playlists"),
                 ("Favorites", "favorites"),
+                ("Radio", RADIO_ROOT_PATH),
                 ("Albums A-Z", "albums-index"),
                 ("Artists A-Z", "artists-index"),
             ];
