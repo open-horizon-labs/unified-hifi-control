@@ -937,6 +937,8 @@ pub enum LmsPlayTarget {
     /// that reassigns ids — which is why [`LmsAdapter::play_target`] verifies
     /// it still exists before mutating the queue.
     Library { kind: LmsSearchResultType, id: i64 },
+    /// Whole saved playlist, validated before using `playlistcontrol playlist_id`.
+    SavedPlaylist { id: i64 },
     /// `playlist <load|add|insert> <url>`. Mostly durable: a plugin-resolvable
     /// URL that survives restarts and dies only if the plugin is removed or a
     /// subscription lapses.
@@ -2195,6 +2197,9 @@ impl LmsAdapter {
                 ("Albums", "albums"),
                 ("Artists", "artists"),
                 ("Playlists", "playlists"),
+                ("Favorites", "favorites"),
+                ("Albums A-Z", "albums-index"),
+                ("Artists A-Z", "artists-index"),
             ];
             let items: Vec<Value> = categories
                 .iter()
@@ -2205,6 +2210,19 @@ impl LmsAdapter {
             let next_offset =
                 (categories.len() > offset + limit).then_some((offset + limit) as u64);
             return Ok(json!({"items": items, "next_offset": next_offset}));
+        }
+        if path == "favorites" {
+            return self.list_favorites(offset, limit).await;
+        }
+        for kind in ["albums", "artists"] {
+            if path == format!("{kind}-index") {
+                return self.browse_letter_index(kind, None, offset, limit).await;
+            }
+            if let Some(letter) = path.strip_prefix(&format!("{kind}-letter:")) {
+                return self
+                    .browse_letter_index(kind, Some(letter), offset, limit)
+                    .await;
+            }
         }
         if path == "albums" {
             return self.query_albums(offset, limit, None).await;
@@ -2249,6 +2267,82 @@ impl LmsAdapter {
                 .await;
         }
         Err(anyhow!("unknown LMS collection path {path:?}"))
+    }
+
+    /// LMS's native `tags:ZZ` index preserves its locale-dependent sort order.
+    /// See Slim/Control/Queries.pm::_createIndexList. Store the letter in the
+    /// location, not its current offset: a library rescan may move that offset.
+    async fn browse_letter_index(
+        &self,
+        kind: &str,
+        letter: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Value> {
+        let raw = self
+            .rpc
+            .execute(
+                None,
+                vec![json!(kind), json!(0), json!(0), json!("tags:ZZ")],
+            )
+            .await?;
+        let rows = raw
+            .get("indexList")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("LMS did not return an alphabetical index"))?;
+        let mut index = Vec::new();
+        let mut total = 0usize;
+        for row in rows {
+            let values = row
+                .as_array()
+                .filter(|v| v.len() == 2)
+                .ok_or_else(|| anyhow!("Invalid LMS index entry"))?;
+            let label = values[0]
+                .as_str()
+                .filter(|s| !s.is_empty() && s.len() <= 64)
+                .ok_or_else(|| anyhow!("Invalid LMS index letter"))?;
+            let count = values[1]
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| anyhow!("Invalid LMS index count"))?;
+            if index.iter().any(|(name, _, _)| *name == label) {
+                return Err(anyhow!("Ambiguous LMS index letter"));
+            }
+            index.push((label, total, count));
+            total = total
+                .checked_add(count)
+                .ok_or_else(|| anyhow!("LMS index overflow"))?;
+        }
+        if let Some(letter) = letter {
+            let Some((_, start, count)) = index.iter().find(|(name, _, _)| *name == letter) else {
+                return Ok(json!({"items":[],"next_offset":null}));
+            };
+            if offset >= *count || limit == 0 {
+                return Ok(json!({"items":[],"next_offset":null}));
+            }
+            let size = limit.min(count - offset);
+            let mut page = if kind == "albums" {
+                self.query_albums(start + offset, size, None).await?
+            } else {
+                self.query_artists(start + offset, size).await?
+            };
+            page["next_offset"] = if offset + size < *count {
+                json!(offset + size)
+            } else {
+                Value::Null
+            };
+            return Ok(page);
+        }
+        let items: Vec<Value> = index
+            .iter()
+            .filter(|(_, _, count)| *count > 0)
+            .map(|(label, _, _)| json!({"title":label,"path":format!("{kind}-letter:{label}")}))
+            .collect();
+        let end = offset.saturating_add(limit);
+        Ok(
+            json!({"items":items.iter().skip(offset).take(limit).collect::<Vec<_>>(),
+            "next_offset":(end < items.len()).then_some(end)}),
+        )
     }
 
     /// `albums <start> <count> [artist_id:<id>]` -- the whole album library,
@@ -2382,7 +2476,7 @@ impl LmsAdapter {
             .filter_map(|row| {
                 let id = loop_entity_id(row, "playlist")?;
                 let title = row.get("playlist").and_then(Value::as_str)?.to_string();
-                Some(json!({"title": title, "path": format!("playlist:{id}")}))
+                Some(json!({"title": title, "path": format!("playlist:{id}"), "kind": "playlist", "id": id}))
             })
             .collect();
         let next_offset = next_offset(&raw, offset, limit, items.len());
@@ -2756,6 +2850,44 @@ impl LmsAdapter {
                     .execute(
                         Some(player_id),
                         vec![json!("playlist"), json!(method), json!(url)],
+                    )
+                    .await?;
+            }
+            LmsPlayTarget::SavedPlaylist { id } => {
+                let title = validate_title
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow!("Saved playlist requires validation title"))?;
+                let raw = self
+                    .rpc
+                    .execute(
+                        None,
+                        vec![
+                            json!("playlists"),
+                            json!(0),
+                            json!(LIBRARY_VALIDATION_SEARCH_LIMIT),
+                            json!(format!("search:{title}")),
+                        ],
+                    )
+                    .await?;
+                let exists = *id > 0
+                    && raw
+                        .get("playlists_loop")
+                        .and_then(Value::as_array)
+                        .is_some_and(|rows| {
+                            rows.iter()
+                                .any(|row| loop_entity_id(row, "playlist") == Some(*id))
+                        });
+                if !exists {
+                    return Err(anyhow!("Saved playlist no longer exists; browse again"));
+                }
+                self.rpc
+                    .execute(
+                        Some(player_id),
+                        vec![
+                            json!("playlistcontrol"),
+                            json!(format!("cmd:{}", action.to_lms_cmd())),
+                            json!(format!("playlist_id:{id}")),
+                        ],
                     )
                     .await?;
             }
