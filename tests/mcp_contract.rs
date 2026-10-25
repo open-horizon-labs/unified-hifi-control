@@ -2330,13 +2330,13 @@ async fn roon_mcp_app(core: &mock_servers::roon_core::FakeRoonCore) -> TestApp {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if roon.is_browse_connected().await {
+        if roon.is_browse_connected().await && !roon.get_zones().await.is_empty() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(
-        roon.is_browse_connected().await,
+        roon.is_browse_connected().await && !roon.get_zones().await.is_empty(),
         "RoonAdapter never connected to the fake core"
     );
 

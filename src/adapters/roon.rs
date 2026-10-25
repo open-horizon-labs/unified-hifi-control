@@ -3867,7 +3867,7 @@ impl LibraryAdapter for RoonAdapter {
             {
                 let mut state = self.state.write().await;
                 if !state.connected || state.transport.is_none() {
-                    return Err(anyhow::anyhow!("Roon is not connected"));
+                    return Err(anyhow::anyhow!("Not connected to Roon"));
                 }
                 if !state.zones.contains_key(&zone_id) {
                     return Err(anyhow::anyhow!("Roon queue zone was not found"));
@@ -4666,7 +4666,7 @@ async fn run_roon_loop(
                                 _ => { let _ = request.reply.send(Err(anyhow::anyhow!("Roon queue subscription failed or timed out"))); }
                             }
                         } else {
-                            let _ = request.reply.send(Err(anyhow::anyhow!("Roon is not connected")));
+                            let _ = request.reply.send(Err(anyhow::anyhow!("Not connected to Roon")));
                         }
                     }
                     continue;

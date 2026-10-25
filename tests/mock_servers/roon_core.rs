@@ -830,6 +830,14 @@ impl FakeRoonCore {
         self.addr.port().to_string()
     }
 
+    /// Close the registered Core connection while leaving its listener alive.
+    pub async fn disconnect(&self) {
+        let push = self.state.read().await.zone_push.clone();
+        if let Some((_, writer)) = push {
+            let _ = writer.lock().await.close().await;
+        }
+    }
+
     pub async fn set_queue_delay(&self, delay: Duration) {
         self.state.write().await.queue_delay = delay;
     }

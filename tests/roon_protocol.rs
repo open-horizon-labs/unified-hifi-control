@@ -3623,6 +3623,19 @@ async fn back_to_back_cover_requests_never_lose_a_fast_reply() {
     core.stop().await;
 }
 
+// Queue reads require a discovered zone, not merely a registered Browse service.
+async fn queue_connected(core: &FakeRoonCore) -> Arc<RoonAdapter> {
+    let adapter = connected(core).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while adapter.get_zones().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("initial zone snapshot");
+    adapter
+}
+
 // #877: read-only queue snapshots, through the real Roon wire parser.
 fn queue_track(title: &str, id: u32) -> serde_json::Value {
     serde_json::json!({"queue_item_id": id, "length": 123,
@@ -3637,7 +3650,7 @@ async fn queue_read_returns_snapshot_and_unsubscribes() {
     let core = FakeRoonCore::start().await;
     core.set_queue("zone_fake_1", vec![queue_track("First", 99)])
         .await;
-    let adapter = connected(&core).await;
+    let adapter = queue_connected(&core).await;
     let result = adapter
         .read_queue("roon:zone_fake_1")
         .await
@@ -3664,7 +3677,7 @@ async fn queue_read_returns_snapshot_and_unsubscribes() {
 async fn queue_read_distinguishes_empty_complete_and_capped_snapshots() {
     use unified_hifi_control::adapters::traits::LibraryAdapter;
     let core = FakeRoonCore::start().await;
-    let adapter = connected(&core).await;
+    let adapter = queue_connected(&core).await;
     let empty = adapter.read_queue("roon:zone_fake_1").await.unwrap();
     assert_eq!(empty["items"], serde_json::json!([]));
     assert_eq!(empty["total"], 0);
@@ -3705,7 +3718,7 @@ async fn queue_read_serializes_different_zones() {
     core.set_queue("two", vec![queue_track("Zone two", 2)])
         .await;
     core.set_queue_delay(Duration::from_millis(50)).await;
-    let adapter = connected(&core).await;
+    let adapter = queue_connected(&core).await;
     let (one, two) = tokio::join!(
         adapter.read_queue("roon:one"),
         adapter.read_queue("roon:two")
@@ -3736,7 +3749,7 @@ async fn queue_read_cancellation_unsubscribes_before_next_reader() {
     core.set_queue("zone_fake_1", vec![queue_track("Stale", 6)])
         .await;
     core.set_queue_delay(Duration::from_millis(100)).await;
-    let adapter = connected(&core).await;
+    let adapter = queue_connected(&core).await;
     let reader = adapter.clone();
     let task = tokio::spawn(async move { reader.read_queue("roon:zone_fake_1").await });
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -3780,9 +3793,10 @@ async fn queue_read_rejects_invalid_unknown_and_disconnected_zones() {
         .await
         .unwrap_err()
         .to_string()
+        .to_ascii_lowercase()
         .contains("not connected"));
     let core = FakeRoonCore::start().await;
-    let adapter = connected(&core).await;
+    let adapter = queue_connected(&core).await;
     for id in ["zone_fake_1", "lms:zone_fake_1", "roon:", "roon:unknown"] {
         assert!(adapter.read_queue(id).await.is_err(), "{id}");
     }
@@ -3798,7 +3812,7 @@ async fn queue_read_times_out_without_turning_failure_into_empty_queue() {
     use unified_hifi_control::adapters::traits::LibraryAdapter;
     let core = FakeRoonCore::start().await;
     core.set_queue_delay(Duration::from_secs(20)).await;
-    let adapter = connected(&core).await;
+    let adapter = queue_connected(&core).await;
     let result = tokio::time::timeout(
         Duration::from_secs(12),
         adapter.read_queue("roon:zone_fake_1"),
@@ -3824,7 +3838,7 @@ async fn queue_read_shutdown_releases_waiters_promptly() {
     use unified_hifi_control::adapters::traits::{LibraryAdapter, Startable};
     let core = FakeRoonCore::start().await;
     core.set_queue_delay(Duration::from_secs(20)).await;
-    let adapter = connected(&core).await;
+    let adapter = queue_connected(&core).await;
     let reader = adapter.clone();
     let task = tokio::spawn(async move { reader.read_queue("roon:zone_fake_1").await });
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -3845,5 +3859,37 @@ async fn queue_read_shutdown_releases_waiters_promptly() {
         .unwrap()
         .unwrap();
     assert!(result.is_err());
+    assert!(adapter.read_queue("roon:zone_fake_1").await.is_err());
+}
+
+#[tokio::test]
+async fn queue_read_disconnect_fails_inflight_reader_promptly() {
+    use unified_hifi_control::adapters::traits::LibraryAdapter;
+    let core = FakeRoonCore::start().await;
+    core.set_queue_delay(Duration::from_secs(20)).await;
+    let adapter = queue_connected(&core).await;
+    let reader = adapter.clone();
+    let task = tokio::spawn(async move { reader.read_queue("roon:zone_fake_1").await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !core
+            .requests()
+            .await
+            .iter()
+            .any(|r| r.name.ends_with("/subscribe_queue"))
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    core.disconnect().await;
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        result.is_err(),
+        "a disconnected subscription must not become an empty queue"
+    );
     assert!(adapter.read_queue("roon:zone_fake_1").await.is_err());
 }
