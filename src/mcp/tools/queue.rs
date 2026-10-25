@@ -14,7 +14,7 @@ use super::spotify::refusal_for_spotify_error;
 
 #[mcp_tool(
     name = "hifi_queue",
-    description = "Read a queue; edit Music Assistant queues with readback. Transfer requires two Music Assistant zones. Add items with hifi_play_ref or hifi_play action=queue."
+    description = "Read a queue (Roon: first 50 items, with truncation reported); edit Music Assistant queues with readback. Transfer requires two Music Assistant zones. Add items with hifi_play_ref or hifi_play action=queue."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiQueueTool {
@@ -127,6 +127,14 @@ pub async fn handle_queue(
         };
     }
     match target.for_library() {
+        LibraryRoute::Roon => match state
+            .adapter_registry
+            .read_library_queue("roon", &args.zone_id)
+            .await
+        {
+            Ok(value) => Ok(env.json_result(&value)),
+            Err(e) => env.failed(format!("Roon queue error: {e}")),
+        },
         LibraryRoute::Spotify => match state
             .adapter_registry
             .read_library_queue("spotify", &args.zone_id)

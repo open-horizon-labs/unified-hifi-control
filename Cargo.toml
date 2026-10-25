@@ -119,7 +119,7 @@ tower = { version = "0.5.3", optional = true }
 tower-http = { version = "0.7.1", features = ["cors", "compression-gzip", "trace"], optional = true }
 
 # Roon API (server only)
-roon-api = { git = "https://github.com/open-horizon-labs/rust-roon-api.git", branch = "ohc/main", features = ["transport", "image", "status", "browse"], optional = true }
+roon-api = { git = "https://github.com/open-horizon-labs/rust-roon-api.git", rev = "8305ac74938c80701ae2cf48f4e20ded29266fe4", features = ["transport", "image", "status", "browse"], optional = true }
 # TODO: Switch back to upstream after TheAppgineer/rust-roon-api#1 and #2 are merged
 
 # HTTP client (server only)

@@ -374,7 +374,10 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
                 || (target == ZoneTarget::MusicAssistant
                     && matches!(target.for_transport(), TransportRoute::MusicAssistant))
         }
-        Capability::QueueRead => matches!(target, ZoneTarget::Spotify | ZoneTarget::MusicAssistant),
+        Capability::QueueRead => matches!(
+            target,
+            ZoneTarget::Roon | ZoneTarget::Spotify | ZoneTarget::MusicAssistant
+        ),
         Capability::QueueJump
         | Capability::QueueReorder
         | Capability::QueueRemove
@@ -532,9 +535,6 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     (ZoneTarget::Roon, Capability::PlayByRef, Gap::NotWired("#396",
         "RoonAdapter::browse/load/play_item exist and are exposed over HTTP; MCP mints no \
          reference for a search hit to act on.")),
-    (ZoneTarget::Roon, Capability::QueueRead, Gap::NotWired("#400",
-        "the pinned roon-api fork exposes subscribe_queue(zone, max_items), which nothing in \
-         UHC calls.")),
     (ZoneTarget::Roon, Capability::QueueJump, Gap::NotWired("#400",
         "the pinned roon-api fork exposes play_from_here(zone, queue_item_id), which nothing \
          in UHC calls.")),

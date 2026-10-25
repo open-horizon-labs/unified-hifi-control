@@ -277,7 +277,7 @@ Control your hi-fi with natural language. The bridge includes an MCP server so C
 | `hifi_search` | Search provider catalogs *(Roon, LMS, Spotify)* |
 | `hifi_play` | Search and play/queue in one command *(Roon, LMS, Spotify)* |
 | `hifi_play_ref` | Play or queue an exact search result |
-| `hifi_queue` | Read the current provider queue |
+| `hifi_queue` | Read the current provider queue (including Roon); edit Music Assistant queues |
 | `hifi_spotify` | Access Spotify playlists/liked tracks and create/edit playlists |
 | `hifi_status` | Overall bridge status |
 | `hifi_hqplayer_status` | HQPlayer Embedded status and pipeline |
@@ -286,6 +286,8 @@ Control your hi-fi with natural language. The bridge includes an MCP server so C
 | `hifi_hqplayer_set_pipeline` | Change filter, shaper, dither settings |
 
 *Spotify is a controller for existing Spotify Connect devices, not a receiver. Spotify search, exact play/queue-add, queue read, playlists, liked tracks, repeat, and shuffle require the corresponding OAuth scopes. New Development Mode applications cannot use the removed categories, featured-playlists, or new-releases browse endpoints; UHC defaults to that mode. Existing Extended Quota applications can explicitly retain those legacy browse calls with `UHC_SPOTIFY_QUOTA_MODE=extended`. Spotify exposes no active-queue jump/reorder/remove/clear/transfer operations, and Transfer Playback selects one device rather than synchronizing a multiroom group. Transport controls work with all enabled adapters.*
+
+Roon queue reads return a fresh snapshot of up to 50 items using Roon's transport queue subscription. `truncated: true` means more items were omitted; `total` is then `null` because the subscription does not supply the full count. An empty queue returns an empty list; disconnection or timeout returns an error. Roon queue jump and mutations remain unavailable.
 
 The MCP endpoint is unauthenticated like the rest of the bridge — see [Security and Network Exposure](#security-and-network-exposure).
 

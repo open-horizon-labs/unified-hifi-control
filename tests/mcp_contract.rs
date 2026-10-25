@@ -2330,13 +2330,13 @@ async fn roon_mcp_app(core: &mock_servers::roon_core::FakeRoonCore) -> TestApp {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if roon.is_browse_connected().await {
+        if roon.is_browse_connected().await && !roon.get_zones().await.is_empty() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(
-        roon.is_browse_connected().await,
+        roon.is_browse_connected().await && !roon.get_zones().await.is_empty(),
         "RoonAdapter never connected to the fake core"
     );
 
@@ -6301,15 +6301,15 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
     // queue_transfer (#507), plus two more for Roon and LMS multiroom_sync,
     // generalized from the Music Assistant-only original (#517), plus five
     // for #531's LMS (browse, saved_playlists, favorites) and Roon (browse,
-    // saved_playlists) hifi_collections cells, plus one for Roon's seek (#740).
+    // saved_playlists) hifi_collections cells, plus one for Roon's seek (#740) and one for Roon queue reads (#877).
     // Apple Music's transport/skip/volume
     // cells remain gated until signed physical companion validation (#465).
     // Asserted exactly, not as a floor: a floor would pass while a cell silently
     // stopped being reported as supported, which is the direction that hides a
     // capability rather than inventing one.
     assert_eq!(
-        proved, 56,
-        "{proved} supported cells were proved end to end, expected 56. If a capability was deliberately wired or unwired, change this number in the same commit."
+        proved, 57,
+        "{proved} supported cells were proved end to end, expected 57. If a capability was deliberately wired or unwired, change this number in the same commit."
     );
 }
 
@@ -8220,4 +8220,54 @@ async fn shared_collection_contract_unwired_providers_are_explicit() {
             "unsupported browsing must not fabricate a successful empty library: {zone}: {result}"
         );
     }
+}
+
+/// #877: a real Roon queue subscription reaches the existing MCP envelope
+/// through the library registry, and discovery advertises read-only support.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn roon_queue_read_routes_through_mcp_and_reports_truthful_capabilities() {
+    use mock_servers::roon_core::FakeRoonCore;
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let core = FakeRoonCore::start().await;
+    core.set_queue(
+        "zone_fake_1",
+        vec![json!({
+            "queue_item_id": 42, "length": 180,
+            "one_line": {"line1": "Queue track"},
+            "two_line": {"line1": "Queue track", "line2": "Artist"},
+            "three_line": {"line1": "Queue track", "line2": "Artist", "line3": "Album"},
+        })],
+    )
+    .await;
+    let app = roon_mcp_app(&core).await;
+    let result = app
+        .call_tool(
+            "hifi_queue",
+            json!({"zone_id": "roon:zone_fake_1", "action": "read"}),
+        )
+        .await;
+    let envelope = &result["structuredContent"];
+    assert_eq!(envelope["outcome"], "ok", "{result}");
+    assert_eq!(envelope["operation"], "queue_read");
+    assert_eq!(envelope["data"]["items"][0]["title"], "Queue track");
+    assert_eq!(envelope["data"]["truncated"], false);
+    assert!(!envelope["data"].to_string().contains("queue_item_id"));
+    let payload = capability_payload(&app.call_tool("hifi_capabilities", json!({})).await);
+    let caps = capabilities_of(&payload, "roon");
+    assert_eq!(support_of(&caps["queue_read"]), SUPPORTED);
+    assert_eq!(support_of(&caps["queue_jump"]), NOT_IMPLEMENTED);
+    for action in ["jump", "reorder", "remove", "clear", "transfer"] {
+        let result = app
+            .call_tool(
+                "hifi_queue",
+                json!({"zone_id": "roon:zone_fake_1", "action": action, "item_id": "42"}),
+            )
+            .await;
+        assert_ne!(
+            result["structuredContent"]["outcome"], "ok",
+            "{action}: {result}"
+        );
+    }
+    core.assert_no_unhandled_requests().await;
 }

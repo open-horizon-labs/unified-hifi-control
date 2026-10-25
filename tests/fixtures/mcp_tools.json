@@ -680,7 +680,7 @@
     }
   },
   "hifi_queue": {
-    "description": "Read a queue; edit Music Assistant queues with readback. Transfer requires two Music Assistant zones. Add items with hifi_play_ref or hifi_play action=queue.",
+    "description": "Read a queue (Roon: first 50 items, with truncation reported); edit Music Assistant queues with readback. Transfer requires two Music Assistant zones. Add items with hifi_play_ref or hifi_play action=queue.",
     "inputSchema": {
       "properties": {
         "action": {
