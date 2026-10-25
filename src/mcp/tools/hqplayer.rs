@@ -189,7 +189,7 @@ async fn resolve_target(state: &AppState, zone_id: Option<&str>) -> HqpTarget {
 fn target_failure(
     env: Envelope,
     target: HqpTarget,
-) -> Result<(String, Arc<HqpAdapter>, Envelope), Result<CallToolResult, CallToolError>> {
+) -> Result<(String, Arc<HqpAdapter>, Envelope), Box<Result<CallToolResult, CallToolError>>> {
     match target {
         HqpTarget::Resolved {
             instance,
@@ -208,6 +208,7 @@ fn target_failure(
             .scope(scope)
             .failed(format!("HQPlayer instance '{instance}' is not configured"))),
     }
+    .map_err(Box::new)
 }
 
 fn hqp_status_payload_from_snapshot(
@@ -353,7 +354,7 @@ pub async fn handle_status(
     let target = resolve_target(state, args.zone_id.as_deref()).await;
     let (instance, _adapter, env) = match target_failure(env, target) {
         Ok(resolved) => resolved,
-        Err(result) => return result,
+        Err(result) => return *result,
     };
     Ok(env.json_result(&hqp_status_payload_for_adapter(state, &instance).await))
 }
@@ -378,7 +379,7 @@ pub async fn handle_profiles(
     let target = resolve_target(state, args.zone_id.as_deref()).await;
     let (instance, _adapter, env) = match target_failure(env, target) {
         Ok(resolved) => resolved,
-        Err(result) => return result,
+        Err(result) => return *result,
     };
     if state.reliable_commands.is_none() {
         return env.failed("Failed to list profiles: Web credentials not configured");
@@ -401,7 +402,7 @@ pub async fn handle_load_profile(
     let target = resolve_target(state, args.zone_id.as_deref()).await;
     let (instance, _adapter, env) = match target_failure(env, target) {
         Ok(resolved) => resolved,
-        Err(result) => return result,
+        Err(result) => return *result,
     };
     // Compatibility construction used by embedded MCP consumers predates the reliable runtime.
     // It also has no web credentials, and the established tool contract reports that actionable
@@ -448,7 +449,7 @@ pub async fn handle_set_pipeline(
     let target = resolve_target(state, args.zone_id.as_deref()).await;
     let (instance, _adapter, env) = match target_failure(env, target) {
         Ok(resolved) => resolved,
-        Err(result) => return result,
+        Err(result) => return *result,
     };
     // All settings use name-based lookups; the adapter handles the conversion.
     // Only samplerate needs numeric parsing (an Hz value).

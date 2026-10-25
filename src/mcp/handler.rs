@@ -227,7 +227,12 @@ impl ServerHandler for HifiMcpHandler {
             )
             .await
             .map_err(|error| RpcError::internal_error().with_message(error.to_string()))?;
-        crate::mcp::resources::listen_for_list_changes(&self.state, runtime.clone()).await;
+        crate::mcp::resources::listen_for_list_changes(
+            &self.state,
+            runtime.clone(),
+            request_id.clone(),
+        )
+        .await;
         Ok(SubscriptionsListenResult {
             meta: SubscriptionsListenResultMetaObject {
                 io_modelcontextprotocol_server_info: Some(

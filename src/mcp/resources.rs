@@ -324,7 +324,11 @@ pub fn list_fingerprint(resources: &[Resource]) -> Option<String> {
 
 /// Observe one explicit MCP 2 notification subscription. No client session or
 /// global baseline survives the stream: reconnecting clients fetch a fresh list.
-pub async fn listen_for_list_changes(state: &crate::api::AppState, runtime: Arc<dyn McpServer>) {
+pub async fn listen_for_list_changes(
+    state: &crate::api::AppState,
+    runtime: Arc<dyn McpServer>,
+    subscription_id: rust_mcp_sdk::schema::RequestId,
+) {
     let mut rx = state.bus.subscribe();
     let mut reconcile = tokio::time::interval(std::time::Duration::from_secs(1));
     let settings = crate::api::load_app_settings();
@@ -350,7 +354,12 @@ pub async fn listen_for_list_changes(state: &crate::api::AppState, runtime: Arc<
         if current.is_some() && current != baseline {
             let sent = tokio::select! {
                 _ = state.shutdown.cancelled() => break,
-                result = tokio::time::timeout(std::time::Duration::from_secs(2), runtime.notify_resource_list_changed(None)) => matches!(result, Ok(Ok(()))),
+                result = tokio::time::timeout(std::time::Duration::from_secs(2), runtime.notify_resource_list_changed(Some(rust_mcp_sdk::schema::NotificationParams {
+                    meta: Some(rust_mcp_sdk::schema::NotificationMetaObject {
+                        io_modelcontextprotocol_subscription_id: Some(subscription_id.clone()),
+                        ..Default::default()
+                    }),
+                }))) => matches!(result, Ok(Ok(()))),
             };
             if !sent {
                 break;

@@ -13,7 +13,7 @@ load it:
 
 1. Feature-detects `document.modelContext`. If the browser doesn't have it,
    the script does nothing else -- zero behavior change, no console noise.
-2. Opens a session against UHC's own `/mcp` endpoint (the same MCP server any
+2. Posts a stateless request to UHC's own `/mcp` endpoint (the same MCP server any
    external client like Claude Code talks to -- see the [MCP Server
    section](../README.md#mcp-server-claude-integration) of the README) and
    fetches `tools/list`.

@@ -297,7 +297,6 @@ pub struct AppState {
     /// constructor parameter -- like `sse_connections` above -- so every
     /// existing `AppState::new` call site is untouched by this addition.
     pub mcp_refs: crate::mcp::refs::RefTable,
-    /// Bounded per-session served resource lists and pending invalidations (#833).
     /// Durable provider-private collection identities behind canonical
     /// `/library/<source>/<view>/loc_…` URLs. Unlike `mcp_refs`, these survive
     /// process and provider-session restarts.

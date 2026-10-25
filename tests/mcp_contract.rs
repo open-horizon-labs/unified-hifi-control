@@ -682,8 +682,7 @@ fn declared_protocol_version_and_capabilities_are_pinned() {
 
     // #397: `resources` is now declared, but only the sub-features actually
     // implemented. `listChanged` is wired off the aggregator's own zone-discovery
-    // bus events (best-effort: undelivered with no open stream, since
-    // `event_store: None` gives no replay). `subscribe` is deliberately omitted —
+    // bus events on explicit subscription streams, without event replay. `subscribe` is deliberately omitted —
     // resource-content subscriptions are not implemented, so advertising it would
     // oblige honoring something this server cannot.
     let resources = details
@@ -7842,7 +7841,7 @@ async fn resource_list(app: &TestApp) -> Value {
 
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
-async fn resource_list_notifications_follow_each_sessions_served_snapshot() {
+async fn explicit_resource_subscriptions_track_distinct_list_changes() {
     use unified_hifi_control::bus::BusEvent;
     let _settings = SettingsFixture::with_hqplayer(false);
     let bus = create_bus();
@@ -7869,11 +7868,15 @@ async fn resource_list_notifications_follow_each_sessions_served_snapshot() {
     assert!(resource_hint(&mut stream_a, Duration::from_secs(3))
         .await
         .is_some());
-    // Client A has not re-listed: content updates and further discovery coalesce.
+    // A distinct listing change gets its own hint without retaining session state.
     seed_zone(&bus, &state, "roon:attic", "Attic").await;
-    assert!(resource_hint(&mut stream_a, Duration::from_millis(1100))
+    let hint = resource_hint(&mut stream_a, Duration::from_secs(3))
         .await
-        .is_none());
+        .unwrap();
+    assert_eq!(
+        hint.pointer("/params/_meta/io.modelcontextprotocol~1subscriptionId"),
+        Some(&json!(834))
+    );
     let mut stream_b = resource_stream(&app).await;
     let fresh_b = resource_list(&app).await;
     assert_eq!(fresh_b["resources"].as_array().unwrap().len(), 5);
@@ -7934,8 +7937,8 @@ async fn resource_list_notifications_follow_each_sessions_served_snapshot() {
             .len(),
         5
     );
-    // Dropping a stream does not delete the logical session. Re-listing returns
-    // the complete current set and the same notifier can use a reopened stream.
+    // A new subscription owns a new baseline. Stateless reads always return
+    // the current set after disconnect.
     drop(stream_a);
     assert_eq!(
         resource_list(&app).await["resources"]
