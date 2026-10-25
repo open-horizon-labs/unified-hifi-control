@@ -1,7 +1,7 @@
 // Unit tests for public/webmcp-bridge.js (#579).
 //
 // Covers the pure translation functions (SSE framing, tool policy,
-// envelope -> CallToolResult) plus the session lifecycle and CSRF header
+// envelope -> CallToolResult) plus stateless request metadata and CSRF header
 // wiring of `Bridge`, driven with a stub `fetch` so no server is needed.
 //
 // Run with: node --test tests/webmcp_bridge.test.js
@@ -118,8 +118,7 @@ test("envelopeToCallToolResult handles a null/unparseable envelope", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Bridge: session lifecycle (initialize -> notifications/initialized ->
-// tools/list / tools/call) and CSRF header attachment, against a stub fetch.
+// Bridge: stateless tools/list / tools/call and CSRF headers.
 // ---------------------------------------------------------------------------
 
 function fakeHeaders(map) {

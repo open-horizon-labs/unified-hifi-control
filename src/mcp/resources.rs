@@ -56,10 +56,11 @@
 //!
 //! # `listChanged`
 //!
-//! The notifier compares the advertised list with each session's last served
-//! snapshot. One pending invalidation suppresses repeated hints until re-listing.
-//! A periodic reconciliation covers bus/aggregate scheduling races and settings
-//! edited directly on disk. Idle sessions expire; re-listing starts a fresh notifier.
+//! Each explicit subscription owns its current advertised-list fingerprint.
+//! Duplicate bus events stay quiet; real list changes send one notification.
+//! A periodic comparison also detects visibility and settings edits on disk.
+//! Disconnect and shutdown retire the stream; reconnect starts fresh. A failed
+//! or blocked send ends that subscription instead of retaining a session cache.
 //!
 //! # Reading an unknown or stale URI
 //!

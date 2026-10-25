@@ -12,7 +12,7 @@
 //! | Module      | Responsibility                                           |
 //! |-------------|----------------------------------------------------------|
 //! | `mod.rs`     | Axum route handlers, stateless HTTP, SDK wiring         |
-//! | [`server`]   | the `initialize` result: identity, capabilities, protocol |
+//! | [`server`]   | discovery identity and capabilities |
 //! | [`handler`]  | the `ServerHandler` impl: advertise tools, dispatch calls |
 //! | [`tools`]    | tool definitions + handlers, by family                    |
 //! | [`types`]    | response shapes and result constructors                   |
@@ -24,7 +24,7 @@
 //!
 //! # The MCP surface is pinned by tests
 //!
-//! `tests/mcp_contract.rs` snapshots `tools/list` and `initialize` against
+//! `tests/mcp_contract.rs` snapshots `tools/list` and `server/discover` against
 //! committed fixtures and pins every tool's runtime behavior, including the
 //! error strings a model reads. Epic #392 is additive-only, so a fixture diff on
 //! a PR in that epic is a bug report, not a chore. Regenerate deliberately:

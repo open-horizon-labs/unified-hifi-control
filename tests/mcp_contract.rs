@@ -9,12 +9,12 @@
 //!
 //! 1. **Wire-level snapshots** driven through the real Axum `/mcp` route via
 //!    `tower::ServiceExt::oneshot`. These capture the bytes an MCP client
-//!    actually receives for `initialize` and `tools/list`, including the
+//!    actually receives for `server/discover` and `tools/list`, including the
 //!    settings-based HQPlayer tool filtering. They exercise `create_mcp_extension`,
 //!    the streamable-HTTP transport, and the `ServerHandler` impl — i.e. every
 //!    layer a refactor could disturb. Committed fixtures:
 //!      - `tests/fixtures/mcp_tools.json`      (`tools/list`, HQPlayer enabled)
-//!      - `tests/fixtures/mcp_discover.json` (`initialize` result)
+//!      - `tests/fixtures/mcp_discover.json` (discovery result)
 //!
 //! 2. **In-process assertions** over `unified_hifi_control::mcp` for things a
 //!    snapshot cannot express: JSON Schema structural validity, the documented
@@ -78,12 +78,7 @@ use mock_servers::{MockHqpServer, MockLmsServer, MockOpenHomeDevice, MockUpnpRen
 
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 
-/// The protocol version the server declares in `create_mcp_extension`.
-///
-/// The SDK negotiates down to whatever the client asks for, so the test client
-/// asks for exactly this: that way the `initialize` snapshot pins the *declared*
-/// version, and lowering the declared version turns a client request for this
-/// version into an outright error rather than a silent downgrade.
+/// Exact current protocol used on every request; obsolete versions are refused.
 const SERVER_PROTOCOL_VERSION: &str = "2026-07-28";
 
 fn fixture_path(name: &str) -> std::path::PathBuf {
@@ -315,11 +310,7 @@ impl TestApp {
     ///
     /// `enable_json_response` is false in `create_mcp_extension`, so responses
     /// arrive SSE-framed; the `data:` payload is the JSON-RPC envelope.
-    async fn post(
-        &self,
-        session_id: Option<&str>,
-        mut payload: Value,
-    ) -> (axum::http::HeaderMap, Option<Value>) {
+    async fn post(&self, mut payload: Value) -> (axum::http::HeaderMap, Option<Value>) {
         let version = payload
             .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
             .and_then(Value::as_str)
@@ -350,9 +341,6 @@ impl TestApp {
         {
             builder = builder.header("Mcp-Name", target);
         }
-        if let Some(sid) = session_id {
-            builder = builder.header(MCP_SESSION_ID_HEADER, sid);
-        }
         let request = builder
             .body(Body::from(payload.to_string()))
             .expect("build request");
@@ -374,31 +362,29 @@ impl TestApp {
     }
 
     /// Discover the current stateless protocol; there is no initialize handshake.
-    async fn discover(&self) -> (String, Value) {
+    async fn discover(&self) -> Value {
         self.discover_with_protocol(SERVER_PROTOCOL_VERSION).await
     }
 
-    async fn discover_with_protocol(&self, protocol_version: &str) -> (String, Value) {
-        let (headers, response) = self.post(None, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
-            "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": protocol_version}}
-        })).await;
+    async fn discover_with_protocol(&self, protocol_version: &str) -> Value {
+        let (headers, response) = self
+            .post(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+                "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": protocol_version}}
+            }))
+            .await;
         assert!(
             headers.get(MCP_SESSION_ID_HEADER).is_none(),
             "stateless responses must not mint a session"
         );
         let response = response.expect("server/discover response");
-        (String::new(), response["result"].clone())
+        response["result"].clone()
     }
 
-    /// `tools/list` against an initialized session.
+    /// `tools/list` without a handshake.
     async fn list_tools(&self) -> Value {
-        let (session_id, _) = self.discover().await;
         let (_, response) = self
-            .post(
-                Some(&session_id),
-                json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
-            )
+            .post(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }))
             .await;
         let response = response.expect("tools/list must return a JSON-RPC response");
         response
@@ -407,19 +393,15 @@ impl TestApp {
             .unwrap_or_else(|| panic!("tools/list returned no result: {response}"))
     }
 
-    /// `tools/call` against an initialized session. Returns the `result` object.
+    /// `tools/call` without a handshake. Returns the `result` object.
     async fn call_tool(&self, name: &str, arguments: Value) -> Value {
-        let (session_id, _) = self.discover().await;
         let (_, response) = self
-            .post(
-                Some(&session_id),
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": 3,
-                    "method": "tools/call",
-                    "params": { "name": name, "arguments": arguments }
-                }),
-            )
+            .post(json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            }))
             .await;
         let response = response.expect("tools/call must return a JSON-RPC response");
         response
@@ -428,15 +410,11 @@ impl TestApp {
             .unwrap_or_else(|| panic!("tools/call {name} returned no result: {response}"))
     }
 
-    /// `resources/list` against an initialized session. Returns the `result`
+    /// `resources/list` without a handshake. Returns the `result`
     /// object.
     async fn list_resources(&self) -> Value {
-        let (session_id, _) = self.discover().await;
         let (_, response) = self
-            .post(
-                Some(&session_id),
-                json!({ "jsonrpc": "2.0", "id": 20, "method": "resources/list", "params": {} }),
-            )
+            .post(json!({ "jsonrpc": "2.0", "id": 20, "method": "resources/list", "params": {} }))
             .await;
         let response = response.expect("resources/list must return a JSON-RPC response");
         response
@@ -445,19 +423,15 @@ impl TestApp {
             .unwrap_or_else(|| panic!("resources/list returned no result: {response}"))
     }
 
-    /// `resources/read` against an initialized session. Returns the full
+    /// `resources/read` without a handshake. Returns the full
     /// JSON-RPC response (not just `result`), so a caller can inspect `error`
     /// for the unknown/stale-uri cases without a separate code path.
     async fn read_resource(&self, uri: &str) -> Value {
-        let (session_id, _) = self.discover().await;
         let (_, response) = self
-            .post(
-                Some(&session_id),
-                json!({
-                    "jsonrpc": "2.0", "id": 21, "method": "resources/read",
-                    "params": { "uri": uri }
-                }),
-            )
+            .post(json!({
+                "jsonrpc": "2.0", "id": 21, "method": "resources/read",
+                "params": { "uri": uri }
+            }))
             .await;
         response.expect("resources/read must return a JSON-RPC response")
     }
@@ -655,10 +629,10 @@ async fn hqplayer_tools_filtered_when_adapter_disabled() {
 }
 
 // =============================================================================
-// 2. initialize snapshot
+// 2. Discovery snapshot
 // =============================================================================
 
-/// The `initialize` result — server info, declared capabilities, instructions,
+/// The discovery result — server info, declared capabilities, instructions,
 /// and protocol version — must match the committed fixture.
 ///
 /// `serverInfo.version` comes from `CARGO_PKG_VERSION`, which release builds
@@ -670,7 +644,7 @@ async fn discover_result_matches_fixture() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
 
-    let (_, mut result) = app.discover().await;
+    let mut result = app.discover().await;
 
     let version = result
         .pointer("/_meta/io.modelcontextprotocol~1serverInfo/version")
@@ -689,17 +663,7 @@ async fn discover_result_matches_fixture() {
     assert_matches_fixture("mcp_discover.json", &result);
 }
 
-/// The wire snapshot above cannot see a *raised* declared protocol version,
-/// because the SDK negotiates down to whatever the client asked for: declare
-/// `2026-06-18`, have the client ask for `2025-11-25`, and the result still says
-/// `2025-11-25`. Lowering it is caught (the request becomes an outright error);
-/// raising it is not.
-///
-/// So the declared value is also asserted directly off `server_details()` — the
-/// reason that function was extracted from `create_mcp_extension`. This reads
-/// production's own value instead of restating it, and it is what makes
-/// `SERVER_PROTOCOL_VERSION` above a checked mirror rather than a second source
-/// of truth.
+/// Pin the current protocol and the capabilities production advertises.
 #[test]
 fn declared_protocol_version_and_capabilities_are_pinned() {
     let details = mcp::server_details();
@@ -720,7 +684,7 @@ fn declared_protocol_version_and_capabilities_are_pinned() {
     // implemented. `listChanged` is wired off the aggregator's own zone-discovery
     // bus events (best-effort: undelivered with no open stream, since
     // `event_store: None` gives no replay). `subscribe` is deliberately omitted —
-    // the SDK has no subscription registry and no replay, so advertising it would
+    // resource-content subscriptions are not implemented, so advertising it would
     // oblige honoring something this server cannot.
     let resources = details
         .capabilities
@@ -756,13 +720,46 @@ async fn old_protocol_versions_are_rejected() {
     let app = TestApp::new().await;
     for version in ["2024-11-05", "2025-11-25"] {
         let (_, response) = app
-            .post(
-                None,
-                json!({"jsonrpc":"2.0","id":1,"method":"server/discover",
-            "params":{"_meta":{"io.modelcontextprotocol/protocolVersion":version}}}),
-            )
+            .post(json!({"jsonrpc":"2.0","id":1,"method":"server/discover",
+            "params":{"_meta":{"io.modelcontextprotocol/protocolVersion":version}}}))
             .await;
         assert!(response.unwrap().get("error").is_some());
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn stateless_transport_rejects_missing_metadata_and_mismatched_headers() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+    for (method_header, version_header, meta) in [
+        ("tools/list", SERVER_PROTOCOL_VERSION, json!({})),
+        (
+            "tools/call",
+            SERVER_PROTOCOL_VERSION,
+            json!({
+                "io.modelcontextprotocol/protocolVersion": SERVER_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }),
+        ),
+        (
+            "tools/list",
+            "2025-11-25",
+            json!({
+                "io.modelcontextprotocol/protocolVersion": SERVER_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }),
+        ),
+    ] {
+        let response = app.router.clone().oneshot(Request::builder()
+            .method(Method::POST).uri("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", version_header)
+            .header("Mcp-Method", method_header)
+            .body(Body::from(json!({"jsonrpc":"2.0","id":99,"method":"tools/list","params":{"_meta":meta}}).to_string()))
+            .unwrap()).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 }
 
@@ -1123,55 +1120,40 @@ async fn every_tool_has_a_nonempty_description() {
 }
 
 // =============================================================================
-// 3b. Transport layer: session recovery, GET, DELETE
+// 3b. Stateless transport and removed legacy methods
 // =============================================================================
-//
-// Everything above POSTs with a valid session. That leaves three of the four
-// public functions in src/mcp/mod.rs unexercised — including
-// `auto_recover_session`, which is the most intricate code in the module and was
-// moved verbatim by the split. It exists because real clients hold stale sessions
-// across a server restart, so it is load-bearing rather than glue.
 
-/// A POST carrying a session id the server has never heard of must still
-/// succeed: `auto_recover_session` transparently mints a new session and rewrites
-/// the request headers, so the client's request goes through instead of failing.
-///
-/// Without this test the split could have broken stale-session recovery and every
-/// other test in this file would still pass.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
 async fn obsolete_session_headers_do_not_create_state() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
-
-    // Never initialized; this id exists nowhere in the session store.
-    let (_, response) = app
-        .post(
-            Some("stale-session-from-a-previous-server-process"),
-            json!({ "jsonrpc": "2.0", "id": 99, "method": "tools/list", "params": {} }),
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", SERVER_PROTOCOL_VERSION)
+                .header("Mcp-Method", "tools/list")
+                .header(MCP_SESSION_ID_HEADER, "obsolete-session")
+                .body(Body::from(
+                    json!({"jsonrpc":"2.0","id":99,"method":"tools/list","params":{"_meta":{
+            "io.modelcontextprotocol/protocolVersion":SERVER_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities":{}}}})
+                    .to_string(),
+                ))
+                .unwrap(),
         )
-        .await;
-
-    let response = response.expect("a stale session must still get a JSON-RPC response");
-    assert!(
-        response.get("error").is_none(),
-        "stale session recovery must not surface an error to the client: {response}"
-    );
-    let tools = response
-        .pointer("/result/tools")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("recovered request must return the tool list, got: {response}"));
-    assert_eq!(
-        tools.len(),
-        21,
-        "the recovered session must serve the same tool list as a fresh one"
-    );
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert!(response.headers().get(MCP_SESSION_ID_HEADER).is_none());
 }
 
-/// GET opens the server-to-client SSE stream; DELETE tears a session down. Both
-/// are wired in `src/main.rs` and neither had any coverage. Smoked here so a
-/// mis-wired route surfaces as a test failure rather than as a client that
-/// silently cannot receive notifications.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
 async fn get_and_delete_are_not_supported_by_stateless_http() {
@@ -1209,7 +1191,7 @@ async fn get_and_delete_are_not_supported_by_stateless_http() {
 async fn resource_methods_dispatch_now_that_resources_is_declared() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
-    let (session_id, init) = app.discover().await;
+    let init = app.discover().await;
 
     // Precondition: the declared capability set contains both tools and
     // resources.
@@ -1223,10 +1205,7 @@ async fn resource_methods_dispatch_now_that_resources_is_declared() {
     );
 
     let (_, list_response) = app
-        .post(
-            Some(&session_id),
-            json!({ "jsonrpc": "2.0", "id": 10, "method": "resources/list", "params": {} }),
-        )
+        .post(json!({ "jsonrpc": "2.0", "id": 10, "method": "resources/list", "params": {} }))
         .await;
     let list_response = list_response.expect("resources/list must return a JSON-RPC response");
     assert!(
@@ -1242,13 +1221,10 @@ async fn resource_methods_dispatch_now_that_resources_is_declared() {
     );
 
     let (_, read_response) = app
-        .post(
-            Some(&session_id),
-            json!({
-                "jsonrpc": "2.0", "id": 11, "method": "resources/read",
-                "params": { "uri": "hifi://zones" }
-            }),
-        )
+        .post(json!({
+            "jsonrpc": "2.0", "id": 11, "method": "resources/read",
+            "params": { "uri": "hifi://zones" }
+        }))
         .await;
     let read_response = read_response.expect("resources/read must return a JSON-RPC response");
     assert!(
@@ -1266,9 +1242,7 @@ async fn resource_methods_dispatch_now_that_resources_is_declared() {
     // No templates are advertised (#397 chose live enumeration over templates),
     // so this returns an empty list rather than the SDK's generic refusal.
     let (_, templates_response) = app
-        .post(
-            Some(&session_id),
-            json!({ "jsonrpc": "2.0", "id": 12, "method": "resources/templates/list", "params": {} }),
+        .post(json!({ "jsonrpc": "2.0", "id": 12, "method": "resources/templates/list", "params": {} }),
         )
         .await;
     let templates_response =
@@ -1290,7 +1264,7 @@ async fn resource_methods_dispatch_now_that_resources_is_declared() {
 async fn resources_subscribe_is_not_advertised_and_not_implemented() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
-    let (session_id, init) = app.discover().await;
+    let init = app.discover().await;
 
     assert!(
         init.pointer("/capabilities/resources/subscribe").is_none(),
@@ -1298,13 +1272,10 @@ async fn resources_subscribe_is_not_advertised_and_not_implemented() {
     );
 
     let (_, response) = app
-        .post(
-            Some(&session_id),
-            json!({
-                "jsonrpc": "2.0", "id": 13, "method": "resources/subscribe",
-                "params": { "uri": "hifi://zones" }
-            }),
-        )
+        .post(json!({
+            "jsonrpc": "2.0", "id": 13, "method": "resources/subscribe",
+            "params": { "uri": "hifi://zones" }
+        }))
         .await;
     let response = response.expect("resources/subscribe must return a JSON-RPC response");
     let error = response
@@ -5374,17 +5345,13 @@ async fn an_unplaceable_prefix_reaches_no_adapter_at_all() {
 async fn argument_parse_failures_get_an_envelope_and_unknown_tools_do_not() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
-    let (session_id, _) = app.discover().await;
 
-    async fn call(app: &TestApp, session_id: &str, id: i32, name: &str, arguments: Value) -> Value {
+    async fn call(app: &TestApp, id: i32, name: &str, arguments: Value) -> Value {
         let (_, response) = app
-            .post(
-                Some(session_id),
-                json!({
-                    "jsonrpc": "2.0", "id": id, "method": "tools/call",
-                    "params": { "name": name, "arguments": arguments }
-                }),
-            )
+            .post(json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            }))
             .await;
         response
             .and_then(|r| r.get("result").cloned())
@@ -5392,14 +5359,7 @@ async fn argument_parse_failures_get_an_envelope_and_unknown_tools_do_not() {
     }
 
     // A known tool, a required parameter omitted.
-    let result = call(
-        &app,
-        &session_id,
-        90,
-        "hifi_control",
-        json!({ "action": "play" }),
-    )
-    .await;
+    let result = call(&app, 90, "hifi_control", json!({ "action": "play" })).await;
     assert_eq!(
         result_text(&result),
         "missing field `zone_id`",
@@ -5432,7 +5392,6 @@ async fn argument_parse_failures_get_an_envelope_and_unknown_tools_do_not() {
     // A wrong type, where the deserializer message may not name the field.
     let result = call(
         &app,
-        &session_id,
         91,
         "hifi_control",
         json!({ "zone_id": "roon:x", "action": "play", "value": "loud" }),
@@ -5452,7 +5411,7 @@ async fn argument_parse_failures_get_an_envelope_and_unknown_tools_do_not() {
     );
 
     // An unknown tool name: text preserved, no envelope, on purpose.
-    let result = call(&app, &session_id, 92, "hifi_frobnicate", json!({})).await;
+    let result = call(&app, 92, "hifi_frobnicate", json!({})).await;
     assert_eq!(result_text(&result), "Unknown tool: hifi_frobnicate");
     assert_eq!(result.get("isError"), Some(&json!(true)));
     assert!(
@@ -7779,14 +7738,14 @@ async fn music_details_both_transports_refuse_late_context_for_changed_music() {
     task.abort();
 }
 
-// #833: exercise the real session transport, including the quiet period that
+// #833: exercise explicit notification subscriptions, including the quiet period that
 // distinguishes an unchanged listing from a merely throttled false hint.
 struct ResourceStream {
     body: Body,
     pending: String,
 }
 
-async fn resource_stream(app: &TestApp, _session: &str) -> ResourceStream {
+async fn resource_stream(app: &TestApp) -> ResourceStream {
     // SDK retirement is detected by its keep-alive, not immediately by Body drop.
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
@@ -7874,12 +7833,9 @@ fn resource_hint_parser_preserves_duplicates_and_partial_frames() {
     pending.push_str("\"method\":\"notifications/resources/list_changed\"}\n");
     assert!(take_resource_hint(&mut pending).is_some());
 }
-async fn session_resource_list(app: &TestApp, session: &str) -> Value {
+async fn resource_list(app: &TestApp) -> Value {
     let (_, response) = app
-        .post(
-            Some(session),
-            json!({"jsonrpc":"2.0","id":833,"method":"resources/list"}),
-        )
+        .post(json!({"jsonrpc":"2.0","id":833,"method":"resources/list"}))
         .await;
     response.unwrap()["result"].clone()
 }
@@ -7895,9 +7851,8 @@ async fn resource_list_notifications_follow_each_sessions_served_snapshot() {
     let running = tokio::spawn(async move { aggregator.run().await });
     seed_zone(&bus, &state, "roon:kitchen", "Kitchen").await;
     let app = TestApp::with_state(state.clone());
-    let (a, _) = app.discover().await;
-    let mut stream_a = resource_stream(&app, &a).await;
-    let original = session_resource_list(&app, &a).await;
+    let mut stream_a = resource_stream(&app).await;
+    let original = resource_list(&app).await;
     for i in 1..=18 {
         let mut zone = state.aggregator.get_zone("roon:kitchen").await.unwrap();
         zone.last_updated = i;
@@ -7908,7 +7863,7 @@ async fn resource_list_notifications_follow_each_sessions_served_snapshot() {
     assert!(resource_hint(&mut stream_a, Duration::from_millis(1200))
         .await
         .is_none());
-    assert_eq!(session_resource_list(&app, &a).await, original);
+    assert_eq!(resource_list(&app).await, original);
 
     seed_zone(&bus, &state, "roon:study", "Study").await;
     assert!(resource_hint(&mut stream_a, Duration::from_secs(3))
@@ -7919,14 +7874,13 @@ async fn resource_list_notifications_follow_each_sessions_served_snapshot() {
     assert!(resource_hint(&mut stream_a, Duration::from_millis(1100))
         .await
         .is_none());
-    let (b, _) = app.discover().await;
-    let mut stream_b = resource_stream(&app, &b).await;
-    let fresh_b = session_resource_list(&app, &b).await;
+    let mut stream_b = resource_stream(&app).await;
+    let fresh_b = resource_list(&app).await;
     assert_eq!(fresh_b["resources"].as_array().unwrap().len(), 5);
     assert!(resource_hint(&mut stream_b, Duration::from_millis(1100))
         .await
         .is_none());
-    assert_eq!(session_resource_list(&app, &a).await, fresh_b);
+    assert_eq!(resource_list(&app).await, fresh_b);
 
     // Provider rename preserves membership but changes advertised metadata.
     let mut renamed = state.aggregator.get_zone("roon:kitchen").await.unwrap();
@@ -7938,7 +7892,7 @@ async fn resource_list_notifications_follow_each_sessions_served_snapshot() {
     assert!(resource_hint(&mut stream_b, Duration::from_secs(3))
         .await
         .is_some());
-    let renamed_list = session_resource_list(&app, &a).await;
+    let renamed_list = resource_list(&app).await;
     assert!(renamed_list["resources"]
         .as_array()
         .unwrap()
@@ -7955,7 +7909,7 @@ async fn resource_list_notifications_follow_each_sessions_served_snapshot() {
     assert!(resource_hint(&mut stream_a, Duration::from_secs(3))
         .await
         .is_some());
-    let policy_list = session_resource_list(&app, &a).await;
+    let policy_list = resource_list(&app).await;
     assert!(!policy_list["resources"]
         .as_array()
         .unwrap()
@@ -7974,7 +7928,7 @@ async fn resource_list_notifications_follow_each_sessions_served_snapshot() {
         .await
         .is_some());
     assert_eq!(
-        session_resource_list(&app, &a).await["resources"]
+        resource_list(&app).await["resources"]
             .as_array()
             .unwrap()
             .len(),
@@ -7984,7 +7938,7 @@ async fn resource_list_notifications_follow_each_sessions_served_snapshot() {
     // the complete current set and the same notifier can use a reopened stream.
     drop(stream_a);
     assert_eq!(
-        session_resource_list(&app, &a).await["resources"]
+        resource_list(&app).await["resources"]
             .as_array()
             .unwrap()
             .len(),
@@ -7992,10 +7946,10 @@ async fn resource_list_notifications_follow_each_sessions_served_snapshot() {
     );
     settings["hidden_zones"] = json!([]);
     std::fs::write(&settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
-    let mut reopened = resource_stream(&app, &a).await;
+    let mut reopened = resource_stream(&app).await;
     // No replay is promised: returning clients fetch the complete current set.
     assert_eq!(
-        session_resource_list(&app, &a).await["resources"]
+        resource_list(&app).await["resources"]
             .as_array()
             .unwrap()
             .len(),
@@ -8006,7 +7960,7 @@ async fn resource_list_notifications_follow_each_sessions_served_snapshot() {
     assert!(resource_hint(&mut reopened, Duration::from_secs(3))
         .await
         .is_some());
-    let recovered = session_resource_list(&app, &a).await;
+    let recovered = resource_list(&app).await;
     assert_eq!(recovered["resources"].as_array().unwrap().len(), 4);
     state.shutdown.cancel();
     bus.publish(BusEvent::ShuttingDown { reason: None });

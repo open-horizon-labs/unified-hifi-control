@@ -6,11 +6,11 @@ use rust_mcp_sdk::schema::{
 };
 use rust_mcp_sdk::ServerDetails;
 
-/// The `initialize` result this server advertises.
+/// Identity and capabilities used by `server/discover`.
 ///
-/// Every field is snapshotted in `tests/fixtures/mcp_initialize.json`. Changing
+/// Every field is snapshotted in `tests/fixtures/mcp_discover.json`. Changing
 /// any of them — instructions included, since a model reads them — fails
-/// `initialize_result_matches_fixture`, which is the intended behavior: the
+/// `discover_result_matches_fixture`, which is the intended behavior: the
 /// fixture is regenerated deliberately, never incidentally.
 ///
 /// `server_info.version` comes from `CARGO_PKG_VERSION`, which release builds
@@ -27,8 +27,8 @@ pub fn server_details() -> ServerDetails {
         },
         capabilities: ServerCapabilities {
             tools: Some(ServerCapabilitiesTools { list_changed: None }),
-            // #397: only the sub-features actually implemented. See the module
-            // docs for why `subscribe` stays unset.
+            // Explicit list-change subscriptions are implemented; individual
+            // resource-content subscriptions are not advertised.
             resources: Some(ServerCapabilitiesResources {
                 list_changed: Some(true),
                 subscribe: None,
