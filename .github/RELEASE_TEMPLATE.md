@@ -1,3 +1,14 @@
+## Changes in beta.9
+
+- Sweep direct Rust and npm dependencies against current stable releases, including major API migrations: Rand 0.10, SHA2 0.11, Ed25519 3, Reqwest 0.13, Syn 3 and MCP SDK 2.0. Refresh the transitive graph and npm lockfile.
+- Build with Rust 1.99.1, Zig 0.17, cargo-zigbuild 0.24, Tailwind 4.3.3 and Node 26.12.1. Use Alpine 3.24.3 for published runtime containers.
+- Preserve OAuth form submission, bounded streamed responses, cryptographic random sources and existing encrypted credential formats while adapting upstream APIs.
+- Preserve WASM-bindgen metadata until the browser bundle is processed on LLVM 23. Native release binaries retain their stripping, LTO and hardening settings.
+- **Breaking MCP protocol update:** use MCP 2026-07-28 with `server/discover`, per-request protocol/capability metadata and method/name headers. Legacy initialize/session GET/DELETE and automatic stale-session recovery are removed. Resource-list notifications use explicit POST `subscriptions/listen` streams. The browser WebMCP bridge and contract clients are migrated together.
+- Update CI actions to their latest stable major lines. Model/evaluation Git pins and the MQTT security fix retain their reviewed provenance.
+
+Pair with **HiPhi firmware v2.8.0-alpha.4**. Exact packaged artifacts, hardware and live providers still require qualification before promotion to stable.
+
 ## Changes in beta.8
 
 - Play and queue complete LMS saved playlists from collection rows. Stale playlist handles are checked before the queue is changed.

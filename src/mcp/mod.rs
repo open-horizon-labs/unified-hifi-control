@@ -11,8 +11,8 @@
 //!
 //! | Module      | Responsibility                                           |
 //! |-------------|----------------------------------------------------------|
-//! | `mod.rs`     | Axum route handlers, session recovery, SDK wiring         |
-//! | [`server`]   | the `initialize` result: identity, capabilities, protocol |
+//! | `mod.rs`     | Axum route handlers, stateless HTTP, SDK wiring         |
+//! | [`server`]   | discovery identity and capabilities |
 //! | [`handler`]  | the `ServerHandler` impl: advertise tools, dispatch calls |
 //! | [`tools`]    | tool definitions + handlers, by family                    |
 //! | [`types`]    | response shapes and result constructors                   |
@@ -24,7 +24,7 @@
 //!
 //! # The MCP surface is pinned by tests
 //!
-//! `tests/mcp_contract.rs` snapshots `tools/list` and `initialize` against
+//! `tests/mcp_contract.rs` snapshots `tools/list` and `server/discover` against
 //! committed fixtures and pins every tool's runtime behavior, including the
 //! error strings a model reads. Epic #392 is additive-only, so a fixture diff on
 //! a PR in that epic is a bug report, not a chore. Regenerate deliberately:
@@ -33,7 +33,6 @@
 //! UPDATE_MCP_FIXTURES=1 cargo test --test mcp_contract
 //! ```
 
-pub mod baselines;
 pub mod capabilities;
 pub mod collection_locations;
 pub mod envelope;
@@ -53,8 +52,8 @@ use axum::http::{HeaderMap, Method, Uri};
 use axum::{body::Body, extract::Extension, response::IntoResponse};
 use rust_mcp_sdk::{
     id_generator::{FastIdGenerator, UuidGenerator},
-    mcp_server::{McpAppState, McpHttpHandler, ToMcpServerHandler},
-    session_store::InMemorySessionStore,
+    mcp_http::{McpAppState, McpHttpHandler},
+    mcp_server::ToMcpServerHandler,
     TransportOptions,
 };
 use std::{sync::Arc, time::Duration};
@@ -62,9 +61,6 @@ use std::{sync::Arc, time::Duration};
 pub use handler::HifiMcpHandler;
 pub use server::server_details;
 pub use tools::HifiTools;
-
-/// MCP session header name
-const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 
 // ============================================================================
 // MCP State Container (for Extension layer)
@@ -96,12 +92,6 @@ pub async fn handle_mcp_get(
             let (parts, body) = res.into_parts();
             axum::response::Response::from_parts(parts, Body::new(body))
         }
-        // The SDK reports a vanished SSE session as a typed transport error.
-        // Match it here rather than prechecking the store (which races teardown)
-        // or disguising unrelated server failures as client errors.
-        Err(rust_mcp_sdk::mcp_server::error::TransportServerError::SessionIdInvalid(_)) => {
-            (axum::http::StatusCode::NOT_FOUND, "MCP session not found").into_response()
-        }
         // Response builder with valid status/body cannot fail
         #[allow(clippy::unwrap_used)]
         Err(e) => axum::response::Response::builder()
@@ -117,12 +107,6 @@ pub async fn handle_mcp_post(
     Extension(ext): Extension<McpExtState>,
     payload: String,
 ) -> impl IntoResponse {
-    // Check for stale session and auto-recover
-    let headers = match auto_recover_session(&headers, &uri, &ext, &payload).await {
-        Some(new_headers) => new_headers,
-        None => headers,
-    };
-
     let request = McpHttpHandler::create_request(Method::POST, uri, headers, Some(&payload));
     match ext
         .http_handler
@@ -140,67 +124,6 @@ pub async fn handle_mcp_post(
             .body(Body::from(format!("MCP error: {}", e)))
             .unwrap(),
     }
-}
-
-/// Check if client has a stale session and auto-initialize a new one.
-/// Returns new headers with fresh session ID, or None if no recovery needed.
-async fn auto_recover_session(
-    headers: &HeaderMap,
-    uri: &Uri,
-    ext: &McpExtState,
-    _payload: &str,
-) -> Option<HeaderMap> {
-    // Get session ID from header
-    let session_id = headers
-        .get(MCP_SESSION_ID_HEADER)
-        .and_then(|v| v.to_str().ok())?;
-
-    // Check if session exists
-    if ext
-        .mcp_state
-        .session_store
-        .has(&session_id.to_string())
-        .await
-    {
-        return None; // Session is valid, no recovery needed
-    }
-
-    tracing::info!(
-        "MCP session '{}' not found, auto-initializing new session",
-        session_id
-    );
-
-    // Create initialize request to get a new session
-    let init_payload = r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"auto-recovery","version":"1.0"}}}"#;
-
-    // Create headers without the stale session ID (so SDK creates new session)
-    let mut init_headers = headers.clone();
-    init_headers.remove(MCP_SESSION_ID_HEADER);
-
-    let init_request =
-        McpHttpHandler::create_request(Method::POST, uri.clone(), init_headers, Some(init_payload));
-
-    // Process initialize request
-    let init_response = ext
-        .http_handler
-        .handle_streamable_http(init_request, ext.mcp_state.clone())
-        .await
-        .ok()?;
-
-    // Extract new session ID from response headers
-    let new_session_id = init_response
-        .headers()
-        .get(MCP_SESSION_ID_HEADER)
-        .and_then(|v| v.to_str().ok())?;
-
-    tracing::info!("Auto-initialized new MCP session: {}", new_session_id);
-
-    // Create new headers with the fresh session ID
-    let mut new_headers = headers.clone();
-    new_headers.remove(MCP_SESSION_ID_HEADER);
-    new_headers.insert(MCP_SESSION_ID_HEADER, new_session_id.parse().ok()?);
-
-    Some(new_headers)
 }
 
 pub async fn handle_mcp_delete(
@@ -239,7 +162,6 @@ pub fn create_mcp_extension(state: AppState) -> axum::Extension<McpExtState> {
 
     // Create MCP app state (mirrors what HyperServer does internally)
     let mcp_state: Arc<McpAppState> = Arc::new(McpAppState {
-        session_store: Arc::new(InMemorySessionStore::new()),
         id_generator: Arc::new(UuidGenerator {}),
         stream_id_gen: Arc::new(FastIdGenerator::new(Some("s_"))),
         server_details: Arc::new(server::server_details()),
@@ -247,13 +169,14 @@ pub fn create_mcp_extension(state: AppState) -> axum::Extension<McpExtState> {
         ping_interval: Duration::from_secs(12),
         transport_options: Arc::new(TransportOptions::default()),
         enable_json_response: false,
-        event_store: None,
-        task_store: None,
-        client_task_store: None,
+        message_observer: None,
+        extensions: Arc::new(tokio::sync::RwLock::new(None)),
+        active_listen_streams: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        max_listen_streams: 256,
     });
 
     // Create HTTP handler (no auth, no middleware)
-    let http_handler = Arc::new(McpHttpHandler::new(vec![]));
+    let http_handler = Arc::new(McpHttpHandler::new(vec![], None));
 
     // Bundle into extension state
     let ext_state = McpExtState {

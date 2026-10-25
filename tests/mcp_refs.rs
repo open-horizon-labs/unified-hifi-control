@@ -74,7 +74,7 @@ fn text_of(result: &ToolResult) -> String {
     }
 }
 
-fn structured_of(result: &ToolResult) -> serde_json::Map<String, Value> {
+fn structured_of(result: &ToolResult) -> Value {
     let result = result
         .as_ref()
         .expect("tool must not return a transport-level error");

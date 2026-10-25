@@ -35,14 +35,9 @@
 //     or description that looks like admin/owner/credential surface is
 //     refused.
 //
-// # Session lifecycle
-//
-// UHC's `/mcp` endpoint uses the MCP Streamable HTTP transport
-// (`enable_json_response: false` in src/mcp/mod.rs), so every response is
-// SSE-framed even for a single request/response exchange, and every call
-// after `initialize` must carry the `mcp-session-id` header it returned.
-// This bridge opens exactly one session per page load, lazily, the first
-// time it is needed.
+// # Stateless MCP transport
+// Each POST includes the protocol version, client capabilities and matching
+// routing headers. There is no initialize handshake or retained session ID.
 //
 // # Controller-auth (#570)
 //
@@ -70,13 +65,12 @@
   // its /mcp POSTs under the same prefix or they escape the proxy. Absent
   // tag (direct mode) resolves to "" and the endpoint stays "/mcp".
   var BASE_PATH_META = "uhc-base-path";
-  var MCP_SESSION_HEADER = "mcp-session-id";
   var CSRF_HEADER = "x-uhc-csrf-token";
   // Mirrors `CSRF_STORAGE_KEY` in src/app/controller_auth.rs exactly -- this
   // is the one piece of bootstrap state a browser-side script can see (the
   // session cookie itself is HttpOnly).
   var CSRF_STORAGE_KEY = "uhc_controller_csrf";
-  var PROTOCOL_VERSION = "2025-11-25";
+  var PROTOCOL_VERSION = "2026-07-28";
 
   // Playback/content plane only. Kept in sync by hand with
   // tests/fixtures/mcp_tools.json; a tool absent from both this list and the
@@ -179,7 +173,6 @@
     this._fetch = fetchImpl;
     this._storage = storage;
     this._endpoint = endpoint || MCP_ENDPOINT;
-    this._sessionId = null;
     this._nextId = 1;
   }
 
@@ -197,21 +190,28 @@
   };
 
   /// POST one JSON-RPC message to `/mcp` and return
-  /// `{ sessionId, envelope }`, where `envelope` is the parsed JSON-RPC
+  /// `{ envelope }`, where `envelope` is the parsed JSON-RPC
   /// response (or null for a fire-and-forget notification / unparseable
   /// body).
-  Bridge.prototype._rpc = function (method, params, sessionId) {
+  Bridge.prototype._rpc = function (method, params) {
     var self = this;
     var headers = {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
     };
-    if (sessionId) headers[MCP_SESSION_HEADER] = sessionId;
+    headers["MCP-Protocol-Version"] = PROTOCOL_VERSION;
+    headers["Mcp-Method"] = method;
+    if (params && (params.name || params.uri)) headers["Mcp-Name"] = params.name || params.uri;
     var token = self._csrfToken();
     if (token) headers[CSRF_HEADER] = token;
 
     var isNotification = method.indexOf("notifications/") === 0;
     var body = { jsonrpc: "2.0", method: method, params: params || {} };
+    body.params._meta = {
+      "io.modelcontextprotocol/protocolVersion": PROTOCOL_VERSION,
+      "io.modelcontextprotocol/clientCapabilities": {},
+      "io.modelcontextprotocol/clientInfo": { name: "uhc-webmcp-bridge", version: "2" },
+    };
     if (!isNotification) body.id = self._nextId++;
 
     return self
@@ -222,34 +222,8 @@
         body: JSON.stringify(body),
       })
       .then(function (res) {
-        var newSessionId = res.headers && res.headers.get ? res.headers.get(MCP_SESSION_HEADER) : null;
         return res.text().then(function (text) {
-          return { sessionId: newSessionId || sessionId || null, envelope: parseSseJson(text), ok: res.ok };
-        });
-      });
-  };
-
-  Bridge.prototype._ensureSession = function () {
-    var self = this;
-    if (self._sessionId) return Promise.resolve(self._sessionId);
-    return self
-      ._rpc(
-        "initialize",
-        {
-          protocolVersion: PROTOCOL_VERSION,
-          capabilities: {},
-          clientInfo: { name: "uhc-webmcp-bridge", version: "1" },
-        },
-        null
-      )
-      .then(function (result) {
-        if (!result.sessionId) {
-          throw new Error("MCP initialize did not return an mcp-session-id");
-        }
-        self._sessionId = result.sessionId;
-        // Fire-and-forget: the SDK does not reply to notifications.
-        return self._rpc("notifications/initialized", {}, self._sessionId).then(function () {
-          return self._sessionId;
+          return { envelope: parseSseJson(text), ok: res.ok };
         });
       });
   };
@@ -258,18 +232,15 @@
   /// definitions (name/description/inputSchema) UHC advertised.
   Bridge.prototype.listAllowedTools = function () {
     var self = this;
-    return self._ensureSession().then(function (sessionId) {
-      return self._rpc("tools/list", {}, sessionId).then(function (result) {
-        var tools = (result.envelope && result.envelope.result && result.envelope.result.tools) || [];
-        return tools.filter(function (tool) {
-          return isToolAllowed(tool && tool.name);
-        });
-      });
+    return self._rpc("tools/list", {}).then(function (result) {
+      if (!result.ok || !result.envelope || result.envelope.error) throw new Error("MCP tools/list failed");
+      var tools = (result.envelope.result && result.envelope.result.tools) || [];
+      return tools.filter(function (tool) { return isToolAllowed(tool && tool.name); });
     });
   };
 
   /// Call one MCP tool and return a WebMCP `CallToolResult`. Never rejects:
-  /// any failure (network, transport, stale session) comes back as
+  /// any failure (network or transport) comes back as
   /// `{ isError: true }` so a `document.modelContext` `execute()` handler
   /// can return it directly.
   Bridge.prototype.callTool = function (name, args) {
@@ -278,18 +249,12 @@
       return Promise.resolve(errorResult(name + ": not permitted by UHC's WebMCP tool policy"));
     }
     return self
-      ._ensureSession()
-      .then(function (sessionId) {
-        return self._rpc("tools/call", { name: name, arguments: args || {} }, sessionId);
-      })
+      ._rpc("tools/call", { name: name, arguments: args || {} })
       .then(function (result) {
         return envelopeToCallToolResult(result.envelope, name);
       })
       .catch(function (e) {
-        // A stale/expired session (server restart, TTL) fails once here;
-        // drop it so the *next* call re-initializes, rather than retrying
-        // inline and risking a duplicate side-effecting tools/call.
-        self._sessionId = null;
+        // Never retry a side-effecting tool call after a transport failure.
         return errorResult(name + ": " + (e && e.message ? e.message : String(e)));
       });
   };

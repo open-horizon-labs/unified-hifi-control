@@ -13,7 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{distr::Alphanumeric, RngExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -450,7 +450,7 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 fn random_token(length: usize) -> String {
-    rand::thread_rng()
+    rand::rng()
         .sample_iter(&Alphanumeric)
         .take(length)
         .map(char::from)

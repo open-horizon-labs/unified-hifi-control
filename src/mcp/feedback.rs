@@ -5,7 +5,7 @@
 //! carry a bounded event identity and confidence so future observed events can
 //! be distinguished from user intent without changing the retention boundary.
 
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -205,7 +205,7 @@ pub fn now_secs() -> u64 {
 /// logical event; persisted records remain the durable source of truth.
 pub fn next_event_id() -> String {
     let sequence = NEXT_EVENT_ID.fetch_add(1, Ordering::Relaxed);
-    let boot_nonce = *BOOT_NONCE.get_or_init(|| rand::thread_rng().next_u64());
+    let boot_nonce = *BOOT_NONCE.get_or_init(|| rand::rng().next_u64());
     format!("feedback-{}-{}-{}", now_secs(), boot_nonce, sequence)
 }
 

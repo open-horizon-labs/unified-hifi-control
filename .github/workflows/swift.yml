@@ -21,7 +21,7 @@ jobs:
   uhckit:
     runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-15' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -47,7 +47,7 @@ jobs:
   apple-companion:
     runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-15' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 

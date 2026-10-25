@@ -45,10 +45,7 @@ use serde_json::Value;
 fn envelope_response(result: Result<CallToolResult, CallToolError>) -> (StatusCode, Json<Value>) {
     match result {
         Ok(call_result) => {
-            let body = call_result
-                .structured_content
-                .map(Value::Object)
-                .unwrap_or(Value::Null);
+            let body = call_result.structured_content.unwrap_or(Value::Null);
             (StatusCode::OK, Json(body))
         }
         Err(error) => (

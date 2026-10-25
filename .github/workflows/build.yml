@@ -398,10 +398,10 @@ jobs:
     name: LMS feed auto-merge contract
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: '24'
+          node-version: '26.12.1'
       - name: Test API-only feed merge behavior
         run: node --test tests/lms_feed_automerge.test.cjs
 
@@ -410,17 +410,17 @@ jobs:
     runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name
       == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Isolate mutable tool state
       run: |
         echo "CARGO_HOME=${HOME}/.cargo" >> "$GITHUB_ENV"
         echo "RUSTUP_HOME=${HOME}/.rustup" >> "$GITHUB_ENV"
     - name: Cache generated CSS
       id: cache-css
-      uses: actions/cache@v5
+      uses: actions/cache@v6
       with:
         path: public/tailwind.css
-        key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
+        key: css-v4.3.3-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
     - name: Build Tailwind CSS
       if: steps.cache-css.outputs.cache-hit != 'true'
       run: make css
@@ -464,7 +464,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Setup latest stable Rust
         uses: dtolnay/rust-toolchain@master
         with:
@@ -486,17 +486,17 @@ jobs:
     runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name
       == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Isolate mutable tool state
       run: |
         echo "CARGO_HOME=${HOME}/.cargo" >> "$GITHUB_ENV"
         echo "RUSTUP_HOME=${HOME}/.rustup" >> "$GITHUB_ENV"
     - name: Cache generated CSS
       id: cache-css
-      uses: actions/cache@v5
+      uses: actions/cache@v6
       with:
         path: public/tailwind.css
-        key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
+        key: css-v4.3.3-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
     - name: Build Tailwind CSS
       if: steps.cache-css.outputs.cache-hit != 'true'
       run: make css
@@ -525,7 +525,7 @@ jobs:
       env:
         SCCACHE_GHA_ENABLED: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
         RUSTC_WRAPPER: sccache
-      run: cargo test --workspace
+      run: cargo test --workspace --no-fail-fast
     - name: Report compiler cache
       if: always()
       run: if command -v sccache >/dev/null; then sccache --show-stats; fi
@@ -534,7 +534,7 @@ jobs:
     name: Synology Package Contract
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Validate SPK metadata and structure
         run: tests/synology_package_contract.sh
@@ -546,7 +546,7 @@ jobs:
     name: QNAP x86_64 Package Contract
     runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Validate QPKG metadata and x86_64 build wiring
         run: tests/qnap_package_contract.sh
@@ -566,15 +566,26 @@ jobs:
         echo 'RUSTUP_HOME=/opt/gh-builder/rustup' >> "$GITHUB_ENV"
         cat /opt/gh-builder/path >> "$GITHUB_PATH"
         cat /opt/gh-builder/env >> "$GITHUB_ENV"
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
+    - name: Isolate mutable tool state
+      run: 'echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+
+        echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
+
+        '
+    - name: Setup Rust
+      uses: ./.github/actions/setup-rust
+      with:
+        targets: wasm32-unknown-unknown
+        components: llvm-tools-preview
     - name: Cache WASM build output
       id: cache-wasm
-      uses: actions/cache@v5
+      uses: actions/cache@v6
       with:
         path: |
           target/dx/
           target/wasm32-unknown-unknown/
-        key: wasm-v4-tw4.1.18-${{ hashFiles('rust-toolchain.toml', '.github/actions/setup-rust/action.yml', 'build/prepared-builders/source.yml',
+        key: wasm-v4-tw4.3.3-${{ hashFiles('rust-toolchain.toml', '.github/actions/setup-rust/action.yml', 'build/prepared-builders/source.yml',
           '**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/lib.rs', 'src/app/**/*.rs', 'src/components/**/*.rs', 'src/adaptive/**/*.rs',
           'assets/**', 'src/input.css', 'public/**') }}
         restore-keys: |
@@ -600,10 +611,10 @@ jobs:
     - name: Cache generated CSS
       if: steps.check-cache.outputs.needs_build == 'true'
       id: cache-css
-      uses: actions/cache@v5
+      uses: actions/cache@v6
       with:
         path: public/tailwind.css
-        key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
+        key: css-v4.3.3-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
     - name: Build Tailwind CSS
       if: steps.check-cache.outputs.needs_build == 'true'
       run: make css
@@ -668,7 +679,31 @@ jobs:
         echo 'RUSTUP_HOME=/opt/gh-builder/rustup' >> "$GITHUB_ENV"
         cat /opt/gh-builder/path >> "$GITHUB_PATH"
         cat /opt/gh-builder/env >> "$GITHUB_ENV"
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
+    - name: Isolate mutable tool state
+      run: 'echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+
+        echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
+
+        '
+    - name: Setup Rust
+      uses: ./.github/actions/setup-rust
+      with:
+        targets: x86_64-unknown-linux-musl
+    - name: Install zig
+      run: "set -euo pipefail\nZIG_VERSION=\"0.17.0\"\n\n# The fleet image may already carry the exact compiler. Reuse it;\n#\
+        \ the host being x86_64 does not remove the musl linker requirement.\nif command -v zig >/dev/null 2>&1 && [ \"$(zig version)\"\
+        \ = \"$ZIG_VERSION\" ]; then\n  echo \"Using runner-provided Zig $(zig version)\"\n  exit 0\nfi\n\nZIG_ROOT=\"${RUNNER_TOOL_CACHE:-$HOME/.cache/uhc-tools}/zig/$ZIG_VERSION/x64\"\
+        \nif [ ! -x \"$ZIG_ROOT/zig\" ]; then\n  ZIG_PARENT=$(dirname \"$ZIG_ROOT\")\n  mkdir -p \"$ZIG_PARENT\"\n  TEMP_DIR=$(mktemp\
+        \ -d \"$ZIG_PARENT/.zig-install.XXXXXX\")\n  trap 'rm -rf \"$TEMP_DIR\"' EXIT\n  curl --fail --show-error --location \\\
+        \n    \"https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz\" | \\\n    tar -xJ -C \"$TEMP_DIR\"\
+        \n  STAGED_ROOT=\"$TEMP_DIR/zig-x86_64-linux-$ZIG_VERSION\"\n  test -x \"$STAGED_ROOT/zig\"\n  rm -rf \"$ZIG_ROOT\"\n\
+        \  mv \"$STAGED_ROOT\" \"$ZIG_ROOT\"\n  rm -rf \"$TEMP_DIR\"\n  trap - EXIT\nfi\ntest -x \"$ZIG_ROOT/zig\"\necho \"$ZIG_ROOT\"\
+        \ >> \"$GITHUB_PATH\"\n"
+    - name: Ensure cargo-zigbuild
+      run: "set -euo pipefail\nif command -v cargo-zigbuild >/dev/null 2>&1 && \\\n   cargo-zigbuild --version | grep -q 'cargo-zigbuild\
+        \ 0.24.0'; then\n  echo \"Using cached cargo-zigbuild $(cargo-zigbuild --version)\"\nelse\n  cargo install cargo-zigbuild\
+        \ --version 0.24.0 --locked\nfi\n"
     - name: Restore Cargo state from NAS
       if: runner.environment == 'self-hosted'
       continue-on-error: true
@@ -686,10 +721,10 @@ jobs:
         path: target/dx/unified-hifi-control/release/web/
     - name: Cache generated CSS
       id: cache-css
-      uses: actions/cache@v5
+      uses: actions/cache@v6
       with:
         path: public/tailwind.css
-        key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
+        key: css-v4.3.3-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
     - name: Build Tailwind CSS
       if: steps.cache-css.outputs.cache-hit != 'true'
       run: make css
@@ -753,14 +788,14 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version: '26.12.1'
 
       - name: Install Node dependencies
         run: npm ci
@@ -948,7 +983,30 @@ jobs:
         echo 'RUSTUP_HOME=/opt/gh-builder/rustup' >> "$GITHUB_ENV"
         cat /opt/gh-builder/path >> "$GITHUB_PATH"
         cat /opt/gh-builder/env >> "$GITHUB_ENV"
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
+    - name: Isolate mutable tool state
+      run: 'echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+
+        echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
+
+        '
+    - name: Setup Rust
+      uses: ./.github/actions/setup-rust
+      with:
+        targets: ${{ matrix.target }}
+    - name: Install zig
+      run: "set -euo pipefail\nZIG_VERSION=\"0.17.0\"\nZIG_ARCH=\"$(uname -m)\"\nif command -v zig >/dev/null 2>&1 && [ \"$(zig\
+        \ version)\" = \"$ZIG_VERSION\" ]; then\n  echo \"Using runner-provided Zig $(zig version)\"\nelse\n  ZIG_ROOT=\"${RUNNER_TOOL_CACHE:-$HOME/.cache/uhc-tools}/zig/$ZIG_VERSION/$ZIG_ARCH\"\
+        \n  if [ ! -x \"$ZIG_ROOT/zig\" ]; then\n    ZIG_PARENT=$(dirname \"$ZIG_ROOT\")\n    mkdir -p \"$ZIG_PARENT\"\n    TEMP_DIR=$(mktemp\
+        \ -d \"$ZIG_PARENT/.zig-install.XXXXXX\")\n    trap 'rm -rf \"$TEMP_DIR\"' EXIT\n    curl --fail --show-error --location\
+        \ \\\n      \"https://ziglang.org/download/$ZIG_VERSION/zig-${ZIG_ARCH}-linux-$ZIG_VERSION.tar.xz\" | \\\n      tar -xJ\
+        \ -C \"$TEMP_DIR\"\n    STAGED_ROOT=\"$TEMP_DIR/zig-${ZIG_ARCH}-linux-$ZIG_VERSION\"\n    test -x \"$STAGED_ROOT/zig\"\
+        \n    rm -rf \"$ZIG_ROOT\"\n    mv \"$STAGED_ROOT\" \"$ZIG_ROOT\"\n    rm -rf \"$TEMP_DIR\"\n    trap - EXIT\n  fi\n \
+        \ test -x \"$ZIG_ROOT/zig\"\n  echo \"$ZIG_ROOT\" >> \"$GITHUB_PATH\"\nfi\n"
+    - name: Ensure cargo-zigbuild
+      run: "set -euo pipefail\nif command -v cargo-zigbuild >/dev/null 2>&1 && \\\n   cargo-zigbuild --version | grep -q 'cargo-zigbuild\
+        \ 0.24.0'; then\n  echo \"Using cached cargo-zigbuild $(cargo-zigbuild --version)\"\nelse\n  cargo install cargo-zigbuild\
+        \ --version 0.24.0 --locked\nfi\n"
     - name: Restore Cargo state from NAS
       if: runner.environment == 'self-hosted'
       continue-on-error: true
@@ -966,10 +1024,10 @@ jobs:
         path: target/dx/unified-hifi-control/release/web/
     - name: Cache generated CSS
       id: cache-css
-      uses: actions/cache@v5
+      uses: actions/cache@v6
       with:
         path: public/tailwind.css
-        key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
+        key: css-v4.3.3-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
     - name: Build Tailwind CSS
       if: steps.cache-css.outputs.cache-hit != 'true'
       run: make css
@@ -1039,7 +1097,7 @@ jobs:
     runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name
       == github.repository) && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-latest' }}
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Reuse persistent macOS target state
       if: runner.environment == 'self-hosted'
       run: |
@@ -1067,10 +1125,10 @@ jobs:
         path: target/dx/unified-hifi-control/release/web/
     - name: Cache generated CSS
       id: cache-css
-      uses: actions/cache@v5
+      uses: actions/cache@v6
       with:
         path: public/tailwind.css
-        key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
+        key: css-v4.3.3-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
     - name: Build Tailwind CSS
       if: steps.cache-css.outputs.cache-hit != 'true'
       run: make css
@@ -1103,7 +1161,7 @@ jobs:
     runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name
       == github.repository) && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-latest' }}
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Reuse persistent macOS target state
       if: runner.environment == 'self-hosted'
       run: |
@@ -1131,10 +1189,10 @@ jobs:
         path: target/dx/unified-hifi-control/release/web/
     - name: Cache generated CSS
       id: cache-css
-      uses: actions/cache@v5
+      uses: actions/cache@v6
       with:
         path: public/tailwind.css
-        key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
+        key: css-v4.3.3-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
     - name: Build Tailwind CSS
       if: steps.cache-css.outputs.cache-hit != 'true'
       run: make css
@@ -1217,7 +1275,7 @@ jobs:
       HAS_APPLE_CERT: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12 != '' && secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD != '' }}
       HAS_APPLE_NOTARY: ${{ secrets.APPLE_NOTARY_KEY_P8 != '' && secrets.APPLE_NOTARY_KEY_ID != '' && secrets.APPLE_NOTARY_KEY_ISSUER_ID != '' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # macOS signing/notarization (issue #561): the owner already has an
       # Apple Developer Program membership, so this only needs the two
@@ -1332,7 +1390,15 @@ jobs:
         echo 'RUSTUP_HOME=/opt/gh-builder/rustup' >> "$GITHUB_ENV"
         cat /opt/gh-builder/path >> "$GITHUB_PATH"
         cat /opt/gh-builder/env >> "$GITHUB_ENV"
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
+    - name: Isolate mutable tool state
+      run: |
+        echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+        echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
+    - name: Setup reviewed Rust toolchain
+      uses: ./.github/actions/setup-rust
+      with:
+        targets: x86_64-pc-windows-msvc
     - name: Restore Cargo state from NAS
       if: runner.environment == 'self-hosted'
       continue-on-error: true
@@ -1349,10 +1415,10 @@ jobs:
         path: target/dx/unified-hifi-control/release/web/
     - name: Cache generated CSS
       id: cache-css
-      uses: actions/cache@v5
+      uses: actions/cache@v6
       with:
         path: public/tailwind.css
-        key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
+        key: css-v4.3.3-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
     - name: Build Tailwind CSS
       if: steps.cache-css.outputs.cache-hit != 'true'
       run: make css
@@ -1415,7 +1481,7 @@ jobs:
     env:
       HAS_WINDOWS_CERT: ${{ secrets.WINDOWS_SIGNING_CERT_BASE64 != '' && secrets.WINDOWS_SIGNING_CERT_PASSWORD != '' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Download cross-built binaries
         uses: actions/download-artifact@v8
         with:
@@ -1482,7 +1548,7 @@ jobs:
     # Packaging only (prebuilt artifacts); needs zip / a docker daemon, which the self-hosted fleet image lacks — same reason build-qnap is pinned.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # Download all available binaries
       - name: Download Linux x64 binary
@@ -1644,7 +1710,7 @@ jobs:
             binary: unified-hifi-linux-arm64
             pairing_helper: uhc-hiphi-pair-arm64
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Check if binary available
         if: matrix.target == 'aarch64-unknown-linux-musl'
@@ -1690,7 +1756,7 @@ jobs:
     env:
       HAS_QNAP_SIGNING: ${{ secrets.QNAP_SIGNING_CERT != '' && secrets.QNAP_SIGNING_KEY != '' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download Linux binary
         uses: actions/download-artifact@v8
@@ -1774,7 +1840,7 @@ jobs:
     env:
       HAS_QNAP_SIGNING: ${{ secrets.QNAP_SIGNING_CERT != '' && secrets.QNAP_SIGNING_KEY != '' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download Linux binary
         uses: actions/download-artifact@v8
@@ -1850,7 +1916,7 @@ jobs:
     permissions:
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download Linux binary
         uses: actions/download-artifact@v8
@@ -1884,7 +1950,7 @@ jobs:
             type=ref,event=branch
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         env:
           DOCKER_BUILD_RECORD_UPLOAD: false
         with:
@@ -1924,7 +1990,7 @@ jobs:
             arch: armv7
             pairing_helper: uhc-hiphi-pair-armv7
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download Linux binary
         uses: actions/download-artifact@v8
@@ -1949,7 +2015,7 @@ jobs:
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         env:
           DOCKER_BUILD_RECORD_UPLOAD: false
         with:
@@ -2033,7 +2099,7 @@ jobs:
       # short-lived Fulcio certificate and records the signature in the
       # public Rekor transparency log.
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@v4
 
       - name: Sign container images (cosign keyless)
         env:
@@ -2054,7 +2120,7 @@ jobs:
       needs.build-linux-x64.result == 'success'
     runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download Linux binaries
         uses: actions/download-artifact@v8
@@ -2317,7 +2383,7 @@ jobs:
           cat release/lms-beta.xml
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: release/*
           append_body: true
@@ -2347,7 +2413,7 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: v4
 
@@ -2421,7 +2487,7 @@ jobs:
 
       - name: Merge feed PR when ready
         if: steps.create-pr.outputs.pull-request-number
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         env:
           LMS_FEED_PR: ${{ steps.create-pr.outputs.pull-request-number }}
           LMS_FEED_BRANCH: chore/lms-update
@@ -2466,7 +2532,7 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: v4
 
@@ -2502,7 +2568,7 @@ jobs:
 
       - name: Merge feed PR when ready
         if: steps.create-pr.outputs.pull-request-number
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         env:
           LMS_FEED_PR: ${{ steps.create-pr.outputs.pull-request-number }}
           LMS_FEED_BRANCH: chore/lms-beta-feed
@@ -2528,7 +2594,7 @@ jobs:
       needs.upload-release.result == 'success'
     runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-latest' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Get release version
         id: version
@@ -2562,7 +2628,7 @@ jobs:
           sed -i "s/^sha256sums_armv7h=.*/sha256sums_armv7h=('${armv7h_sha}')/" PKGBUILD
 
       - name: Publish to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
+        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
         with:
           pkgname: unified-hifi-control-bin
           pkgbuild: build/arch/PKGBUILD

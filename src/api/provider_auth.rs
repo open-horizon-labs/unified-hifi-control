@@ -21,7 +21,7 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use rand::{distributions::Alphanumeric, Rng, RngCore};
+use rand::{distr::Alphanumeric, Rng, RngExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -1173,7 +1173,7 @@ impl SpotifyTokenRefresher for SpotifyOAuthRefresher {
 
 fn generate_pkce_verifier() -> String {
     let mut bytes = [0_u8; 48];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
@@ -1238,7 +1238,7 @@ struct SpotifyTokenResponse {
 }
 
 fn random_token(length: usize) -> String {
-    rand::thread_rng()
+    rand::rng()
         .sample_iter(&Alphanumeric)
         .take(length)
         .map(char::from)

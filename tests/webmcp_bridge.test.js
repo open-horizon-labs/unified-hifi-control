@@ -1,7 +1,7 @@
 // Unit tests for public/webmcp-bridge.js (#579).
 //
 // Covers the pure translation functions (SSE framing, tool policy,
-// envelope -> CallToolResult) plus the session lifecycle and CSRF header
+// envelope -> CallToolResult) plus stateless request metadata and CSRF header
 // wiring of `Bridge`, driven with a stub `fetch` so no server is needed.
 //
 // Run with: node --test tests/webmcp_bridge.test.js
@@ -118,8 +118,7 @@ test("envelopeToCallToolResult handles a null/unparseable envelope", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Bridge: session lifecycle (initialize -> notifications/initialized ->
-// tools/list / tools/call) and CSRF header attachment, against a stub fetch.
+// Bridge: stateless tools/list / tools/call and CSRF headers.
 // ---------------------------------------------------------------------------
 
 function fakeHeaders(map) {
@@ -134,64 +133,23 @@ function sseResponse(jsonBody, headerMap) {
   };
 }
 
-test("Bridge opens exactly one session across tools/list and a tools/call", async () => {
+test("Bridge uses stateless MCP metadata and routing headers for every call", async () => {
   const calls = [];
-  let nextResultId = 1;
-  const fetchStub = async (url, init) => {
+  const b = new bridge.Bridge(async (_url, init) => {
     const req = JSON.parse(init.body);
-    calls.push({ method: req.method, headers: init.headers, sessionHeaderSent: init.headers["mcp-session-id"] });
-    if (req.method === "initialize") {
-      return sseResponse({ jsonrpc: "2.0", id: req.id, result: { protocolVersion: "2025-11-25" } }, {
-        "mcp-session-id": "sess-123",
-      });
-    }
-    if (req.method === "notifications/initialized") {
-      return sseResponse({}, {});
-    }
-    if (req.method === "tools/list") {
-      return sseResponse({
-        jsonrpc: "2.0",
-        id: req.id,
-        result: {
-          tools: [
-            { name: "hifi_zones", description: "list zones", inputSchema: { type: "object" } },
-            { name: "hifi_admin", description: "danger", inputSchema: { type: "object" } },
-          ],
-        },
-      });
-    }
-    if (req.method === "tools/call") {
-      return sseResponse({
-        jsonrpc: "2.0",
-        id: req.id,
-        result: { content: [{ type: "text", text: "ok" }], isError: false },
-      });
-    }
-    throw new Error("unexpected method " + req.method);
-  };
-
-  const b = new bridge.Bridge(fetchStub, null);
-  const tools = await b.listAllowedTools();
-  // hifi_admin must never reach the caller, even though the (stubbed) server
-  // advertised it -- this is the tool-policy filter, not the server's job.
-  assert.deepEqual(tools.map((t) => t.name), ["hifi_zones"]);
-
-  const result = await b.callTool("hifi_zones", {});
-  assert.deepEqual(result, { content: [{ type: "text", text: "ok" }], isError: false });
-
-  const methodsCalled = calls.map((c) => c.method);
-  assert.deepEqual(methodsCalled, [
-    "initialize",
-    "notifications/initialized",
-    "tools/list",
-    "tools/call",
-  ]);
-  // Every call after initialize carries the session id the server minted.
-  assert.equal(calls[1].sessionHeaderSent, "sess-123");
-  assert.equal(calls[2].sessionHeaderSent, "sess-123");
-  assert.equal(calls[3].sessionHeaderSent, "sess-123");
-  // initialize itself has no prior session to send.
-  assert.equal(calls[0].sessionHeaderSent, undefined);
+    calls.push(req.method);
+    assert.equal(init.headers["mcp-session-id"], undefined);
+    assert.equal(init.headers["MCP-Protocol-Version"], "2026-07-28");
+    assert.equal(init.headers["Mcp-Method"], req.method);
+    assert.equal(req.params._meta["io.modelcontextprotocol/protocolVersion"], "2026-07-28");
+    assert.deepEqual(req.params._meta["io.modelcontextprotocol/clientCapabilities"], {});
+    if (req.method === "tools/list") return sseResponse({jsonrpc:"2.0",id:req.id,result:{tools:[{name:"hifi_zones"},{name:"hifi_admin"}]}});
+    assert.equal(init.headers["Mcp-Name"], "hifi_zones");
+    return sseResponse({jsonrpc:"2.0",id:req.id,result:{content:[],resultType:"complete"}});
+  }, null);
+  assert.deepEqual((await b.listAllowedTools()).map(t => t.name), ["hifi_zones"]);
+  assert.equal((await b.callTool("hifi_zones", {})).resultType, "complete");
+  assert.deepEqual(calls, ["tools/list", "tools/call"]);
 });
 
 test("Bridge.callTool refuses a denied tool without making any request", async () => {
@@ -223,40 +181,20 @@ test("Bridge attaches x-uhc-csrf-token from storage on every request, mirroring 
   assert.ok(seenTokens.every((t) => t === "csrf-token-abc"));
 });
 
-test("Bridge.callTool recovers from a transport failure as an isError result and re-initializes next time", async () => {
-  let initializeCalls = 0;
-  const fetchStub = async (url, init) => {
-    const req = JSON.parse(init.body);
-    if (req.method === "initialize") {
-      initializeCalls++;
-      return sseResponse({ jsonrpc: "2.0", id: req.id, result: {} }, { "mcp-session-id": "sess-" + initializeCalls });
-    }
-    if (req.method === "notifications/initialized") {
-      return sseResponse({}, {});
-    }
-    if (req.method === "tools/call") {
-      throw new Error("network down");
-    }
-    throw new Error("unexpected " + req.method);
+test("Bridge never retries a failed tool call and the next request needs no handshake", async () => {
+  const calls = [];
+  const b = new bridge.Bridge(async (_url, init) => {
+    calls.push(JSON.parse(init.body).method);
+    throw new Error("network down");
+  }, null);
+  assert.equal((await b.callTool("hifi_status", {})).isError, true);
+  assert.deepEqual(calls, ["tools/call"]);
+  b._fetch = async (_url, init) => {
+    calls.push(JSON.parse(init.body).method);
+    return sseResponse({jsonrpc:"2.0",id:2,result:{content:[],resultType:"complete"}});
   };
-  const b = new bridge.Bridge(fetchStub, null);
-  const first = await b.callTool("hifi_status", {});
-  assert.equal(first.isError, true);
-  assert.match(first.content[0].text, /network down/);
-  assert.equal(initializeCalls, 1);
-
-  // The dropped session forces a fresh initialize on the next call.
-  const fetchStub2Calls = [];
-  b._fetch = async (url, init) => {
-    const req = JSON.parse(init.body);
-    fetchStub2Calls.push(req.method);
-    if (req.method === "initialize") {
-      return sseResponse({ jsonrpc: "2.0", id: req.id, result: {} }, { "mcp-session-id": "sess-2" });
-    }
-    return sseResponse({ jsonrpc: "2.0", id: req.id, result: { content: [], isError: false } }, {});
-  };
-  await b.callTool("hifi_status", {});
-  assert.ok(fetchStub2Calls.includes("initialize"), "a dropped session must be re-initialized");
+  assert.equal((await b.callTool("hifi_status", {})).isError, undefined);
+  assert.deepEqual(calls, ["tools/call", "tools/call"]);
 });
 
 // ---------------------------------------------------------------------------
