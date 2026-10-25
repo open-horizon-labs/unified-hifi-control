@@ -88,6 +88,8 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - uses: sigstore/cosign-installer@v4.1.2
+        with:
+          cosign-release: v3.1.4
 
       - name: Publish and verify signed prerelease indexes
         shell: bash
