@@ -11,7 +11,7 @@ use roon_api::{
     },
     image::{Args as ImageArgs, Format as ImageFormat, Image, Scale, Scaling},
     status::{self, Status},
-    transport::{self, volume, Control, Seek, Transport, Zone as RoonZone},
+    transport::{self, volume, Control, QueueItem, Seek, Transport, Zone as RoonZone},
     CoreEvent, Info, Parsed, RoonApi, RoonApiError, Services, Svc,
 };
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{oneshot, Mutex, RwLock, Semaphore};
+use tokio::sync::{oneshot, Mutex, Notify, OwnedMutexGuard, RwLock, Semaphore};
 use tokio::time::timeout_at;
 use tokio_util::sync::CancellationToken;
 
@@ -971,6 +971,70 @@ pub struct RoonStatus {
     pub zone_count: usize,
 }
 
+// The fork has a single queue subscription shared by every Transport clone.
+// The event loop owns it, including cancellation cleanup; the permit stays
+// with the request so dropping its caller cannot let another read overtake it.
+const QUEUE_READ_LIMIT: usize = 50;
+const QUEUE_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct QueueReadRequest {
+    zone_id: String,
+    deadline: tokio::time::Instant,
+    reply: oneshot::Sender<Result<Value>>,
+    _permit: OwnedMutexGuard<()>,
+}
+
+struct ActiveQueueRead {
+    request: QueueReadRequest,
+    transport: Transport,
+    request_id: usize,
+}
+
+impl ActiveQueueRead {
+    fn matches(&self, request_id: Option<usize>) -> bool {
+        request_id == Some(self.request_id)
+    }
+
+    async fn finish(self, result: Result<Value>) {
+        // Do not stall the event loop indefinitely on a broken connection.
+        let result =
+            match tokio::time::timeout(Duration::from_secs(1), self.transport.unsubscribe_queue())
+                .await
+            {
+                Ok(()) => result,
+                Err(_) => Err(anyhow::anyhow!("Roon queue unsubscribe timed out")),
+            };
+        let _ = self.request.reply.send(result);
+    }
+}
+
+fn queue_snapshot(zone_id: &str, queue: &[QueueItem]) -> Value {
+    // Ask for one extra item so exactly 50 items is distinguishable from a
+    // capped queue. The API supplies no reliable full queue total here.
+    let truncated = queue.len() > QUEUE_READ_LIMIT;
+    let items: Vec<_> = queue
+        .iter()
+        .take(QUEUE_READ_LIMIT)
+        .map(|item| {
+            json!({
+                "title": item.three_line.line1,
+                "artist": item.three_line.line2,
+                "album": item.three_line.line3,
+                "duration_seconds": item.length,
+                "image_key": item.image_key,
+            })
+        })
+        .collect();
+    json!({
+        "zone_id": format!("roon:{zone_id}"),
+        "items": items,
+        "returned": items.len(),
+        "limit": QUEUE_READ_LIMIT,
+        "truncated": truncated,
+        "total": if truncated { None } else { Some(items.len()) },
+    })
+}
+
 /// Internal state
 #[derive(Default)]
 struct RoonState {
@@ -987,6 +1051,9 @@ struct RoonState {
     pending_browses: HashMap<usize, (Option<String>, BrowseRequest)>,
     /// Pending load requests: request_id -> (session_key, oneshot sender)
     pending_loads: HashMap<usize, (Option<String>, LoadRequest)>,
+    queue_gate: Arc<Mutex<()>>,
+    queue_notify: Arc<Notify>,
+    pending_queue: Option<QueueReadRequest>,
 }
 
 async fn clear_roon_runtime_state(state: &Arc<RwLock<RoonState>>) {
@@ -1001,6 +1068,7 @@ async fn clear_roon_runtime_state(state: &Arc<RwLock<RoonState>>) {
     state.pending_images.clear();
     state.pending_browses.clear();
     state.pending_loads.clear();
+    state.pending_queue.take();
 }
 
 impl RoonState {
@@ -3788,6 +3856,34 @@ fn select_location_match(
 /// Music Assistant (`src/adapters/musicassistant.rs`).
 #[async_trait]
 impl LibraryAdapter for RoonAdapter {
+    async fn read_queue(&self, zone_id: &str) -> Result<Value> {
+        let zone_id = roon_zone_id(zone_id, "zone_id")?;
+        let deadline = tokio::time::Instant::now() + QUEUE_READ_TIMEOUT;
+        let gate = self.state.read().await.queue_gate.clone();
+        let shutdown = self.shutdown.read().await.clone();
+        timeout_at(deadline, async {
+            let permit = gate.lock_owned().await;
+            let (reply, receiver) = oneshot::channel();
+            {
+                let mut state = self.state.write().await;
+                if !state.connected || state.transport.is_none() {
+                    return Err(anyhow::anyhow!("Roon is not connected"));
+                }
+                if !state.zones.contains_key(&zone_id) {
+                    return Err(anyhow::anyhow!("Roon queue zone was not found"));
+                }
+                state.pending_queue = Some(QueueReadRequest {
+                    zone_id, deadline, reply, _permit: permit,
+                });
+                state.queue_notify.notify_one();
+            }
+            tokio::select! {
+                result = receiver => result.context("Roon queue read interrupted")?,
+                _ = shutdown.cancelled() => Err(anyhow::anyhow!("Roon queue read interrupted by shutdown")),
+            }
+        }).await.map_err(|_| anyhow::anyhow!("Roon queue read timed out"))?
+    }
+
     async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<LibrarySearchResult>> {
         Err(anyhow::anyhow!(
             "Roon search is not reachable through the generic library registry; hifi_search \
@@ -4518,8 +4614,11 @@ async fn run_roon_loop(
     let restart_needed_for_events = restart_needed.clone();
     let knob_store_for_events = knob_store;
     let runtime_bridge_for_events = runtime_bridge;
+    let queue_notify = state.read().await.queue_notify.clone();
     handles.spawn(async move {
+        let mut active_queue: Option<ActiveQueueRead> = None;
         loop {
+            let queue_deadline = active_queue.as_ref().map(|active| active.request.deadline);
             // Use select! to allow cancellation and handle channel close
             // Issue #128: Without this, the loop would spin on channel close
             // causing high CPU and preventing graceful shutdown
@@ -4527,6 +4626,50 @@ async fn run_roon_loop(
                 _ = shutdown_for_events.cancelled() => {
                     tracing::info!("Roon event handler shutdown requested");
                     break;
+                }
+                _ = async {
+                    match active_queue.as_mut() {
+                        Some(active) => active.request.reply.closed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(active) = active_queue.take() {
+                        active.finish(Err(anyhow::anyhow!("Roon queue read cancelled"))).await;
+                    }
+                    continue;
+                }
+                _ = async {
+                    match queue_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(active) = active_queue.take() {
+                        active.finish(Err(anyhow::anyhow!("Roon queue read timed out"))).await;
+                    }
+                    continue;
+                }
+                _ = queue_notify.notified() => {
+                    let (request, transport) = {
+                        let mut state = state_for_events.write().await;
+                        (state.pending_queue.take(), state.transport.clone())
+                    };
+                    if let Some(request) = request {
+                        if request.reply.is_closed() || request.deadline <= tokio::time::Instant::now() {
+                            continue;
+                        }
+                        if let Some(transport) = transport {
+                            match timeout_at(request.deadline,
+                                transport.subscribe_queue(&request.zone_id, (QUEUE_READ_LIMIT + 1) as u32)
+                            ).await {
+                                Ok(Some(request_id)) => active_queue = Some(ActiveQueueRead { request, transport, request_id }),
+                                _ => { let _ = request.reply.send(Err(anyhow::anyhow!("Roon queue subscription failed or timed out"))); }
+                            }
+                        } else {
+                            let _ = request.reply.send(Err(anyhow::anyhow!("Roon is not connected")));
+                        }
+                    }
+                    continue;
                 }
                 result = core_rx.recv() => result
             };
@@ -4603,6 +4746,9 @@ async fn run_roon_loop(
                     });
                 }
                 CoreEvent::Lost(mut core) => {
+                    if let Some(active) = active_queue.take() {
+                        active.finish(Err(anyhow::anyhow!("Roon disconnected during queue read"))).await;
+                    }
                     let lost_core_name = core.display_name.clone();
                     let lost_core_version = core.display_version.clone();
 
@@ -4665,6 +4811,16 @@ async fn run_roon_loop(
                             tracing::warn!("Failed to save Roon state: {}", e);
                         } else {
                             tracing::debug!("Roon state saved to {}", state_path_for_events);
+                        }
+                    }
+                    Parsed::Queue(queue) => {
+                        // A previous snapshot can already be buffered when its
+                        // subscription is cancelled. Never route it by arrival order.
+                        if active_queue.as_ref().is_some_and(|active| active.matches(moo_request_id(&raw_msg))) {
+                            if let Some(active) = active_queue.take() {
+                                let snapshot = queue_snapshot(&active.request.zone_id, &queue);
+                                active.finish(Ok(snapshot)).await;
+                            }
                         }
                     }
                     Parsed::Zones(zones) => {
@@ -4985,6 +5141,10 @@ async fn run_roon_loop(
                 }
             }
         }
+        if let Some(active) = active_queue.take() {
+            active.finish(Err(anyhow::anyhow!("Roon queue read interrupted"))).await;
+        }
+        state_for_events.write().await.pending_queue.take();
     });
 
     // Wait for handles - abort all when one signals restart needed
@@ -5008,6 +5168,7 @@ async fn run_roon_loop(
         s.pending_images.clear();
         s.pending_browses.clear();
         s.pending_loads.clear();
+        s.pending_queue.take();
     }
 
     // Check if restart is needed

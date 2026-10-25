@@ -211,7 +211,7 @@ Two things this table does **not** claim:
 | `play_by_query` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 | 🚧 #481 | ✅ | ✅ |
 | `play_by_ref` | 🚧 #396 | 🚧 #396 | 🚧 #396 | 🚧 #396 | 🚧 #209 | 🚧 #481 | ✅ | ✅ |
 | `browse` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 | 🚧 #482 | 🚧 #473 | ✅ |
-| `queue_read` | 🚧 #400 | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | ✅ | ✅ |
+| `queue_read` | ✅ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | ✅ | ✅ |
 | `queue_jump` | 🚧 #400 | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | ⛔ | ✅ |
 | `queue_reorder` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | ⛔ | ✅ |
 | `queue_remove` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | ⛔ | ✅ |
@@ -253,7 +253,6 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - 🚧 **hqplayer / `browse`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `browse`** (#482) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
 - 🚧 **spotify / `browse`** (#473) — Spotify removed categories, category playlists, featured playlists, and new releases from the Web API surface available to new Development Mode applications in February 2026. A future browse implementation must use a currently available, quota-aware surface rather than call those retired endpoints.
-- 🚧 **roon / `queue_read`** (#400) — the pinned roon-api fork exposes subscribe_queue(zone, max_items), which nothing in UHC calls.
 - 🚧 **lms / `queue_read`** (#400) — status <player> <start> <n> returns the whole current playlist with playlist_cur_index; verified live.
 - 🚧 **openhome / `queue_read`** (#392) — OpenHome's Playlist:1 service provides Read/ReadList/IdArray, Insert, DeleteId, DeleteAll, SeekId/SeekIndex and SetRepeat/SetShuffle. UHC discovers only Product/Transport/Volume and drives none of it, so this is a UHC gap. Verified from the OpenHome service definitions, not from a device.
 - ⛔ **upnp / `queue_read`** — AVTransport:1 holds a single current transport URI plus one SetNextAVTransportURI; it has no playlist to enumerate or mutate. Verified from the UPnP AV service definitions, not from a device.

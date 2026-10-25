@@ -3622,3 +3622,227 @@ async fn back_to_back_cover_requests_never_lose_a_fast_reply() {
 
     core.stop().await;
 }
+
+// #877: read-only queue snapshots, through the real Roon wire parser.
+fn queue_track(title: &str, id: u32) -> serde_json::Value {
+    serde_json::json!({"queue_item_id": id, "length": 123,
+        "one_line": {"line1": title},
+        "two_line": {"line1": title, "line2": "Artist"},
+        "three_line": {"line1": title, "line2": "Artist", "line3": "Album"}})
+}
+
+#[tokio::test]
+async fn queue_read_returns_snapshot_and_unsubscribes() {
+    use unified_hifi_control::adapters::traits::LibraryAdapter;
+    let core = FakeRoonCore::start().await;
+    core.set_queue("zone_fake_1", vec![queue_track("First", 99)])
+        .await;
+    let adapter = connected(&core).await;
+    let result = adapter
+        .read_queue("roon:zone_fake_1")
+        .await
+        .expect("queue read");
+    assert_eq!(result["items"][0]["title"], "First");
+    assert_eq!(result["items"][0]["artist"], "Artist");
+    assert_eq!(result["total"], 1);
+    assert_eq!(result["truncated"], false);
+    assert!(!result.to_string().contains("queue_item_id"));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let requests = core.requests().await;
+    assert!(requests
+        .iter()
+        .any(|r| r.name.ends_with("/unsubscribe_queue")));
+    let request = requests
+        .iter()
+        .find(|r| r.name.ends_with("/subscribe_queue"))
+        .unwrap();
+    assert_eq!(request.body["zone_or_output_id"], "zone_fake_1");
+    assert_eq!(request.body["max_item_count"], 51);
+}
+
+#[tokio::test]
+async fn queue_read_distinguishes_empty_complete_and_capped_snapshots() {
+    use unified_hifi_control::adapters::traits::LibraryAdapter;
+    let core = FakeRoonCore::start().await;
+    let adapter = connected(&core).await;
+    let empty = adapter.read_queue("roon:zone_fake_1").await.unwrap();
+    assert_eq!(empty["items"], serde_json::json!([]));
+    assert_eq!(empty["total"], 0);
+    assert_eq!(empty["truncated"], false);
+    for count in [50, 51, 100] {
+        core.set_queue(
+            "zone_fake_1",
+            (0..count)
+                .map(|n| queue_track(&format!("Track {n}"), n))
+                .collect(),
+        )
+        .await;
+        let result = adapter.read_queue("roon:zone_fake_1").await.unwrap();
+        assert_eq!(result["items"].as_array().unwrap().len(), 50);
+        assert_eq!(result["truncated"], count > 50);
+        assert_eq!(
+            result["total"],
+            if count > 50 {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(50)
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn queue_read_serializes_different_zones() {
+    use unified_hifi_control::adapters::traits::LibraryAdapter;
+    let core = FakeRoonCore::start().await;
+    let zones = vec![
+        zone_with_grouping("one", "One", "output1", &[]),
+        zone_with_grouping("two", "Two", "output2", &[]),
+    ];
+    core.set_zones(zones).await;
+    core.set_queue("one", vec![queue_track("Zone one", 1)])
+        .await;
+    core.set_queue("two", vec![queue_track("Zone two", 2)])
+        .await;
+    core.set_queue_delay(Duration::from_millis(50)).await;
+    let adapter = connected(&core).await;
+    let (one, two) = tokio::join!(
+        adapter.read_queue("roon:one"),
+        adapter.read_queue("roon:two")
+    );
+    assert_eq!(one.unwrap()["items"][0]["title"], "Zone one");
+    assert_eq!(two.unwrap()["items"][0]["title"], "Zone two");
+    let requests = core.requests().await;
+    let queue_requests: Vec<_> = requests
+        .iter()
+        .filter(|r| r.name.ends_with("_queue"))
+        .map(|r| r.name.as_str())
+        .collect();
+    assert_eq!(
+        queue_requests,
+        vec![
+            "com.roonlabs.transport:2/subscribe_queue",
+            "com.roonlabs.transport:2/unsubscribe_queue",
+            "com.roonlabs.transport:2/subscribe_queue",
+            "com.roonlabs.transport:2/unsubscribe_queue"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn queue_read_cancellation_unsubscribes_before_next_reader() {
+    use unified_hifi_control::adapters::traits::LibraryAdapter;
+    let core = FakeRoonCore::start().await;
+    core.set_queue("zone_fake_1", vec![queue_track("Stale", 6)]).await;
+    core.set_queue_delay(Duration::from_millis(100)).await;
+    let adapter = connected(&core).await;
+    let reader = adapter.clone();
+    let task = tokio::spawn(async move { reader.read_queue("roon:zone_fake_1").await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if core
+                .requests()
+                .await
+                .iter()
+                .any(|r| r.name.ends_with("/subscribe_queue"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    let _ = task.await;
+    core.set_queue_delay(Duration::from_millis(250)).await;
+    core.set_queue("zone_fake_1", vec![queue_track("Fresh", 7)])
+        .await;
+    let result = adapter.read_queue("roon:zone_fake_1").await.unwrap();
+    assert_eq!(result["items"][0]["title"], "Fresh");
+    let requests = core.requests().await;
+    let names: Vec<_> = requests
+        .iter()
+        .filter(|r| r.name.ends_with("_queue"))
+        .map(|r| r.name.as_str())
+        .collect();
+    assert_eq!(names[1], "com.roonlabs.transport:2/unsubscribe_queue");
+    assert_eq!(names[2], "com.roonlabs.transport:2/subscribe_queue");
+}
+
+#[tokio::test]
+async fn queue_read_rejects_invalid_unknown_and_disconnected_zones() {
+    use unified_hifi_control::adapters::traits::LibraryAdapter;
+    let adapter = RoonAdapter::new_disconnected(create_bus());
+    assert!(adapter
+        .read_queue("roon:zone_fake_1")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("not connected"));
+    let core = FakeRoonCore::start().await;
+    let adapter = connected(&core).await;
+    for id in ["zone_fake_1", "lms:zone_fake_1", "roon:", "roon:unknown"] {
+        assert!(adapter.read_queue(id).await.is_err(), "{id}");
+    }
+    assert!(!core
+        .requests()
+        .await
+        .iter()
+        .any(|r| r.name.ends_with("/subscribe_queue")));
+}
+
+#[tokio::test]
+async fn queue_read_times_out_without_turning_failure_into_empty_queue() {
+    use unified_hifi_control::adapters::traits::LibraryAdapter;
+    let core = FakeRoonCore::start().await;
+    core.set_queue_delay(Duration::from_secs(20)).await;
+    let adapter = connected(&core).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(12),
+        adapter.read_queue("roon:zone_fake_1"),
+    )
+    .await
+    .unwrap();
+    assert!(result.unwrap_err().to_string().contains("timed out"));
+    core.set_queue_delay(Duration::ZERO).await;
+    assert!(adapter.read_queue("roon:zone_fake_1").await.is_ok());
+    let names: Vec<_> = core
+        .requests()
+        .await
+        .into_iter()
+        .filter(|r| r.name.ends_with("_queue"))
+        .map(|r| r.name)
+        .collect();
+    assert!(names[1].ends_with("/unsubscribe_queue"));
+    assert!(names[2].ends_with("/subscribe_queue"));
+}
+
+#[tokio::test]
+async fn queue_read_shutdown_releases_waiters_promptly() {
+    use unified_hifi_control::adapters::traits::{LibraryAdapter, Startable};
+    let core = FakeRoonCore::start().await;
+    core.set_queue_delay(Duration::from_secs(20)).await;
+    let adapter = connected(&core).await;
+    let reader = adapter.clone();
+    let task = tokio::spawn(async move { reader.read_queue("roon:zone_fake_1").await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !core
+            .requests()
+            .await
+            .iter()
+            .any(|r| r.name.ends_with("/subscribe_queue"))
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    adapter.stop().await;
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.is_err());
+    assert!(adapter.read_queue("roon:zone_fake_1").await.is_err());
+}

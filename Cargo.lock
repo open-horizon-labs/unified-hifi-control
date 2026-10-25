@@ -4556,7 +4556,7 @@ dependencies = [
 [[package]]
 name = "roon-api"
 version = "0.3.1"
-source = "git+https://github.com/open-horizon-labs/rust-roon-api.git?branch=ohc%2Fmain#8eb9c52ec7c42b7ea361158241cb7faa607c08f4"
+source = "git+https://github.com/open-horizon-labs/rust-roon-api.git?rev=65fc407#65fc407dfd56cd7bb5b55b8cacc5523014a35633"
 dependencies = [
  "futures-util",
  "if-addrs 0.13.4",

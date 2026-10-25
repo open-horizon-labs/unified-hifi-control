@@ -718,6 +718,8 @@ struct CoreState {
     /// (issue #416). Same purpose as `key_delays`, for the load side.
     level_delays: HashMap<u64, Duration>,
     zones: Vec<Value>,
+    queues: HashMap<String, Vec<Value>>,
+    queue_delay: Duration,
     log: Vec<RecordedRequest>,
     /// What this Core answered, in send order: (request id, message name).
     /// Without this, "the adapter hung" and "the Core never replied" are
@@ -783,6 +785,8 @@ impl FakeRoonCore {
             key_delays: HashMap::new(),
             level_delays: HashMap::new(),
             zones: vec![default_zone("zone_fake_1", "Fake Living Room")],
+            queues: HashMap::new(),
+            queue_delay: Duration::ZERO,
             log: Vec::new(),
             sent: Vec::new(),
             errors: Vec::new(),
@@ -824,6 +828,18 @@ impl FakeRoonCore {
 
     pub fn port(&self) -> String {
         self.addr.port().to_string()
+    }
+
+    pub async fn set_queue_delay(&self, delay: Duration) {
+        self.state.write().await.queue_delay = delay;
+    }
+
+    pub async fn set_queue(&self, zone: &str, items: Vec<Value>) {
+        self.state
+            .write()
+            .await
+            .queues
+            .insert(zone.to_owned(), items);
     }
 
     // ---- behaviour knobs ---------------------------------------------------
@@ -1471,6 +1487,31 @@ async fn handle_request(
             )
             .await;
         }
+        // Official RoonLabs/node-roon-api-transport lib.js subscribe_queue:
+        // zone_or_output_id + max_item_count; fork transport.rs parses an
+        // initial CONTINUE Subscribed {items} on the subscription request ID.
+        RequestKind::SubscribeQueue => {
+            let delay = core.read().await.queue_delay;
+            let items = core
+                .read()
+                .await
+                .queues
+                .get(body["zone_or_output_id"].as_str().unwrap_or_default())
+                .cloned()
+                .unwrap_or_default();
+            let limit = body["max_item_count"].as_u64().unwrap_or(0) as usize;
+            tokio::time::sleep(delay).await;
+            let body = json!({"items": items.into_iter().take(limit).collect::<Vec<_>>()});
+            respond(
+                &core,
+                &writer,
+                "CONTINUE",
+                "Subscribed",
+                req_id,
+                Some(&body),
+            )
+            .await;
+        }
         RequestKind::SubscribeZones => {
             let body = json!({ "zones": core.read().await.zones.clone() });
             // Remember this request id and connection so group_outputs /
@@ -1493,7 +1534,7 @@ async fn handle_request(
             )
             .await;
         }
-        RequestKind::UnsubscribeZones | RequestKind::Ping => {
+        RequestKind::UnsubscribeQueue | RequestKind::UnsubscribeZones | RequestKind::Ping => {
             respond(&core, &writer, "COMPLETE", "Success", req_id, None).await;
         }
         RequestKind::Browse => handle_browse(req_id, &body, &core, &writer, &root_title).await,
@@ -1553,6 +1594,8 @@ async fn handle_request(
 enum RequestKind {
     RegistryInfo,
     RegistryRegister,
+    SubscribeQueue,
+    UnsubscribeQueue,
     SubscribeZones,
     UnsubscribeZones,
     Browse,
@@ -1569,6 +1612,8 @@ impl RequestKind {
         match name {
             "com.roonlabs.registry:1/info" => Self::RegistryInfo,
             "com.roonlabs.registry:1/register" => Self::RegistryRegister,
+            "com.roonlabs.transport:2/subscribe_queue" => Self::SubscribeQueue,
+            "com.roonlabs.transport:2/unsubscribe_queue" => Self::UnsubscribeQueue,
             "com.roonlabs.transport:2/subscribe_zones" => Self::SubscribeZones,
             "com.roonlabs.transport:2/unsubscribe_zones" => Self::UnsubscribeZones,
             "com.roonlabs.browse:1/browse" => Self::Browse,
