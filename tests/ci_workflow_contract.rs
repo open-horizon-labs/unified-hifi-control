@@ -126,13 +126,13 @@ fn jobs_that_need_playwright_or_docker_stay_on_hosted_ubuntu() {
 }
 
 #[test]
-fn linux_tools_are_prepared_once_and_activated_before_compilation() {
+fn linux_builds_activate_prepared_baseline_then_current_stable_tools() {
     let source = workflow("build.yml");
     let setup = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/prepared-builders/source.yml"),
     )
     .unwrap();
-    assert!(setup.contains("cargo install cargo-zigbuild --version 0.23.4 --locked"));
+    assert!(setup.contains("cargo install cargo-zigbuild --version 0.24.0 --locked"));
     assert!(setup.contains("test -x \"$STAGED_ROOT/zig\""));
     for name in ["build-linux-x64", "build-linux-arm"] {
         let body = job(&source, name);
@@ -145,8 +145,17 @@ fn linux_tools_are_prepared_once_and_activated_before_compilation() {
             body.contains("|| ''"),
             "fleet must not request a nested job container"
         );
-        assert!(!body.contains("cargo install cargo-zigbuild"));
-        assert!(!body.contains("name: Install zig"));
+        // The published builder is a baseline. Current stable compilers are
+        // activated in isolated mutable directories until it is republished.
+        assert!(body.contains("name: Isolate mutable tool state"));
+        assert!(body.contains("name: Setup Rust"));
+        assert!(body.contains("name: Install zig"));
+        assert!(body.contains("name: Ensure cargo-zigbuild"));
+        assert!(body.contains("0.17.0"));
+        assert!(body.contains("0.24.0"));
+        assert!(body.find("name: Setup Rust") < body.find("cargo zigbuild --release"));
+        assert!(body.find("name: Install zig") < body.find("cargo zigbuild --release"));
+        assert!(body.find("name: Ensure cargo-zigbuild") < body.find("cargo zigbuild --release"));
         assert!(
             body.find("name: Activate prepared builder") < body.find("cargo zigbuild --release")
         );

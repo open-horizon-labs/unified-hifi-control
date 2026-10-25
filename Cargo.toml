@@ -123,7 +123,7 @@ roon-api = { git = "https://github.com/open-horizon-labs/rust-roon-api.git", bra
 # TODO: Switch back to upstream after TheAppgineer/rust-roon-api#1 and #2 are merged
 
 # HTTP client (server only)
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "cookies", "rustls", "form", "stream"], optional = true }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "cookies", "rustls-no-provider", "form", "stream"], optional = true }
 
 # WebSocket client (server only) - Music Assistant event subscription (#506).
 # rustls to match reqwest's TLS backend rather than pulling in a second (native-tls)

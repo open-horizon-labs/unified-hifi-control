@@ -976,7 +976,7 @@ fn apple_music_precondition_is_an_object_and_preserves_companion_fields() {
     }
     let schema = HifiAppleMusicTool::json_schema();
     let spec = &schema["properties"]["precondition"];
-    assert_eq!(spec["type"], "object");
+    assert_eq!(spec["type"], json!(["object", "null"]));
     assert_eq!(spec["properties"]["playlist_version"]["type"], "integer");
 }
 

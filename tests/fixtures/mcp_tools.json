@@ -9,93 +9,125 @@
         },
         "confirm": {
           "description": "Explicit user confirmation; true required for account mutations, feedback, clear_feedback.",
-          "nullable": true,
-          "type": "boolean"
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "description": {
           "description": "Playlist description.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "id": {
           "description": "Content/playlist ID; fallback ref for feedback/play_next.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "idempotency_key": {
           "description": "Required retry key for companion account mutations; reuse on retry.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "items": {
           "description": "Ordered opaque search refs for queue_plan/queue_append.",
           "items": {
             "type": "string"
           },
-          "nullable": true,
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "limit": {
           "description": "Maximum results.",
-          "nullable": true,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "name": {
           "description": "Playlist name.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "offset": {
           "description": "Zero-based result offset.",
-          "nullable": true,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "precondition": {
           "additionalProperties": true,
           "description": "Companion revision/ownership object from a prior read.",
-          "nullable": true,
           "properties": {
             "playlist_version": {
               "description": "Playlist revision returned by a prior companion read.",
               "type": "integer"
             }
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "query": {
           "description": "Search text.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "rating": {
           "description": "1-5; required for signal=rating.",
-          "nullable": true,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "reason": {
           "description": "User-provided feedback reason.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "signal": {
           "description": "Explicit favorite, unfavorite, rating, skip, more_like_this, less_like_this.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "source": {
           "description": "Feedback source: user (default and only accepted value).",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "uri": {
           "description": "Content URI; opaque search ref for feedback/play_next.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "zone_id": {
           "description": "applemusic:<owner>; required except catalog_search.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -113,8 +145,10 @@
       "properties": {
         "zone_id": {
           "description": "Zone ID; omit for all zones/providers.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -130,28 +164,38 @@
         },
         "limit": {
           "description": "Results per page: 1-50, default 20.",
-          "nullable": true,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "location": {
           "description": "Durable browse location; omit when using path.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "media_type": {
           "description": "radio for live stations (Roon: My Live Radio); favorites default to tracks.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "offset": {
           "description": "Zero-based offset; default 0.",
-          "nullable": true,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "path": {
           "description": "Short-lived browse continuation; omit when using location.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "zone_id": {
           "description": "Library’s zone ID.",
@@ -175,8 +219,10 @@
         },
         "value": {
           "description": "Seek: required finite, non-negative seconds. Volume_set: required; provider scale (0-100 or HQPlayer dB); linked devices use dB. Up/down default: 5, or linked-device step.",
-          "nullable": true,
-          "type": "number"
+          "type": [
+            "number",
+            "null"
+          ]
         },
         "zone_id": {
           "description": "Zone ID from hifi_zones.",
@@ -200,56 +246,76 @@
         },
         "ceiling": {
           "description": "Maximum dB; omit to clear. Can only lower device limit.",
-          "nullable": true,
-          "type": "number"
+          "type": [
+            "number",
+            "null"
+          ]
         },
         "command": {
           "description": "For control: power_on, power_off, power_toggle, select_input, volume_set, volume_up, volume_down, mute, unmute.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "device_id": {
           "description": "Required for link/set_ceiling/report; control: this or zone_id, never both.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "enabled": {
           "description": "For set_recording: opt in to local recording (default off); false stops and forgets.",
-          "nullable": true,
-          "type": "boolean"
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "input": {
           "description": "For select_input: input ID or name.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "muted": {
           "description": "For mute: true/false; omit to toggle.",
-          "nullable": true,
-          "type": "boolean"
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "sections": {
           "description": "Report sections: environment, anomalies, device_state, excerpts. Default excludes excerpts.",
           "items": {
             "type": "string"
           },
-          "nullable": true,
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "source_id": {
           "description": "For link: device input ID from list.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "value": {
           "description": "Control volume level/step in dB; relative default: device step.",
-          "nullable": true,
-          "type": "number"
+          "type": [
+            "number",
+            "null"
+          ]
         },
         "zone_id": {
           "description": "Required for link/unlink; or linked control target.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -271,8 +337,10 @@
         },
         "zone_id": {
           "description": "hqplayer:<instance>; omit for default instance.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -291,86 +359,118 @@
         },
         "adapter_name": {
           "description": "Relay’s advertised NAA/DAC name.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "bind": {
           "description": "Relay listen address; default LAN, automatic port.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "correlation_id": {
           "description": "Retry key: identical payload reuses operation; changed payload is refused.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "device_id": {
           "description": "DAC ID returned by discovery.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "discovery_interface": {
           "description": "IPv4 discovery interface; auto-selected for enabled LAN relays.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "discovery_port": {
           "description": "Discovery query port; default 43210.",
-          "nullable": true,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "enabled": {
           "description": "Enable/disable relay.",
-          "nullable": true,
-          "type": "boolean"
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "expected_output_revision": {
           "description": "output_revision from latest hifi_hqplayer_outputs.",
-          "nullable": true,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "expected_source_epoch": {
           "description": "source_epoch from latest hifi_hqplayer_outputs.",
-          "nullable": true,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "host": {
           "description": "NAA destination host/address.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "hqp_allow": {
           "description": "HQPlayer source allowlist; empty accepts any reachable NAA peer.",
           "items": {
             "type": "string"
           },
-          "nullable": true,
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "name": {
           "description": "Route or relay name.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "port": {
           "description": "NAA destination TCP port.",
-          "nullable": true,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "preview_id": {
           "description": "ID returned by preview.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "route_id": {
           "description": "Existing route ID for update/remove/select.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "routes_json": {
           "description": "JSON route document for import.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "zone_id": {
           "description": "Exact hqplayer:<instance>; no default.",
@@ -393,8 +493,10 @@
       "properties": {
         "operation_id": {
           "description": "Receipt ID; omit for full routing state.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "zone_id": {
           "description": "Exact hqplayer:<instance>; no default.",
@@ -416,8 +518,10 @@
       "properties": {
         "zone_id": {
           "description": "hqplayer:<instance>; omit for default instance.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -437,8 +541,10 @@
         },
         "zone_id": {
           "description": "hqplayer:<instance>; omit for default instance.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -457,8 +563,10 @@
       "properties": {
         "zone_id": {
           "description": "hqplayer:<instance>; omit for default instance.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -513,8 +621,10 @@
       "properties": {
         "action": {
           "description": "play (default), queue, radio (Roon Radio, not live stations).",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "query": {
           "description": "Music to search for. Plays the first match.",
@@ -522,8 +632,10 @@
         },
         "source": {
           "description": "Roon only: library (default), tidal, qobuz.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "zone_id": {
           "description": "Playback zone ID.",
@@ -546,8 +658,10 @@
       "properties": {
         "action": {
           "description": "play (default), queue, radio (Roon Radio), next (LMS only).",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "ref": {
           "description": "Opaque ref returned by search or collections.",
@@ -575,18 +689,24 @@
         },
         "item_id": {
           "description": "Required for jump/reorder/remove; ID from queue read.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "position": {
           "description": "Required for reorder; zero-based destination.",
-          "nullable": true,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "target_zone_id": {
           "description": "Required for transfer; destination Music Assistant zone.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "zone_id": {
           "description": "Queue’s zone ID.",
@@ -613,13 +733,17 @@
         },
         "source": {
           "description": "Roon only: library (default), tidal, qobuz.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "zone_id": {
           "description": "Target zone; omit for Roon. Required to route to other providers.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -638,43 +762,59 @@
         },
         "category_id": {
           "description": "Category ID; extended browse only.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "description": {
           "description": "Playlist description for create/update.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "limit": {
           "description": "Maximum results.",
-          "nullable": true,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "name": {
           "description": "Playlist name for create/update.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "playlist_id": {
           "description": "Playlist ID for playlist reads/edits.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "public": {
           "description": "Playlist visibility for create/update.",
-          "nullable": true,
-          "type": "boolean"
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "track_id": {
           "description": "Track ID for saved-track operations.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "uri": {
           "description": "Track URI for playlist edits.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -703,26 +843,34 @@
         },
         "confirm": {
           "description": "Explicit user confirmation; true required for join/leave.",
-          "nullable": true,
-          "type": "boolean"
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "leader_zone_id": {
           "description": "Required for join; same provider as members.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "member_zone_ids": {
           "description": "Required for join/leave; one provider, matching leader for join.",
           "items": {
             "type": "string"
           },
-          "nullable": true,
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "zone_id": {
           "description": "Status provider filter; omit for all providers.",
-          "nullable": true,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

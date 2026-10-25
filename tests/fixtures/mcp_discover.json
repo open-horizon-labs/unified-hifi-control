@@ -1,16 +1,4 @@
 {
-  "capabilities": {
-    "resources": {
-      "listChanged": true
-    },
-    "tools": {}
-  },
-  "instructions": "Use hifi_zones for zone IDs and hifi_capabilities for provider/device support. Search or browse collections, then pass the returned ref to hifi_play_ref for exact playback. hifi_play searches and plays the first match; action=queue appends to the playback queue, not a saved playlist. For live stations, use hifi_collections action=favorites with media_type=radio; hifi_play action=radio starts Roon Radio. Spotify controls existing Connect devices. Apple Music requires a paired companion.",
-  "cacheScope": "private",
-  "ttlMs": 0,
-  "supportedVersions": [
-    "2026-07-28"
-  ],
   "_meta": {
     "io.modelcontextprotocol/serverInfo": {
       "description": "Control your music system via MCP",
@@ -20,5 +8,17 @@
       "websiteUrl": "https://github.com/open-horizon-labs/unified-hifi-control"
     }
   },
-  "resultType": "complete"
+  "cacheScope": "private",
+  "capabilities": {
+    "resources": {
+      "listChanged": true
+    },
+    "tools": {}
+  },
+  "instructions": "Use hifi_zones for zone IDs and hifi_capabilities for provider/device support. Search or browse collections, then pass the returned ref to hifi_play_ref for exact playback. hifi_play searches and plays the first match; action=queue appends to the playback queue, not a saved playlist. For live stations, use hifi_collections action=favorites with media_type=radio; hifi_play action=radio starts Roon Radio. Spotify controls existing Connect devices. Apple Music requires a paired companion.",
+  "resultType": "complete",
+  "supportedVersions": [
+    "2026-07-28"
+  ],
+  "ttlMs": 0
 }
