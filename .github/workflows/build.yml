@@ -569,9 +569,9 @@ jobs:
     - uses: actions/checkout@v6
     - name: Isolate mutable tool state
       run: 'echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
-    
+
         echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
-    
+
         '
     - name: Setup Rust
       uses: ./.github/actions/setup-rust
@@ -682,9 +682,9 @@ jobs:
     - uses: actions/checkout@v6
     - name: Isolate mutable tool state
       run: 'echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
-    
+
         echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
-    
+
         '
     - name: Setup Rust
       uses: ./.github/actions/setup-rust
@@ -986,9 +986,9 @@ jobs:
     - uses: actions/checkout@v6
     - name: Isolate mutable tool state
       run: 'echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
-    
+
         echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
-    
+
         '
     - name: Setup Rust
       uses: ./.github/actions/setup-rust
