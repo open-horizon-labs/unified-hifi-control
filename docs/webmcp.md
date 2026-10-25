@@ -65,16 +65,15 @@ exact `localStorage` key the Dioxus app writes it to
 `src/app/controller_auth.rs`) -- it authenticates exactly as the rest of the
 UI does, with no separate credential and no new attack surface.
 
-## Session lifecycle
+## Stateless MCP transport
 
-UHC's `/mcp` endpoint uses the MCP Streamable HTTP transport with
-`enable_json_response: false` (see `src/mcp/mod.rs`), so every response --
-even a single request/response exchange -- is SSE-framed
-(`data: {...}\n\n`), and every call after `initialize` must carry the
-`mcp-session-id` header the server returned. The bridge opens exactly one
-session per page load, lazily, the first time a tool is registered or
-called, and drops it (forcing a fresh `initialize` on the next call) if a
-request fails outright.
+The bridge uses MCP 2026-07-28. Every POST includes matching
+`MCP-Protocol-Version` and `Mcp-Method` headers and request `_meta` protocol,
+client capabilities and client identity fields. Tool calls also include
+`Mcp-Name`. Responses remain SSE-framed for request/response exchanges.
+There is no initialization handshake, session identifier, or session recovery.
+Failed tool calls are returned as errors and never automatically retried,
+so an uncertain transport result cannot duplicate a playback action.
 
 ## Verification
 

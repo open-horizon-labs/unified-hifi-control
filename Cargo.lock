@@ -1245,6 +1245,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer 0.10.4",
  "crypto-common 0.1.7",
+ "subtle",
 ]
 
 [[package]]
@@ -2045,7 +2046,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2576,6 +2577,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest 0.10.7",
+]
 
 [[package]]
 name = "http"
@@ -3639,7 +3649,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4139,7 +4149,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -4178,9 +4188,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4680,9 +4690,9 @@ dependencies = [
 
 [[package]]
 name = "rust-mcp-macros"
-version = "1.1.0"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff0136be0cb86e89fb45dcbb77c6d943fd57315352b1affb2796c3049b2b15f7"
+checksum = "58bd70356e3da5f64bb9cae7b1acc90279378c9220c6b69731d8af945938fef8"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4693,9 +4703,9 @@ dependencies = [
 
 [[package]]
 name = "rust-mcp-schema"
-version = "1.0.0"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74408cc52f048a01f6b7fc3917bfdeaae675343b2fd2ff282b265f8fa30aedfd"
+checksum = "5a66664d256795cdd61b7d4d6516d8afe041c947bedd1d10aff9e41e15771b43"
 dependencies = [
  "serde",
  "serde_json",
@@ -4703,22 +4713,25 @@ dependencies = [
 
 [[package]]
 name = "rust-mcp-sdk"
-version = "1.1.0"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74c7cd785069709c362e6c33346cfce022f114a85173a5e5dd27de035eafce3d"
+checksum = "9849649137179b679d8115c79716fcf03b1bd7d3b579bb61081eed59d9bbabcb"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
  "bytes",
  "futures",
+ "hmac",
  "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
+ "reqwest 0.12.28",
  "rust-mcp-macros",
  "rust-mcp-schema",
  "rust-mcp-transport",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.21",
  "time",
  "tokio",
@@ -4729,9 +4742,9 @@ dependencies = [
 
 [[package]]
 name = "rust-mcp-transport"
-version = "1.0.1"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1511de7f39c263cefeda343854b4beb7a082311aea59497d45bfc7ada0f7e9a"
+checksum = "1421cf8c7524c398b94c84af024a5af59c146bdbc1d4afed076b2eac9b0a99df"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4791,7 +4804,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4859,7 +4872,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5551,10 +5564,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6859,7 +6872,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

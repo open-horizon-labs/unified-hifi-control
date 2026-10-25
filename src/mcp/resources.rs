@@ -71,8 +71,8 @@
 
 use crate::aggregator::ZoneAggregator;
 use crate::api::{AppSettings, AppState};
-use crate::bus::{BusEvent, SharedBus};
-use crate::mcp::baselines::{list_fingerprint, McpResourceBaselines};
+use crate::bus::BusEvent;
+
 use crate::mcp::tools::{hqplayer, status, zones};
 use rust_mcp_sdk::{
     schema::{ReadResourceContent, ReadResourceResult, Resource, RpcError, TextResourceContents},
@@ -80,7 +80,6 @@ use rust_mcp_sdk::{
 };
 use serde::Serialize;
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 
 /// `hifi_zones`'s resource equivalent: every zone, in one document.
 const ZONES_URI: &str = "hifi://zones";
@@ -289,6 +288,9 @@ pub async fn read_resource(state: &AppState, uri: &str) -> Result<ReadResourceRe
     };
 
     Ok(ReadResourceResult {
+        cache_scope: rust_mcp_sdk::schema::ReadResourceResultCacheScope::Private,
+        result_type: "complete".into(),
+        ttl_ms: 0,
         contents: vec![content],
         meta: None,
     })
@@ -311,83 +313,51 @@ fn changes_the_zone_list(event: &BusEvent) -> bool {
     )
 }
 
-/// Best-effort invalidation for one session generation. Entries and tasks expire
-/// after idle TTL; capacity eviction also stops old tasks on the next tick.
-/// A returning session re-lists to obtain the full snapshot and rearm observation.
-pub fn spawn_list_changed_notifier(
-    bus: SharedBus,
-    runtime: Arc<dyn McpServer>,
-    aggregator: Arc<ZoneAggregator>,
-    baselines: Arc<McpResourceBaselines>,
-    session_id: String,
-    generation: u64,
-    shutdown: CancellationToken,
-) {
-    let mut rx = bus.subscribe();
-    tokio::spawn(async move {
-        let mut reconcile = tokio::time::interval(std::time::Duration::from_secs(1));
-        let mut retry_after = tokio::time::Instant::now();
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = reconcile.tick() => {},
-                event = rx.recv() => match event {
-                    Ok(event) if changes_the_zone_list(&event) => {},
-                    Ok(_) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                },
-            }
-            let revision_before = {
-                let mut baseline = baselines.inner.lock().await;
-                if !baseline.active(&session_id, generation) {
-                    break;
-                }
-                baseline.revision(&session_id)
-            };
-            if revision_before.is_none() || tokio::time::Instant::now() < retry_after {
-                continue;
-            }
-            let settings = crate::api::load_app_settings();
-            let current = list_resources_for_aggregator(&aggregator, &settings).await;
-            let Some(fingerprint) = list_fingerprint(&current) else {
-                continue;
-            };
-            let mut baseline = baselines.inner.lock().await;
-            if !baseline.active(&session_id, generation) {
-                break;
-            }
-            // Discard snapshots built while a client re-listed.
-            if baseline.revision(&session_id) != revision_before {
-                continue;
-            }
-            if baseline.needs_notification(&session_id, &fingerprint) {
-                let Some(revision) = baseline.claim(&session_id) else {
-                    continue;
-                };
-                drop(baseline);
-                // A transport may disappear or block. Bound the send and retain
-                // the served baseline so reconnect can recover on a later tick.
-                let sent = tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    result = tokio::time::timeout(std::time::Duration::from_secs(2), runtime.notify_resource_list_changed(None)) => matches!(result, Ok(Ok(()))),
-                };
-                if !sent {
-                    retry_after = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
-                    baselines
-                        .inner
-                        .lock()
-                        .await
-                        .send_failed(&session_id, generation, revision);
-                }
-            }
-        }
-        baselines.inner.lock().await.remove(&session_id, generation);
-    });
+pub fn list_fingerprint(resources: &[Resource]) -> Option<String> {
+    serde_json::to_string(resources)
+        .map_err(|error| {
+            tracing::warn!(%error, "Cannot compare MCP resource advertisements");
+        })
+        .ok()
 }
 
-#[cfg(test)]
-mod lifecycle_tests;
+/// Observe one explicit MCP 2 notification subscription. No client session or
+/// global baseline survives the stream: reconnecting clients fetch a fresh list.
+pub async fn listen_for_list_changes(state: &crate::api::AppState, runtime: Arc<dyn McpServer>) {
+    let mut rx = state.bus.subscribe();
+    let mut reconcile = tokio::time::interval(std::time::Duration::from_secs(1));
+    let settings = crate::api::load_app_settings();
+    let resources = list_resources_for_aggregator(&state.aggregator, &settings).await;
+    let mut baseline = list_fingerprint(&resources);
+    loop {
+        tokio::select! {
+            _ = state.shutdown.cancelled() => break,
+            _ = reconcile.tick() => {},
+            event = rx.recv() => match event {
+                Ok(event) if changes_the_zone_list(&event) => {},
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+        }
+        if !runtime.is_stream_active() {
+            break;
+        }
+        let settings = crate::api::load_app_settings();
+        let resources = list_resources_for_aggregator(&state.aggregator, &settings).await;
+        let current = list_fingerprint(&resources);
+        if current.is_some() && current != baseline {
+            let sent = tokio::select! {
+                _ = state.shutdown.cancelled() => break,
+                result = tokio::time::timeout(std::time::Duration::from_secs(2), runtime.notify_resource_list_changed(None)) => matches!(result, Ok(Ok(()))),
+            };
+            if !sent {
+                break;
+            }
+            baseline = current;
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

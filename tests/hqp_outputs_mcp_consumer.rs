@@ -51,9 +51,8 @@ use mock_servers::hqplayer::wire::{WirePolicy, WireServer};
 use rust_mcp_sdk::mcp_client::{client_runtime, ClientHandler, ClientRuntime};
 use rust_mcp_sdk::schema::{
     CallToolRequestParams, CallToolResult, ClientCapabilities, Implementation,
-    InitializeRequestParams, LATEST_PROTOCOL_VERSION,
 };
-use rust_mcp_sdk::{McpClient, RequestOptions, StreamableTransportOptions};
+use rust_mcp_sdk::{ClientDetails, McpClient, RequestOptions, StreamableTransportOptions};
 
 use unified_hifi_control::adapters::hqplayer::{
     HqpAdapter, HqpInstanceManager, HqpRecoveryConfig, HqpRuntimeBridge, HqpTimeouts,
@@ -200,7 +199,7 @@ impl Rig {
             let _ = axum::serve(listener, app).await;
         });
 
-        let client_details = InitializeRequestParams {
+        let client_details = ClientDetails {
             capabilities: ClientCapabilities::default(),
             client_info: Implementation {
                 name: "uhc-mcp-outputs-test-client".into(),
@@ -210,8 +209,6 @@ impl Rig {
                 icons: vec![],
                 website_url: None,
             },
-            protocol_version: LATEST_PROTOCOL_VERSION.into(),
-            meta: None,
         };
         let transport_options = StreamableTransportOptions {
             mcp_url: format!("http://{addr}/mcp"),
@@ -221,7 +218,6 @@ impl Rig {
             client_details,
             transport_options,
             TestClientHandler,
-            None,
             None,
         );
         client.clone().start().await.expect("start mcp test client");
@@ -282,8 +278,12 @@ impl Rig {
             .request_tool_call(CallToolRequestParams {
                 name: name.to_string(),
                 arguments,
-                meta: None,
-                task: None,
+                meta: rust_mcp_sdk::schema::RequestMetaObject::new(
+                    rust_mcp_sdk::schema::LATEST_PROTOCOL_VERSION,
+                    ClientCapabilities::default(),
+                ),
+                input_responses: None,
+                request_state: None,
             })
             .await
             .unwrap_or_else(|e| panic!("tool call `{name}` failed at the protocol level: {e}"))

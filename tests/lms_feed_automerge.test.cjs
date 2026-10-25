@@ -22,7 +22,7 @@ test('feed workflows use the bundled API client, not an external gh binary', () 
   for (const name of ['update-repo-xml', 'update-beta-repo-xml']) {
     const job = workflow.split(`\n  ${name}:`)[1].split(/\n  [a-z][\w-]*:/)[0];
     assert.ok(!job.includes('run: gh pr merge'), `${name} requires missing GitHub CLI`);
-    assert.ok(job.includes('uses: actions/github-script@v8'), name);
+    assert.ok(job.includes('uses: actions/github-script@v9'), name);
     assert.ok(job.includes("require('./.github/scripts/lms-feed-auto-merge.cjs')"), name);
     assert.ok(job.includes('LMS_FEED_PR:'), name);
     assert.ok(!job.includes('pullRequest.data.node_id'), name);

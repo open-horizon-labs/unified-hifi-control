@@ -13,9 +13,11 @@ use rust_mcp_sdk::{
     schema::{
         schema_utils::CallToolError, CallToolRequestParams, CallToolResult,
         ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
-        ReadResourceRequestParams, ReadResourceResult, RpcError,
+        ReadResourceRequestParams, RequestId, RpcError, ServerResult,
+        SubscriptionsListenRequestParams, SubscriptionsListenResult,
+        SubscriptionsListenResultMetaObject,
     },
-    McpServer,
+    McpServer, RequestContext,
 };
 use std::sync::Arc;
 
@@ -28,31 +30,9 @@ impl HifiMcpHandler {
     pub fn new(state: AppState) -> Self {
         Self { state }
     }
-}
-
-#[async_trait]
-impl ServerHandler for HifiMcpHandler {
-    async fn handle_list_tools_request(
-        &self,
-        _params: Option<PaginatedRequestParams>,
-        _runtime: Arc<dyn McpServer>,
-    ) -> Result<ListToolsResult, RpcError> {
-        // Read settings per request: the operator can toggle the HQPlayer
-        // adapter while the server is running, and the advertised tool list has
-        // to follow.
-        let settings = load_app_settings();
-
-        Ok(ListToolsResult {
-            meta: None,
-            next_cursor: None,
-            tools: tools::list_tools(settings.adapters.hqplayer),
-        })
-    }
-
-    async fn handle_call_tool_request(
+    async fn call_tool(
         &self,
         params: CallToolRequestParams,
-        _runtime: Arc<dyn McpServer>,
     ) -> Result<CallToolResult, CallToolError> {
         // Argument parsing happens before any tool runs, and its failures are the
         // commonest `invalid` a real client produces — a required parameter left
@@ -127,6 +107,39 @@ impl ServerHandler for HifiMcpHandler {
             }
         }
     }
+}
+
+#[async_trait]
+impl ServerHandler for HifiMcpHandler {
+    async fn handle_list_tools_request(
+        &self,
+        _params: Option<PaginatedRequestParams>,
+        _context: &RequestContext,
+        _runtime: Arc<dyn McpServer>,
+    ) -> Result<ListToolsResult, RpcError> {
+        // Read settings per request: the operator can toggle the HQPlayer
+        // adapter while the server is running, and the advertised tool list has
+        // to follow.
+        let settings = load_app_settings();
+
+        Ok(ListToolsResult {
+            cache_scope: rust_mcp_sdk::schema::ListToolsResultCacheScope::Private,
+            result_type: "complete".into(),
+            ttl_ms: 0,
+            meta: None,
+            next_cursor: None,
+            tools: tools::list_tools(settings.adapters.hqplayer),
+        })
+    }
+
+    async fn handle_call_tool_request(
+        &self,
+        params: CallToolRequestParams,
+        _context: &RequestContext,
+        _runtime: Arc<dyn McpServer>,
+    ) -> Result<ServerResult, CallToolError> {
+        self.call_tool(params).await.map(Into::into)
+    }
 
     /// Same settings-based gate as `handle_list_tools_request`: the HQPlayer
     /// resources are hidden when the adapter is disabled, exactly like the
@@ -134,30 +147,17 @@ impl ServerHandler for HifiMcpHandler {
     async fn handle_list_resources_request(
         &self,
         _params: Option<PaginatedRequestParams>,
-        runtime: Arc<dyn McpServer>,
+        _context: &RequestContext,
+        _runtime: Arc<dyn McpServer>,
     ) -> Result<ListResourcesResult, RpcError> {
         let settings = load_app_settings();
         let resources =
             crate::mcp::resources::list_resources_for_aggregator(&self.state.aggregator, &settings)
                 .await;
-        if let (Some(session_id), Some(fingerprint)) = (
-            runtime.session_id(),
-            crate::mcp::baselines::list_fingerprint(&resources),
-        ) {
-            let mut baselines = self.state.mcp_resource_baselines.inner.lock().await;
-            if let Some(generation) = baselines.served(&session_id, fingerprint) {
-                crate::mcp::resources::spawn_list_changed_notifier(
-                    self.state.bus.clone(),
-                    runtime,
-                    self.state.aggregator.clone(),
-                    self.state.mcp_resource_baselines.clone(),
-                    session_id,
-                    generation,
-                    self.state.shutdown.clone(),
-                );
-            }
-        }
         Ok(ListResourcesResult {
+            cache_scope: rust_mcp_sdk::schema::ListResourcesResultCacheScope::Private,
+            result_type: "complete".into(),
+            ttl_ms: 0,
             meta: None,
             next_cursor: None,
             resources,
@@ -173,9 +173,13 @@ impl ServerHandler for HifiMcpHandler {
     async fn handle_list_resource_templates_request(
         &self,
         _params: Option<PaginatedRequestParams>,
+        _context: &RequestContext,
         _runtime: Arc<dyn McpServer>,
     ) -> Result<ListResourceTemplatesResult, RpcError> {
         Ok(ListResourceTemplatesResult {
+            cache_scope: rust_mcp_sdk::schema::ListResourceTemplatesResultCacheScope::Private,
+            result_type: "complete".into(),
+            ttl_ms: 0,
             meta: None,
             next_cursor: None,
             resource_templates: vec![],
@@ -185,9 +189,55 @@ impl ServerHandler for HifiMcpHandler {
     async fn handle_read_resource_request(
         &self,
         params: ReadResourceRequestParams,
+        _context: &RequestContext,
         _runtime: Arc<dyn McpServer>,
-    ) -> Result<ReadResourceResult, RpcError> {
-        crate::mcp::resources::read_resource(&self.state, &params.uri).await
+    ) -> Result<ServerResult, RpcError> {
+        crate::mcp::resources::read_resource(&self.state, &params.uri)
+            .await
+            .map(Into::into)
+    }
+
+    async fn handle_subscriptions_listen_request(
+        &self,
+        request_id: RequestId,
+        params: SubscriptionsListenRequestParams,
+        _context: &RequestContext,
+        runtime: Arc<dyn McpServer>,
+    ) -> Result<SubscriptionsListenResult, RpcError> {
+        // Acknowledge only the resource-list notifications UHC implements.
+        runtime.store_subscription(rust_mcp_sdk::schema::SubscriptionFilter {
+            resources_list_changed: params.notifications.resources_list_changed,
+            resource_subscriptions: Vec::new(),
+            prompts_list_changed: None,
+            tools_list_changed: None,
+        });
+        runtime.stream_started();
+        runtime.register_notification_transport();
+        runtime
+            .notify_subscriptions_acknowledged(
+                rust_mcp_sdk::schema::SubscriptionsAcknowledgedNotificationParams {
+                    notifications: runtime
+                        .subscription_filter()
+                        .ok_or_else(RpcError::internal_error)?,
+                    meta: Some(rust_mcp_sdk::schema::NotificationMetaObject {
+                        io_modelcontextprotocol_subscription_id: Some(request_id.clone()),
+                        ..Default::default()
+                    }),
+                },
+            )
+            .await
+            .map_err(|error| RpcError::internal_error().with_message(error.to_string()))?;
+        crate::mcp::resources::listen_for_list_changes(&self.state, runtime.clone()).await;
+        Ok(SubscriptionsListenResult {
+            meta: SubscriptionsListenResultMetaObject {
+                io_modelcontextprotocol_server_info: Some(
+                    runtime.server_details().server_info.clone(),
+                ),
+                io_modelcontextprotocol_subscription_id: request_id,
+                extra: None,
+            },
+            result_type: "complete".into(),
+        })
     }
 }
 
