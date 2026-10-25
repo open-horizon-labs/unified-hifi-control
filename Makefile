@@ -1,7 +1,7 @@
 # Unified Hi-Fi Control - Build helpers
 
 # Pin Tailwind version for reproducible builds (update manually when needed)
-TAILWIND_VERSION := v4.1.18
+TAILWIND_VERSION := v4.3.3
 
 # Detect OS and architecture for Tailwind CLI download
 UNAME_S := $(shell uname -s)
