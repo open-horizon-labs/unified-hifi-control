@@ -87,9 +87,10 @@ else
             fail "extractsize ${declared_size:-missing} KiB is smaller than extracted size ${actual_size} KiB"
         fi
 
-        tar -xOf "$output_spk" package.tgz | tar -tzf - | grep -q '^./port_conf/unified-hifi-control.sc$' \
+        # Drain the listing: grep -q may close the pipe early and make tar fail.
+        tar -xOf "$output_spk" package.tgz | tar -tzf - | grep '^./port_conf/unified-hifi-control.sc$' >/dev/null \
             || fail "SPK must contain its DSM firewall protocol file"
-        tar -xOf "$output_spk" package.tgz | tar -tzf - | grep -q '^./uhc-hiphi-pair$' \
+        tar -xOf "$output_spk" package.tgz | tar -tzf - | grep '^./uhc-hiphi-pair$' >/dev/null \
             || fail "SPK must contain the HiPhi pairing helper"
     done
 
