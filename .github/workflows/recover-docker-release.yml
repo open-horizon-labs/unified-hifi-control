@@ -1,0 +1,118 @@
+name: Recover Docker prerelease publication
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing prerelease tag (for example v4.0.0-beta.9)
+        required: true
+        type: string
+      build_run_id:
+        description: Completed Build run containing the three successful Docker image jobs
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+concurrency:
+  group: docker-release-recovery-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/v4'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+    steps:
+      - name: Validate original release provenance
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          tag, run_id = os.environ['RELEASE_TAG'], os.environ['BUILD_RUN_ID']
+          assert re.fullmatch(r'v\d+\.\d+\.\d+-(?:alpha|beta|rc)\.\d+', tag), 'Prereleases only'
+          assert re.fullmatch(r'[1-9]\d*', run_id), 'Invalid run ID'
+          repo = os.environ['GITHUB_REPOSITORY']
+          def api(path):
+              return json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/{path}']))
+          run = api(f'actions/runs/{run_id}')
+          assert run['event'] == 'push' and run['status'] == 'completed'
+          assert run['path'] == '.github/workflows/build.yml'
+          assert run['head_sha'] == api(f'commits/{tag}')['sha'], 'Tag/run source mismatch'
+          assert api(f'releases/tags/{tag}')['prerelease'], 'Stable releases are excluded'
+          jobs = api(f'actions/runs/{run_id}/jobs?per_page=100')['jobs']
+          for arch in ['amd64', 'arm64', 'armv7']:
+              assert any(j['name'] == f'Build Docker ({arch})' and j['conclusion'] == 'success' for j in jobs), arch
+          artifacts = api(f'actions/runs/{run_id}/artifacts?per_page=100')['artifacts']
+          for target in ['x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl', 'armv7-unknown-linux-musleabihf']:
+              matches = [a for a in artifacts if a['name'] == f'docker-digest-{target}']
+              assert len(matches) == 1 and not matches[0]['expired'], target
+          print('Validated original release source:', run['head_sha'])
+          PY
+
+      - name: Download original image digests
+        uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.build_run_id }}
+          pattern: docker-digest-*
+          path: /tmp/digests
+
+      - name: Validate digest artifacts
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+          root = pathlib.Path('/tmp/digests')
+          targets = ['x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl', 'armv7-unknown-linux-musleabihf']
+          assert {p.name for p in root.iterdir()} == {f'docker-digest-{t}' for t in targets}
+          digests = []
+          for target in targets:
+              files = list((root / f'docker-digest-{target}').iterdir())
+              assert len(files) == 1
+              f = files[0]
+              assert f.is_file() and not f.is_symlink() and f.stat().st_size == 0
+              assert re.fullmatch(r'[0-9a-f]{64}', f.name)
+              digests.append(f.name)
+          assert len(set(digests)) == 3
+          pathlib.Path('/tmp/recovery-digests.txt').write_text('\n'.join(digests) + '\n')
+          PY
+
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Publish and verify signed prerelease indexes
+        shell: bash
+        run: |
+          set -euo pipefail
+          sources=()
+          while IFS= read -r digest; do
+            sources+=("muness/unified-hifi-control@sha256:$digest")
+          done < /tmp/recovery-digests.txt
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/recover-docker-release.yml@refs/heads/v4"
+          for image in muness/unified-hifi-control muness/roon-extension-knob; do
+            ref="$image:${RELEASE_TAG#v}"
+            docker buildx imagetools create --tag "$ref" "${sources[@]}"
+            docker buildx imagetools inspect --raw "$ref" > /tmp/recovery-index.json
+            python3 - <<'PY'
+          import json
+          index = json.load(open('/tmp/recovery-index.json'))
+          platforms = {(p['os'], p['architecture'], p.get('variant', '')) for m in index['manifests'] if (p := m['platform'])['os'] != 'unknown'}
+          assert {p[:2] for p in platforms} == {('linux', 'amd64'), ('linux', 'arm64'), ('linux', 'arm')}, platforms
+          assert ('linux', 'arm', 'v7') in platforms, platforms
+          PY
+            digest=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest.Digest}}' | tr -d '"')
+            cosign sign --yes "$image@$digest"
+            cosign verify "$image@$digest" \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+            printf '%s@%s\n' "$ref" "$digest" >> "$GITHUB_STEP_SUMMARY"
+          done

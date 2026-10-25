@@ -2099,7 +2099,7 @@ jobs:
       # short-lived Fulcio certificate and records the signature in the
       # public Rekor transparency log.
       - name: Install cosign
-        uses: sigstore/cosign-installer@v4
+        uses: sigstore/cosign-installer@v4.1.2
 
       - name: Sign container images (cosign keyless)
         env:
