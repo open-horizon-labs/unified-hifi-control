@@ -186,13 +186,12 @@ async fn resolve_target(state: &AppState, zone_id: Option<&str>) -> HqpTarget {
     }
 }
 
-type ResolvedHqpTarget = (String, Arc<HqpAdapter>, Envelope);
-type HqpToolResult = Result<CallToolResult, CallToolError>;
+type HqpTargetFailure = Box<Result<CallToolResult, CallToolError>>;
 
 fn target_failure(
     env: Envelope,
     target: HqpTarget,
-) -> Result<ResolvedHqpTarget, Box<HqpToolResult>> {
+) -> Result<(String, Arc<HqpAdapter>, Envelope), HqpTargetFailure> {
     match target {
         HqpTarget::Resolved {
             instance,
