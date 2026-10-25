@@ -3733,7 +3733,8 @@ async fn queue_read_serializes_different_zones() {
 async fn queue_read_cancellation_unsubscribes_before_next_reader() {
     use unified_hifi_control::adapters::traits::LibraryAdapter;
     let core = FakeRoonCore::start().await;
-    core.set_queue("zone_fake_1", vec![queue_track("Stale", 6)]).await;
+    core.set_queue("zone_fake_1", vec![queue_track("Stale", 6)])
+        .await;
     core.set_queue_delay(Duration::from_millis(100)).await;
     let adapter = connected(&core).await;
     let reader = adapter.clone();
