@@ -307,7 +307,6 @@ fn envelope_of(result: &CallToolResult) -> Value {
     result
         .structured_content
         .clone()
-        .map(Value::Object)
         .expect("every UHC MCP tool result carries the structured envelope")
 }
 
