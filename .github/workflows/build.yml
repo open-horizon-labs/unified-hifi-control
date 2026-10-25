@@ -401,7 +401,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: '24'
+          node-version: '26.12.1'
       - name: Test API-only feed merge behavior
         run: node --test tests/lms_feed_automerge.test.cjs
 
@@ -567,6 +567,17 @@ jobs:
         cat /opt/gh-builder/path >> "$GITHUB_PATH"
         cat /opt/gh-builder/env >> "$GITHUB_ENV"
     - uses: actions/checkout@v6
+    - name: Isolate mutable tool state
+      run: 'echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+    
+        echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
+    
+        '
+    - name: Setup Rust
+      uses: ./.github/actions/setup-rust
+      with:
+        targets: wasm32-unknown-unknown
+        components: llvm-tools-preview
     - name: Cache WASM build output
       id: cache-wasm
       uses: actions/cache@v5
@@ -669,6 +680,30 @@ jobs:
         cat /opt/gh-builder/path >> "$GITHUB_PATH"
         cat /opt/gh-builder/env >> "$GITHUB_ENV"
     - uses: actions/checkout@v6
+    - name: Isolate mutable tool state
+      run: 'echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+    
+        echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
+    
+        '
+    - name: Setup Rust
+      uses: ./.github/actions/setup-rust
+      with:
+        targets: x86_64-unknown-linux-musl
+    - name: Install zig
+      run: "set -euo pipefail\nZIG_VERSION=\"0.17.0\"\n\n# The fleet image may already carry the exact compiler. Reuse it;\n#\
+        \ the host being x86_64 does not remove the musl linker requirement.\nif command -v zig >/dev/null 2>&1 && [ \"$(zig version)\"\
+        \ = \"$ZIG_VERSION\" ]; then\n  echo \"Using runner-provided Zig $(zig version)\"\n  exit 0\nfi\n\nZIG_ROOT=\"${RUNNER_TOOL_CACHE:-$HOME/.cache/uhc-tools}/zig/$ZIG_VERSION/x64\"\
+        \nif [ ! -x \"$ZIG_ROOT/zig\" ]; then\n  ZIG_PARENT=$(dirname \"$ZIG_ROOT\")\n  mkdir -p \"$ZIG_PARENT\"\n  TEMP_DIR=$(mktemp\
+        \ -d \"$ZIG_PARENT/.zig-install.XXXXXX\")\n  trap 'rm -rf \"$TEMP_DIR\"' EXIT\n  curl --fail --show-error --location \\\
+        \n    \"https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz\" | \\\n    tar -xJ -C \"$TEMP_DIR\"\
+        \n  STAGED_ROOT=\"$TEMP_DIR/zig-x86_64-linux-$ZIG_VERSION\"\n  test -x \"$STAGED_ROOT/zig\"\n  rm -rf \"$ZIG_ROOT\"\n\
+        \  mv \"$STAGED_ROOT\" \"$ZIG_ROOT\"\n  rm -rf \"$TEMP_DIR\"\n  trap - EXIT\nfi\ntest -x \"$ZIG_ROOT/zig\"\necho \"$ZIG_ROOT\"\
+        \ >> \"$GITHUB_PATH\"\n"
+    - name: Ensure cargo-zigbuild
+      run: "set -euo pipefail\nif command -v cargo-zigbuild >/dev/null 2>&1 && \\\n   cargo-zigbuild --version | grep -q 'cargo-zigbuild\
+        \ 0.24.0'; then\n  echo \"Using cached cargo-zigbuild $(cargo-zigbuild --version)\"\nelse\n  cargo install cargo-zigbuild\
+        \ --version 0.24.0 --locked\nfi\n"
     - name: Restore Cargo state from NAS
       if: runner.environment == 'self-hosted'
       continue-on-error: true
@@ -760,7 +795,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version: '26.12.1'
 
       - name: Install Node dependencies
         run: npm ci
@@ -949,6 +984,29 @@ jobs:
         cat /opt/gh-builder/path >> "$GITHUB_PATH"
         cat /opt/gh-builder/env >> "$GITHUB_ENV"
     - uses: actions/checkout@v6
+    - name: Isolate mutable tool state
+      run: 'echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+    
+        echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
+    
+        '
+    - name: Setup Rust
+      uses: ./.github/actions/setup-rust
+      with:
+        targets: ${{ matrix.target }}
+    - name: Install zig
+      run: "set -euo pipefail\nZIG_VERSION=\"0.17.0\"\nZIG_ARCH=\"$(uname -m)\"\nif command -v zig >/dev/null 2>&1 && [ \"$(zig\
+        \ version)\" = \"$ZIG_VERSION\" ]; then\n  echo \"Using runner-provided Zig $(zig version)\"\nelse\n  ZIG_ROOT=\"${RUNNER_TOOL_CACHE:-$HOME/.cache/uhc-tools}/zig/$ZIG_VERSION/$ZIG_ARCH\"\
+        \n  if [ ! -x \"$ZIG_ROOT/zig\" ]; then\n    ZIG_PARENT=$(dirname \"$ZIG_ROOT\")\n    mkdir -p \"$ZIG_PARENT\"\n    TEMP_DIR=$(mktemp\
+        \ -d \"$ZIG_PARENT/.zig-install.XXXXXX\")\n    trap 'rm -rf \"$TEMP_DIR\"' EXIT\n    curl --fail --show-error --location\
+        \ \\\n      \"https://ziglang.org/download/$ZIG_VERSION/zig-${ZIG_ARCH}-linux-$ZIG_VERSION.tar.xz\" | \\\n      tar -xJ\
+        \ -C \"$TEMP_DIR\"\n    STAGED_ROOT=\"$TEMP_DIR/zig-${ZIG_ARCH}-linux-$ZIG_VERSION\"\n    test -x \"$STAGED_ROOT/zig\"\
+        \n    rm -rf \"$ZIG_ROOT\"\n    mv \"$STAGED_ROOT\" \"$ZIG_ROOT\"\n    rm -rf \"$TEMP_DIR\"\n    trap - EXIT\n  fi\n \
+        \ test -x \"$ZIG_ROOT/zig\"\n  echo \"$ZIG_ROOT\" >> \"$GITHUB_PATH\"\nfi\n"
+    - name: Ensure cargo-zigbuild
+      run: "set -euo pipefail\nif command -v cargo-zigbuild >/dev/null 2>&1 && \\\n   cargo-zigbuild --version | grep -q 'cargo-zigbuild\
+        \ 0.24.0'; then\n  echo \"Using cached cargo-zigbuild $(cargo-zigbuild --version)\"\nelse\n  cargo install cargo-zigbuild\
+        \ --version 0.24.0 --locked\nfi\n"
     - name: Restore Cargo state from NAS
       if: runner.environment == 'self-hosted'
       continue-on-error: true
