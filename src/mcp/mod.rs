@@ -53,7 +53,8 @@ use axum::http::{HeaderMap, Method, Uri};
 use axum::{body::Body, extract::Extension, response::IntoResponse};
 use rust_mcp_sdk::{
     id_generator::{FastIdGenerator, UuidGenerator},
-    mcp_server::{McpAppState, McpHttpHandler, ToMcpServerHandler},
+    mcp_http::{McpAppState, McpHttpError, McpHttpHandler},
+    mcp_server::ToMcpServerHandler,
     session_store::InMemorySessionStore,
     TransportOptions,
 };
@@ -99,7 +100,7 @@ pub async fn handle_mcp_get(
         // The SDK reports a vanished SSE session as a typed transport error.
         // Match it here rather than prechecking the store (which races teardown)
         // or disguising unrelated server failures as client errors.
-        Err(rust_mcp_sdk::mcp_server::error::TransportServerError::SessionIdInvalid(_)) => {
+        Err(McpHttpError::SessionIdInvalid(_)) => {
             (axum::http::StatusCode::NOT_FOUND, "MCP session not found").into_response()
         }
         // Response builder with valid status/body cannot fail
@@ -250,10 +251,11 @@ pub fn create_mcp_extension(state: AppState) -> axum::Extension<McpExtState> {
         event_store: None,
         task_store: None,
         client_task_store: None,
+        message_observer: None,
     });
 
     // Create HTTP handler (no auth, no middleware)
-    let http_handler = Arc::new(McpHttpHandler::new(vec![]));
+    let http_handler = Arc::new(McpHttpHandler::new(vec![], None));
 
     // Bundle into extension state
     let ext_state = McpExtState {

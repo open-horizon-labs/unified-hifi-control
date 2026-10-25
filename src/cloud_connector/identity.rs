@@ -1,4 +1,4 @@
-use rand::{rngs::SysRng, RngExt};
+use rand::TryRng;
 use std::{collections::HashMap, fs, io, path::Path};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -29,7 +29,7 @@ impl InstallationIdentity {
         }
         Ok(Self {
             installation_id,
-            signing_key: SigningKey::generate(&mut SysRng),
+            signing_key: SigningKey::generate(&mut rand::rng()),
         })
     }
 
@@ -118,7 +118,9 @@ impl ZoneHandleMap {
         }
         let mut bytes = [0u8; 18];
         loop {
-            SysRng.fill_bytes(&mut bytes);
+            rand::rngs::SysRng
+                .try_fill_bytes(&mut bytes)
+                .expect("OS randomness unavailable");
             let handle = format!(
                 "zh_{}",
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
