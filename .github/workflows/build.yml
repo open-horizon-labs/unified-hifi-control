@@ -1391,6 +1391,14 @@ jobs:
         cat /opt/gh-builder/path >> "$GITHUB_PATH"
         cat /opt/gh-builder/env >> "$GITHUB_ENV"
     - uses: actions/checkout@v6
+    - name: Isolate mutable tool state
+      run: |
+        echo "CARGO_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/cargo" >> "$GITHUB_ENV"
+        echo "RUSTUP_HOME=${RUNNER_TOOL_CACHE}/uhc/${RUNNER_NAME}/rustup" >> "$GITHUB_ENV"
+    - name: Setup reviewed Rust toolchain
+      uses: ./.github/actions/setup-rust
+      with:
+        targets: x86_64-pc-windows-msvc
     - name: Restore Cargo state from NAS
       if: runner.environment == 'self-hosted'
       continue-on-error: true

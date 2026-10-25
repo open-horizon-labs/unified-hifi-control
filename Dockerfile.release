@@ -1,7 +1,7 @@
 # Minimal runtime image using pre-built musl binary with embedded web assets (ADR 002)
 # Used by CI - expects binary in build context
 # Use GHCR for faster pulls from GitHub Actions (same datacenter)
-FROM ghcr.io/linuxcontainers/alpine:3.24.3
+FROM alpine:3.24.3
 
 WORKDIR /app
 

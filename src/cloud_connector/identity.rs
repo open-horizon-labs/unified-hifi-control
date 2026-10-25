@@ -1,4 +1,4 @@
-use rand::TryRng;
+use rand::Rng;
 use std::{collections::HashMap, fs, io, path::Path};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -118,9 +118,7 @@ impl ZoneHandleMap {
         }
         let mut bytes = [0u8; 18];
         loop {
-            rand::rngs::SysRng
-                .try_fill_bytes(&mut bytes)
-                .expect("OS randomness unavailable");
+            rand::rng().fill_bytes(&mut bytes);
             let handle = format!(
                 "zh_{}",
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)

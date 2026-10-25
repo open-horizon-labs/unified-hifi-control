@@ -1,7 +1,7 @@
 # CI Dockerfile - uses pre-built binaries with embedded web assets (ADR 002)
 # This is much faster than building inside Docker with QEMU emulation
 # Use GHCR for faster pulls from GitHub Actions (same datacenter)
-FROM ghcr.io/linuxcontainers/alpine:3.24.3
+FROM alpine:3.24.3
 
 WORKDIR /app
 

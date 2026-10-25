@@ -205,6 +205,7 @@ impl Rig {
             TestClientHandler,
             None,
             None,
+            None,
         );
         client.clone().start().await.expect("start mcp test client");
 
