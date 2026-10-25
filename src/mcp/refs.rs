@@ -76,7 +76,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use rand::RngCore;
+use rand::Rng;
 use tokio::sync::Mutex;
 
 use crate::adapters::lms::LmsPlayTarget;
@@ -376,7 +376,7 @@ impl RefTable {
 
 fn generate_token() -> String {
     let mut bytes = [0u8; 16]; // 128 bits
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     format!("{TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes))
 }
 

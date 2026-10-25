@@ -17,7 +17,7 @@
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, Key, KeyInit, Nonce};
-use rand::{rngs::OsRng, RngCore};
+use rand::{rngs::SysRng, RngExt};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -148,7 +148,7 @@ impl EncryptedCredentialStore {
         std::fs::create_dir_all(parent)?;
         let plaintext = serde_json::to_vec(record).context("serialize Spotify credentials")?;
         let mut nonce_bytes = [0_u8; NONCE_BYTES];
-        OsRng.fill_bytes(&mut nonce_bytes);
+        SysRng.fill_bytes(&mut nonce_bytes);
         let cipher = ChaCha20Poly1305::new(&Key::from(self.key));
         let ciphertext = cipher
             .encrypt(&Nonce::from(nonce_bytes), plaintext.as_ref())
@@ -291,7 +291,7 @@ impl MusicAssistantCredentialStore {
         let plaintext =
             serde_json::to_vec(record).context("serialize Music Assistant credentials")?;
         let mut nonce = [0_u8; NONCE_BYTES];
-        OsRng.fill_bytes(&mut nonce);
+        SysRng.fill_bytes(&mut nonce);
         let ciphertext = ChaCha20Poly1305::new(&Key::from(self.key))
             .encrypt(&Nonce::from(nonce), plaintext.as_ref())
             .map_err(|_| anyhow!("encrypt Music Assistant credentials"))?;
@@ -465,7 +465,7 @@ impl MqttCredentialStore {
         std::fs::create_dir_all(parent)?;
         let plaintext = serde_json::to_vec(record).context("serialize MQTT credentials")?;
         let mut nonce = [0_u8; NONCE_BYTES];
-        OsRng.fill_bytes(&mut nonce);
+        SysRng.fill_bytes(&mut nonce);
         let ciphertext = ChaCha20Poly1305::new(&Key::from(self.key))
             .encrypt(&Nonce::from(nonce), plaintext.as_ref())
             .map_err(|_| anyhow!("encrypt MQTT credentials"))?;
@@ -576,7 +576,7 @@ impl AppleBridgeCredentialStore {
         let plaintext =
             serde_json::to_vec(records).context("serialize Apple bridge credentials")?;
         let mut nonce = [0_u8; NONCE_BYTES];
-        OsRng.fill_bytes(&mut nonce);
+        SysRng.fill_bytes(&mut nonce);
         let ciphertext = ChaCha20Poly1305::new(&Key::from(self.key))
             .encrypt(&Nonce::from(nonce), plaintext.as_ref())
             .map_err(|_| anyhow!("encrypt Apple bridge credentials"))?;
@@ -626,7 +626,7 @@ fn load_or_create_key(path: &Path) -> Result<[u8; KEY_BYTES]> {
                 .ok_or_else(|| anyhow!("credential key path has no parent"))?;
             std::fs::create_dir_all(parent)?;
             let mut key = [0_u8; KEY_BYTES];
-            OsRng.fill_bytes(&mut key);
+            SysRng.fill_bytes(&mut key);
             write_private_file(path, &key)?;
             Ok(key)
         }

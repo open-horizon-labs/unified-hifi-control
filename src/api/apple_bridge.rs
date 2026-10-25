@@ -11,7 +11,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     Json,
 };
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{distr::Alphanumeric, RngExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -292,7 +292,7 @@ impl AppleBridgeRegistry {
             .chars()
             .take(MAX_BRIDGE_ID_LENGTH)
             .collect::<String>();
-        let pairing_code = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000));
+        let pairing_code = format!("{:06}", rand::rng().random_range(0..1_000_000));
         let expires_at = now_secs() + PAIRING_TTL.as_secs();
         let mut state = self.inner.write().await;
         let now = now_secs();
@@ -1299,7 +1299,7 @@ fn bearer(headers: &HeaderMap) -> Result<String, (StatusCode, Json<ErrorBody>)> 
 }
 
 fn random_token(length: usize) -> String {
-    rand::thread_rng()
+    rand::rng()
         .sample_iter(&Alphanumeric)
         .take(length)
         .map(char::from)

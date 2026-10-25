@@ -82,7 +82,7 @@ pub fn resolve_command_target(current_instance: impl Fn() -> String) -> String {
 #[cfg(target_arch = "wasm32")]
 fn session_salt_bytes() -> [u8; 16] {
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).expect("a secure random source is available");
+    getrandom::fill(&mut bytes).expect("a secure random source is available");
     bytes
 }
 

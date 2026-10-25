@@ -7,7 +7,7 @@ use cloud_connector::protocol::{
 use cloud_connector::protocol::{FieldPatch, ZoneDelta};
 use cloud_connector::*;
 use ed25519_dalek::{Signer, SigningKey, Verifier};
-use rand::rngs::OsRng;
+use rand::rngs::SysRng;
 use serde_json::json;
 use std::time::Duration;
 
@@ -65,8 +65,8 @@ fn signed_session_grant_with_kid(
 fn session_issuer_rotation_overlaps_then_retires_the_old_key() {
     use sha2::{Digest as _, Sha256};
 
-    let old = SigningKey::generate(&mut OsRng);
-    let new = SigningKey::generate(&mut OsRng);
+    let old = SigningKey::generate(&mut SysRng);
+    let new = SigningKey::generate(&mut SysRng);
     let identity =
         InstallationIdentity::generate("11111111-1111-4111-8111-111111111111".to_owned()).unwrap();
     let now = 1_800_000_000_000_i64;
@@ -117,7 +117,7 @@ fn session_issuer_rotation_overlaps_then_retires_the_old_key() {
 fn session_grant_is_verified_before_it_can_authenticate_the_websocket_upgrade() {
     use sha2::{Digest as _, Sha256};
 
-    let issuer = SigningKey::generate(&mut OsRng);
+    let issuer = SigningKey::generate(&mut SysRng);
     let installation_id = "11111111-1111-4111-8111-111111111111".to_owned();
     let identity = InstallationIdentity::generate(installation_id.clone()).unwrap();
     let now = 1_800_000_000_000_i64;
@@ -164,7 +164,7 @@ fn session_grant_is_verified_before_it_can_authenticate_the_websocket_upgrade() 
 
     let mut forged_claims = claims;
     forged_claims.grant_generation = 8;
-    let forged_payload = signed_session_grant(&SigningKey::generate(&mut OsRng), &forged_claims);
+    let forged_payload = signed_session_grant(&SigningKey::generate(&mut SysRng), &forged_claims);
     assert_eq!(
         verify_installation_session_grant(
             &forged_payload,
@@ -690,8 +690,8 @@ fn signed_grant_with_kid(key_id: &str, identity: &SigningKey, claims: &GrantClai
 
 #[test]
 fn command_issuer_rotation_overlaps_then_retires_the_old_key() {
-    let old = SigningKey::generate(&mut OsRng);
-    let new = SigningKey::generate(&mut OsRng);
+    let old = SigningKey::generate(&mut SysRng);
+    let new = SigningKey::generate(&mut SysRng);
     let overlapping = || {
         let mut verifier = CommandGrantVerifier::new(
             "hiphi-command-authorization",
@@ -784,7 +784,7 @@ fn command_with_claims_and_kid(
 
 #[test]
 fn grant_binds_key_audience_expiry_generation_and_replay() {
-    let key = SigningKey::generate(&mut OsRng);
+    let key = SigningKey::generate(&mut SysRng);
     let mut verifier = CommandGrantVerifier::new(
         "hiphi-command-authorization",
         "uhc-connector",
@@ -809,7 +809,7 @@ fn grant_binds_key_audience_expiry_generation_and_replay() {
 
 #[test]
 fn grant_rejects_each_security_binding_dimension() {
-    let key = SigningKey::generate(&mut OsRng);
+    let key = SigningKey::generate(&mut SysRng);
     let mut verifier = CommandGrantVerifier::new(
         "hiphi-command-authorization",
         "uhc-connector",
@@ -826,7 +826,7 @@ fn grant_rejects_each_security_binding_dimension() {
         Err(GrantError::WrongAudience)
     );
 
-    let mut wrong_key = command_and_grant(1_000, &SigningKey::generate(&mut OsRng), 3);
+    let mut wrong_key = command_and_grant(1_000, &SigningKey::generate(&mut SysRng), 3);
     assert_eq!(
         verifier.verify(&wrong_key, 1_000),
         Err(GrantError::InvalidSignature)
@@ -924,7 +924,7 @@ fn command_ledger_refuses_new_entry_at_capacity_without_evicting_live_results() 
 
 #[test]
 fn valid_new_request_retry_uses_the_signed_idempotency_result_without_reexecution() {
-    let key = SigningKey::generate(&mut OsRng);
+    let key = SigningKey::generate(&mut SysRng);
     let mut verifier = CommandGrantVerifier::new(
         "hiphi-command-authorization",
         "uhc-connector",
@@ -962,7 +962,7 @@ fn valid_new_request_retry_uses_the_signed_idempotency_result_without_reexecutio
 
 #[test]
 fn invalid_grant_cannot_poison_the_idempotency_ledger() {
-    let key = SigningKey::generate(&mut OsRng);
+    let key = SigningKey::generate(&mut SysRng);
     let mut verifier = CommandGrantVerifier::new(
         "hiphi-command-authorization",
         "uhc-connector",
@@ -1003,7 +1003,7 @@ fn command_ledger_binds_idempotency_to_payload_hash() {
 
 #[test]
 fn command_replay_cache_remains_bounded_under_unique_grants() {
-    let key = SigningKey::generate(&mut OsRng);
+    let key = SigningKey::generate(&mut SysRng);
     let mut verifier = CommandGrantVerifier::new(
         "hiphi-command-authorization",
         "uhc-connector",
@@ -1027,7 +1027,7 @@ fn command_replay_cache_remains_bounded_under_unique_grants() {
 
 #[test]
 fn command_verifier_binds_the_signed_node_to_each_envelope() {
-    let key = SigningKey::generate(&mut OsRng);
+    let key = SigningKey::generate(&mut SysRng);
     let mut verifier = CommandGrantVerifier::new(
         "hiphi-command-authorization",
         "uhc-connector",
@@ -1221,7 +1221,7 @@ fn challenge_proof_binds_nonce_endpoint_and_is_raw_proof_json() {
 
 #[test]
 fn pairing_possession_proof_binds_all_ceremony_inputs() {
-    let key = SigningKey::generate(&mut OsRng);
+    let key = SigningKey::generate(&mut SysRng);
     let pairing_id = uuid(61);
     let installation_id = uuid(62);
     let account_id = uuid(63);
