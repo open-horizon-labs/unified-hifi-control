@@ -3636,6 +3636,25 @@ async fn queue_connected(core: &FakeRoonCore) -> Arc<RoonAdapter> {
     adapter
 }
 
+async fn wait_for_queue_unsubscribes(core: &FakeRoonCore, count: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let seen = core
+                .requests()
+                .await
+                .iter()
+                .filter(|request| request.name.ends_with("/unsubscribe_queue"))
+                .count();
+            if seen >= count {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("queue unsubscribe reached the Core");
+}
+
 // #877: read-only queue snapshots, through the real Roon wire parser.
 fn queue_track(title: &str, id: u32) -> serde_json::Value {
     serde_json::json!({"queue_item_id": id, "length": 123,
@@ -3660,7 +3679,7 @@ async fn queue_read_returns_snapshot_and_unsubscribes() {
     assert_eq!(result["total"], 1);
     assert_eq!(result["truncated"], false);
     assert!(!result.to_string().contains("queue_item_id"));
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    wait_for_queue_unsubscribes(&core, 1).await;
     let requests = core.requests().await;
     assert!(requests
         .iter()
@@ -3725,6 +3744,7 @@ async fn queue_read_serializes_different_zones() {
     );
     assert_eq!(one.unwrap()["items"][0]["title"], "Zone one");
     assert_eq!(two.unwrap()["items"][0]["title"], "Zone two");
+    wait_for_queue_unsubscribes(&core, 2).await;
     let requests = core.requests().await;
     let queue_requests: Vec<_> = requests
         .iter()
@@ -3739,6 +3759,26 @@ async fn queue_read_serializes_different_zones() {
             "com.roonlabs.transport:2/subscribe_queue",
             "com.roonlabs.transport:2/unsubscribe_queue"
         ]
+    );
+    let subscriptions: Vec<_> = requests
+        .iter()
+        .filter(|r| r.name.ends_with("/subscribe_queue"))
+        .collect();
+    let unsubscribes: Vec<_> = requests
+        .iter()
+        .filter(|r| r.name.ends_with("/unsubscribe_queue"))
+        .collect();
+    assert_ne!(
+        subscriptions[0].body["subscription_key"],
+        subscriptions[1].body["subscription_key"]
+    );
+    assert_eq!(
+        unsubscribes[0].body["subscription_key"],
+        subscriptions[0].body["subscription_key"]
+    );
+    assert_eq!(
+        unsubscribes[1].body["subscription_key"],
+        subscriptions[1].body["subscription_key"]
     );
 }
 

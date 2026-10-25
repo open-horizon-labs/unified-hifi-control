@@ -984,6 +984,14 @@ struct QueueReadRequest {
     _permit: OwnedMutexGuard<()>,
 }
 
+impl QueueReadRequest {
+    fn complete(self, result: Result<Value>) {
+        if self.reply.send(result).is_err() {
+            tracing::debug!(zone_id = %self.zone_id, "Roon queue reader cancelled before reply");
+        }
+    }
+}
+
 struct ActiveQueueRead {
     request: QueueReadRequest,
     transport: Transport,
@@ -1004,7 +1012,7 @@ impl ActiveQueueRead {
                 Ok(()) => result,
                 Err(_) => Err(anyhow::anyhow!("Roon queue unsubscribe timed out")),
             };
-        let _ = self.request.reply.send(result);
+        self.request.complete(result);
     }
 }
 
@@ -4663,10 +4671,10 @@ async fn run_roon_loop(
                                 transport.subscribe_queue(&request.zone_id, (QUEUE_READ_LIMIT + 1) as u32)
                             ).await {
                                 Ok(Some(request_id)) => active_queue = Some(ActiveQueueRead { request, transport, request_id }),
-                                _ => { let _ = request.reply.send(Err(anyhow::anyhow!("Roon queue subscription failed or timed out"))); }
+                                _ => { request.complete(Err(anyhow::anyhow!("Roon queue subscription failed or timed out"))); }
                             }
                         } else {
-                            let _ = request.reply.send(Err(anyhow::anyhow!("Not connected to Roon")));
+                            request.complete(Err(anyhow::anyhow!("Not connected to Roon")));
                         }
                     }
                     continue;
