@@ -325,10 +325,10 @@ mod tests {
     #[test]
     fn declared_params_match_the_advertised_input_schemas() {
         for tool in list_tools(true) {
-            let advertised: std::collections::BTreeSet<String> = tool
-                .input_schema
-                .properties
-                .as_ref()
+            let schema = serde_json::to_value(&tool.input_schema).expect("serialize input schema");
+            let advertised: std::collections::BTreeSet<String> = schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
                 .map(|props| props.keys().cloned().collect())
                 .unwrap_or_default();
             let declared: std::collections::BTreeSet<String> = declared_params(&tool.name)
