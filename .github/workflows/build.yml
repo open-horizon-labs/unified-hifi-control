@@ -525,7 +525,7 @@ jobs:
       env:
         SCCACHE_GHA_ENABLED: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
         RUSTC_WRAPPER: sccache
-      run: cargo test --workspace
+      run: cargo test --workspace --no-fail-fast
     - name: Report compiler cache
       if: always()
       run: if command -v sccache >/dev/null; then sccache --show-stats; fi
