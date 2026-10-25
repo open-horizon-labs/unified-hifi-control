@@ -20,9 +20,9 @@ jobs:
             setup: build/prepared-builders/windows-source.yml
             profile: build/prepared-builders/windows-profile.json
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Check out the reviewed converter
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: open-horizon-labs/homelab-infra
           ref: 8580a722f15d3c5e7be60afdd013755f45b628ae

@@ -25,11 +25,11 @@ jobs:
     name: Compile connector and pairing helper
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Cache generated CSS
         id: cache-css
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: public/tailwind.css
           key: css-v4.3.3-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}

@@ -529,7 +529,7 @@ fn trait_impls_for(file: &File, type_name: &str) -> Vec<String> {
     }
     impl<'ast> Visit<'ast> for ImplVisitor<'_> {
         fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
-            if let Some((_, path, _)) = item.trait_.as_ref() {
+            if let Some((path, _)) = item.trait_.as_ref() {
                 if let syn::Type::Path(type_path) = item.self_ty.as_ref() {
                     let target = type_path
                         .path
@@ -840,7 +840,7 @@ fn root_launderings(file: &File) -> Vec<String> {
         fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
             if generics_names_forbidden_module_or_alias(&item.generics, self.tainted_aliases)
                 || self.type_is_forbidden(&item.self_ty)
-                || item.trait_.as_ref().is_some_and(|(_, path, _)| {
+                || item.trait_.as_ref().is_some_and(|(path, _)| {
                     syn_path_names_forbidden_module_or_alias(path, self.tainted_aliases)
                 })
             {

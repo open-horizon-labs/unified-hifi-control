@@ -1,6 +1,6 @@
 # Minimal runtime image using pre-built musl binary with embedded web assets (ADR 002)
 # Used by CI - expects binary in build context
-# Use GHCR for faster pulls from GitHub Actions (same datacenter)
+# Official upstream image; the GHCR mirror does not publish this patch tag.
 FROM alpine:3.24.3
 
 WORKDIR /app
