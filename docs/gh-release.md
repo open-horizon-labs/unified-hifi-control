@@ -487,3 +487,15 @@ There's no automation wiring this to this repo's own release workflow yet;
 it's a manual two-field bump after you're satisfied a release is stable
 enough to push to Home Assistant users (skip beta/rc tags — point the add-on
 at stable releases only).
+
+### Recovering Docker prerelease publication
+
+If a tagged Build run successfully uploaded its three Docker architecture images
+but failed to publish/sign the index, dispatch `recover-docker-release.yml` from
+`v4` with the existing prerelease tag and Build run ID. It verifies their source
+commit matches and uses only the original digest artifacts; it creates no build,
+release tag, or stable alias. It publishes both image names and verifies all three
+platforms and keyless signatures. The recovery signature's certificate identity
+is the recovery workflow at `refs/heads/v4`; the general verification command
+above accepts this repository's workflows. Fix the original workflow before
+recovery so subsequent tagged releases follow the normal path.
