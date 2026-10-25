@@ -711,6 +711,7 @@ mod command {
 #[cfg(feature = "server")]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    unified_hifi_control::tls::install_crypto_provider();
     command::run().await
 }
 

@@ -43,6 +43,7 @@ async fn now_playing(zone: &str) -> anyhow::Result<MusicIdentity> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    unified_hifi_control::tls::install_crypto_provider();
     let mut args = std::env::args().skip(1);
     let first = args.next();
     let zone = if first.as_deref() == Some("--zone") {
