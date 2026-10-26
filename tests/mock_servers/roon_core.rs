@@ -706,6 +706,7 @@ struct CoreState {
     dropped_sessions: HashSet<String>,
     /// One-shot: the next browse, whatever it is, is rejected.
     reject_next_browse: bool,
+    reject_identity_once: Option<String>,
     /// One-shot: the next browse carrying `pop_levels` is rejected with
     /// `InvalidLevels` (see [`FakeRoonCore::reject_next_pop_levels`]).
     reject_next_pop_levels: bool,
@@ -780,6 +781,7 @@ impl FakeRoonCore {
             rejection_names: HashMap::new(),
             dropped_sessions: HashSet::new(),
             reject_next_browse: false,
+            reject_identity_once: None,
             reject_next_pop_levels: false,
             delay: Duration::ZERO,
             key_delays: HashMap::new(),
@@ -891,6 +893,12 @@ impl FakeRoonCore {
             .await
             .rejected_keys
             .insert(item_key.to_string());
+    }
+
+    /// Invalidate a resolved row just as playback enters it, once. Resolution only loads the
+    /// final row, so this exercises the gap between durable resolution and its native play.
+    pub async fn reject_identity_once(&self, identity: &str) {
+        self.state.write().await.reject_identity_once = Some(identity.into());
     }
 
     /// Answer `InvalidItemKey` for the next browse, whatever it carries.
@@ -1767,7 +1775,15 @@ async fn handle_browse(
     }
 
     // --- error injection ---------------------------------------------------
-    let rejected = state.reject_next_browse
+    let reject_identity = item_key
+        .and_then(|key| state.arena.index_of(key))
+        .and_then(|index| state.arena.nodes.get(index))
+        .map(|node| format!("{}|{}", node.title, node.subtitle.as_deref().unwrap_or("")))
+        .is_some_and(|identity| state.reject_identity_once.as_ref() == Some(&identity));
+    if reject_identity {
+        state.reject_identity_once = None;
+    }
+    let rejected = reject_identity || state.reject_next_browse
         || item_key.is_some_and(|k| state.rejected_keys.contains(k))
         || match (state.item_key_scope, item_key) {
             (ItemKeyScope::PerSession, Some(key)) => !state

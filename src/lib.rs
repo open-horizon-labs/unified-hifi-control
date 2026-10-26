@@ -73,6 +73,8 @@ pub mod firmware;
 #[cfg(feature = "server")]
 pub mod knobs;
 #[cfg(feature = "server")]
+pub mod library_playback;
+#[cfg(feature = "server")]
 pub mod mcp;
 #[cfg(feature = "server")]
 pub mod mdns;

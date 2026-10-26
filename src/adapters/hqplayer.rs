@@ -11230,6 +11230,9 @@ async fn execute_hqplayer_runtime_command(
             .fetch_profiles()
             .await
             .map(|_| HqpRuntimeReadback::Profile),
+        RuntimeCommand::LibraryPlay(_) => {
+            Err(anyhow!("Library command routed to HQPlayer endpoint"))
+        }
         RuntimeCommand::Hqplayer(HqpRuntimeCommand::Output(_)) => Err(anyhow!(
             "HQPlayer output commands are executed by the exact-instance output coordinator"
         )),

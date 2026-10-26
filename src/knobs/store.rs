@@ -199,6 +199,18 @@ fn legacy_device_type() -> String {
     "knob".into()
 }
 
+/// Canonical owner boundary for current and persisted controller zone reports. Legacy controllers
+/// send bare Roon IDs; every consumer must see the same identity without surface-specific guessing.
+fn canonical_zone_id(id: String) -> Option<String> {
+    if id.is_empty() {
+        None
+    } else if id.contains(':') {
+        Some(id)
+    } else {
+        Some(crate::bus::PrefixedZoneId::roon(id).to_string())
+    }
+}
+
 /// Registered knob device
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Knob {
@@ -273,14 +285,22 @@ impl KnobStore {
             },
             Err(error) => return Err(error).context("read controller settings"),
         };
-        serde_json::from_slice(&bytes).map_err(|error| {
-            // Never include configuration contents in diagnostics.
+        let mut knobs: HashMap<String, Knob> = serde_json::from_slice(&bytes).map_err(|error| {
             anyhow::anyhow!(
                 "invalid controller settings JSON at line {}, column {}",
                 error.line(),
                 error.column()
             )
-        })
+        })?;
+        for knob in knobs.values_mut() {
+            knob.status.zone_id = knob.status.zone_id.take().and_then(canonical_zone_id);
+            let assigned = knob.config.assigned_zone_id.take();
+            knob.config.assigned_zone_id = assigned.clone().and_then(canonical_zone_id);
+            if assigned != knob.config.assigned_zone_id {
+                knob.config_sha = compute_sha(&knob.config, &knob.name);
+            }
+        }
+        Ok(knobs)
     }
 
     fn ensure_loaded(&self) -> Result<()> {
@@ -457,7 +477,7 @@ impl KnobStore {
                 knob.status.battery_charging = Some(charging);
             }
             if let Some(zone_id) = updates.zone_id {
-                knob.status.zone_id = Some(zone_id);
+                knob.status.zone_id = canonical_zone_id(zone_id);
             }
             if let Some(ip) = updates.ip {
                 knob.status.ip = Some(ip);
@@ -528,7 +548,7 @@ impl KnobStore {
             knob.config.volume_step_override = if v > 0.0 { Some(v) } else { None };
         }
         if let Some(v) = updates.assigned_zone_id {
-            knob.config.assigned_zone_id = if v.is_empty() { None } else { Some(v) };
+            knob.config.assigned_zone_id = canonical_zone_id(v);
         }
         if let Some(v) = updates.hidden_zone_ids {
             knob.config.hidden_zone_ids = normalize_zone_ids(v);
@@ -995,6 +1015,40 @@ mod device_setting_tests {
         let done = store.get("f1").await.unwrap();
         assert!(done.config.firmware_update.is_none());
         assert_ne!(done.config_sha, pending.config_sha);
+    }
+
+    #[tokio::test]
+    async fn legacy_persisted_zone_identity_is_normalized_before_any_consumer_reads_it() {
+        let (_dir, store) = store();
+        register(&store, "d1", "dial", "2.8.0-alpha.5").await;
+        let mut saved = store.get("d1").await.unwrap();
+        saved.status.zone_id = Some("current-room".into());
+        saved.config.assigned_zone_id = Some("assigned-room".into());
+        saved.config_sha = compute_sha(&saved.config, &saved.name);
+        let old_sha = saved.config_sha.clone();
+        fs::write(
+            store.path.as_ref(),
+            serde_json::to_vec(&HashMap::from([("d1".to_string(), saved)])).unwrap(),
+        )
+        .unwrap();
+        let loaded = KnobStore::load_from_disk(store.path.as_ref(), store.path.as_ref()).unwrap();
+        let controller = &loaded["d1"];
+        assert_eq!(
+            controller.status.zone_id.as_deref(),
+            Some("roon:current-room")
+        );
+        assert_eq!(
+            controller.config.assigned_zone_id.as_deref(),
+            Some("roon:assigned-room")
+        );
+        assert_eq!(
+            controller.config_sha,
+            compute_sha(&controller.config, &controller.name)
+        );
+        assert_ne!(
+            controller.config_sha, old_sha,
+            "the device must refetch the normalized assignment"
+        );
     }
 
     #[test]

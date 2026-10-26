@@ -1469,7 +1469,7 @@ async fn run_upnp_command_endpoint(
             RuntimeCommand::Control(command) => {
                 execute_upnp_runtime_command(&adapter, &uuid, command).await
             }
-            RuntimeCommand::Hqplayer(_) => {
+            RuntimeCommand::Hqplayer(_) | RuntimeCommand::LibraryPlay(_) => {
                 Err(anyhow!("HQPlayer runtime command routed to UPnP endpoint"))
             }
         };

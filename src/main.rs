@@ -481,6 +481,21 @@ mod server {
         let mut legacy_startables = legacy_startables;
         legacy_startables.push(device_set.clone());
 
+        // The HTTP/SSE and command owners share graceful server shutdown.
+        let shutdown_token = CancellationToken::new();
+        coord
+            .register_companion(
+                "spotify",
+                Arc::new(adapters::library_commands::LibraryCommandWorker::new(
+                    "spotify-library",
+                    "spotify",
+                    spotify.clone(),
+                    reliable_commands.clone(),
+                    shutdown_token.clone(),
+                )),
+            )
+            .await;
+
         let mut provider_startables: Vec<Arc<dyn adapters::Startable>> = vec![spotify.clone()];
         let mut startable_adapters = legacy_startables.clone();
         startable_adapters.extend(provider_startables.iter().cloned());
@@ -520,9 +535,6 @@ mod server {
             .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
         let addr = SocketAddr::from((bind_ip, config.port));
         let listener = tokio::net::TcpListener::bind(addr).await?;
-
-        // SSE closes as soon as graceful HTTP shutdown begins.
-        let shutdown_token = CancellationToken::new();
 
         // Single loop to start all enabled adapters. Manual device hosts are read straight from
         // the link document so the device adapter can probe them on its first discovery pass.
@@ -678,6 +690,21 @@ mod server {
             Ok(cloud_connector::runtime::ConnectorStart::NotConfigured) => {}
             Err(error) => tracing::warn!("HiPhi Cloud connector disabled: {error}"),
         }
+        coord
+            .register_companion(
+                "musicassistant",
+                Arc::new(adapters::library_commands::LibraryCommandWorker::new(
+                    "musicassistant-library",
+                    "musicassistant",
+                    state.musicassistant.clone(),
+                    state
+                        .reliable_commands
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("command runtime unavailable"))?,
+                    shutdown_token.clone(),
+                )),
+            )
+            .await;
         provider_startables.push(state.musicassistant.clone());
         let mut startable_adapters = (*state.startable_adapters).clone();
         startable_adapters.push(state.musicassistant.clone());

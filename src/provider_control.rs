@@ -42,7 +42,9 @@ pub(crate) async fn dispatch_lms_runtime_command_via(
         .map_err(|error| anyhow::anyhow!("LMS command admission failed: {error:?}"))?;
     match ticket.wait_for_observable_result().await {
         CommandStatus::Confirmed { .. } => Ok(()),
-        CommandStatus::Failed { detail } => Err(anyhow::anyhow!(detail)),
+        CommandStatus::Failed { detail } | CommandStatus::ItemUnavailable { detail } => {
+            Err(anyhow::anyhow!(detail))
+        }
         CommandStatus::NotDispatched { detail } => {
             if tokio::time::Instant::now() >= dispatch_by {
                 Err(crate::command_dispatch::DispatchExpired.into())
@@ -159,7 +161,9 @@ async fn dispatch_provider_runtime_command(
         .map_err(|error| anyhow::anyhow!("{provider} command admission failed: {error:?}"))?;
     match ticket.wait_for_observable_result().await {
         CommandStatus::Confirmed { .. } => Ok(()),
-        CommandStatus::Failed { detail } => Err(anyhow::anyhow!(detail)),
+        CommandStatus::Failed { detail } | CommandStatus::ItemUnavailable { detail } => {
+            Err(anyhow::anyhow!(detail))
+        }
         CommandStatus::NotDispatched { detail } => {
             if tokio::time::Instant::now() >= dispatch_by {
                 Err(crate::command_dispatch::DispatchExpired.into())
@@ -302,7 +306,9 @@ pub(crate) async fn dispatch_hqplayer_runtime_command_via(
         })?;
     match ticket.wait_for_observable_result().await {
         CommandStatus::Confirmed { .. } => Ok(()),
-        CommandStatus::Failed { detail } => Err(HqpDispatchError::Backend(detail)),
+        CommandStatus::Failed { detail } | CommandStatus::ItemUnavailable { detail } => {
+            Err(HqpDispatchError::Backend(detail))
+        }
         CommandStatus::NotDispatched { detail } => Err(HqpDispatchError::Backend(
             if tokio::time::Instant::now() >= dispatch_by {
                 crate::command_dispatch::EXPIRED_MESSAGE.into()

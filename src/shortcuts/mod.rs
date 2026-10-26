@@ -13,8 +13,8 @@
 //! (see `mcp::refs`), and a Roon `item_key` is only meaningful inside the browse session that
 //! minted it. A shortcut keeps the part that outlives both:
 //!
-//! - **Roon:** the title trail from the browse root to the item, re-walked in a fresh session at
-//!   press time (`RoonAdapter::resolve_trail`, the recovery #616 added).
+//! - **Roon:** the unique title/subtitle walk, resolved and retried coherently by the provider's
+//!   reliable command endpoint. Mutable list positions never identify a shortcut.
 //! - **LMS:** the database id or URL, which `LmsAdapter::play_target` re-validates before it
 //!   touches the queue. A `GlobalSearchItem` is a positional breadcrumb that can play the wrong
 //!   thing silently, so it can never be pinned.
@@ -51,38 +51,9 @@ const SHORTCUTS_FILE: &str = "shortcuts.json";
 
 pub use crate::adapters::lms::LmsDurableTarget as LmsShortcutTarget;
 
-/// What a shortcut points at, in a form that survives restarts and expired sessions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "provider", rename_all = "snake_case")]
-pub enum ShortcutTarget {
-    /// The Roon browse walk with each row's subtitle and position, replayed by the same resolver
-    /// the Library uses for a durable URL: it matches on title and subtitle, uses position only
-    /// to split genuine duplicates, and fails rather than pick a plausible-but-wrong row.
-    Roon {
-        location: CollectionLocation,
-    },
-    Lms {
-        target: LmsShortcutTarget,
-    },
-    Spotify {
-        uri: String,
-    },
-    MusicAssistant {
-        uri: String,
-    },
-}
+pub use crate::library_playback::DurableTarget as ShortcutTarget;
 
 impl ShortcutTarget {
-    /// Provider label as the API reports it.
-    pub fn provider_label(&self) -> &'static str {
-        match self {
-            Self::Roon { .. } => "roon",
-            Self::Lms { .. } => "lms",
-            Self::Spotify { .. } => "spotify",
-            Self::MusicAssistant { .. } => "musicassistant",
-        }
-    }
-
     pub fn provider(&self) -> crate::mcp::envelope::Provider {
         use crate::mcp::envelope::Provider;
         match self {
@@ -321,6 +292,12 @@ pub struct RecentEvent {
     pub code: &'static str,
 }
 
+struct BindingPress {
+    shortcut_id: String,
+    zone_id: Option<String>,
+    press: LastPress,
+}
+
 /// How many distinct recent events are kept per controller.
 const RECENT_EVENTS: usize = 8;
 
@@ -334,6 +311,7 @@ pub struct ShortcutStore {
     load_failed: bool,
     last_press: Arc<RwLock<HashMap<String, LastPress>>>,
     recent: Arc<RwLock<HashMap<String, Vec<RecentEvent>>>>,
+    binding_press: Arc<RwLock<HashMap<(String, String), BindingPress>>>,
 }
 
 impl ShortcutStore {
@@ -359,6 +337,7 @@ impl ShortcutStore {
             load_failed,
             last_press: Arc::new(RwLock::new(HashMap::new())),
             recent: Arc::new(RwLock::new(HashMap::new())),
+            binding_press: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -437,8 +416,13 @@ impl ShortcutStore {
         name: Option<String>,
     ) -> Result<(Shortcut, bool)> {
         self.ensure_loaded()?;
+        let target = target.canonical_identity();
         let mut data = self.data.write().await;
-        if let Some(existing) = data.shortcuts.values().find(|s| s.target == target) {
+        if let Some(existing) = data
+            .shortcuts
+            .values()
+            .find(|s| s.target.canonical_identity() == target)
+        {
             return Ok((existing.clone(), true));
         }
         let name = name
@@ -490,6 +474,10 @@ impl ShortcutStore {
         candidate.bindings.retain(|_, map| !map.is_empty());
         self.save(&mut data, candidate)?;
         self.last_press.write().await.remove(id);
+        self.binding_press
+            .write()
+            .await
+            .retain(|_, last| last.shortcut_id != id);
         Ok(true)
     }
 
@@ -510,7 +498,7 @@ impl ShortcutStore {
         controller_id: &str,
         bindings: BTreeMap<String, String>,
     ) -> Result<(), BindingError> {
-        for (event, shortcut_id) in &bindings {
+        for event in bindings.keys() {
             let (key, gesture) = split_event_key(event).ok_or_else(|| BindingError::Event {
                 event: event.clone(),
                 refusal: EventRefusal::BadKey,
@@ -519,12 +507,14 @@ impl ShortcutStore {
                 event: event.clone(),
                 refusal,
             })?;
-            if self.get(shortcut_id).await.is_none() {
-                return Err(BindingError::UnknownShortcut(shortcut_id.clone()));
-            }
         }
         self.ensure_loaded().map_err(BindingError::Storage)?;
         let mut data = self.data.write().await;
+        for shortcut_id in bindings.values() {
+            if !data.shortcuts.contains_key(shortcut_id) {
+                return Err(BindingError::UnknownShortcut(shortcut_id.clone()));
+            }
+        }
         let mut candidate = data.clone();
         if bindings.is_empty() {
             candidate.bindings.remove(controller_id);
@@ -535,6 +525,39 @@ impl ShortcutStore {
         }
         self.save(&mut data, candidate)
             .map_err(BindingError::Storage)
+    }
+
+    pub async fn record_binding_press(
+        &self,
+        controller_id: &str,
+        event: &str,
+        shortcut_id: &str,
+        zone_id: Option<&str>,
+        press: LastPress,
+    ) {
+        self.binding_press.write().await.insert(
+            (controller_id.into(), event.into()),
+            BindingPress {
+                shortcut_id: shortcut_id.into(),
+                zone_id: zone_id.map(str::to_string),
+                press,
+            },
+        );
+    }
+
+    pub async fn last_binding_press(
+        &self,
+        controller_id: &str,
+        event: &str,
+        shortcut_id: &str,
+        zone_id: Option<&str>,
+    ) -> Option<LastPress> {
+        self.binding_press
+            .read()
+            .await
+            .get(&(controller_id.into(), event.into()))
+            .filter(|last| last.shortcut_id == shortcut_id && last.zone_id.as_deref() == zone_id)
+            .map(|last| last.press.clone())
     }
 
     pub async fn record_press(&self, shortcut_id: &str, press: LastPress) {

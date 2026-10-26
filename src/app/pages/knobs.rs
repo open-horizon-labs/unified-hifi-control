@@ -1019,7 +1019,7 @@ fn gestures_for_key(key: &str) -> &'static [&'static str] {
 /// The chip for one binding: a class, and words, because colour alone is not a state.
 fn binding_chip(status: &str) -> (&'static str, &'static str) {
     match status {
-        "ok" => ("badge badge-success", "Worked last time"),
+        "ok" => ("badge badge-success", "Accepted last time"),
         "untested" => ("badge badge-secondary", "Not tried yet"),
         "last_failed" => ("badge status-err", "Last press failed"),
         "no_zone" => ("badge status-err", "No zone yet"),
@@ -1440,7 +1440,7 @@ fn PinnedShortcuts(shortcuts: Vec<ShortcutInfo>, on_changed: EventHandler<()>) -
                                             span {
                                                 class: if result.ok { "badge badge-success" } else { "badge status-err" },
                                                 title: "{result.message}",
-                                                if result.ok { "Worked last time" } else { "Last press failed" }
+                                                if result.ok { "Accepted last time" } else { "Last press failed" }
                                             }
                                         }
                                         if is_confirming {
@@ -2231,7 +2231,7 @@ mod shortcut_ui_tests {
             assert!(class.contains("status-err"), "{status}");
             assert!(!text.is_empty());
         }
-        assert_eq!(binding_chip("ok").1, "Worked last time");
+        assert_eq!(binding_chip("ok").1, "Accepted last time");
         assert_eq!(binding_chip("untested").1, "Not tried yet");
         // A status from a newer bridge is shown as unknown, never as working.
         assert_eq!(binding_chip("from_the_future").1, "Unknown");
