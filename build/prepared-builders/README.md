@@ -51,13 +51,13 @@ The main Build workflow owns formatting, workspace clippy, and workspace tests
 (including the HTTP API contract). The former streaming-alpha workflow repeated
 those same checks on v4 PRs and has been consolidated into Build.
 
-Untagged validation builds use ThinLTO and 16 codegen units. Tagged releases
-retain the Cargo.toml fat-LTO / one-codegen-unit profile. A same-runner x64
-comparison measured 230s versus 111s, with the server binary increasing from
-29.8 MB to 37.0 MB; hardening and server identity checks passed. The experiment
-is [run 37250408869](https://github.com/open-horizon-labs/unified-hifi-control/actions/runs/37250408869).
-NAS state keys include the profile overrides, so the two configurations keep
-separate dependency snapshots. WASM keeps its existing LTO-disabled profile.
+All distributable PR, manual, branch and tagged builds use the same Cargo.toml
+release profile: fat LTO, one codegen unit, no debug info, stripped native binaries,
+and abort-on-panic. The browser inherits that optimization profile while keeping
+wasm-bindgen metadata until Dioxus processes it. Dioxus removes browser names and
+DWARF before fingerprinting assets; `scripts/check-wasm-release.py` rejects debug
+sections and source maps in final output, including restored caches. Fast
+non-shipping development/test builds keep their own Cargo profiles.
 
 The Test job uses the fleet S3 compiler cache without full target snapshots:
 its measured 2.2 GB archive cost more to transfer than the compilation it saved.
@@ -73,7 +73,7 @@ immutable image contents, separate from per-job NAS Cargo state. Microsoft SDK
 use is subject to its license (linked in cargo-xwin upstream documentation).
 
 The Linux cross job produces all three executables with the existing version,
-assets, NAA features and tag-dependent optimization profile. A blocking native
+assets, NAA features and canonical release optimization profile. A blocking native
 Windows job verifies executable loading, helper entrypoints, HTTP/version/SHA and
 embedded assets, then applies the existing optional signing and publishes the
 unchanged binary-windows artifact. Signing/publishing never bypass native checks.

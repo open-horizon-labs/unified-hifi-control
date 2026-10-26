@@ -7,9 +7,13 @@ WORKDIR /app
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     pkg-config \
+    python3 \
     curl \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Use the same pinned compiler as CI, including for the Dioxus tooling.
+COPY rust-toolchain.toml ./
 
 # Install wasm32 target for client build
 RUN rustup target add wasm32-unknown-unknown
@@ -21,6 +25,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # Copy manifests first (for dependency caching)
 COPY Cargo.toml Cargo.lock Dioxus.toml Makefile ./
+COPY crates/ ./crates/
 # build.rs sets UHC_VERSION/UHC_GIT_SHA via cargo:rustc-env; main.rs's env!()
 # macros fail to compile without it, so it must be present for every cargo
 # invocation (including the dummy-source dependency-caching build below).
@@ -40,20 +45,21 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # Copy actual source
 COPY src/ ./src/
-COPY input.css tailwind.config.js ./
+COPY public/ ./public/
+COPY scripts/check-wasm-release.py ./scripts/check-wasm-release.py
 
 # Build Tailwind CSS (downloads standalone CLI if needed)
 RUN make css
 
 # ADR 002: Build WASM assets first, then build server which embeds them
-# Keep the server feature set identical for the Dioxus build and the final binary
-# so embedded server artifacts expose the same runtime capabilities.
+# Match CI: finish and audit the browser bundle before native embedding.
 ARG UHC_SERVER_FEATURES=server,naa-proxy
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    dx build --fullstack --release @client --no-default-features --features web @server --features "$UHC_SERVER_FEATURES" && \
-    cargo build --release --features "$UHC_SERVER_FEATURES" && \
+    dx build --fullstack=false --release @client --no-default-features --features web && \
+    python3 scripts/check-wasm-release.py target/dx/unified-hifi-control/release/web/public && \
+    cargo build --release --no-default-features --features "$UHC_SERVER_FEATURES" && \
     cp target/release/unified-hifi-control /app/unified-hifi-control-bin
 
 # Runtime stage - minimal image, no public/ directory needed

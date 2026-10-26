@@ -342,12 +342,12 @@ fn compiler_changes_invalidate_wasm_output_and_trigger_platform_validation() {
 }
 
 #[test]
-fn validation_uses_the_fast_profile_and_tagged_releases_keep_reviewed_optimization() {
+fn installable_builds_share_release_optimization_and_macos_reuses_target_state() {
     let source = workflow("build.yml");
-    assert!(source.contains("startsWith(github.ref, 'refs/tags/') && 'true' || 'thin'"));
-    assert!(source.contains("startsWith(github.ref, 'refs/tags/') && '1' || '16'"));
+    assert!(!source.contains("CARGO_PROFILE_RELEASE_LTO"));
+    assert!(!source.contains("CARGO_PROFILE_RELEASE_CODEGEN_UNITS"));
     let wasm = job(&source, "build-wasm");
-    assert!(wasm.contains("CARGO_PROFILE_RELEASE_LTO: 'false'"));
+    assert!(wasm.contains("Audit final browser assets"));
     for name in ["build-macos-x64", "build-macos-arm64"] {
         let body = job(&source, name);
         assert!(body.contains("Library/Caches/uhc-build/"));
