@@ -109,6 +109,7 @@ pub struct MockFavorite {
 
 /// Mock LMS server state
 struct MockLmsState {
+    blocked_once: Option<(String, Arc<(tokio::sync::Notify, tokio::sync::Notify)>)>,
     players: HashMap<String, MockPlayer>,
     /// Every command received, in arrival order. Lets a test assert which
     /// backend command an MCP action actually produced (issue #394) rather than
@@ -157,6 +158,7 @@ impl MockLmsServer {
     /// Start a mock LMS server on a random port
     pub async fn start() -> Self {
         let state = Arc::new(RwLock::new(MockLmsState {
+            blocked_once: None,
             players: HashMap::new(),
             commands: Vec::new(),
             library: HashMap::new(),
@@ -240,6 +242,15 @@ impl MockLmsServer {
 
     /// Drop the recorded command log. Call before the action under test so
     /// polling traffic (`players`, `status`) does not have to be filtered out.
+    pub async fn block_command_once(
+        &self,
+        command: &str,
+    ) -> Arc<(tokio::sync::Notify, tokio::sync::Notify)> {
+        let gate = Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+        self.state.write().await.blocked_once = Some((command.into(), gate.clone()));
+        gate
+    }
+
     pub async fn clear_commands(&self) {
         self.state.write().await.commands.clear();
     }
@@ -508,6 +519,23 @@ async fn handle_jsonrpc(
         player_id: player_id.to_string(),
         command: commands.clone(),
     });
+
+    let gate = {
+        let mut state = state.write().await;
+        if state
+            .blocked_once
+            .as_ref()
+            .is_some_and(|(blocked, _)| blocked == command)
+        {
+            state.blocked_once.take().map(|(_, gate)| gate)
+        } else {
+            None
+        }
+    };
+    if let Some(gate) = gate {
+        gate.0.notify_one();
+        gate.1.notified().await;
+    }
 
     // Handle commands that modify state
     match command {

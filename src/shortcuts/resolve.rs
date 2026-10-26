@@ -14,9 +14,8 @@
 use chrono::Utc;
 use serde::Serialize;
 
-use super::{LastPress, Shortcut, ShortcutTarget};
+use super::{LastPress, Shortcut};
 use crate::api::AppState;
-use crate::mcp::collection_locations::CollectionLocation;
 use crate::mcp::routing::ZoneTarget;
 
 /// What happened to a press. Stable: controllers and tests branch on these strings.
@@ -105,7 +104,26 @@ pub async fn controller_zone(state: &AppState, controller_id: &str) -> Option<St
 /// Resolve and play whatever `event` is bound to on `controller_id`, and remember that the
 /// controller sent it so the editor can offer it.
 pub async fn press(state: &AppState, controller_id: &str, event: &str) -> PressOutcome {
-    let outcome = press_inner(state, controller_id, event).await;
+    let bindings = state.shortcuts.bindings_for(controller_id).await;
+    let shortcut_id = bindings.get(event);
+    let outcome = press_inner(state, controller_id, shortcut_id.map(String::as_str)).await;
+    if let Some(shortcut_id) = shortcut_id {
+        state
+            .shortcuts
+            .record_binding_press(
+                controller_id,
+                event,
+                shortcut_id,
+                outcome.zone_id.as_deref(),
+                LastPress {
+                    at: Utc::now(),
+                    code: code_str(outcome.code),
+                    ok: outcome.ok,
+                    message: outcome.message.clone(),
+                },
+            )
+            .await;
+    }
     state
         .shortcuts
         .record_event(controller_id, event, code_str(outcome.code))
@@ -113,9 +131,12 @@ pub async fn press(state: &AppState, controller_id: &str, event: &str) -> PressO
     outcome
 }
 
-async fn press_inner(state: &AppState, controller_id: &str, event: &str) -> PressOutcome {
-    let bindings = state.shortcuts.bindings_for(controller_id).await;
-    let Some(shortcut_id) = bindings.get(event) else {
+async fn press_inner(
+    state: &AppState,
+    controller_id: &str,
+    shortcut_id: Option<&str>,
+) -> PressOutcome {
+    let Some(shortcut_id) = shortcut_id else {
         return PressOutcome::new(PressCode::Unmapped, "No shortcut is set for that button.");
     };
     let Some(shortcut) = state.shortcuts.get(shortcut_id).await else {
@@ -202,128 +223,34 @@ async fn play_inner(state: &AppState, shortcut: &Shortcut, zone_id: &str) -> Pre
         );
     }
 
-    // Every provider is reached through the adapter registry, the sanctioned seam. This does not
-    // go through the MCP `hifi_play_ref` handler: that one reaches the Roon and LMS adapters
-    // directly (grandfathered in `adapter_boundary_lint`), and building on it would have made new
-    // code lean on that debt where the lint cannot see it.
-    let title = shortcut.title.as_str();
-    let result: anyhow::Result<String> = match &shortcut.target {
-        ShortcutTarget::Roon { location } => {
-            let (session_key, item_key) =
-                match resolve_roon_location(state, zone_id, location).await {
-                    Ok(pair) => pair,
-                    Err(error) => {
-                        return PressOutcome::new(
-                            PressCode::ItemUnavailable,
-                            format!("Roon could not find “{title}” any more ({error})."),
-                        );
-                    }
-                };
-            let trail: Vec<&str> = location.steps().iter().map(|s| s.title.as_str()).collect();
-            state
-                .adapter_registry
-                .library_content(
-                    "roon",
-                    "play_resolved",
-                    &serde_json::json!({
-                        "zone_id": zone_id,
-                        "item_key": item_key,
-                        "session_key": session_key,
-                        "trail": trail,
-                        "title": title,
-                    }),
-                )
-                .await
-                .map(message_of)
-        }
-        ShortcutTarget::Lms { target } => state
-            .adapter_registry
-            .library_content(
-                "lms",
-                "play_durable_target",
-                &serde_json::json!({ "zone_id": zone_id, "target": target, "title": title }),
-            )
-            .await
-            .map(message_of),
-        ShortcutTarget::Spotify { uri } => {
-            state
-                .adapter_registry
-                .play_library_uri("spotify", zone_id, uri)
-                .await
-        }
-        ShortcutTarget::MusicAssistant { uri } => {
-            state
-                .adapter_registry
-                .play_library_uri("musicassistant", zone_id, uri)
-                .await
-        }
-    };
-
-    // "Accepted" is what the provider's reply can honestly support: it took the command. Whether
-    // audio started is not something this call observed, so it is never reported as played.
-    match result {
-        Ok(_) => PressOutcome::new(
+    match crate::library_playback::play(
+        state.reliable_commands.as_ref(),
+        zone_id,
+        &shortcut.target,
+        &shortcut.title,
+    )
+    .await
+    {
+        Ok(()) => PressOutcome::new(
             PressCode::Accepted,
             format!("Sent “{}” to play.", shortcut.name),
         ),
+        Err(error) if error.is::<crate::library_playback::ItemUnavailable>() => {
+            PressOutcome::new(PressCode::ItemUnavailable, error.to_string())
+        }
         Err(error) => PressOutcome::new(
             PressCode::Refused,
-            format!("“{}” was not played: {error}", shortcut.name),
+            format!(
+                "Could not establish acceptance of “{}”: {error}",
+                shortcut.name
+            ),
         ),
     }
-}
-
-/// The provider's own one-line reply, when it gave one.
-fn message_of(reply: serde_json::Value) -> String {
-    reply
-        .get("message")
-        .and_then(|m| m.as_str())
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// Resolve a pinned Roon location in a fresh browse session, through the adapter registry like
-/// every other surface (`adapter_boundary_lint` forbids reaching for the concrete adapter).
-///
-/// This is the resolver the Library's durable URLs use: title and subtitle identify a row, position
-/// only separates genuine duplicates, and when neither identifies exactly one row it fails, so a
-/// press says "not found" instead of playing a different recording.
-async fn resolve_roon_location(
-    state: &AppState,
-    zone_id: &str,
-    location: &CollectionLocation,
-) -> anyhow::Result<(String, String)> {
-    let reply = state
-        .adapter_registry
-        .library_content(
-            "roon",
-            "collections_resolve_location",
-            &serde_json::json!({ "zone_id": zone_id, "location": location }),
-        )
-        .await?;
-    let field = |name: &str| {
-        reply
-            .get(name)
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("Roon returned no {name}"))
-    };
-    Ok((field("session_key")?, field("item_key")?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_providers_reply_is_read_without_inventing_one() {
-        assert_eq!(
-            message_of(serde_json::json!({ "message": "Play Now" })),
-            "Play Now"
-        );
-        assert_eq!(message_of(serde_json::json!({})), "");
-        assert_eq!(message_of(serde_json::json!(null)), "");
-    }
 
     #[test]
     fn only_accepted_is_ok_and_nothing_claims_the_audio_started() {

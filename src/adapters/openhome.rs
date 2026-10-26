@@ -1401,7 +1401,7 @@ async fn run_openhome_command_endpoint(
             RuntimeCommand::Control(command) => {
                 execute_openhome_runtime_command(&adapter, &uuid, command).await
             }
-            RuntimeCommand::Hqplayer(_) => Err(anyhow!(
+            RuntimeCommand::Hqplayer(_) | RuntimeCommand::LibraryPlay(_) => Err(anyhow!(
                 "HQPlayer runtime command routed to OpenHome endpoint"
             )),
         };

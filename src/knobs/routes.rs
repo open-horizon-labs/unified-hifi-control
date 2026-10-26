@@ -35,6 +35,13 @@ use crate::knobs::store::{KnobConfigUpdate, KnobStatusUpdate};
 
 /// Keep the existing JSON error shape; never report volatile settings as saved.
 fn knob_persistence_error(error: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
+    // A setting the controller does not have, or out of range, is the caller's mistake.
+    if let Some(rejected) = error.downcast_ref::<crate::knobs::store::SettingRejected>() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": rejected.to_string()})),
+        );
+    }
     tracing::warn!(%error, "Controller configuration request failed");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1297,6 +1304,8 @@ pub async fn knob_config_update_handler(
         )
     })?;
 
+    guard_install_request(&state, &knob_id, &updates).await?;
+
     let knob = state
         .knobs
         .update_config(&knob_id, updates)
@@ -1345,6 +1354,70 @@ pub async fn knob_remove_handler(
     }
 }
 
+/// The version an install request would deliver: the channel's image, only when it is newer than
+/// what the controller runs. A controller never changes channel and never goes backwards.
+fn install_offer(available: Option<&str>, running: &str) -> Option<String> {
+    let available = available?;
+    crate::firmware_catalog::firmware_version_is_newer(available, running)
+        .then(|| available.to_string())
+}
+
+/// Refuse an install request the bridge cannot honour, so the settings page never promises an
+/// update that no image backs.
+async fn guard_install_request(
+    state: &AppState,
+    knob_id: &str,
+    updates: &KnobConfigUpdate,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    use crate::firmware_catalog::{FirmwareChannel, FirmwareTarget};
+    if updates.firmware_update.as_deref() != Some("install") {
+        return Ok(());
+    }
+    let refuse = |status, code: &str, message: &str| {
+        (
+            status,
+            Json(serde_json::json!({"error": message, "error_code": code})),
+        )
+    };
+    let Some(knob) = state.knobs.get(knob_id).await else {
+        return Err(refuse(
+            StatusCode::NOT_FOUND,
+            "KNOB_NOT_FOUND",
+            "knob not found",
+        ));
+    };
+    let (Some(target), Some(running)) = (FirmwareTarget::parse(&knob.device_type), knob.version)
+    else {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            "FIRMWARE_UNKNOWN",
+            "the controller has not reported its type and firmware version yet",
+        ));
+    };
+    let Some(channel) = FirmwareChannel::for_version(&running) else {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            "FIRMWARE_CHANNEL_UNKNOWN",
+            "this firmware build is outside the published channels and cannot be updated from here",
+        ));
+    };
+    let available = firmware_artifact(target, channel).and_then(|(path, info)| {
+        let named = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| target.filename_version(name).map(str::to_string));
+        info.version.or(named)
+    });
+    if install_offer(available.as_deref(), &running).is_none() {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            "NO_FIRMWARE_UPDATE",
+            "no newer firmware is available for this controller on its channel",
+        ));
+    }
+    Ok(())
+}
+
 /// GET /config/{knob_id} - Get knob configuration (path parameter format)
 pub async fn knob_config_by_path_handler(
     State(state): State<AppState>,
@@ -1379,6 +1452,7 @@ pub async fn knob_config_update_by_path_handler(
     axum::extract::Path(knob_id): axum::extract::Path<String>,
     Json(updates): Json<KnobConfigUpdate>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    guard_install_request(&state, &knob_id, &updates).await?;
     let knob = state
         .knobs
         .update_config(&knob_id, updates)
@@ -1678,6 +1752,32 @@ mod tests {
             axum::http::HeaderValue::from_bytes(b"\xff").unwrap(),
         );
         assert_eq!(extract_device_type(&headers), None);
+    }
+
+    #[test]
+    fn an_install_is_offered_only_when_the_channel_holds_a_newer_image() {
+        // A controller follows its own channel: an alpha build is offered alphas only.
+        assert_eq!(
+            install_offer(Some("2.8.0-alpha.6"), "2.8.0-alpha.5"),
+            Some("2.8.0-alpha.6".to_string())
+        );
+        assert_eq!(install_offer(Some("2.8.0-alpha.5"), "2.8.0-alpha.5"), None);
+        assert_eq!(install_offer(Some("2.8.0-alpha.4"), "2.8.0-alpha.5"), None);
+        assert_eq!(install_offer(None, "2.8.0-alpha.5"), None);
+        // A local build outside the published grammar is never offered a downgrade or sidegrade.
+        assert_eq!(install_offer(Some("2.8.0"), "2.8.0-dev"), None);
+    }
+
+    #[test]
+    fn rejected_settings_are_the_callers_error_not_a_server_fault() {
+        let error = anyhow::Error::new(crate::knobs::store::SettingRejected(
+            "Frame has no \"brightness\" setting".into(),
+        ));
+        let (status, body) = knob_persistence_error(error);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.0["error"].as_str().unwrap().contains("brightness"));
+        let (status, _) = knob_persistence_error(anyhow::anyhow!("disk full"));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     fn make_zone(id: &str, name: &str) -> ZoneInfo {

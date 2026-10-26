@@ -299,3 +299,33 @@ async fn recent_events_keep_the_distinct_keys_a_remote_sends_most_recent_first()
     assert_eq!(store.recent_events("dial1").await.len(), 8);
     assert!(store.recent_events("someone-else").await.is_empty());
 }
+
+#[tokio::test]
+async fn button_history_does_not_follow_a_rebinding_or_zone_change() {
+    let (store, _dir) = store();
+    let result = LastPress {
+        at: Utc::now(),
+        code: "accepted",
+        ok: true,
+        message: "Sent".into(),
+    };
+    store
+        .record_binding_press("dial", "home:press", "pin-a", Some("roon:room-a"), result)
+        .await;
+    assert!(store
+        .last_binding_press("dial", "home:press", "pin-a", Some("roon:room-a"))
+        .await
+        .is_some());
+    assert!(store
+        .last_binding_press("dial", "home:long", "pin-a", Some("roon:room-a"))
+        .await
+        .is_none());
+    assert!(store
+        .last_binding_press("dial", "home:press", "pin-b", Some("roon:room-a"))
+        .await
+        .is_none());
+    assert!(store
+        .last_binding_press("dial", "home:press", "pin-a", Some("roon:room-b"))
+        .await
+        .is_none());
+}

@@ -181,7 +181,10 @@ async fn controller_view(state: &AppState, controller_id: &str) -> Option<Value>
             continue;
         };
         let (key, gesture) = split_event_key(&event).unwrap_or((event.as_str(), ""));
-        let last = state.shortcuts.last_press(&shortcut_id).await;
+        let last = state
+            .shortcuts
+            .last_binding_press(controller_id, &event, &shortcut_id, zone_id.as_deref())
+            .await;
         let mismatch = zone_id.as_deref().is_some_and(|id| {
             crate::mcp::routing::ZoneTarget::classify(id).provider() != shortcut.target.provider()
         });

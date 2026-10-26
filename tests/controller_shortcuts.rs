@@ -95,7 +95,18 @@ async fn harness(zones: &[(&str, &str)]) -> Harness {
         .await;
 
     let bus = create_bus();
-    let lms = Arc::new(LmsAdapter::new(bus.clone()));
+    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+    let runtime = unified_hifi_control::bus::runtime::build_runtime(aggregator.clone(), 16, 64);
+    let gateway = runtime.commands.clone();
+    let bridge = Arc::new(unified_hifi_control::adapters::lms::LmsRuntimeBridge::new(
+        runtime.projection_ingress.clone(),
+        gateway.clone(),
+    ));
+    tokio::spawn(runtime.projection_actor.run());
+    let (lms, _) = unified_hifi_control::adapters::lms::create_lms_adapters_with_runtime(
+        bus.clone(),
+        Some(bridge),
+    );
     lms.configure(
         mock.addr().ip().to_string(),
         Some(mock.addr().port()),
@@ -105,7 +116,6 @@ async fn harness(zones: &[(&str, &str)]) -> Harness {
     .await;
     lms.start().await.expect("LMS adapter must start");
 
-    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     {
         let aggregator = aggregator.clone();
@@ -136,7 +146,13 @@ async fn harness(zones: &[(&str, &str)]) -> Harness {
         startable,
         Instant::now(),
         CancellationToken::new(),
-    );
+    )
+    .with_reliable_commands(gateway.clone());
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    while !gateway.has_endpoint(&unified_hifi_control::bus::PrefixedZoneId::lms(LMS_PLAYER)) {
+        assert!(Instant::now() < deadline, "LMS endpoint never registered");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     // The resolver plays through the registry, as main.rs wires it.
     state
         .adapter_registry
@@ -482,10 +498,21 @@ const ROON_ZONE: &str = "roon:zone_fake_1";
 async fn roon_state(core: &FakeRoonCore) -> (AppState, tempfile::TempDir) {
     isolate_config();
     let bus = create_bus();
-    let roon = Arc::new(RoonAdapter::new_configured(
+    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+    let runtime = unified_hifi_control::bus::runtime::build_runtime(aggregator.clone(), 16, 64);
+    let gateway = runtime.commands.clone();
+    let bridge = Arc::new(
+        unified_hifi_control::adapters::roon::RoonRuntimeBridge::new(
+            runtime.projection_ingress.clone(),
+            gateway.clone(),
+        ),
+    );
+    tokio::spawn(runtime.projection_actor.run());
+    let roon = Arc::new(RoonAdapter::new_configured_with_runtime(
         bus.clone(),
         "http://test.invalid:8088".to_string(),
         KnobStore::new(),
+        Some(bridge),
     ));
     {
         let runner = roon.clone();
@@ -502,7 +529,6 @@ async fn roon_state(core: &FakeRoonCore) -> (AppState, tempfile::TempDir) {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
-    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     {
         let aggregator = aggregator.clone();
@@ -530,7 +556,8 @@ async fn roon_state(core: &FakeRoonCore) -> (AppState, tempfile::TempDir) {
         startable,
         Instant::now(),
         CancellationToken::new(),
-    );
+    )
+    .with_reliable_commands(gateway);
     state.adapter_registry.register_library("roon", roon).await;
     let dir = tempfile::tempdir().unwrap();
     state.shortcuts = ShortcutStore::open(dir.path().join("shortcuts.json"));
@@ -791,4 +818,227 @@ async fn a_lookalike_never_stands_in_for_a_vanished_album() {
         "must not open the lookalike: {walked:?}"
     );
     core.stop().await;
+}
+
+#[tokio::test]
+async fn audit_resolved_pin_must_not_fall_back_to_title_after_key_rejection() {
+    let core = FakeRoonCore::start().await;
+    core.set_item_key_scope(ItemKeyScope::PerSession).await;
+    core.set_children_by_title("Albums", greatest_hits()).await;
+    let (state, _dir) = roon_state(&core).await;
+    let albums = albums_page(&state).await;
+    let pinned = pin_album_row(&state, &albums, 1).await;
+    let mut bindings = std::collections::BTreeMap::new();
+    bindings.insert(EVENT.to_string(), pinned);
+    state
+        .shortcuts
+        .set_bindings(controller(), bindings)
+        .await
+        .unwrap();
+    core.reject_identity_once("Greatest Hits|Artist B").await;
+    let before = core.browsed_identities().await.len();
+    let result = press(&state, controller(), EVENT).await;
+    let walked = core.browsed_identities().await[before..].to_vec();
+    core.stop().await;
+    assert!(
+        !walked.iter().any(|row| row == "Greatest Hits|Artist A"),
+        "Rejected resolved key must not open another artist: {walked:?}; result={result:?}"
+    );
+    assert_eq!(
+        result.code,
+        PressCode::Accepted,
+        "Retry must recover the same item"
+    );
+}
+
+#[tokio::test]
+async fn audit_disconnected_gateway_must_prevent_shortcut_native_dispatch() {
+    use unified_hifi_control::bus::runtime::build_runtime;
+    let mut h = harness(&[(&format!("lms:{LMS_PLAYER}"), "Living Room")]).await;
+    let pinned = h.pin_kind_of_blue().await;
+    h.bind(&pinned).await;
+    h.state
+        .knobs
+        .update_status(
+            controller(),
+            KnobStatusUpdate {
+                zone_id: Some(format!("lms:{LMS_PLAYER}")),
+                ..Default::default()
+            },
+        )
+        .await;
+    // A gateway with no registered endpoint must refuse admission; keeping a concrete
+    // library adapter object must not provide an alternate way to send native commands.
+    let runtime = build_runtime(h.state.aggregator.clone(), 1, 1);
+    h.state.reliable_commands = Some(runtime.commands);
+    h.mock.clear_commands().await;
+    let outcome = press(&h.state, controller(), EVENT).await;
+    let native = h.playlist_commands(LMS_PLAYER).await;
+    eprintln!("Native writes despite missing gateway endpoint: {native:?}");
+    h.stop().await;
+    assert_ne!(
+        outcome.code,
+        PressCode::Accepted,
+        "Shortcut bypassed the gateway's missing endpoint: {}",
+        outcome.message
+    );
+}
+
+#[tokio::test]
+async fn audit_repin_after_reorder_is_idempotent() {
+    let core = FakeRoonCore::start().await;
+    core.set_children_by_title("Albums", greatest_hits()).await;
+    let (state, _dir) = roon_state(&core).await;
+    let first_page = albums_page(&state).await;
+    let first = pin_album_row(&state, &first_page, 1).await;
+    let mut reordered = greatest_hits();
+    reordered.reverse();
+    core.set_children_by_title("Albums", reordered).await;
+    let second_page = albums_page(&state).await;
+    let second = pin_album_row(&state, &second_page, 0).await;
+    core.stop().await;
+    assert_eq!(
+        first, second,
+        "Reordering an unchanged album must not create another pin"
+    );
+}
+
+#[tokio::test]
+async fn audit_button_status_is_scoped_to_the_controller() {
+    use axum::extract::Path;
+    use unified_hifi_control::api::shortcuts::controller_get_handler;
+    let h = harness(&[(&format!("lms:{LMS_PLAYER}"), "Living Room")]).await;
+    let pin = h.pin_kind_of_blue().await;
+    h.bind(&pin).await;
+    let other = format!("{}-other", controller());
+    h.state
+        .knobs
+        .get_or_create(&other, Some("test"))
+        .await
+        .unwrap();
+    h.state
+        .knobs
+        .update_status(
+            &other,
+            KnobStatusUpdate {
+                zone_id: Some(format!("lms:{LMS_PLAYER}")),
+                ..Default::default()
+            },
+        )
+        .await;
+    let mut bindings = std::collections::BTreeMap::new();
+    bindings.insert(EVENT.to_string(), pin);
+    h.state
+        .shortcuts
+        .set_bindings(&other, bindings)
+        .await
+        .unwrap();
+    let outcome = press(&h.state, controller(), EVENT).await;
+    assert_eq!(outcome.code, PressCode::NoZone);
+    let Json(view) = controller_get_handler(State(h.state.clone()), Path(other))
+        .await
+        .unwrap();
+    h.stop().await;
+    assert_eq!(
+        view["bindings"][0]["status"], "untested",
+        "A different controller's failure must not become this controller's history: {view}"
+    );
+}
+
+#[tokio::test]
+async fn audit_legacy_roon_zone_reports_work_for_shortcuts() {
+    let core = FakeRoonCore::start().await;
+    let (state, _dir) = roon_state(&core).await;
+    let albums = albums_page(&state).await;
+    let pinned = pin_album_row(&state, &albums, 0).await;
+    let mut bindings = std::collections::BTreeMap::new();
+    bindings.insert(EVENT.to_string(), pinned);
+    state
+        .shortcuts
+        .set_bindings(controller(), bindings)
+        .await
+        .unwrap();
+    state
+        .knobs
+        .update_status(
+            controller(),
+            KnobStatusUpdate {
+                zone_id: Some(ROON_ZONE.strip_prefix("roon:").unwrap().into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    let outcome = press(&state, controller(), EVENT).await;
+    core.stop().await;
+    assert_eq!(
+        outcome.code,
+        PressCode::Accepted,
+        "Normal knob endpoints accept and store this legacy report: {}",
+        outcome.message
+    );
+}
+
+#[tokio::test]
+async fn indistinguishable_roon_recordings_refuse_instead_of_guessing_by_position() {
+    let core = FakeRoonCore::start().await;
+    core.set_children_by_title(
+        "Albums",
+        vec![
+            mock_servers::roon_core::album("Greatest Hits", "Same Artist", &["Edition one"]),
+            mock_servers::roon_core::album("Greatest Hits", "Same Artist", &["Edition two"]),
+        ],
+    )
+    .await;
+    let (state, _dir) = roon_state(&core).await;
+    let albums = albums_page(&state).await;
+    let pin = pin_album_row(&state, &albums, 1).await;
+    let mut bindings = std::collections::BTreeMap::new();
+    bindings.insert(EVENT.to_string(), pin);
+    state
+        .shortcuts
+        .set_bindings(controller(), bindings)
+        .await
+        .unwrap();
+    let before = core.browsed_titles().await.len();
+    let outcome = press(&state, controller(), EVENT).await;
+    let walked = core.browsed_titles().await[before..].to_vec();
+    core.stop().await;
+    assert_eq!(outcome.code, PressCode::ItemUnavailable);
+    assert!(
+        !walked.iter().any(|title| title == "Play Now"),
+        "A list position cannot safely choose between indistinguishable recordings: {walked:?}"
+    );
+}
+
+#[tokio::test]
+async fn stopping_lms_during_item_validation_cannot_start_playback_after_shutdown() {
+    let h = harness(&[(&format!("lms:{LMS_PLAYER}"), "Living Room")]).await;
+    let pin = h.pin_kind_of_blue().await;
+    h.bind(&pin).await;
+    h.controller_reports_zone(&format!("lms:{LMS_PLAYER}"))
+        .await;
+    h.mock.clear_commands().await;
+    let gate = h.mock.block_command_once("search").await;
+    let state = h.state.clone();
+    let controller_id = controller().to_string();
+    let press_task = tokio::spawn(async move { press(&state, &controller_id, EVENT).await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), gate.0.notified())
+        .await
+        .unwrap();
+    let stopped = tokio::time::timeout(std::time::Duration::from_millis(150), h.state.lms.stop())
+        .await
+        .is_ok();
+    gate.1.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let writes = h.playlist_commands(LMS_PLAYER).await;
+    press_task.abort();
+    h.stop().await;
+    assert!(
+        stopped,
+        "stopping must cancel the validation future instead of waiting for a provider"
+    );
+    assert!(
+        writes.is_empty(),
+        "validation completing after shutdown must not write the queue: {writes:?}"
+    );
 }

@@ -17,8 +17,10 @@ not in the device's settings.
 
 1. The controller reports the key and gesture (`POST /knob/input`, identified by `X-Knob-Id`).
 2. The bridge looks up the controller's map, finds the shortcut and plays it on **the controller's own zone**:
-   its assigned zone if it has one, otherwise the zone it last reported. Playback goes through the adapter
-   registry (the same seam the other surfaces use), not the MCP `hifi_play_ref` handler.
+   its assigned zone if it has one, otherwise the zone it last reported. The controller store normalizes
+   legacy bare Roon IDs. Playback is typed intent admitted through the reliable command runtime; a missing,
+   expired or stopped endpoint cannot issue a native write. Provider resolution and retries stay inside
+   the adapter. Spotify and Music Assistant use coordinator-owned library command companions.
 3. The reply carries a stable `code` so a controller with no screen can show something. A press that is not
    bound to anything replies `unmapped`, which is normal and not an error.
 
@@ -59,7 +61,7 @@ only means something inside the session that minted it. A shortcut keeps the par
 
 | Provider | Stored | At press time |
 | --- | --- | --- |
-| Roon | the browse walk from the root, **each row's title, subtitle and position** | resolved in a fresh session by the Library's durable-URL resolver: title and subtitle identify a row, position only splits genuine duplicates, and if no row is identified exactly it fails |
+| Roon | the semantic browse walk from the root, each row's title and subtitle | resolved uniquely in a fresh session inside the provider endpoint; every retry retains that full identity. List positions never identify a shortcut, and indistinguishable rows refuse rather than select a recording by position |
 | LMS | database id, saved-playlist id or URL | validated against the live library before the queue is touched |
 | Spotify, Music Assistant | the provider URI | played as is |
 
@@ -74,7 +76,11 @@ button nobody can see:
 Titles alone are never used to find a Roon item: two albums can share one, and a title match takes the first. Two
 "Greatest Hits" by different artists are two pins, and a press opens the one that was pinned. If it has gone and only a
 lookalike remains, the press reports `item_unavailable` rather than playing the lookalike. Renaming or moving an item
-in Roon or LMS has the same effect, and the Controllers page shows it on the shortcut and on each button that uses it.
+in Roon or LMS has the same effect. Reordering the list does not create a new pin when the same item is pinned again.
+
+The pinned list shows the pin's latest aggregate result. Each button's history is separately scoped to its
+controller, event, pin and target zone; another controller's failure cannot become that button's history.
+“Accepted last time” reports native acceptance, not confirmed audio playback.
 
 ## API
 

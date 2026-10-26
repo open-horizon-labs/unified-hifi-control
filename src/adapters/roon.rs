@@ -1623,20 +1623,67 @@ impl RoonAdapter {
             .unwrap_or_else(|| "http://test.invalid".to_string());
         let shutdown = self.shutdown.read().await.clone();
 
-        run_roon_loop(
-            self.state.clone(),
-            self.bus.clone(),
-            base_url,
-            shutdown,
-            self.knob_store.clone(),
-            self.runtime_bridge.clone(),
+        self.run_with_connection(
+            AdapterContext {
+                bus: self.bus.clone(),
+                shutdown,
+            },
             CoreConnect::Direct {
                 ip,
                 port: port.to_string(),
             },
-            self.state_path.clone(),
+            base_url,
         )
         .await
+    }
+
+    async fn run_with_connection(
+        &self,
+        ctx: AdapterContext,
+        connection: CoreConnect,
+        base_url: String,
+    ) -> Result<()> {
+        // Roon callbacks are the provider's authoritative state observation.  Register one
+        // endpoint for transport/volume writes before consuming that callback stream; it waits
+        // for a matching full-zone callback rather than manufacturing a readback response.
+        let command_shutdown = ctx.shutdown.child_token();
+        let _command_lifetime = command_shutdown.clone().drop_guard();
+        let command_join = self.runtime_bridge.as_ref().and_then(|bridge| {
+            match bridge.commands().register_provider("roon", 16) {
+                Ok(endpoint) => {
+                    let adapter = self.clone();
+                    let bridge = bridge.clone();
+                    let shutdown = command_shutdown.clone();
+                    Some(tokio::spawn(async move {
+                        run_roon_command_endpoint(adapter, endpoint, shutdown, bridge).await;
+                    }))
+                }
+                Err(error) => {
+                    tracing::error!(?error, "Roon reliable endpoint registration failed");
+                    None
+                }
+            }
+        });
+
+        let result = run_roon_loop(
+            self.state.clone(),
+            ctx.bus,
+            base_url,
+            ctx.shutdown.clone(),
+            self.knob_store.clone(),
+            self.runtime_bridge.clone(),
+            connection,
+            self.state_path.clone(),
+        )
+        .await;
+        command_shutdown.cancel();
+        if let Some(join) = command_join {
+            if let Err(error) = join.await {
+                tracing::warn!(%error, "Roon reliable command endpoint failed to join");
+            }
+        }
+        clear_roon_runtime_state(&self.state).await;
+        result
     }
 
     /// Stop the Roon adapter (internal - use Startable trait)
@@ -3300,6 +3347,54 @@ impl RoonAdapter {
         .map_err(|_| error)
     }
 
+    /// Resolve and execute one durable identity under the command endpoint's ownership. A rejected
+    /// session key retries the same semantic location, never its title-only predecessor.
+    async fn play_durable_location(
+        &self,
+        zone_id: &str,
+        location: &CollectionLocation,
+        title: &str,
+    ) -> Result<()> {
+        let mut location = location.clone();
+        if let CollectionLocation::Roon { steps, .. } = &mut location {
+            // A mutable position cannot safely identify indistinguishable recordings.
+            for step in steps {
+                step.position = None;
+            }
+        }
+        for attempt in 0..2 {
+            let (session, key) = self
+                .resolve_collection_location(zone_id, &location)
+                .await
+                .map_err(|error| crate::library_playback::ItemUnavailable(error.to_string()))?;
+            match self
+                .resolve_item_key(
+                    &session,
+                    &key,
+                    strip_roon_prefix(zone_id),
+                    PlayAction::Play,
+                    Some(title),
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(error)
+                    if attempt == 0
+                        && matches!(
+                            RoonBrowseError::from_error(&error).map(|rejection| rejection.kind),
+                            Some(RoonBrowseErrorKind::InvalidItemKey)
+                        ) =>
+                {
+                    continue
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(anyhow::anyhow!(
+            "Roon could not retain the resolved item identity"
+        ))
+    }
+
     /// Re-walk `trail` -- titles from the browse root down to and including
     /// the wanted item -- in a session minted for this walk, and report
     /// `(session_key, item_key)` for the item it lands on.
@@ -4072,38 +4167,6 @@ impl LibraryAdapter for RoonAdapter {
                     "item_key": item_key,
                 }))
             }
-            "play_resolved" => {
-                // Play the row a prior `collections_resolve_location` landed on. Kept apart from
-                // resolution so a caller can tell "the item is gone" from "Roon refused to play".
-                let field = |name: &str| {
-                    params
-                        .get(name)
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| anyhow::anyhow!("Roon playback requires {name}"))
-                };
-                let trail = params
-                    .get("trail")
-                    .and_then(Value::as_array)
-                    .map(|titles| {
-                        titles
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(ToOwned::to_owned)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let message = self
-                    .play_ref(
-                        field("item_key")?,
-                        field("session_key")?,
-                        field("zone_id")?,
-                        PlayAction::Play,
-                        field("title")?,
-                        &trail,
-                    )
-                    .await?;
-                Ok(serde_json::json!({ "message": message }))
-            }
             _ => Err(anyhow::anyhow!(
                 "Roon content operation `{operation}` is not supported"
             )),
@@ -4118,52 +4181,14 @@ impl AdapterLogic for RoonAdapter {
     }
 
     async fn run(&self, ctx: AdapterContext) -> Result<()> {
-        let base_url = {
-            let url = self.base_url.read().await;
-            url.clone()
-                .ok_or_else(|| anyhow::anyhow!("Roon base_url not configured"))?
-        };
-
-        // Roon callbacks are the provider's authoritative state observation.  Register one
-        // endpoint for transport/volume writes before consuming that callback stream; it waits
-        // for a matching full-zone callback rather than manufacturing a readback response.
-        let command_shutdown = ctx.shutdown.child_token();
-        let command_join = self.runtime_bridge.as_ref().and_then(|bridge| {
-            match bridge.commands().register_provider("roon", 16) {
-                Ok(endpoint) => {
-                    let adapter = self.clone();
-                    let bridge = bridge.clone();
-                    let shutdown = command_shutdown.clone();
-                    Some(tokio::spawn(async move {
-                        run_roon_command_endpoint(adapter, endpoint, shutdown, bridge).await;
-                    }))
-                }
-                Err(error) => {
-                    tracing::error!(?error, "Roon reliable endpoint registration failed");
-                    None
-                }
-            }
-        });
-
-        let result = run_roon_loop(
-            self.state.clone(),
-            ctx.bus,
-            base_url,
-            ctx.shutdown.clone(),
-            self.knob_store.clone(),
-            self.runtime_bridge.clone(),
-            CoreConnect::Discovery,
-            self.state_path.clone(),
-        )
-        .await;
-        command_shutdown.cancel();
-        if let Some(join) = command_join {
-            if let Err(error) = join.await {
-                tracing::warn!(%error, "Roon reliable command endpoint failed to join");
-            }
-        }
-        clear_roon_runtime_state(&self.state).await;
-        result
+        let base_url = self
+            .base_url
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Roon base_url not configured"))?;
+        self.run_with_connection(ctx, CoreConnect::Discovery, base_url)
+            .await
     }
 
     async fn handle_command(
@@ -4250,17 +4275,40 @@ async fn run_roon_command_endpoint(
                 continue;
             }
         };
-        let native = match command {
-            RuntimeCommand::Control(command) => {
-                execute_roon_runtime_command(&adapter, target.raw_id(), command).await
+        let native = async {
+            match command {
+                RuntimeCommand::Control(command) => {
+                    execute_roon_runtime_command(&adapter, target.raw_id(), command).await
+                }
+                RuntimeCommand::LibraryPlay(request) => match request.target {
+                    crate::library_playback::DurableTarget::Roon { location } => {
+                        adapter
+                            .play_durable_location(target.as_str(), &location, &request.title)
+                            .await
+                    }
+                    _ => Err(anyhow::anyhow!(
+                        "item provider does not match the Roon endpoint"
+                    )),
+                },
+                RuntimeCommand::Hqplayer(_) => Err(anyhow::anyhow!(
+                    "HQPlayer runtime command routed to Roon endpoint"
+                )),
             }
-            RuntimeCommand::Hqplayer(_) => Err(anyhow::anyhow!(
-                "HQPlayer runtime command routed to Roon endpoint"
-            )),
+        };
+        let native = match permit.run_native(&shutdown, native).await {
+            crate::bus::runtime::NativeAttempt::Completed(result) => result,
+            crate::bus::runtime::NativeAttempt::Cancelled => {
+                bridge.disarm(command_id).await;
+                break;
+            }
+            crate::bus::runtime::NativeAttempt::TimedOut => {
+                bridge.disarm(command_id).await;
+                continue;
+            }
         };
         if let Err(error) = native {
             bridge.disarm(command_id).await;
-            permit.complete_native(NativeResult::Failed(error.to_string()));
+            permit.complete_native(crate::library_playback::native_failure(error));
             continue;
         }
         permit.complete_native(NativeResult::Accepted);
@@ -4268,7 +4316,11 @@ async fn run_roon_command_endpoint(
         // The command ledger independently transitions this command to Indeterminate at the same
         // deadline.  This await only keeps later provider writes out of Roon's uncorrelatable
         // callback window; it never turns a timeout into a failed native operation.
-        match timeout_at(confirm_by, &mut observed).await {
+        let observation = tokio::select! {
+            _ = shutdown.cancelled() => { bridge.disarm(command_id).await; break; }
+            result = timeout_at(confirm_by, &mut observed) => result,
+        };
+        match observation {
             Ok(Ok(())) => {}
             Ok(Err(_)) => tracing::warn!(
                 command_id = command_id.get(),
@@ -4312,7 +4364,7 @@ async fn roon_expectation(
             };
             Ok(RoonObservationExpectation::Playback(expected))
         }
-        RuntimeCommand::Control(Command::Next) => {
+        RuntimeCommand::Control(Command::Next) | RuntimeCommand::LibraryPlay(_) => {
             let previous = zone.now_playing.map(|now_playing| {
                 (
                     now_playing.title,
