@@ -16,6 +16,9 @@ pub struct LayoutProps {
     pub nav_active: String,
     /// Page content
     pub children: Element,
+    /// Space for a fixed bottom bar, measured by the page that owns it.
+    #[props(default = 0.0)]
+    pub bottom_bar_height: f64,
     /// Hide HQPlayer tab in nav
     #[props(default = false)]
     pub hide_hqp: bool,
@@ -104,7 +107,9 @@ pub fn Layout(props: LayoutProps) -> Element {
             }
             {props.children}
         }
-        footer { class: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center py-3",
+        footer {
+            class: "app-footer max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center",
+            style: "--bottom-bar-height: {props.bottom_bar_height}px;",
             small { class: "text-muted", "{crate::brand::PRODUCT_NAME} v{version} ({git_sha})" }
             div { class: "app-attribution",
                 a {
@@ -113,7 +118,7 @@ pub fn Layout(props: LayoutProps) -> Element {
                     rel: "noopener noreferrer",
                     "A HiPhi project"
                 }
-                span { " by {crate::brand::COMPANY_NAME} · Local control, optional Cloud" }
+                span { " by {crate::brand::COMPANY_NAME}" }
                 span { " · " }
                 a {
                     href: "https://buymeacoffee.com/muness",

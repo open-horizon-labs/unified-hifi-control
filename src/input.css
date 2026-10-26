@@ -113,6 +113,12 @@
     color: var(--text-secondary);
   }
 
+  /* Reserve the measured playback bar below the footer, including on wrapped mobile layouts. */
+  .app-footer {
+    padding-top: 0.75rem;
+    padding-bottom: calc(0.75rem + var(--bottom-bar-height, 0px));
+  }
+
   .app-attribution {
     color: var(--text-secondary);
     font-size: var(--text-sm);
@@ -487,10 +493,6 @@
   /* ======================================================================
    * Library page (#550): home page browse/search surface.
    * ==================================================================== */
-
-  .library-page {
-    @apply pb-28;
-  }
 
   .library-search-input {
     @apply mb-4 text-base;
@@ -1062,20 +1064,6 @@
   .zones-strip-transfer {
     @apply mt-2 flex flex-wrap items-center gap-2 border-t pt-2;
     border-color: var(--border-subtle);
-  }
-
-  /* #596: sized to the strip it reserves room for -- the wrapped
-     target+rail header measures ~150px below `sm` (~200px under 360px
-     where the volume slot takes its own rail line) vs the single ~76px
-     row at `sm`+. Undersizing this hides the tail of the library list
-     behind the fixed strip. */
-  .library-strip-spacer {
-    @apply h-40 sm:h-24;
-  }
-  @media (max-width: 359px) {
-    .library-strip-spacer {
-      height: 13rem;
-    }
   }
 }
 
