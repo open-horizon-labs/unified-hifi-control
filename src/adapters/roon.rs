@@ -4072,6 +4072,38 @@ impl LibraryAdapter for RoonAdapter {
                     "item_key": item_key,
                 }))
             }
+            "play_resolved" => {
+                // Play the row a prior `collections_resolve_location` landed on. Kept apart from
+                // resolution so a caller can tell "the item is gone" from "Roon refused to play".
+                let field = |name: &str| {
+                    params
+                        .get(name)
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow::anyhow!("Roon playback requires {name}"))
+                };
+                let trail = params
+                    .get("trail")
+                    .and_then(Value::as_array)
+                    .map(|titles| {
+                        titles
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let message = self
+                    .play_ref(
+                        field("item_key")?,
+                        field("session_key")?,
+                        field("zone_id")?,
+                        PlayAction::Play,
+                        field("title")?,
+                        &trail,
+                    )
+                    .await?;
+                Ok(serde_json::json!({ "message": message }))
+            }
             _ => Err(anyhow::anyhow!(
                 "Roon content operation `{operation}` is not supported"
             )),

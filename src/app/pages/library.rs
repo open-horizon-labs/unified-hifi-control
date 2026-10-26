@@ -834,6 +834,35 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
         });
     });
 
+    // Pin an item as a controller shortcut. The bridge resolves the ref itself and keeps only what
+    // outlives it (see `crate::shortcuts`), so a refusal here is the bridge's own sentence: a
+    // search hit with no stable path, a folder, an item type that cannot be pinned yet.
+    let pin_item = use_callback(move |item_ref: String| {
+        status.set(Some("Pinning…".to_string()));
+        spawn(async move {
+            let req = api::PinShortcutRequest { item_ref };
+            let message =
+                match api::post_json::<_, api::PinShortcutResponse>("/api/shortcuts", &req).await {
+                    Ok(pinned) if pinned.already_pinned => format!(
+                        "Already pinned as “{}”. Map it to a button under Controllers.",
+                        pinned.shortcut.name
+                    ),
+                    Ok(pinned) => format!(
+                        "Pinned as “{}”. Map it to a button under Controllers.",
+                        pinned.shortcut.name
+                    ),
+                    Err(message) => message,
+                };
+            status.set(Some(message));
+            let generation = status_generation.peek().wrapping_add(1);
+            status_generation.set(generation);
+            dioxus_sdk_time::sleep(std::time::Duration::from_secs(8)).await;
+            if *status_generation.peek() == generation {
+                status.set(None);
+            }
+        });
+    });
+
     // ---- Unified search (#550): local filter + debounced global search ----
     // (Declared above `open_folder` so opening a folder can clear it -- see
     // there. Kept in this block so the search wiring reads as one unit.)
@@ -1033,6 +1062,7 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
                             currently_playing_title: currently_playing_title.clone(),
                             on_open: open_folder,
                             on_play: play_item,
+                            on_pin: pin_item,
                         }
                     }
                 }
@@ -1150,6 +1180,7 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
                 currently_playing_title: currently_playing_title.clone(),
                 on_open: open_folder,
                 on_play: play_item,
+                on_pin: pin_item,
             }
             if can_load_more {
                 button {
@@ -1346,6 +1377,7 @@ fn LibraryRows(
     currently_playing_title: Option<String>,
     on_open: EventHandler<(String, String)>,
     on_play: EventHandler<(String, &'static str)>,
+    on_pin: EventHandler<String>,
 ) -> Element {
     let grid_shaped = library_uses_cards(layout, &items);
 
@@ -1361,6 +1393,7 @@ fn LibraryRows(
                         is_playing: currently_playing_title.as_deref() == Some(items.get(index).map(|i| i.title.as_str()).unwrap_or_default()),
                         on_open: on_open,
                         on_play: on_play,
+                        on_pin: on_pin,
                     }
                 }
             }
@@ -1377,6 +1410,7 @@ fn LibraryRows(
                         is_playing: currently_playing_title.as_deref() == Some(items.get(index).map(|i| i.title.as_str()).unwrap_or_default()),
                         on_open: on_open,
                         on_play: on_play,
+                        on_pin: on_pin,
                     }
                 }
             }
@@ -1392,6 +1426,7 @@ fn LibraryRow(
     is_playing: bool,
     on_open: EventHandler<(String, String)>,
     on_play: EventHandler<(String, &'static str)>,
+    on_pin: EventHandler<String>,
 ) -> Element {
     let mut menu_open = use_signal(|| false);
     let stagger_style = format!("--library-stagger-index: {index};");
@@ -1492,6 +1527,18 @@ fn LibraryRow(
                                     },
                                     "Queue"
                                 }
+                                button {
+                                    r#type: "button",
+                                    onclick: {
+                                        let item_ref = item_ref.clone();
+                                        move |evt: Event<MouseData>| {
+                                            evt.stop_propagation();
+                                            menu_open.set(false);
+                                            on_pin(item_ref.clone());
+                                        }
+                                    },
+                                    "Pin as shortcut"
+                                }
                             }
                         }
                     }
@@ -1529,6 +1576,7 @@ fn LibraryTile(
     is_playing: bool,
     on_open: EventHandler<(String, String)>,
     on_play: EventHandler<(String, &'static str)>,
+    on_pin: EventHandler<String>,
 ) -> Element {
     let stagger_style = format!("--library-stagger-index: {index};");
     let has_ref = item.item_ref.is_some();
@@ -1585,6 +1633,22 @@ fn LibraryTile(
                             }
                         },
                         "▶"
+                    }
+                    button {
+                        class: "library-tile-pin",
+                        aria_label: "Pin {item.title} as a shortcut",
+                        title: "Pin as shortcut",
+                        r#type: "button",
+                        onclick: {
+                            let item_ref = item.item_ref.clone().unwrap_or_default();
+                            move |evt| {
+                                evt.stop_propagation();
+                                on_pin(item_ref.clone());
+                            }
+                        },
+                        svg { class: "w-4 h-4", fill: "none", view_box: "0 0 24 24", stroke: "currentColor", "stroke-width": "2",
+                            path { "stroke-linecap": "round", "stroke-linejoin": "round", d: "M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-4-7 4V5z" }
+                        }
                     }
                 }
                 if has_location {

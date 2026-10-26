@@ -72,6 +72,8 @@ pub mod knobs;
 pub mod mcp;
 #[cfg(feature = "server")]
 pub mod mdns;
+#[cfg(feature = "server")]
+pub mod shortcuts;
 // Optional MQTT publisher: exposes UHC zones to Home Assistant (#508).
 #[cfg(feature = "server")]
 pub mod mqtt;

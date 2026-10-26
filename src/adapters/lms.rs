@@ -917,6 +917,31 @@ impl LmsPlayAction {
     }
 }
 
+/// The part of an LMS play target that is safe to keep across restarts, for callers that store a
+/// pointer (controller shortcuts). It has no variant for [`LmsPlayTarget::GlobalSearchItem`]:
+/// that is a positional breadcrumb that can play the wrong item with no error, so it can never be
+/// expressed here, let alone persisted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LmsDurableTarget {
+    Library { item: LmsSearchResultType, id: i64 },
+    SavedPlaylist { id: i64 },
+    Url { url: String },
+}
+
+impl LmsDurableTarget {
+    pub fn to_play_target(&self) -> LmsPlayTarget {
+        match self {
+            Self::Library { item, id } => LmsPlayTarget::Library {
+                kind: *item,
+                id: *id,
+            },
+            Self::SavedPlaylist { id } => LmsPlayTarget::SavedPlaylist { id: *id },
+            Self::Url { url } => LmsPlayTarget::Url { url: url.clone() },
+        }
+    }
+}
+
 /// One resolved way to play/queue/insert an LMS result, independent of how it
 /// was found.
 ///
@@ -4000,6 +4025,32 @@ impl LibraryAdapter for LmsAdapter {
 
     async fn content(&self, operation: &str, params: &Value) -> Result<Value> {
         match operation {
+            "play_durable_target" => {
+                // A stored pointer, played. `play_target` validates it against the live library
+                // before it touches the queue, so a rescanned id refuses instead of wiping it.
+                let zone_id = params
+                    .get("zone_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("LMS playback requires zone_id"))?;
+                let title = params.get("title").and_then(Value::as_str);
+                let target: LmsDurableTarget = serde_json::from_value(
+                    params
+                        .get("target")
+                        .cloned()
+                        .ok_or_else(|| anyhow!("LMS playback requires target"))?,
+                )
+                .map_err(|error| anyhow!("decode LMS target: {error}"))?;
+                self.play_target(
+                    &target.to_play_target(),
+                    zone_id,
+                    LmsPlayAction::Play,
+                    title,
+                )
+                .await?;
+                Ok(
+                    serde_json::json!({ "message": format!("Sent {} to LMS", title.unwrap_or("item")) }),
+                )
+            }
             "multiroom_status" => self.multiroom_status().await,
             "multiroom_set_members" => {
                 let leader = params

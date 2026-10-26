@@ -66,6 +66,15 @@ pub struct KnobConfig {
     /// the device via `config_sha`, e.g. from a Home Assistant `select`
     /// entity (#523).
     pub assigned_zone_id: Option<String>,
+
+    /// Zones this controller does not list, on top of the global hide list in app settings.
+    ///
+    /// A list filter and nothing else, like the global one (see `zone_list`): a zone hidden here
+    /// still plays when addressed by ID, so an `assigned_zone_id` or a shortcut that targets it
+    /// keeps working. Omitted from the serialised config while empty so a controller that never
+    /// uses this keeps its `config_sha`, and is not resynced by an upgrade.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hidden_zone_ids: Vec<String>,
 }
 
 impl Default for KnobConfig {
@@ -110,6 +119,7 @@ impl Default for KnobConfig {
             sleep_poll_stopped_sec: 60,
             volume_step_override: None,
             assigned_zone_id: None,
+            hidden_zone_ids: Vec::new(),
         }
     }
 }
@@ -443,6 +453,9 @@ impl KnobStore {
         if let Some(v) = updates.assigned_zone_id {
             knob.config.assigned_zone_id = if v.is_empty() { None } else { Some(v) };
         }
+        if let Some(v) = updates.hidden_zone_ids {
+            knob.config.hidden_zone_ids = normalize_zone_ids(v);
+        }
 
         // Recompute config hash
         knob.config_sha = compute_sha(&knob.config, &knob.name);
@@ -539,6 +552,18 @@ pub struct KnobConfigUpdate {
     /// Zone reassignment override (empty string = clear override, device
     /// chooses its own zone again)
     pub assigned_zone_id: Option<String>,
+    /// Replaces the controller's own hide list (empty list = show every zone again).
+    pub hidden_zone_ids: Option<Vec<String>>,
+}
+
+/// Drop blanks and duplicates, keeping first-seen order, so the stored list and `config_sha` do
+/// not depend on how a client happened to send it.
+fn normalize_zone_ids(ids: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    ids.into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty() && seen.insert(id.clone()))
+        .collect()
 }
 
 /// Summary for listing knobs
@@ -604,5 +629,40 @@ mod persistence_tests {
             serde_json::from_slice(&fs::read(store.path.as_ref()).unwrap()).unwrap();
         assert_eq!(current["dial"].name, disk["dial"].name);
         assert_eq!(current["dial"].name, "Installed");
+    }
+}
+
+#[cfg(test)]
+mod hidden_zone_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_drops_blanks_and_duplicates_keeping_first_seen_order() {
+        let ids = vec![
+            " roon:a ".to_string(),
+            "".to_string(),
+            "lms:b".to_string(),
+            "roon:a".to_string(),
+        ];
+        assert_eq!(normalize_zone_ids(ids), ["roon:a", "lms:b"]);
+    }
+
+    #[test]
+    fn empty_hide_list_leaves_config_sha_unchanged() {
+        // A controller that never uses per-controller hiding must not be resynced by an upgrade:
+        // the empty list is skipped when serialising, so the hash input is what it was before.
+        let config = KnobConfig::default();
+        let json = serde_json::to_value(&config).unwrap();
+        assert!(json.get("hidden_zone_ids").is_none());
+
+        let mut hiding = config.clone();
+        hiding.hidden_zone_ids = vec!["roon:a".to_string()];
+        assert_ne!(compute_sha(&config, "k"), compute_sha(&hiding, "k"));
+    }
+
+    #[test]
+    fn config_without_the_field_deserialises_to_an_empty_list() {
+        let config: KnobConfig = serde_json::from_str("{}").unwrap();
+        assert!(config.hidden_zone_ids.is_empty());
     }
 }

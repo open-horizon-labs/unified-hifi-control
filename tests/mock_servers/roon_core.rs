@@ -1053,6 +1053,27 @@ impl FakeRoonCore {
             .collect()
     }
 
+    /// Like [`Self::browsed_titles`], but each entry is `"title|subtitle"`, so a test can tell two
+    /// rows that share a title apart (two albums called "Greatest Hits" by different artists).
+    pub async fn browsed_identities(&self) -> Vec<String> {
+        let state = self.state.read().await;
+        state
+            .log
+            .iter()
+            .filter(|r| r.name == "com.roonlabs.browse:1/browse")
+            .filter_map(|r| r.item_key())
+            .filter_map(|key| {
+                let index = state.arena.index_of(key)?;
+                let node = &state.arena.nodes[index];
+                Some(format!(
+                    "{}|{}",
+                    node.title,
+                    node.subtitle.clone().unwrap_or_default()
+                ))
+            })
+            .collect()
+    }
+
     /// Every MOO request the adapter sent, in arrival order.
     pub async fn requests(&self) -> Vec<RecordedRequest> {
         self.state.read().await.log.clone()
