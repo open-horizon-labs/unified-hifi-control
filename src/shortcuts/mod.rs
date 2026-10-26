@@ -230,26 +230,25 @@ impl Gesture {
     }
 }
 
-/// Keys whose plain press already means something (transport and volume). A shortcut may sit on
-/// their long or double gesture, never on the press itself: a remote whose play/pause starts a
-/// playlist cannot pause.
-const TRANSPORT_KEYS: &[&str] = &[
-    "play_pause",
-    "play",
-    "pause",
-    "next",
-    "previous",
-    "volume_up",
-    "volume_down",
-    "mute",
-];
+/// Keys whose plain press already means something and keeps meaning it: the controller runs the
+/// key's normal action on the press, before any gesture is recognised. Only a long press can carry
+/// a shortcut, because a press or a double would have already done the normal thing (a remote
+/// whose play/pause starts a playlist cannot pause).
+const TRANSPORT_KEYS: &[&str] = &["play_pause", "play", "pause", "next", "previous"];
+
+/// Keys that never carry a shortcut under any gesture: volume must always mean volume, and a
+/// firmware that recognised a gesture on them would be acting on it after already changing it.
+const RESERVED_KEYS: &[&str] = &["volume_up", "volume_down", "mute"];
 
 /// Why an input event cannot carry a shortcut.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventRefusal {
     BadKey,
     BadGesture,
+    /// A press or double on a transport key.
     TransportPress,
+    /// Any gesture on a volume or mute key.
+    ReservedKey,
 }
 
 impl EventRefusal {
@@ -258,6 +257,7 @@ impl EventRefusal {
             Self::BadKey => "bad_key",
             Self::BadGesture => "bad_gesture",
             Self::TransportPress => "transport_press",
+            Self::ReservedKey => "reserved_key",
         }
     }
 
@@ -266,8 +266,11 @@ impl EventRefusal {
             Self::BadKey => "Key names are lowercase letters, digits and underscores, up to 24.",
             Self::BadGesture => "Gesture must be press, long or double.",
             Self::TransportPress => {
-                "A plain press on a transport or volume key keeps its normal job. Use a long or \
-                 double press, or a key with no transport role."
+                "Play/pause, next and previous keep their normal job on a press. Only a long \
+                 press can start a shortcut, or use a key with no transport role."
+            }
+            Self::ReservedKey => {
+                "Volume and mute always mean volume and mute, so they cannot start a shortcut."
             }
         }
     }
@@ -284,7 +287,10 @@ pub fn event_key(key: &str, gesture: &str) -> Result<String, EventRefusal> {
         return Err(EventRefusal::BadKey);
     }
     let gesture = Gesture::parse(gesture).ok_or(EventRefusal::BadGesture)?;
-    if gesture == Gesture::Press && TRANSPORT_KEYS.contains(&key) {
+    if RESERVED_KEYS.contains(&key) {
+        return Err(EventRefusal::ReservedKey);
+    }
+    if gesture != Gesture::Long && TRANSPORT_KEYS.contains(&key) {
         return Err(EventRefusal::TransportPress);
     }
     Ok(format!("{key}:{}", gesture.as_str()))
@@ -314,6 +320,18 @@ pub struct LastPress {
     pub message: String,
 }
 
+/// A button event a controller reported, kept in memory so the editor can show which keys a remote
+/// actually sends (and let a person map one by pressing it).
+#[derive(Debug, Clone, Serialize)]
+pub struct RecentEvent {
+    pub event: String,
+    pub at: DateTime<Utc>,
+    pub code: &'static str,
+}
+
+/// How many distinct recent events are kept per controller.
+const RECENT_EVENTS: usize = 8;
+
 /// Persistent shortcuts and controller maps.
 #[derive(Clone)]
 pub struct ShortcutStore {
@@ -323,6 +341,7 @@ pub struct ShortcutStore {
     /// the next save cannot replace a file the person may still be able to repair.
     load_failed: bool,
     last_press: Arc<RwLock<HashMap<String, LastPress>>>,
+    recent: Arc<RwLock<HashMap<String, Vec<RecentEvent>>>>,
 }
 
 impl ShortcutStore {
@@ -347,6 +366,7 @@ impl ShortcutStore {
             path: Arc::new(path),
             load_failed,
             last_press: Arc::new(RwLock::new(HashMap::new())),
+            recent: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -530,6 +550,32 @@ impl ShortcutStore {
             .write()
             .await
             .insert(shortcut_id.to_string(), press);
+    }
+
+    /// Remember that `controller_id` reported `event`. A repeat moves it to the front rather than
+    /// filling the list, so ten presses of one key still leave room for the others.
+    pub async fn record_event(&self, controller_id: &str, event: &str, code: &'static str) {
+        let mut recent = self.recent.write().await;
+        let list = recent.entry(controller_id.to_string()).or_default();
+        list.retain(|seen| seen.event != event);
+        list.insert(
+            0,
+            RecentEvent {
+                event: event.to_string(),
+                at: Utc::now(),
+                code,
+            },
+        );
+        list.truncate(RECENT_EVENTS);
+    }
+
+    pub async fn recent_events(&self, controller_id: &str) -> Vec<RecentEvent> {
+        self.recent
+            .read()
+            .await
+            .get(controller_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub async fn last_press(&self, shortcut_id: &str) -> Option<LastPress> {

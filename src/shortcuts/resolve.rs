@@ -99,8 +99,18 @@ pub async fn controller_zone(state: &AppState, controller_id: &str) -> Option<St
         .or(knob.status.zone_id.filter(|id| !id.is_empty()))
 }
 
-/// Resolve and play whatever `event` is bound to on `controller_id`.
+/// Resolve and play whatever `event` is bound to on `controller_id`, and remember that the
+/// controller sent it so the editor can offer it.
 pub async fn press(state: &AppState, controller_id: &str, event: &str) -> PressOutcome {
+    let outcome = press_inner(state, controller_id, event).await;
+    state
+        .shortcuts
+        .record_event(controller_id, event, code_str(outcome.code))
+        .await;
+    outcome
+}
+
+async fn press_inner(state: &AppState, controller_id: &str, event: &str) -> PressOutcome {
     let bindings = state.shortcuts.bindings_for(controller_id).await;
     let Some(shortcut_id) = bindings.get(event) else {
         return PressOutcome::new(PressCode::Unmapped, "No shortcut is set for that button.");
@@ -191,7 +201,7 @@ async fn play_inner(state: &AppState, shortcut: &Shortcut, zone_id: &str) -> Pre
 
     let title = shortcut.title.clone();
     let ref_target = match &shortcut.target {
-        ShortcutTarget::Roon { trail } => match state.roon.resolve_trail(zone_id, trail).await {
+        ShortcutTarget::Roon { trail } => match resolve_roon_trail(state, zone_id, trail).await {
             Ok((multi_session_key, item_key)) => RefTarget::Roon {
                 target: RoonRefTarget {
                     item_key,
@@ -239,6 +249,31 @@ async fn play_inner(state: &AppState, shortcut: &Shortcut, zone_id: &str) -> Pre
         Ok(call) => interpret(&shortcut.name, call.structured_content.as_ref()),
         Err(error) => PressOutcome::new(PressCode::Refused, error.to_string()),
     }
+}
+
+/// Re-walk a saved Roon trail in a fresh browse session, through the adapter registry like every
+/// other surface (`adapter_boundary_lint` forbids reaching for the concrete adapter).
+async fn resolve_roon_trail(
+    state: &AppState,
+    zone_id: &str,
+    trail: &[String],
+) -> anyhow::Result<(String, String)> {
+    let reply = state
+        .adapter_registry
+        .library_content(
+            "roon",
+            "resolve_trail",
+            &serde_json::json!({ "zone_id": zone_id, "trail": trail }),
+        )
+        .await?;
+    let field = |name: &str| {
+        reply
+            .get(name)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("Roon returned no {name}"))
+    };
+    Ok((field("session_key")?, field("item_key")?))
 }
 
 /// Read the play envelope's verdict. `ok` and `accepted` are the two outcomes that mean the

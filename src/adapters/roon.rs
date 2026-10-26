@@ -4072,6 +4072,28 @@ impl LibraryAdapter for RoonAdapter {
                     "item_key": item_key,
                 }))
             }
+            "resolve_trail" => {
+                // Re-walk a saved title trail in a fresh browse session and report the keys it
+                // lands on (#616's recovery, exposed for controller shortcuts, which keep the
+                // trail and never a session key).
+                let zone_id = params
+                    .get("zone_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("Roon trail resolution requires zone_id"))?;
+                let trail = params
+                    .get("trail")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow::anyhow!("Roon trail resolution requires trail"))?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                let (session_key, item_key) = self.resolve_trail(zone_id, &trail).await?;
+                Ok(serde_json::json!({
+                    "session_key": session_key,
+                    "item_key": item_key,
+                }))
+            }
             _ => Err(anyhow::anyhow!(
                 "Roon content operation `{operation}` is not supported"
             )),

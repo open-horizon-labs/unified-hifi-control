@@ -70,7 +70,7 @@ async fn a_map_naming_an_unknown_shortcut_or_a_bad_event_writes_nothing() {
 
     let mut mixed = BTreeMap::new();
     mixed.insert("preset_1:press".to_string(), a.id.clone());
-    mixed.insert("play_pause:press".to_string(), a.id.clone());
+    mixed.insert("play_pause:press".to_string(), a.id.clone()); // refused: transport press
     assert!(matches!(
         store.set_bindings("dial1", mixed).await,
         Err(BindingError::Event {
@@ -85,15 +85,39 @@ async fn a_map_naming_an_unknown_shortcut_or_a_bad_event_writes_nothing() {
 }
 
 #[test]
-fn a_plain_press_on_a_transport_key_is_refused_but_its_long_press_is_not() {
-    for key in ["play_pause", "next", "previous", "volume_up", "volume_down"] {
+fn transport_keys_carry_a_shortcut_only_on_a_long_press_and_volume_never() {
+    // The controller runs a transport key's normal action on the press, so a press or double can
+    // never be "the shortcut": the normal action has already happened.
+    for key in ["play_pause", "play", "pause", "next", "previous"] {
         assert_eq!(
             event_key(key, "press"),
             Err(EventRefusal::TransportPress),
             "{key}"
         );
+        assert_eq!(
+            event_key(key, "double"),
+            Err(EventRefusal::TransportPress),
+            "{key}"
+        );
         assert_eq!(event_key(key, "long"), Ok(format!("{key}:long")));
-        assert_eq!(event_key(key, "double"), Ok(format!("{key}:double")));
+    }
+    // Volume and mute: nothing, ever.
+    for key in ["volume_up", "volume_down", "mute"] {
+        for gesture in ["press", "long", "double"] {
+            assert_eq!(
+                event_key(key, gesture),
+                Err(EventRefusal::ReservedKey),
+                "{key}:{gesture}"
+            );
+        }
+    }
+    // Everything else takes all three.
+    for gesture in ["press", "long", "double"] {
+        assert_eq!(event_key("home", gesture), Ok(format!("home:{gesture}")));
+        assert_eq!(
+            event_key("usage_0192", gesture),
+            Ok(format!("usage_0192:{gesture}"))
+        );
     }
     assert_eq!(event_key("preset_1", "press"), Ok("preset_1:press".into()));
     assert_eq!(event_key("Preset", "press"), Err(EventRefusal::BadKey));
@@ -198,4 +222,28 @@ fn a_stored_target_carries_no_session_or_ref_token() {
     assert!(!json.contains("item_key"));
     assert!(!json.contains("session"));
     assert!(!json.contains("ref_"));
+}
+
+#[tokio::test]
+async fn recent_events_keep_the_distinct_keys_a_remote_sends_most_recent_first() {
+    let (store, _dir) = store();
+    for event in ["home:press", "back:long", "home:press", "usage_0192:double"] {
+        store.record_event("dial1", event, "unmapped").await;
+    }
+    let seen: Vec<_> = store
+        .recent_events("dial1")
+        .await
+        .into_iter()
+        .map(|e| e.event)
+        .collect();
+    // A repeated key moves up; it does not crowd the others out.
+    assert_eq!(seen, ["usage_0192:double", "home:press", "back:long"]);
+
+    for n in 0..20 {
+        store
+            .record_event("dial1", &format!("key_{n}:press"), "unmapped")
+            .await;
+    }
+    assert_eq!(store.recent_events("dial1").await.len(), 8);
+    assert!(store.recent_events("someone-else").await.is_empty());
 }

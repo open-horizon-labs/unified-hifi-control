@@ -217,6 +217,7 @@ async fn controller_view(state: &AppState, controller_id: &str) -> Option<Value>
             "hidden_here": hidden_here,
         },
         "bindings": bindings,
+        "recent_events": state.shortcuts.recent_events(controller_id).await,
     }))
 }
 
@@ -329,7 +330,10 @@ pub async fn input_handler(
         Ok(event) => event,
         // A transport key's plain press is not an error the controller caused: it simply has no
         // shortcut, and its normal action is the controller's own business.
-        Err(crate::shortcuts::EventRefusal::TransportPress) => {
+        Err(
+            crate::shortcuts::EventRefusal::TransportPress
+            | crate::shortcuts::EventRefusal::ReservedKey,
+        ) => {
             return Ok(Json(outcome_json(PressOutcome::unmapped_transport())));
         }
         Err(refusal) => {
