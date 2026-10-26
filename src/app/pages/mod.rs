@@ -5,6 +5,7 @@
 mod devices;
 mod hqplayer;
 mod knobs;
+mod knobs_model;
 pub mod library;
 mod lms;
 mod settings;
