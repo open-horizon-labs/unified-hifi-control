@@ -4072,27 +4072,37 @@ impl LibraryAdapter for RoonAdapter {
                     "item_key": item_key,
                 }))
             }
-            "resolve_trail" => {
-                // Re-walk a saved title trail in a fresh browse session and report the keys it
-                // lands on (#616's recovery, exposed for controller shortcuts, which keep the
-                // trail and never a session key).
-                let zone_id = params
-                    .get("zone_id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("Roon trail resolution requires zone_id"))?;
+            "play_resolved" => {
+                // Play the row a prior `collections_resolve_location` landed on. Kept apart from
+                // resolution so a caller can tell "the item is gone" from "Roon refused to play".
+                let field = |name: &str| {
+                    params
+                        .get(name)
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow::anyhow!("Roon playback requires {name}"))
+                };
                 let trail = params
                     .get("trail")
                     .and_then(Value::as_array)
-                    .ok_or_else(|| anyhow::anyhow!("Roon trail resolution requires trail"))?
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .collect::<Vec<_>>();
-                let (session_key, item_key) = self.resolve_trail(zone_id, &trail).await?;
-                Ok(serde_json::json!({
-                    "session_key": session_key,
-                    "item_key": item_key,
-                }))
+                    .map(|titles| {
+                        titles
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let message = self
+                    .play_ref(
+                        field("item_key")?,
+                        field("session_key")?,
+                        field("zone_id")?,
+                        PlayAction::Play,
+                        field("title")?,
+                        &trail,
+                    )
+                    .await?;
+                Ok(serde_json::json!({ "message": message }))
             }
             _ => Err(anyhow::anyhow!(
                 "Roon content operation `{operation}` is not supported"

@@ -42,43 +42,34 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::adapters::lms::{LmsPlayTarget, LmsSearchResultType};
+use crate::adapters::lms::LmsPlayTarget;
 use crate::config::get_config_file_path;
+use crate::mcp::collection_locations::CollectionLocation;
 use crate::mcp::refs::RefTarget;
 
 const SHORTCUTS_FILE: &str = "shortcuts.json";
 
-/// The stored form of an LMS target. A mirror of [`LmsPlayTarget`] without the variant that must
-/// never be persisted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum LmsShortcutTarget {
-    Library { item: LmsSearchResultType, id: i64 },
-    SavedPlaylist { id: i64 },
-    Url { url: String },
-}
-
-impl LmsShortcutTarget {
-    pub fn to_play_target(&self) -> LmsPlayTarget {
-        match self {
-            Self::Library { item, id } => LmsPlayTarget::Library {
-                kind: *item,
-                id: *id,
-            },
-            Self::SavedPlaylist { id } => LmsPlayTarget::SavedPlaylist { id: *id },
-            Self::Url { url } => LmsPlayTarget::Url { url: url.clone() },
-        }
-    }
-}
+pub use crate::adapters::lms::LmsDurableTarget as LmsShortcutTarget;
 
 /// What a shortcut points at, in a form that survives restarts and expired sessions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "snake_case")]
 pub enum ShortcutTarget {
-    Roon { trail: Vec<String> },
-    Lms { target: LmsShortcutTarget },
-    Spotify { uri: String },
-    MusicAssistant { uri: String },
+    /// The Roon browse walk with each row's subtitle and position, replayed by the same resolver
+    /// the Library uses for a durable URL: it matches on title and subtitle, uses position only
+    /// to split genuine duplicates, and fails rather than pick a plausible-but-wrong row.
+    Roon {
+        location: CollectionLocation,
+    },
+    Lms {
+        target: LmsShortcutTarget,
+    },
+    Spotify {
+        uri: String,
+    },
+    MusicAssistant {
+        uri: String,
+    },
 }
 
 impl ShortcutTarget {
@@ -106,20 +97,21 @@ impl ShortcutTarget {
     pub fn from_ref(target: &RefTarget) -> Result<Self, PinRefusal> {
         match target {
             RefTarget::Roon { target, .. } => {
-                // A trail is re-walked from the browse root, so it has to be a path. A search hit
-                // carries only its own title (`library.rs`, #616), which names no root-level row
-                // and could never be found again. Playable items sit at least two levels down
-                // (a section, then the item), so anything shorter is not a path.
-                if target.trail.len() < 2 {
-                    Err(PinRefusal::NoDurableHandle(
+                // Titles alone are not an identity: two albums can share one, and replaying a title
+                // trail takes the first match, so it can play the wrong recording with no error.
+                // The location keeps subtitle and position too. Playable items sit at least two
+                // levels down (a section, then the item); a search hit carries no location at all.
+                match &target.location {
+                    Some(location @ CollectionLocation::Roon { steps, .. }) if steps.len() >= 2 => {
+                        Ok(Self::Roon {
+                            location: location.clone(),
+                        })
+                    }
+                    _ => Err(PinRefusal::NoDurableHandle(
                         "Roon gave no path to this item, so it could not be found again once \
                          this browse session ends. Open it from Browse and pin it there."
                             .into(),
-                    ))
-                } else {
-                    Ok(Self::Roon {
-                        trail: target.trail.clone(),
-                    })
+                    )),
                 }
             }
             RefTarget::Lms { target, .. } => match target {

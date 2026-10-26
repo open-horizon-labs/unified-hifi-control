@@ -137,6 +137,11 @@ async fn harness(zones: &[(&str, &str)]) -> Harness {
         Instant::now(),
         CancellationToken::new(),
     );
+    // The resolver plays through the registry, as main.rs wires it.
+    state
+        .adapter_registry
+        .register_library("lms", state.lms.clone())
+        .await;
     let dir = tempfile::tempdir().unwrap();
     state.shortcuts = ShortcutStore::open(dir.path().join("shortcuts.json"));
 
@@ -250,7 +255,7 @@ async fn a_press_plays_the_pinned_item_on_the_controllers_own_zone() {
     h.mock.clear_commands().await;
 
     let outcome = press(&h.state, controller(), EVENT).await;
-    assert_eq!(outcome.code, PressCode::Played, "{}", outcome.message);
+    assert_eq!(outcome.code, PressCode::Accepted, "{}", outcome.message);
 
     assert!(
         h.playlist_commands(OTHER_PLAYER)
@@ -291,7 +296,7 @@ async fn an_assigned_zone_wins_over_the_zone_the_controller_last_reported() {
 
     assert_eq!(
         press(&h.state, controller(), EVENT).await.code,
-        PressCode::Played
+        PressCode::Accepted
     );
     assert!(!h.playlist_commands(LMS_PLAYER).await.is_empty());
     assert!(h.playlist_commands(OTHER_PLAYER).await.is_empty());
@@ -321,7 +326,7 @@ async fn a_zone_hidden_on_this_controller_still_plays() {
     h.mock.clear_commands().await;
 
     let outcome = press(&h.state, controller(), EVENT).await;
-    assert_eq!(outcome.code, PressCode::Played, "{}", outcome.message);
+    assert_eq!(outcome.code, PressCode::Accepted, "{}", outcome.message);
     assert!(!h.playlist_commands(LMS_PLAYER).await.is_empty());
     h.stop().await;
 }
@@ -446,7 +451,7 @@ async fn the_input_endpoint_plays_unmaps_and_rejects_without_inventing_outcomes(
     let (status, body) = post_input(&h, controller(), "preset_1", "press").await;
     assert_eq!(
         (status, body["code"].as_str()),
-        (200, Some("played")),
+        (200, Some("accepted")),
         "{body}"
     );
 
@@ -619,7 +624,7 @@ async fn a_roon_pin_still_plays_after_the_core_forgets_every_browse_session() {
     core.drop_all_sessions().await;
 
     let outcome = press(&state, controller(), EVENT).await;
-    assert_eq!(outcome.code, PressCode::Played, "{}", outcome.message);
+    assert_eq!(outcome.code, PressCode::Accepted, "{}", outcome.message);
     assert!(
         core.browsed_titles()
             .await
@@ -654,5 +659,136 @@ async fn a_roon_search_hit_cannot_be_pinned() {
         .to_string();
     let ref_target = state.mcp_refs.resolve(&token).await.unwrap();
     assert!(ShortcutTarget::from_ref(&ref_target).is_err());
+    core.stop().await;
+}
+
+// =============================================================================
+// Roon: two albums with one title are two pins, and a press plays the one that was pinned
+// =============================================================================
+
+async fn albums_page(state: &AppState) -> Value {
+    let root = browse(state, None).await;
+    let library = browse(state, row(&root, "Local Library")["location"].as_str()).await;
+    browse(state, row(&library, "Albums")["location"].as_str()).await
+}
+
+/// Pin the row at `index` in the Albums list; returns the shortcut id.
+async fn pin_album_row(state: &AppState, albums: &Value, index: usize) -> String {
+    let item_ref = albums["items"][index]["ref"]
+        .as_str()
+        .expect("a browsed album must be playable")
+        .to_string();
+    let ref_target = state.mcp_refs.resolve(&item_ref).await.unwrap();
+    let target = ShortcutTarget::from_ref(&ref_target).expect("a browsed Roon album is pinnable");
+    let (shortcut, _) = state
+        .shortcuts
+        .pin(target, ref_target.title().to_string(), None)
+        .await
+        .unwrap();
+    shortcut.id
+}
+
+fn greatest_hits() -> Vec<mock_servers::roon_core::FakeItem> {
+    vec![
+        mock_servers::roon_core::album("Greatest Hits", "Artist A", &["A1"]),
+        mock_servers::roon_core::album("Greatest Hits", "Artist B", &["B1"]),
+    ]
+}
+
+/// Found in review: pins kept only a title trail, so both albums became one pin and a press replayed
+/// the first title match. Subtitle and position must survive into the pin.
+#[tokio::test]
+async fn two_albums_with_one_title_get_distinct_pins() {
+    let core = FakeRoonCore::start().await;
+    core.set_children_by_title("Albums", greatest_hits()).await;
+    let (state, _dir) = roon_state(&core).await;
+    let albums = albums_page(&state).await;
+    assert_eq!(albums["items"].as_array().unwrap().len(), 2, "{albums}");
+
+    let a = pin_album_row(&state, &albums, 0).await;
+    let b = pin_album_row(&state, &albums, 1).await;
+    assert_ne!(a, b, "different artists' albums need distinct pins");
+    core.stop().await;
+}
+
+/// The wrong-recording failure: after the Core forgets every session, pressing the pin made from
+/// Artist B's album must open Artist B's, never the first "Greatest Hits" in the list.
+#[tokio::test]
+async fn a_press_plays_the_album_that_was_pinned_not_the_first_with_that_title() {
+    let core = FakeRoonCore::start().await;
+    core.set_item_key_scope(ItemKeyScope::PerSession).await;
+    core.set_children_by_title("Albums", greatest_hits()).await;
+    let (state, _dir) = roon_state(&core).await;
+    let albums = albums_page(&state).await;
+    let pinned_b = pin_album_row(&state, &albums, 1).await;
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(EVENT.to_string(), pinned_b);
+    state
+        .shortcuts
+        .set_bindings(controller(), map)
+        .await
+        .unwrap();
+
+    core.drop_all_sessions().await;
+    let before = core.browsed_identities().await.len();
+
+    let outcome = press(&state, controller(), EVENT).await;
+    assert_eq!(outcome.code, PressCode::Accepted, "{}", outcome.message);
+
+    let walked = core.browsed_identities().await[before..].to_vec();
+    assert!(
+        walked.iter().any(|row| row == "Greatest Hits|Artist B"),
+        "must open Artist B's album: {walked:?}"
+    );
+    assert!(
+        !walked.iter().any(|row| row == "Greatest Hits|Artist A"),
+        "must never open the other artist's: {walked:?}"
+    );
+    core.stop().await;
+}
+
+/// If the pinned album is gone and only a same-titled one by someone else remains, the press must
+/// say it cannot find the item and play nothing, not play the lookalike.
+#[tokio::test]
+async fn a_lookalike_never_stands_in_for_a_vanished_album() {
+    let core = FakeRoonCore::start().await;
+    core.set_item_key_scope(ItemKeyScope::PerSession).await;
+    core.set_children_by_title("Albums", greatest_hits()).await;
+    let (state, _dir) = roon_state(&core).await;
+    let albums = albums_page(&state).await;
+    let pinned_b = pin_album_row(&state, &albums, 1).await;
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(EVENT.to_string(), pinned_b);
+    state
+        .shortcuts
+        .set_bindings(controller(), map)
+        .await
+        .unwrap();
+
+    // Artist B's album leaves the library; Artist A's stays.
+    core.set_children_by_title(
+        "Albums",
+        vec![mock_servers::roon_core::album(
+            "Greatest Hits",
+            "Artist A",
+            &["A1"],
+        )],
+    )
+    .await;
+    core.drop_all_sessions().await;
+    let before = core.browsed_identities().await.len();
+
+    let outcome = press(&state, controller(), EVENT).await;
+    assert_eq!(
+        outcome.code,
+        PressCode::ItemUnavailable,
+        "{}",
+        outcome.message
+    );
+    let walked = core.browsed_identities().await[before..].to_vec();
+    assert!(
+        !walked.iter().any(|row| row == "Greatest Hits|Artist A"),
+        "must not open the lookalike: {walked:?}"
+    );
     core.stop().await;
 }

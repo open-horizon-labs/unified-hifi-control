@@ -97,6 +97,7 @@ GET /upnp/zones
 GET /webmcp-bridge.js
 GET /zones
 GET /zones/{zone_id}/music-details
+PATCH /api/shortcuts/{id}
 POST /admin/fetch-firmware
 POST /api/bridges/applemusic/claim
 POST /api/bridges/applemusic/commands/{command_id}

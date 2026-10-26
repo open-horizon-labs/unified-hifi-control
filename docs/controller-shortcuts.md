@@ -17,13 +17,14 @@ not in the device's settings.
 
 1. The controller reports the key and gesture (`POST /knob/input`, identified by `X-Knob-Id`).
 2. The bridge looks up the controller's map, finds the shortcut and plays it on **the controller's own zone**:
-   its assigned zone if it has one, otherwise the zone it last reported.
+   its assigned zone if it has one, otherwise the zone it last reported. Playback goes through the adapter
+   registry (the same seam the other surfaces use), not the MCP `hifi_play_ref` handler.
 3. The reply carries a stable `code` so a controller with no screen can show something. A press that is not
    bound to anything replies `unmapped`, which is normal and not an error.
 
 | `code` | Meaning |
 | --- | --- |
-| `played` | The provider accepted it. |
+| `accepted` | The provider took the command. This is not a claim that audio started: nothing observes that. |
 | `unmapped` | That key and gesture have no shortcut on this controller. |
 | `no_zone` | The controller has not chosen a zone yet. |
 | `zone_missing` | The controller's zone is not currently discovered. |
@@ -48,7 +49,8 @@ does not deauthorise. The editor says so next to "Plays on".
 
 A key the bridge has no name for arrives as `usage_XXXX` (the HID usage in hex), so any key a remote sends can
 be mapped. The editor lists keys a controller has recently reported, so you can press a button on the remote and
-pick it instead of typing its name.
+pick it instead of typing its name. It re-reads the controller every few seconds while open, so a press made on the
+remote shows up, with its outcome, without reloading.
 
 ## What a shortcut stores
 
@@ -57,20 +59,22 @@ only means something inside the session that minted it. A shortcut keeps the par
 
 | Provider | Stored | At press time |
 | --- | --- | --- |
-| Roon | the title trail from the browse root | re-walked in a fresh session (`resolve_trail`, #616) |
+| Roon | the browse walk from the root, **each row's title, subtitle and position** | resolved in a fresh session by the Library's durable-URL resolver: title and subtitle identify a row, position only splits genuine duplicates, and if no row is identified exactly it fails |
 | LMS | database id, saved-playlist id or URL | validated against the live library before the queue is touched |
 | Spotify, Music Assistant | the provider URI | played as is |
 
 Items without a durable handle are refused at pin time, with the reason, instead of pinned and left to fail on a
 button nobody can see:
 
-- a Roon **search** hit (its trail is only its own title, so it can never be found again): pin it from Browse;
+- a Roon **search** hit (it knows only its own title, which is not an identity and names no root-level row): pin it from Browse;
 - an LMS search result that is only a positional breadcrumb (it can silently play the wrong item);
 - a folder, which does not play;
 - Apple Music items, until the companion's content handles are verified to outlive a session.
 
-Renaming a pin in Roon or LMS, or moving it, makes the next press report `item_unavailable`. The Controllers page
-shows that on the shortcut and on each button that uses it.
+Titles alone are never used to find a Roon item: two albums can share one, and a title match takes the first. Two
+"Greatest Hits" by different artists are two pins, and a press opens the one that was pinned. If it has gone and only a
+lookalike remains, the press reports `item_unavailable` rather than playing the lookalike. Renaming or moving an item
+in Roon or LMS has the same effect, and the Controllers page shows it on the shortcut and on each button that uses it.
 
 ## API
 
@@ -78,7 +82,7 @@ shows that on the shortcut and on each button that uses it.
 | --- | --- | --- |
 | `GET` | `/api/shortcuts` | Every pin, with the last press result |
 | `POST` | `/api/shortcuts` | `{ "ref": "<Library ref>", "name": "<optional>" }`; pinning the same item twice returns the existing pin |
-| `PATCH` | `/api/shortcuts/{id}` | `{ "name": "…" }` |
+| `PATCH` | `/api/shortcuts/{id}` | `{ "name": "…" }` (the API contract check now reads `PATCH` routes) |
 | `DELETE` | `/api/shortcuts/{id}` | Also unmaps it from every controller |
 | `GET` | `/api/controllers/{id}/shortcuts` | The map, where it plays, per-button status, recently heard keys |
 | `PUT` | `/api/controllers/{id}/shortcuts` | `{ "bindings": { "<key>:<gesture>": "<shortcut id>" } }`; replaces the whole map, all or nothing |

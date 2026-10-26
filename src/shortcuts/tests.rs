@@ -1,5 +1,6 @@
 use super::*;
 use crate::adapters::lms::LmsSearchResultType;
+use crate::mcp::collection_locations::{CollectionLocation, CollectionStep, RoonLocationOrigin};
 use crate::mcp::refs::{RefTarget, RoonRefTarget};
 
 fn store() -> (ShortcutStore, tempfile::TempDir) {
@@ -7,9 +8,33 @@ fn store() -> (ShortcutStore, tempfile::TempDir) {
     (ShortcutStore::open(dir.path().join("shortcuts.json")), dir)
 }
 
+fn step(title: &str, subtitle: Option<&str>, position: Option<u32>) -> CollectionStep {
+    CollectionStep::roon(title, subtitle.map(str::to_string), position)
+}
+
+fn roon_location(steps: Vec<CollectionStep>) -> CollectionLocation {
+    CollectionLocation::Roon {
+        origin: RoonLocationOrigin::BrowseRoot,
+        steps,
+    }
+}
+
+/// A Roon pin whose rows have no subtitle: enough to tell pins apart by title.
 fn roon(trail: &[&str]) -> ShortcutTarget {
     ShortcutTarget::Roon {
-        trail: trail.iter().map(|s| s.to_string()).collect(),
+        location: roon_location(trail.iter().map(|t| step(t, None, None)).collect()),
+    }
+}
+
+fn roon_ref(location: Option<CollectionLocation>, trail: &[&str]) -> RefTarget {
+    RefTarget::Roon {
+        target: RoonRefTarget {
+            item_key: "k".into(),
+            multi_session_key: "s".into(),
+            trail: trail.iter().map(|t| t.to_string()).collect(),
+            location,
+        },
+        title: trail.last().copied().unwrap_or("X").to_string(),
     }
 }
 
@@ -141,46 +166,45 @@ async fn an_unreadable_file_is_never_overwritten() {
 fn only_targets_with_a_durable_handle_can_be_pinned() {
     use crate::adapters::lms::LmsPlayTarget;
 
-    let roon_with_trail = RefTarget::Roon {
-        target: RoonRefTarget {
-            item_key: "k".into(),
-            multi_session_key: "s".into(),
-            trail: vec!["Library".into(), "Albums".into()],
-        },
-        title: "X".into(),
-    };
+    let walk = vec![
+        step("Local Library", None, Some(0)),
+        step("Albums", None, Some(2)),
+        step("Kind of Blue", Some("Miles Davis"), Some(5)),
+    ];
+    let with_location = roon_ref(
+        Some(roon_location(walk.clone())),
+        &["Local Library", "Albums", "Kind of Blue"],
+    );
     assert_eq!(
-        ShortcutTarget::from_ref(&roon_with_trail),
-        Ok(roon(&["Library", "Albums"]))
+        ShortcutTarget::from_ref(&with_location),
+        Ok(ShortcutTarget::Roon {
+            location: roon_location(walk)
+        })
     );
 
-    // A search hit's trail is just its own title: not a path from the root, so re-walking it can
-    // never find the item. Pinning it would succeed now and fail on every press.
-    let roon_search_hit = RefTarget::Roon {
-        target: RoonRefTarget {
-            item_key: "k".into(),
-            multi_session_key: "s".into(),
-            trail: vec!["Kind of Blue".into()],
-        },
-        title: "Kind of Blue".into(),
-    };
+    // A search hit knows only its own title: no location, so it can never be found again.
+    let search_hit = roon_ref(None, &["Kind of Blue"]);
     assert!(matches!(
-        ShortcutTarget::from_ref(&roon_search_hit),
+        ShortcutTarget::from_ref(&search_hit),
         Err(PinRefusal::NoDurableHandle(_))
     ));
 
-    // The tempting wrong patch: pin the item_key and session, which only live as long as the
-    // Core's browse session. A trail-less Roon ref must be refused, not stored.
-    let roon_no_trail = RefTarget::Roon {
-        target: RoonRefTarget {
-            item_key: "k".into(),
-            multi_session_key: "s".into(),
-            trail: Vec::new(),
-        },
-        title: "X".into(),
-    };
+    // The tempting wrong patch: keep the title trail, which exists on every Roon ref. Titles are not
+    // an identity (two albums share one, and a trail replay takes the first), so a ref with a trail
+    // but no location must be refused, not stored.
+    let trail_only = roon_ref(None, &["Local Library", "Albums", "Greatest Hits"]);
     assert!(matches!(
-        ShortcutTarget::from_ref(&roon_no_trail),
+        ShortcutTarget::from_ref(&trail_only),
+        Err(PinRefusal::NoDurableHandle(_))
+    ));
+
+    // A location too short to be a path is refused as well.
+    let too_short = roon_ref(
+        Some(roon_location(vec![step("Greatest Hits", None, None)])),
+        &["Greatest Hits"],
+    );
+    assert!(matches!(
+        ShortcutTarget::from_ref(&too_short),
         Err(PinRefusal::NoDurableHandle(_))
     ));
 
@@ -214,6 +238,34 @@ fn only_targets_with_a_durable_handle_can_be_pinned() {
         ShortcutTarget::from_ref(&apple),
         Err(PinRefusal::Unsupported(_))
     ));
+}
+
+#[tokio::test]
+async fn two_albums_with_one_title_by_different_artists_are_two_pins() {
+    let (store, _dir) = store();
+    let walk = |artist: &str| {
+        roon_location(vec![
+            step("Local Library", None, Some(0)),
+            step("Albums", None, Some(2)),
+            step("Greatest Hits", Some(artist), Some(0)),
+        ])
+    };
+    let a = ShortcutTarget::Roon {
+        location: walk("Artist A"),
+    };
+    let b = ShortcutTarget::Roon {
+        location: walk("Artist B"),
+    };
+    let (first, _) = store
+        .pin(a.clone(), "Greatest Hits".into(), None)
+        .await
+        .unwrap();
+    let (second, already) = store.pin(b, "Greatest Hits".into(), None).await.unwrap();
+    assert!(!already, "a different artist is a different item");
+    assert_ne!(first.id, second.id);
+    // The same item pinned again is still one pin.
+    let (again, already) = store.pin(a, "Greatest Hits".into(), None).await.unwrap();
+    assert!(already && again.id == first.id);
 }
 
 #[test]

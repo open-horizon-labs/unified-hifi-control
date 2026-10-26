@@ -397,6 +397,7 @@ pub async fn handle_search(
                             item_key,
                             multi_session_key: session_key.clone(),
                             trail: vec![title.clone()],
+                            location: None,
                         };
                         // #396 (found live, ship-gate re-review): a real
                         // Core's search results mix the actual hit with

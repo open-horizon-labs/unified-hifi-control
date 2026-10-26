@@ -104,6 +104,14 @@ pub fn Knobs() -> Element {
             .ok()
     });
 
+    // Last press results change when a remote is used, not when this page is: keep them current.
+    use_future(move || async move {
+        loop {
+            dioxus_sdk_time::sleep(PINNED_REFRESH).await;
+            shortcuts.restart();
+        }
+    });
+
     // Load firmware version resource
     let mut firmware_version = use_resource(|| async {
         api::fetch_json::<FirmwareVersion>("/firmware/version")
@@ -636,6 +644,13 @@ fn KnobRow(knob: KnobDevice, zones: Vec<Zone>, on_config: EventHandler<String>) 
     }
 }
 
+/// How often the open shortcut editor re-reads its controller, to show keys pressed on the remote
+/// and the result of presses made away from this page.
+const SHORTCUT_REFRESH: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How often the pinned-shortcuts list re-reads each shortcut's last result.
+const PINNED_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// One line per zone this controller can list, hidden ones included.
 ///
 /// What it edits is the controller's *own* hide list, which stacks on the global one in Settings:
@@ -877,6 +892,15 @@ fn ControllerShortcuts(
             api::fetch_json::<api::ControllerShortcutsResponse>(&url)
                 .await
                 .ok()
+        }
+    });
+    // A physical press on the remote happens off this page, so the "recently heard" keys and each
+    // button's last outcome are re-read while the editor is open. Same loop `cloud_connection.rs`
+    // uses; a restart keeps the previous value on screen until the new one arrives.
+    use_future(move || async move {
+        loop {
+            dioxus_sdk_time::sleep(SHORTCUT_REFRESH).await;
+            data.restart();
         }
     });
     // (is_error, text)
