@@ -1769,8 +1769,9 @@ fn ConfigModal(
                         }
                     }
 
+                    // Mounted only while the config has loaded (`loading` swaps this branch out),
+                    // so opening another controller always starts the editor fresh.
                     ControllerShortcuts {
-                        key: "{controller_id}",
                         controller_id: controller_id.clone(),
                         shortcuts: shortcuts.clone(),
                         on_changed: on_shortcuts_changed,
