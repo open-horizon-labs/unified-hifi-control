@@ -979,7 +979,7 @@ async fn audit_legacy_roon_zone_reports_work_for_shortcuts() {
 }
 
 #[tokio::test]
-async fn indistinguishable_roon_recordings_refuse_instead_of_guessing_by_position() {
+async fn indistinguishable_roon_shortcuts_play_first_exact_match_with_notice() {
     let core = FakeRoonCore::start().await;
     core.set_children_by_title(
         "Albums",
@@ -1003,11 +1003,14 @@ async fn indistinguishable_roon_recordings_refuse_instead_of_guessing_by_positio
     let outcome = press(&state, controller(), EVENT).await;
     let walked = core.browsed_titles().await[before..].to_vec();
     core.stop().await;
-    assert_eq!(outcome.code, PressCode::ItemUnavailable);
+    assert_eq!(outcome.code, PressCode::Accepted, "{}", outcome.message);
     assert!(
-        !walked.iter().any(|title| title == "Play Now"),
-        "A list position cannot safely choose between indistinguishable recordings: {walked:?}"
+        outcome.message.contains("Multiple matches"),
+        "{}",
+        outcome.message
     );
+    assert!(outcome.message.contains("first"), "{}", outcome.message);
+    assert!(walked.iter().any(|title| title == "Play Now"), "{walked:?}");
 }
 
 #[tokio::test]

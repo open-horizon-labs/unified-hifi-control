@@ -52,6 +52,8 @@ pub struct PressOutcome {
     pub ok: bool,
     pub code: PressCode,
     pub message: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub show_notice: bool,
     /// The shortcut's name, once one was found.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shortcut: Option<String>,
@@ -66,6 +68,7 @@ impl PressOutcome {
             ok: code.is_ok(),
             code,
             message: message.into(),
+            show_notice: false,
             shortcut: None,
             zone_id: None,
         }
@@ -223,7 +226,7 @@ async fn play_inner(state: &AppState, shortcut: &Shortcut, zone_id: &str) -> Pre
         );
     }
 
-    match crate::library_playback::play(
+    match crate::library_playback::play_shortcut(
         state.reliable_commands.as_ref(),
         zone_id,
         &shortcut.target,
@@ -231,10 +234,17 @@ async fn play_inner(state: &AppState, shortcut: &Shortcut, zone_id: &str) -> Pre
     )
     .await
     {
-        Ok(()) => PressOutcome::new(
-            PressCode::Accepted,
-            format!("Sent “{}” to play.", shortcut.name),
-        ),
+        Ok(notice) => {
+            let mut outcome = PressOutcome::new(
+                PressCode::Accepted,
+                notice
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| format!("Sent “{}” to play.", shortcut.name)),
+            );
+            outcome.show_notice = notice.is_some();
+            outcome
+        }
         Err(error) if error.is::<crate::library_playback::ItemUnavailable>() => {
             PressOutcome::new(PressCode::ItemUnavailable, error.to_string())
         }

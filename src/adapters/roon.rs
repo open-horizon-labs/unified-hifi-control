@@ -3354,7 +3354,8 @@ impl RoonAdapter {
         zone_id: &str,
         location: &CollectionLocation,
         title: &str,
-    ) -> Result<()> {
+        first_exact_match: bool,
+    ) -> Result<Option<String>> {
         let mut location = location.clone();
         if let CollectionLocation::Roon { steps, .. } = &mut location {
             // A mutable position cannot safely identify indistinguishable recordings.
@@ -3363,8 +3364,8 @@ impl RoonAdapter {
             }
         }
         for attempt in 0..2 {
-            let (session, key) = self
-                .resolve_collection_location(zone_id, &location)
+            let (session, key, multiple_matches) = self
+                .resolve_collection_location_with_policy(zone_id, &location, first_exact_match)
                 .await
                 .map_err(|error| crate::library_playback::ItemUnavailable(error.to_string()))?;
             match self
@@ -3377,7 +3378,11 @@ impl RoonAdapter {
                 )
                 .await
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    return Ok(multiple_matches.then(|| {
+                        "Multiple matches found. Sent the first exact match to play.".to_string()
+                    }))
+                }
                 Err(error)
                     if attempt == 0
                         && matches!(
@@ -3476,6 +3481,17 @@ impl RoonAdapter {
         zone_id: &str,
         location: &CollectionLocation,
     ) -> Result<(String, String)> {
+        self.resolve_collection_location_with_policy(zone_id, location, false)
+            .await
+            .map(|(session, key, _)| (session, key))
+    }
+
+    async fn resolve_collection_location_with_policy(
+        &self,
+        zone_id: &str,
+        location: &CollectionLocation,
+        first_exact_match: bool,
+    ) -> Result<(String, String, bool)> {
         let CollectionLocation::Roon { origin, steps } = location else {
             return Err(anyhow::anyhow!(
                 "collection location is not a Roon location"
@@ -3519,6 +3535,7 @@ impl RoonAdapter {
         };
 
         let mut found_key: Option<String> = None;
+        let mut multiple_matches = false;
         for (depth, step) in steps.iter().enumerate() {
             if let Some(parent_key) = found_key.take() {
                 self.browse(BrowseOpts {
@@ -3529,26 +3546,27 @@ impl RoonAdapter {
                 })
                 .await?;
             }
-            found_key = Some(
-                self.find_location_row(
+            let (matched, multiple) = self
+                .find_location_row(
                     &session_key,
                     step,
                     depth == 0 && matches!(origin, RoonLocationOrigin::BrowseRoot),
+                    first_exact_match,
                 )
-                .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "collection location lost row {:?} at depth {depth}",
-                        step.title
-                    )
-                })?,
-            );
+                .await?;
+            multiple_matches |= multiple;
+            found_key = Some(matched.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "collection location lost row {:?} at depth {depth}",
+                    step.title
+                )
+            })?);
         }
 
         let item_key = found_key.ok_or_else(|| {
             anyhow::anyhow!("collection location resolution produced no final row")
         })?;
-        Ok((session_key, item_key))
+        Ok((session_key, item_key, multiple_matches))
     }
 
     async fn find_location_row(
@@ -3556,7 +3574,8 @@ impl RoonAdapter {
         session_key: &str,
         step: &CollectionStep,
         at_root: bool,
-    ) -> Result<Option<String>> {
+        first_exact_match: bool,
+    ) -> Result<(Option<String>, bool)> {
         let mut offset = 0usize;
         let mut matches = Vec::<(usize, String)>::new();
         loop {
@@ -3588,7 +3607,7 @@ impl RoonAdapter {
             }
         }
 
-        select_location_match(&matches, step)
+        select_location_match_with_policy(&matches, step, first_exact_match)
     }
 
     /// Page through the level `session_key` is currently on, looking for a
@@ -3914,6 +3933,19 @@ impl RoonAdapter {
             }
         }
     }
+}
+
+fn select_location_match_with_policy(
+    matches: &[(usize, String)],
+    step: &CollectionStep,
+    first_exact_match: bool,
+) -> Result<(Option<String>, bool)> {
+    if first_exact_match && matches.len() > 1 {
+        // Rows were collected in provider order, after exact title AND subtitle matching.
+        return Ok((Some(matches[0].1.clone()), true));
+    }
+    let key = select_location_match(matches, step)?;
+    Ok((key, false))
 }
 
 fn select_location_match(
@@ -4278,12 +4310,19 @@ async fn run_roon_command_endpoint(
         let native = async {
             match command {
                 RuntimeCommand::Control(command) => {
-                    execute_roon_runtime_command(&adapter, target.raw_id(), command).await
+                    execute_roon_runtime_command(&adapter, target.raw_id(), command)
+                        .await
+                        .map(|_| None)
                 }
                 RuntimeCommand::LibraryPlay(request) => match request.target {
                     crate::library_playback::DurableTarget::Roon { location } => {
                         adapter
-                            .play_durable_location(target.as_str(), &location, &request.title)
+                            .play_durable_location(
+                                target.as_str(),
+                                &location,
+                                &request.title,
+                                request.first_exact_match,
+                            )
                             .await
                     }
                     _ => Err(anyhow::anyhow!(
@@ -4306,12 +4345,18 @@ async fn run_roon_command_endpoint(
                 continue;
             }
         };
-        if let Err(error) = native {
-            bridge.disarm(command_id).await;
-            permit.complete_native(crate::library_playback::native_failure(error));
-            continue;
-        }
-        permit.complete_native(NativeResult::Accepted);
+        let notice = match native {
+            Ok(notice) => notice,
+            Err(error) => {
+                bridge.disarm(command_id).await;
+                permit.complete_native(crate::library_playback::native_failure(error));
+                continue;
+            }
+        };
+        permit.complete_native(match notice {
+            Some(notice) => NativeResult::AcceptedWithNotice(notice),
+            None => NativeResult::Accepted,
+        });
 
         // The command ledger independently transitions this command to Indeterminate at the same
         // deadline.  This await only keeps later provider writes out of Roon's uncorrelatable
@@ -5495,6 +5540,28 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn shortcut_policy_picks_first_exact_duplicate_and_reports_it() {
+        let step = CollectionStep::roon("Playlist", Some("127 Tracks".into()), Some(9));
+        let matches = vec![(3, "first".into()), (9, "second".into())];
+        assert_eq!(
+            select_location_match_with_policy(&matches, &step, true).unwrap(),
+            (Some("first".into()), true)
+        );
+        assert_eq!(
+            select_location_match_with_policy(&matches, &step, false).unwrap(),
+            (Some("second".into()), false)
+        );
+        assert_eq!(
+            select_location_match_with_policy(&matches[..1], &step, true).unwrap(),
+            (Some("first".into()), false)
+        );
+        assert_eq!(
+            select_location_match_with_policy(&[], &step, true).unwrap(),
+            (None, false)
+        );
+    }
 
     #[test]
     fn durable_location_uses_unique_semantic_match_even_after_reorder() {

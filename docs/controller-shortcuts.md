@@ -61,7 +61,7 @@ only means something inside the session that minted it. A shortcut keeps the par
 
 | Provider | Stored | At press time |
 | --- | --- | --- |
-| Roon | the semantic browse walk from the root, each row's title and subtitle | resolved uniquely in a fresh session inside the provider endpoint; every retry retains that full identity. List positions never identify a shortcut, and indistinguishable rows refuse rather than select a recording by position |
+| Roon | the semantic browse walk from the root, each row's title and subtitle | resolved in a fresh session inside the provider endpoint; every retry retains the full title/subtitle path. If multiple exact rows match, a shortcut plays the first in current provider order and shows “Multiple matches found. Sent the first exact match to play.” List positions never identify a shortcut; ordinary Library resolution remains strict |
 | LMS | database id, saved-playlist id or URL | validated against the live library before the queue is touched |
 | Spotify, Music Assistant | the provider URI | played as is |
 

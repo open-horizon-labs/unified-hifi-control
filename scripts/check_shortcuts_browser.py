@@ -92,7 +92,18 @@ def route(r):
         )
     if p.startswith("/api/shortcuts/") and p.endswith("/play"):
         calls.append({"url": p, "body": req.post_data_json})
-        return answer({"ok": True, "code": "accepted", "message": "Command accepted"})
+        return answer(
+            {
+                "ok": True,
+                "code": "accepted",
+                "show_notice": mode == "multiple",
+                "message": (
+                    "Multiple matches found. Sent the first exact match to play."
+                    if mode == "multiple"
+                    else "Command accepted"
+                ),
+            }
+        )
     if p == "/api/collections":
         return answer(
             {
@@ -192,6 +203,15 @@ with sync_playwright() as pl:
     assert section.get_by_role("button", name="12 Playlist").count() == 0
     assert page.evaluate("document.documentElement.scrollWidth") <= 390
     assert len(calls) == 1, "Browsing and refreshing must not play music"
+    mode = "multiple"
+    section.get_by_role("button", name="01 Playlist").click()
+    page.wait_for_timeout(500)
+    assert (
+        "Multiple matches found. Sent the first exact match to play."
+        in section.inner_text()
+    )
+    assert len(calls) == 2
+    assert calls[-1]["body"]["zone_id"] == "lms:room"
     assert not errors, errors
     out.joinpath("web-check.json").write_text(
         json.dumps(
