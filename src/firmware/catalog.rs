@@ -364,3 +364,55 @@ pub fn compare_firmware_versions(left: &str, right: &str) -> Option<std::cmp::Or
             .cmp(&parse_firmware_version(right.trim_start_matches('v'))?),
     )
 }
+
+impl FirmwareChannel {
+    /// The channel a running version belongs to. A prerelease only ever updates within its own
+    /// channel, so an alpha build is never offered a Stable image by mistake. `None` when the
+    /// version is outside the published grammar (for example a local `-dev` build).
+    pub fn for_version(version: &str) -> Option<Self> {
+        let version = version.trim_start_matches('v');
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|channel| channel.matches_version(version))
+    }
+}
+
+/// True when `candidate` is strictly newer than `current`; both must be published versions.
+/// Alpha < beta < stable for the same release, and counters compare numerically.
+pub fn firmware_version_is_newer(candidate: &str, current: &str) -> bool {
+    match (
+        parse_firmware_version(candidate.trim_start_matches('v')),
+        parse_firmware_version(current.trim_start_matches('v')),
+    ) {
+        (Some(candidate), Some(current)) => candidate > current,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod version_order_tests {
+    use super::*;
+
+    #[test]
+    fn a_running_version_names_its_own_channel() {
+        assert_eq!(FirmwareChannel::for_version("2.8.0"), Some(FirmwareChannel::Stable));
+        assert_eq!(FirmwareChannel::for_version("v2.8.0"), Some(FirmwareChannel::Stable));
+        assert_eq!(FirmwareChannel::for_version("2.8.0-beta.3"), Some(FirmwareChannel::Beta));
+        assert_eq!(FirmwareChannel::for_version("2.8.0-alpha.5"), Some(FirmwareChannel::Alpha));
+        assert_eq!(FirmwareChannel::for_version("2.8.0-dev"), None);
+        assert_eq!(FirmwareChannel::for_version(""), None);
+    }
+
+    #[test]
+    fn newer_means_strictly_newer_with_numeric_counters() {
+        assert!(firmware_version_is_newer("2.8.0-alpha.10", "2.8.0-alpha.9"));
+        assert!(!firmware_version_is_newer("2.8.0-alpha.9", "2.8.0-alpha.10"));
+        assert!(!firmware_version_is_newer("2.8.0-alpha.5", "2.8.0-alpha.5"));
+        assert!(firmware_version_is_newer("2.8.0", "2.8.0-beta.2"));
+        assert!(firmware_version_is_newer("2.8.0-beta.1", "2.8.0-alpha.9"));
+        assert!(firmware_version_is_newer("2.9.0-alpha.1", "2.8.0"));
+        assert!(!firmware_version_is_newer("garbage", "2.8.0"));
+        assert!(!firmware_version_is_newer("2.8.1", "garbage"));
+    }
+}
