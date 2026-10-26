@@ -1384,22 +1384,25 @@ fn ControllerShortcuts(
 /// Every pinned shortcut, with rename and delete. Deleting unbinds it everywhere, which the
 /// confirmation says before it happens.
 #[component]
-fn PinnedShortcuts(shortcuts: Vec<ShortcutInfo>, on_changed: EventHandler<()>) -> Element {
+pub(crate) fn PinnedShortcuts(
+    shortcuts: Vec<ShortcutInfo>,
+    on_changed: EventHandler<()>,
+) -> Element {
     let mut message = use_signal(|| None::<(bool, String)>);
     let mut confirming = use_signal(|| None::<String>);
 
     rsx! {
         section { id: "shortcuts-section", class: "mb-8",
             div { class: "mb-4",
-                h2 { class: "text-xl font-semibold", "Pinned shortcuts" }
+                h2 { class: "text-xl font-semibold", "Manage Shortcuts" }
                 p { class: "text-muted text-sm",
-                    "Library items pinned from the Library. Map them to buttons in each controller's configuration."
+                    "Saved music available from Shortcuts in Library and on your controller. Button assignments are optional."
                 }
             }
             div { class: "card p-6",
                 if shortcuts.is_empty() {
                     p { class: "text-muted",
-                        "Nothing pinned yet. In the Library, use ⋯ → Pin as shortcut on an album, playlist or station."
+                        "No shortcuts yet. In Library, use Add to Shortcuts on a playlist, album or station."
                     }
                 } else {
                     ul { class: "divide-y divide-default",

@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 pub enum DurableTarget {
     /// The Roon browse walk with each row's subtitle and position, replayed by the same resolver
     /// the Library uses for a durable URL. Shortcut identity excludes list positions and playback
-    /// requires a unique title/subtitle path, refusing indistinguishable recordings.
+    /// uses an explicit resolution policy: strict Library playback requires uniqueness, while
+    /// saved shortcuts may select the first exact duplicate and return a notice.
     Roon {
         location: CollectionLocation,
     },
@@ -44,8 +45,8 @@ impl DurableTarget {
         }
     }
 
-    /// List positions are recovery hints, not identity. Shortcut playback accepts only unique
-    /// semantic paths; ambiguous identical rows must refuse rather than guess by position.
+    /// List positions are recovery hints, not identity. The command's explicit duplicate policy
+    /// controls exact semantic matches; neither policy falls back to title-only lookalikes.
     pub fn canonical_identity(&self) -> Self {
         let mut canonical = self.clone();
         if let Self::Roon {
@@ -64,6 +65,8 @@ impl DurableTarget {
 pub struct LibraryPlayRequest {
     pub target: DurableTarget,
     pub title: String,
+    /// Only saved shortcuts opt into the maintainer-approved first exact duplicate policy.
+    pub first_exact_match: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +87,27 @@ pub async fn play(
     target: &DurableTarget,
     title: &str,
 ) -> Result<()> {
+    play_with_policy(gateway, zone_id, target, title, false)
+        .await
+        .map(|_| ())
+}
+
+pub async fn play_shortcut(
+    gateway: Option<&CommandGateway>,
+    zone_id: &str,
+    target: &DurableTarget,
+    title: &str,
+) -> Result<Option<String>> {
+    play_with_policy(gateway, zone_id, target, title, true).await
+}
+
+async fn play_with_policy(
+    gateway: Option<&CommandGateway>,
+    zone_id: &str,
+    target: &DurableTarget,
+    title: &str,
+    first_exact_match: bool,
+) -> Result<Option<String>> {
     let gateway = gateway.context("content command runtime is unavailable")?;
     let zone =
         PrefixedZoneId::parse(zone_id).context("content playback needs a canonical zone ID")?;
@@ -98,6 +122,7 @@ pub async fn play(
             command: RuntimeCommand::LibraryPlay(Box::new(LibraryPlayRequest {
                 target: target.canonical_identity(),
                 title: title.to_string(),
+                first_exact_match,
             })),
             correlation_id: None,
             lane: CommandLane::Interactive,
@@ -108,13 +133,17 @@ pub async fn play(
         })
         .await
         .map_err(|error| anyhow::anyhow!("content admission refused: {error:?}"))?;
-    match ticket.wait_for_native_result().await {
-        CommandStatus::AwaitingProjection | CommandStatus::Confirmed { .. } => Ok(()),
-        CommandStatus::NotDispatched { detail } | CommandStatus::Failed { detail } => {
+    use crate::bus::runtime::NativeResult;
+    match ticket.wait_for_native_receipt().await {
+        Ok(NativeResult::Accepted) => Ok(None),
+        Ok(NativeResult::AcceptedWithNotice(notice)) => Ok(Some(notice)),
+        Ok(NativeResult::ItemUnavailable(detail))
+        | Err(CommandStatus::ItemUnavailable { detail }) => Err(ItemUnavailable(detail).into()),
+        Ok(NativeResult::Failed(detail))
+        | Err(CommandStatus::NotDispatched { detail } | CommandStatus::Failed { detail }) => {
             anyhow::bail!("{detail}")
         }
-        CommandStatus::ItemUnavailable { detail } => Err(ItemUnavailable(detail).into()),
-        status => anyhow::bail!(
+        Err(status) => anyhow::bail!(
             "content command outcome is uncertain ({status:?}); do not retry automatically"
         ),
     }

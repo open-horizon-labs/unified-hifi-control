@@ -61,6 +61,7 @@ fn request(provider: &str, expires_in: std::time::Duration) -> CommandRequest {
         command: RuntimeCommand::LibraryPlay(Box::new(LibraryPlayRequest {
             target: target(provider),
             title: "One".into(),
+            first_exact_match: false,
         })),
         correlation_id: None,
         lane: CommandLane::Interactive,

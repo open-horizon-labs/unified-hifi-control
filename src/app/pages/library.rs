@@ -837,22 +837,25 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
     // Pin an item as a controller shortcut. The bridge resolves the ref itself and keeps only what
     // outlives it (see `crate::shortcuts`), so a refusal here is the bridge's own sentence: a
     // search hit with no stable path, a folder, an item type that cannot be pinned yet.
+    let mut shortcuts_revision = use_signal(|| 0u32);
     let pin_item = use_callback(move |item_ref: String| {
-        status.set(Some("Pinning…".to_string()));
+        status.set(Some("Adding to Shortcuts…".to_string()));
         spawn(async move {
             let req = api::PinShortcutRequest { item_ref };
             let message =
                 match api::post_json::<_, api::PinShortcutResponse>("/api/shortcuts", &req).await {
                     Ok(pinned) if pinned.already_pinned => format!(
-                        "Already pinned as “{}”. Map it to a button under Controllers.",
+                        "“{}” is already in Shortcuts above Library.",
                         pinned.shortcut.name
                     ),
                     Ok(pinned) => format!(
-                        "Pinned as “{}”. Map it to a button under Controllers.",
+                        "Added “{}” to Shortcuts above Library.",
                         pinned.shortcut.name
                     ),
                     Err(message) => message,
                 };
+            let next_revision = shortcuts_revision.peek().wrapping_add(1);
+            shortcuts_revision.set(next_revision);
             status.set(Some(message));
             let generation = status_generation.peek().wrapping_add(1);
             status_generation.set(generation);
@@ -1199,6 +1202,10 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
             nav_active: "library".to_string(),
 
             div { class: "library-page",
+                ShortcutsList {
+                    zone: zones_list().into_iter().find(|z| Some(&z.zone_id) == armed.as_ref()),
+                    revision: shortcuts_revision(),
+                }
                 h1 { class: "text-2xl font-bold mb-4", "Library" }
 
                 input {
@@ -1292,7 +1299,9 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
                 }
 
                 if let Some(message) = current_status.clone() {
-                    p { class: "text-sm text-muted mb-2", role: "status", "{message}" }
+                    p { class: "text-sm text-muted mb-2", role: "status", "{message}"
+                        if message.contains("Shortcuts above Library") { a { href: "#shortcuts", " View Shortcuts" } }
+                    }
                 }
 
                 section { class: "library-content", {content} }
@@ -1537,7 +1546,7 @@ fn LibraryRow(
                                             on_pin(item_ref.clone());
                                         }
                                     },
-                                    "Pin as shortcut"
+                                    "Add to Shortcuts"
                                 }
                             }
                         }
@@ -1636,8 +1645,8 @@ fn LibraryTile(
                     }
                     button {
                         class: "library-tile-pin",
-                        aria_label: "Pin {item.title} as a shortcut",
-                        title: "Pin as shortcut",
+                        aria_label: "Add {item.title} to Shortcuts",
+                        title: "Add to Shortcuts",
                         r#type: "button",
                         onclick: {
                             let item_ref = item.item_ref.clone().unwrap_or_default();
@@ -1892,5 +1901,117 @@ mod library_defect_pins {
         assert!(library_uses_cards(LibraryLayout::Auto, &tracks));
         assert!(library_uses_cards(LibraryLayout::Cards, &folders));
         assert!(!library_uses_cards(LibraryLayout::List, &tracks));
+    }
+}
+
+/// The same durable catalog used by the controller menu. Selecting a row sends
+/// exactly one command to the visibly selected zone; never picks a fallback.
+#[component]
+fn ShortcutsList(zone: Option<Zone>, revision: u32) -> Element {
+    let mut offset = use_signal(|| 0usize);
+    let mut refresh = use_signal(|| 0u32);
+    let mut pending = use_signal(|| false);
+    let mut notice = use_signal(|| None::<String>);
+    let shortcuts = use_resource(use_reactive!(|revision| async move {
+        let _ = (revision, refresh());
+        api::fetch_json::<api::ShortcutsResponse>(&format!(
+            "/api/shortcuts?offset={}&limit=12",
+            offset()
+        ))
+        .await
+    }));
+    let target = zone
+        .as_ref()
+        .map(|z| format!("Tap to play in {}", z.zone_name))
+        .unwrap_or_else(|| "Choose a zone below to play".into());
+    rsx! {
+        section { id: "shortcuts", class: "mb-6", aria_label: "Shortcuts",
+            h2 { class: "text-xl font-bold", "Shortcuts" }
+            details {
+                summary { class: "text-sm cursor-pointer", "Manage shortcuts" }
+                ShortcutManager { revision: revision, on_changed: move |_| refresh += 1 }
+            }
+            p { class: "text-sm text-muted mb-2", "{target}" }
+            if let Some(message) = notice() {
+                p { role: "status", class: "text-sm mb-2", "{message}" }
+            }
+            match &*shortcuts.read_unchecked() {
+                None => rsx! { p { role: "status", "Loading shortcuts…" } },
+                Some(Err(message)) => rsx! {
+                    p { role: "alert", "{message}" }
+                    button { r#type: "button", class: "btn btn-sm", onclick: move |_| refresh += 1, "Retry" }
+                },
+                Some(Ok(page)) => rsx! {
+                    if page.shortcuts.is_empty() {
+                        p { class: "text-sm text-muted", "Save a playlist or album with Add to Shortcuts in Library. Then tap it here or open Shortcuts on your controller." }
+                    }
+                    div { class: "flex flex-col gap-2",
+                        for shortcut in page.shortcuts.iter().cloned() {
+                            {
+                                let target = zone.clone();
+                                let id = shortcut.id.clone();
+                                let mismatch = target.as_ref().is_some_and(|z| !z.source.as_deref().unwrap_or_else(|| z.zone_id.split(':').next().unwrap_or("")).eq_ignore_ascii_case(&shortcut.provider));
+                                rsx! {
+                                    button {
+                                        key: "{id}", r#type: "button",
+                                        class: "btn w-full text-left justify-between",
+                                        style: "min-height:44px;height:auto;white-space:normal;gap:1rem",
+                                        disabled: pending() || target.is_none() || mismatch,
+                                        onclick: move |_| {
+                                            if pending() { return; }
+                                            let Some(zone) = target.clone() else { return; };
+                                            let id = id.clone();
+                                            pending.set(true);
+                                            notice.set(Some(format!("Sending to {}…", zone.zone_name)));
+                                            spawn(async move {
+                                                let result = api::post_json::<_, api::PressOutcomeInfo>(
+                                                    &format!("/api/shortcuts/{id}/play"),
+                                                    &serde_json::json!({ "zone_id": zone.zone_id }),
+                                                ).await;
+                                                notice.set(Some(match result {
+                                                    Ok(outcome) => format!("{}: {}", zone.zone_name, outcome.message),
+                                                    Err(message) => format!("{}: {} Check now playing before trying again.", zone.zone_name, message),
+                                                }));
+                                                pending.set(false);
+                                            });
+                                        },
+                                        span { style: "text-align:left;overflow-wrap:anywhere", "{shortcut.name}" }
+                                        span { class: "text-sm", "{source_label(&shortcut.provider)}" if mismatch { " · choose a matching zone" } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    div { class: "flex gap-2 mt-2",
+                        if offset() > 0 {
+                            button { r#type: "button", class: "btn btn-sm", disabled: pending(), onclick: move |_| offset.set(offset().saturating_sub(12)), "Previous" }
+                        }
+                        if let Some(next) = page.next_offset {
+                            button { r#type: "button", class: "btn btn-sm", disabled: pending(), onclick: move |_| offset.set(next), "More shortcuts" }
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
+#[component]
+fn ShortcutManager(revision: u32, on_changed: EventHandler<()>) -> Element {
+    let mut catalog = use_resource(use_reactive!(|revision| async move {
+        let _ = revision;
+        api::fetch_json::<api::ShortcutsResponse>("/api/shortcuts").await
+    }));
+    rsx! {
+        match &*catalog.read_unchecked() {
+            Some(Ok(page)) => rsx! {
+                super::knobs::PinnedShortcuts {
+                    shortcuts: page.shortcuts.clone(),
+                    on_changed: move |_| { catalog.restart(); on_changed.call(()); },
+                }
+            },
+            Some(Err(message)) => rsx! { p { role: "alert", "{message}" } },
+            None => rsx! { p { "Loading…" } },
+        }
     }
 }
