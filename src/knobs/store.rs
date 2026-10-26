@@ -570,7 +570,9 @@ impl KnobStore {
             }
             Some("cancel") => knob.config.firmware_update = None,
             Some(other) => {
-                return Err(reject(format!("unknown firmware_update action \"{other}\"")))
+                return Err(reject(format!(
+                    "unknown firmware_update action \"{other}\""
+                )))
             }
         }
 
@@ -781,7 +783,10 @@ mod device_setting_tests {
         // it: a controller that has none of the new settings must serialize exactly as before.
         let json = serde_json::to_value(KnobConfig::default()).unwrap();
         for key in ALL_KEYS.iter().chain(&["firmware_update"]) {
-            assert!(json.get(key).is_none(), "{key} leaked into the default config");
+            assert!(
+                json.get(key).is_none(),
+                "{key} leaked into the default config"
+            );
         }
     }
 
@@ -868,7 +873,10 @@ mod device_setting_tests {
         let request = knob.config.firmware_update.clone().unwrap();
         assert_eq!(request.action, "install");
         assert_eq!(request.from_version.as_deref(), Some("2.8.0-alpha.4"));
-        assert_ne!(knob.config_sha, before, "the device must see a changed hash");
+        assert_ne!(
+            knob.config_sha, before,
+            "the device must see a changed hash"
+        );
         let json = serde_json::to_value(&knob.config).unwrap();
         assert_eq!(json["firmware_update"]["action"], "install");
         assert_eq!(json["firmware_update"]["from_version"], "2.8.0-alpha.4");

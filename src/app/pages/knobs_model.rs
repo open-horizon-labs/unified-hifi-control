@@ -53,9 +53,9 @@ pub fn update_state(
     }
     match feed {
         FeedState::Loading => UpdateState::Unknown("Checking for updates…"),
-        FeedState::Unavailable => {
-            UpdateState::Unknown("Update check unavailable: no image on this Bridge, or the check failed")
-        }
+        FeedState::Unavailable => UpdateState::Unknown(
+            "Update check unavailable: no image on this Bridge, or the check failed",
+        ),
         FeedState::Image(version) if firmware_version_is_newer(version, running_version) => {
             UpdateState::Available(version.clone())
         }
@@ -91,7 +91,10 @@ mod tests {
             update_feed(Some("hiphi-frame"), Some("2.8.0-alpha.4")),
             Some(("frame", "alpha"))
         );
-        assert_eq!(update_feed(Some("halo"), Some("2.8.0")), Some(("halo", "stable")));
+        assert_eq!(
+            update_feed(Some("halo"), Some("2.8.0")),
+            Some(("halo", "stable"))
+        );
         assert_eq!(update_feed(Some("frame"), Some("2.8.0-dev")), None);
         assert_eq!(update_feed(None, Some("2.8.0")), None);
         assert_eq!(update_feed(Some("frame"), None), None);
@@ -120,7 +123,10 @@ mod tests {
         // Empty cache, failed request, request still in flight: none of these is a freshness claim.
         for feed in [FeedState::Loading, FeedState::Unavailable] {
             let state = update_state(Some("frame"), Some("2.8.0-alpha.4"), &feed);
-            assert!(matches!(state, UpdateState::Unknown(_)), "{feed:?} -> {state:?}");
+            assert!(
+                matches!(state, UpdateState::Unknown(_)),
+                "{feed:?} -> {state:?}"
+            );
         }
     }
 
@@ -135,21 +141,44 @@ mod tests {
             UpdateState::Unknown(_)
         ));
         assert!(matches!(
-            update_state(Some("future-model"), Some("2.8.0"), &FeedState::Image("9.9.9".into())),
+            update_state(
+                Some("future-model"),
+                Some("2.8.0"),
+                &FeedState::Image("9.9.9".into())
+            ),
             UpdateState::Unknown(_)
         ));
         assert!(matches!(
-            update_state(Some("frame"), Some("2.8.0-dev"), &FeedState::Image("9.9.9".into())),
+            update_state(
+                Some("frame"),
+                Some("2.8.0-dev"),
+                &FeedState::Image("9.9.9".into())
+            ),
             UpdateState::Unknown(_)
         ));
     }
 
     #[test]
     fn only_a_literal_address_becomes_a_device_link() {
-        assert_eq!(device_page_url(Some("192.168.1.40")), Some("http://192.168.1.40/".into()));
-        assert_eq!(device_page_url(Some(" 10.0.0.2 ")), Some("http://10.0.0.2/".into()));
-        assert_eq!(device_page_url(Some("fe80::1")), Some("http://[fe80::1]/".into()));
-        for bad in ["", "—", "javascript:alert(1)", "evil.example/x", "1.2.3.4/../x"] {
+        assert_eq!(
+            device_page_url(Some("192.168.1.40")),
+            Some("http://192.168.1.40/".into())
+        );
+        assert_eq!(
+            device_page_url(Some(" 10.0.0.2 ")),
+            Some("http://10.0.0.2/".into())
+        );
+        assert_eq!(
+            device_page_url(Some("fe80::1")),
+            Some("http://[fe80::1]/".into())
+        );
+        for bad in [
+            "",
+            "—",
+            "javascript:alert(1)",
+            "evil.example/x",
+            "1.2.3.4/../x",
+        ] {
             assert_eq!(device_page_url(Some(bad)), None, "{bad}");
         }
         assert_eq!(device_page_url(None), None);

@@ -396,10 +396,22 @@ mod version_order_tests {
 
     #[test]
     fn a_running_version_names_its_own_channel() {
-        assert_eq!(FirmwareChannel::for_version("2.8.0"), Some(FirmwareChannel::Stable));
-        assert_eq!(FirmwareChannel::for_version("v2.8.0"), Some(FirmwareChannel::Stable));
-        assert_eq!(FirmwareChannel::for_version("2.8.0-beta.3"), Some(FirmwareChannel::Beta));
-        assert_eq!(FirmwareChannel::for_version("2.8.0-alpha.5"), Some(FirmwareChannel::Alpha));
+        assert_eq!(
+            FirmwareChannel::for_version("2.8.0"),
+            Some(FirmwareChannel::Stable)
+        );
+        assert_eq!(
+            FirmwareChannel::for_version("v2.8.0"),
+            Some(FirmwareChannel::Stable)
+        );
+        assert_eq!(
+            FirmwareChannel::for_version("2.8.0-beta.3"),
+            Some(FirmwareChannel::Beta)
+        );
+        assert_eq!(
+            FirmwareChannel::for_version("2.8.0-alpha.5"),
+            Some(FirmwareChannel::Alpha)
+        );
         assert_eq!(FirmwareChannel::for_version("2.8.0-dev"), None);
         assert_eq!(FirmwareChannel::for_version(""), None);
     }
@@ -407,7 +419,10 @@ mod version_order_tests {
     #[test]
     fn newer_means_strictly_newer_with_numeric_counters() {
         assert!(firmware_version_is_newer("2.8.0-alpha.10", "2.8.0-alpha.9"));
-        assert!(!firmware_version_is_newer("2.8.0-alpha.9", "2.8.0-alpha.10"));
+        assert!(!firmware_version_is_newer(
+            "2.8.0-alpha.9",
+            "2.8.0-alpha.10"
+        ));
         assert!(!firmware_version_is_newer("2.8.0-alpha.5", "2.8.0-alpha.5"));
         assert!(firmware_version_is_newer("2.8.0", "2.8.0-beta.2"));
         assert!(firmware_version_is_newer("2.8.0-beta.1", "2.8.0-alpha.9"));

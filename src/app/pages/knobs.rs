@@ -6,18 +6,16 @@ use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
 
+use super::knobs_model::{
+    device_page_url, power_support, update_feed, update_state, FeedState, UpdateState,
+};
 use crate::app::api::{
     self, FetchFirmwareResponse, FirmwareUpdateAction, FirmwareVersion, KnobConfig,
     KnobConfigResponse, KnobDevice, KnobDevicesResponse, PowerModeConfig, Zone, ZonesResponse,
 };
 use crate::app::components::Layout;
-use super::knobs_model::{
-    device_page_url, power_support, update_feed, update_state, FeedState, UpdateState,
-};
 use crate::app::sse::use_sse;
-use crate::device_settings::{
-    device_settings, PowerSupport, SettingKind, SettingSpec, ALL_KEYS,
-};
+use crate::device_settings::{device_settings, PowerSupport, SettingKind, SettingSpec, ALL_KEYS};
 use crate::firmware_catalog::FirmwareTarget;
 
 /// Knobs page component.
@@ -310,7 +308,10 @@ pub fn Knobs() -> Element {
                 .unwrap_or_default();
             let sent = |key: &'static str| {
                 debug_assert!(ALL_KEYS.contains(&key));
-                supported.contains(key).then(|| changed.get(key).copied()).flatten()
+                supported
+                    .contains(key)
+                    .then(|| changed.get(key).copied())
+                    .flatten()
             };
             let (show_ip, brightness) = (sent("show_ip").map(|v| v != 0), sent("brightness"));
             let (body_enabled, sound_enabled, sound_volume) = (
