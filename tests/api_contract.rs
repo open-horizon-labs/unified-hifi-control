@@ -101,6 +101,10 @@ fn scan_route_lines(content: &str) -> BTreeSet<String> {
                     "PUT"
                 } else if line.contains("delete(") {
                     "DELETE"
+                } else if line.contains("patch(") {
+                    // Not optional: an unrecognised method is skipped below, so a route using it
+                    // would sit outside this contract without a failure to say so.
+                    "PATCH"
                 } else {
                     continue; // Unknown method
                 };
@@ -189,5 +193,39 @@ fn golden_file_is_sorted() {
     assert_eq!(
         routes, sorted,
         "api_routes.txt is not sorted! Please sort alphabetically."
+    );
+}
+
+/// A route registered with a method the extractor does not know is silently outside the contract.
+/// Every method axum's `routing::` exposes that this router could plausibly use must be read.
+#[test]
+fn the_extractor_reads_every_method_the_router_uses() {
+    let source = r#"
+        .route("/a", get(a))
+        .route("/b", post(b))
+        .route("/c", put(c))
+        .route("/d", delete(d))
+        .route("/e/{id}", patch(e))
+    "#;
+    let routes = scan_route_lines(&normalize_multiline_route_calls(source));
+    for expected in ["GET /a", "POST /b", "PUT /c", "DELETE /d", "PATCH /e/{id}"] {
+        assert!(routes.contains(expected), "{expected} not read: {routes:?}");
+    }
+
+    // And no handler registered in main.rs uses a method this does not recognise.
+    let main = fs::read_to_string("src/main.rs").unwrap();
+    let mut unread = Vec::new();
+    for line in normalize_multiline_route_calls(&main).lines() {
+        if line.trim_start().starts_with(".route(")
+            && !["get(", "post(", "put(", "delete(", "patch("]
+                .iter()
+                .any(|m| line.contains(m))
+        {
+            unread.push(line.trim().to_string());
+        }
+    }
+    assert!(
+        unread.is_empty(),
+        "routes using an unrecognised method: {unread:?}"
     );
 }

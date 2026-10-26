@@ -35,6 +35,13 @@ use crate::knobs::store::{KnobConfigUpdate, KnobStatusUpdate};
 
 /// Keep the existing JSON error shape; never report volatile settings as saved.
 fn knob_persistence_error(error: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
+    // A setting the controller does not have, or out of range, is the caller's mistake.
+    if let Some(rejected) = error.downcast_ref::<crate::knobs::store::SettingRejected>() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": rejected.to_string()})),
+        );
+    }
     tracing::warn!(%error, "Controller configuration request failed");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -45,7 +52,7 @@ fn knob_persistence_error(error: anyhow::Error) -> (StatusCode, Json<serde_json:
 }
 
 /// Extract knob ID from headers or query params
-fn extract_knob_id(headers: &HeaderMap, query_knob_id: Option<&str>) -> Option<String> {
+pub(crate) fn extract_knob_id(headers: &HeaderMap, query_knob_id: Option<&str>) -> Option<String> {
     headers
         .get("x-knob-id")
         .or_else(|| headers.get("x-device-id"))
@@ -166,7 +173,7 @@ pub async fn knob_zones_handler(
             .await
             .map_err(knob_persistence_error)?;
     }
-    let zones = get_all_zones_internal(&state).await;
+    let zones = get_zone_infos(&state, extract_knob_id(&headers, None).as_deref()).await;
     Ok(Json(ZonesResponse { zones }))
 }
 
@@ -272,9 +279,27 @@ pub struct NowPlayingResponse {
     pub zones_sha: Option<String>,
 }
 
-/// Helper to build zone info list for error responses
-async fn get_zone_infos(state: &AppState) -> Vec<ZoneInfo> {
-    get_all_zones_internal(state).await
+/// The zone list one controller is offered: the shared list, minus that controller's own hide list.
+///
+/// A list filter only. The controller's zone is still resolved by ID against the aggregator, so a
+/// zone it hides keeps playing when addressed (see `zone_list`).
+async fn get_zone_infos(state: &AppState, knob_id: Option<&str>) -> Vec<ZoneInfo> {
+    let zones = get_all_zones_internal(state).await;
+    let Some(id) = knob_id else {
+        return zones;
+    };
+    match state.knobs.get(id).await {
+        Some(knob) => without_hidden(zones, &knob.config.hidden_zone_ids),
+        None => zones,
+    }
+}
+
+/// Remove the zones named in `hidden`, preserving order.
+fn without_hidden(mut zones: Vec<ZoneInfo>, hidden: &[String]) -> Vec<ZoneInfo> {
+    if !hidden.is_empty() {
+        zones.retain(|z| !hidden.iter().any(|h| h == &z.zone_id));
+    }
+    zones
 }
 
 /// Compute SHA256 hash of zone list (first 8 hex chars)
@@ -314,7 +339,11 @@ pub async fn knob_now_playing_handler(
     let zone_id = match params.zone_id {
         Some(id) => id,
         None => {
-            let zone_infos = get_zone_infos(&state).await;
+            let zone_infos = get_zone_infos(
+                &state,
+                extract_knob_id(&headers, params.knob_id.as_deref()).as_deref(),
+            )
+            .await;
             let zones_sha = compute_zones_sha(&zone_infos);
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -368,7 +397,7 @@ pub async fn knob_now_playing_handler(
         "/knob/now_playing/image?zone_id={}",
         urlencoding::encode(&zone_id)
     );
-    let zone_infos = get_zone_infos(&state).await;
+    let zone_infos = get_zone_infos(&state, knob_id.as_deref()).await;
 
     // Handle legacy zone_id without prefix (assume Roon)
     let prefixed_zone_id = if !zone_id.contains(':') {
@@ -1275,6 +1304,8 @@ pub async fn knob_config_update_handler(
         )
     })?;
 
+    guard_install_request(&state, &knob_id, &updates).await?;
+
     let knob = state
         .knobs
         .update_config(&knob_id, updates)
@@ -1323,6 +1354,70 @@ pub async fn knob_remove_handler(
     }
 }
 
+/// The version an install request would deliver: the channel's image, only when it is newer than
+/// what the controller runs. A controller never changes channel and never goes backwards.
+fn install_offer(available: Option<&str>, running: &str) -> Option<String> {
+    let available = available?;
+    crate::firmware_catalog::firmware_version_is_newer(available, running)
+        .then(|| available.to_string())
+}
+
+/// Refuse an install request the bridge cannot honour, so the settings page never promises an
+/// update that no image backs.
+async fn guard_install_request(
+    state: &AppState,
+    knob_id: &str,
+    updates: &KnobConfigUpdate,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    use crate::firmware_catalog::{FirmwareChannel, FirmwareTarget};
+    if updates.firmware_update.as_deref() != Some("install") {
+        return Ok(());
+    }
+    let refuse = |status, code: &str, message: &str| {
+        (
+            status,
+            Json(serde_json::json!({"error": message, "error_code": code})),
+        )
+    };
+    let Some(knob) = state.knobs.get(knob_id).await else {
+        return Err(refuse(
+            StatusCode::NOT_FOUND,
+            "KNOB_NOT_FOUND",
+            "knob not found",
+        ));
+    };
+    let (Some(target), Some(running)) = (FirmwareTarget::parse(&knob.device_type), knob.version)
+    else {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            "FIRMWARE_UNKNOWN",
+            "the controller has not reported its type and firmware version yet",
+        ));
+    };
+    let Some(channel) = FirmwareChannel::for_version(&running) else {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            "FIRMWARE_CHANNEL_UNKNOWN",
+            "this firmware build is outside the published channels and cannot be updated from here",
+        ));
+    };
+    let available = firmware_artifact(target, channel).and_then(|(path, info)| {
+        let named = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| target.filename_version(name).map(str::to_string));
+        info.version.or(named)
+    });
+    if install_offer(available.as_deref(), &running).is_none() {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            "NO_FIRMWARE_UPDATE",
+            "no newer firmware is available for this controller on its channel",
+        ));
+    }
+    Ok(())
+}
+
 /// GET /config/{knob_id} - Get knob configuration (path parameter format)
 pub async fn knob_config_by_path_handler(
     State(state): State<AppState>,
@@ -1357,6 +1452,7 @@ pub async fn knob_config_update_by_path_handler(
     axum::extract::Path(knob_id): axum::extract::Path<String>,
     Json(updates): Json<KnobConfigUpdate>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    guard_install_request(&state, &knob_id, &updates).await?;
     let knob = state
         .knobs
         .update_config(&knob_id, updates)
@@ -1658,6 +1754,32 @@ mod tests {
         assert_eq!(extract_device_type(&headers), None);
     }
 
+    #[test]
+    fn an_install_is_offered_only_when_the_channel_holds_a_newer_image() {
+        // A controller follows its own channel: an alpha build is offered alphas only.
+        assert_eq!(
+            install_offer(Some("2.8.0-alpha.6"), "2.8.0-alpha.5"),
+            Some("2.8.0-alpha.6".to_string())
+        );
+        assert_eq!(install_offer(Some("2.8.0-alpha.5"), "2.8.0-alpha.5"), None);
+        assert_eq!(install_offer(Some("2.8.0-alpha.4"), "2.8.0-alpha.5"), None);
+        assert_eq!(install_offer(None, "2.8.0-alpha.5"), None);
+        // A local build outside the published grammar is never offered a downgrade or sidegrade.
+        assert_eq!(install_offer(Some("2.8.0"), "2.8.0-dev"), None);
+    }
+
+    #[test]
+    fn rejected_settings_are_the_callers_error_not_a_server_fault() {
+        let error = anyhow::Error::new(crate::knobs::store::SettingRejected(
+            "Frame has no \"brightness\" setting".into(),
+        ));
+        let (status, body) = knob_persistence_error(error);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.0["error"].as_str().unwrap().contains("brightness"));
+        let (status, _) = knob_persistence_error(anyhow::anyhow!("disk full"));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     fn make_zone(id: &str, name: &str) -> ZoneInfo {
         ZoneInfo {
             zone_id: id.to_string(),
@@ -1670,6 +1792,30 @@ mod tests {
             device: None,
             library_tabs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn controller_hide_list_filters_only_its_own_zones_and_keeps_order() {
+        let zones = vec![
+            make_zone("roon:a", "A"),
+            make_zone("roon:b", "B"),
+            make_zone("lms:c", "C"),
+        ];
+        let kept = without_hidden(zones.clone(), &["roon:b".to_string()]);
+        let ids: Vec<_> = kept.iter().map(|z| z.zone_id.as_str()).collect();
+        assert_eq!(ids, ["roon:a", "lms:c"]);
+
+        // An empty list, or ids naming no listed zone, changes nothing.
+        assert_eq!(without_hidden(zones.clone(), &[]).len(), 3);
+        assert_eq!(without_hidden(zones, &["roon:gone".to_string()]).len(), 3);
+    }
+
+    #[test]
+    fn controller_hide_list_changes_the_zones_sha_the_controller_polls() {
+        let zones = vec![make_zone("roon:a", "A"), make_zone("roon:b", "B")];
+        let shown = compute_zones_sha(&zones);
+        let hidden = compute_zones_sha(&without_hidden(zones, &["roon:b".to_string()]));
+        assert_ne!(shown, hidden);
     }
 
     #[test]

@@ -59,6 +59,8 @@ pub enum RuntimeCommand {
     Control(Command),
     /// HQPlayer's semantic pipeline/profile control plane.
     Hqplayer(HqpRuntimeCommand),
+    /// Durable library intent; native resolution stays in the owning adapter.
+    LibraryPlay(Box<crate::library_playback::LibraryPlayRequest>),
 }
 
 impl From<Command> for RuntimeCommand {
@@ -117,6 +119,10 @@ pub enum CommandStatus {
     Failed {
         detail: String,
     },
+    /// A library item's durable identity cannot be resolved; no substitute was dispatched.
+    ItemUnavailable {
+        detail: String,
+    },
     NotDispatched {
         detail: String,
     },
@@ -126,7 +132,10 @@ impl CommandStatus {
     fn is_final(&self) -> bool {
         matches!(
             self,
-            Self::Confirmed { .. } | Self::Failed { .. } | Self::NotDispatched { .. }
+            Self::Confirmed { .. }
+                | Self::Failed { .. }
+                | Self::ItemUnavailable { .. }
+                | Self::NotDispatched { .. }
         )
     }
 }
@@ -135,6 +144,7 @@ impl CommandStatus {
 pub struct CommandTicket {
     id: CommandId,
     status: watch::Receiver<CommandStatus>,
+    native: watch::Receiver<Option<NativeResult>>,
 }
 
 impl CommandTicket {
@@ -144,6 +154,44 @@ impl CommandTicket {
 
     pub fn status(&self) -> CommandStatus {
         self.status.borrow().clone()
+    }
+
+    /// Wait for native acceptance or refusal without inventing confirmation. Reads from the same
+    /// command ledger as confirmed transport operations; no alternate surface-owned result state.
+    pub async fn wait_for_native_result(&mut self) -> CommandStatus {
+        loop {
+            let current = self.status();
+            if !matches!(current, CommandStatus::Queued | CommandStatus::Dispatched) {
+                return current;
+            }
+            if self.status.changed().await.is_err() {
+                return self.status();
+            }
+        }
+    }
+
+    /// Native receipt, including adapter-owned notices, retained independently of projection
+    /// timing. A fast confirmation must not discard the native resolution detail.
+    pub async fn wait_for_native_receipt(&mut self) -> Result<NativeResult, CommandStatus> {
+        loop {
+            if let Some(result) = self.native.borrow().clone() {
+                return Ok(result);
+            }
+            let status = self.status();
+            if matches!(
+                status,
+                CommandStatus::NotDispatched { .. }
+                    | CommandStatus::Failed { .. }
+                    | CommandStatus::ItemUnavailable { .. }
+                    | CommandStatus::Indeterminate
+            ) {
+                return Err(status);
+            }
+            tokio::select! {
+                result = self.native.changed() => if result.is_err() { return Err(self.status()); },
+                result = self.status.changed() => if result.is_err() { return Err(self.status()); },
+            }
+        }
     }
 
     /// Wait until the operation reaches a final state or becomes indeterminate.
@@ -181,8 +229,10 @@ pub enum CommandSubmissionError {
 pub enum NativeResult {
     /// The provider rejected or failed the attempted command.
     Failed(String),
+    ItemUnavailable(String),
     /// Native I/O was accepted. A matching projection is still required for confirmation.
     Accepted,
+    AcceptedWithNotice(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -375,6 +425,29 @@ impl EndpointWork {
     }
 }
 
+/// Cancellation or expiry after dispatch is uncertain, rather than a retryable native failure.
+pub enum NativeAttempt<T> {
+    Completed(T),
+    Cancelled,
+    TimedOut,
+}
+
+/// Apply the same owner lifetime to a native attempt and its subsequent readback publication.
+pub async fn run_owned_native<F: std::future::Future>(
+    deadline: Instant,
+    shutdown: &tokio_util::sync::CancellationToken,
+    native: F,
+) -> NativeAttempt<F::Output> {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => NativeAttempt::Cancelled,
+        result = timeout_at(deadline, native) => match result {
+            Ok(result) => NativeAttempt::Completed(result),
+            Err(_) => NativeAttempt::TimedOut,
+        },
+    }
+}
+
 /// The only capability which can report a native result for an admitted endpoint work item.
 pub struct EndpointPermit {
     request: CommandRequest,
@@ -391,14 +464,30 @@ impl EndpointPermit {
         &self.request
     }
 
+    /// Bound a composite native operation (including catalog validation) to its endpoint owner.
+    /// Dropping a cancelled operation prevents a read completing later from initiating a write.
+    pub async fn run_native<F: std::future::Future>(
+        &self,
+        shutdown: &tokio_util::sync::CancellationToken,
+        native: F,
+    ) -> NativeAttempt<F::Output> {
+        run_owned_native(self.request.deadlines.confirm_by, shutdown, native).await
+    }
+
     /// The adapter reports only native fact here. `Accepted` is never confirmation; confirmation
     /// is emitted only by [`ProjectionActor`] after a correlated commit.
     pub fn complete_native(self, result: NativeResult) {
+        if let Some(record) = lock(&self.inner.data).commands.get(&self.id) {
+            record.native.send_replace(Some(result.clone()));
+        }
         match result {
             NativeResult::Failed(detail) => self
                 .inner
                 .set_status(self.id, CommandStatus::Failed { detail }),
-            NativeResult::Accepted => {
+            NativeResult::ItemUnavailable(detail) => self
+                .inner
+                .set_status(self.id, CommandStatus::ItemUnavailable { detail }),
+            NativeResult::Accepted | NativeResult::AcceptedWithNotice(_) => {
                 let _ = self.inner.transition(self.id, |status| match status {
                     CommandStatus::Dispatched => Some(CommandStatus::AwaitingProjection),
                     // A confirmation timeout is a caller-visible uncertainty, not permission to
@@ -417,6 +506,7 @@ struct CommandRecord {
     command: RuntimeCommand,
     status: CommandStatus,
     updates: watch::Sender<CommandStatus>,
+    native: watch::Sender<Option<NativeResult>>,
 }
 
 /// Surface-facing reliable command ingress.
@@ -467,10 +557,12 @@ impl CommandGateway {
 
         let id = CommandId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
         let (updates, receiver) = watch::channel(CommandStatus::Queued);
-        self.inner.insert_record(id, &request, updates);
+        let (native, native_receiver) = watch::channel(None);
+        self.inner.insert_record(id, &request, updates, native);
         let ticket = CommandTicket {
             id,
             status: receiver,
+            native: native_receiver,
         };
 
         let Some(endpoint) = self.registry.route(&request.target) else {
@@ -774,6 +866,7 @@ impl RuntimeState {
         id: CommandId,
         request: &CommandRequest,
         updates: watch::Sender<CommandStatus>,
+        native: watch::Sender<Option<NativeResult>>,
     ) {
         let mut data = lock(&self.data);
         data.commands.insert(
@@ -783,6 +876,7 @@ impl RuntimeState {
                 command: request.command.clone(),
                 status: CommandStatus::Queued,
                 updates,
+                native,
             },
         );
         if let Some(correlation) = &request.correlation_id {
@@ -810,6 +904,7 @@ impl RuntimeState {
         Ok(Some(CommandTicket {
             id,
             status: record.updates.subscribe(),
+            native: record.native.subscribe(),
         }))
     }
 
@@ -1329,6 +1424,54 @@ mod tests {
             Ok(()) => {}
             Err(error) => panic!("projection actor join: {error}"),
         }
+    }
+
+    #[tokio::test]
+    async fn native_notice_survives_projection_arriving_before_native_receipt() {
+        let parts = test_runtime();
+        let mut endpoint = parts.commands.register_provider("roon", 1).unwrap();
+        let actor = tokio::spawn(parts.projection_actor.run());
+        let mut ticket = parts
+            .commands
+            .submit(request(PrefixedZoneId::roon("zone"), Some("notice-race")))
+            .await
+            .unwrap();
+        let permit = endpoint.recv().await.unwrap().begin_dispatch().unwrap();
+        parts
+            .projection_ingress
+            .submit(projection(
+                ProjectionSource {
+                    adapter: "roon".into(),
+                    instance: None,
+                    epoch: 1,
+                },
+                1,
+                Some(ticket.id()),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(ticket.status(), CommandStatus::Confirmed { .. }));
+        permit.complete_native(NativeResult::AcceptedWithNotice(
+            "Multiple matches found. Sent the first exact match to play.".into(),
+        ));
+        assert_eq!(
+            ticket.wait_for_native_receipt().await,
+            Ok(NativeResult::AcceptedWithNotice(
+                "Multiple matches found. Sent the first exact match to play.".into()
+            ))
+        );
+        assert!(matches!(ticket.status(), CommandStatus::Confirmed { .. }));
+        let mut repeated = parts
+            .commands
+            .submit(request(PrefixedZoneId::roon("zone"), Some("notice-race")))
+            .await
+            .unwrap();
+        assert_eq!(
+            repeated.wait_for_native_receipt().await,
+            ticket.wait_for_native_receipt().await
+        );
+        drop(parts.projection_ingress);
+        actor.await.unwrap();
     }
 
     #[tokio::test]

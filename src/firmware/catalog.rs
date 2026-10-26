@@ -5,6 +5,7 @@ pub enum FirmwareTarget {
     LegacyKnob,
     Dial,
     Frame,
+    Halo,
     Tough,
     Joy,
     M5Dial,
@@ -19,6 +20,7 @@ impl FirmwareTarget {
         Self::LegacyKnob,
         Self::Dial,
         Self::Frame,
+        Self::Halo,
         Self::Tough,
         Self::Joy,
         Self::M5Dial,
@@ -33,6 +35,7 @@ impl FirmwareTarget {
             "knob" | "roon-knob" => Some(Self::LegacyKnob),
             "dial" | "hiphi-dial" => Some(Self::Dial),
             "frame" | "hiphi-frame" => Some(Self::Frame),
+            "halo" | "hiphi-halo" => Some(Self::Halo),
             "tough" | "hiphi-tough" => Some(Self::Tough),
             "joy" | "hiphi-joy" => Some(Self::Joy),
             "m5dial" | "hiphi-m5dial" | "hiphi-dial-beta" => Some(Self::M5Dial),
@@ -49,6 +52,7 @@ impl FirmwareTarget {
             Self::LegacyKnob => "knob",
             Self::Dial => "dial",
             Self::Frame => "frame",
+            Self::Halo => "halo",
             Self::Tough => "tough",
             Self::Joy => "joy",
             Self::M5Dial => "m5dial",
@@ -63,6 +67,7 @@ impl FirmwareTarget {
         match self {
             Self::LegacyKnob | Self::Dial => "HiPhi Dial",
             Self::Frame => "HiPhi Frame",
+            Self::Halo => "HiPhi HALO",
             Self::Tough => "HiPhi Tough",
             Self::Joy => "HiPhi Joy",
             Self::M5Dial => "HiPhi Dial Lab",
@@ -137,6 +142,7 @@ mod tests {
         for (identity, stem) in [
             ("hiphi-dial", "hiphi_dial"),
             ("hiphi-frame", "hiphi_frame"),
+            ("hiphi-halo", "hiphi_halo"),
             ("hiphi-tough", "hiphi_tough"),
             ("hiphi-joy", "hiphi_joy"),
             ("hiphi-m5dial", "hiphi_m5dial"),
@@ -221,6 +227,23 @@ mod artifact_tests {
         assert!(FirmwareTarget::LegacyKnob.valid_application_filename("roon_knob_v2.5.2.bin"));
         assert!(!FirmwareTarget::LegacyKnob.valid_application_filename("roon_knob_merged.bin"));
         assert!(!FirmwareTarget::LegacyKnob.valid_application_filename("roon_knob_evil.bin"));
+    }
+}
+
+#[cfg(test)]
+mod halo_tests {
+    use super::*;
+    #[test]
+    fn halo_is_its_own_s3_target_and_is_never_the_dial() {
+        let halo = FirmwareTarget::parse("hiphi-halo").expect("HALO identity");
+        assert_eq!(halo.slug(), "halo");
+        assert_eq!(halo.name(), "HiPhi HALO");
+        assert_eq!(halo.application_file(), "hiphi_halo.bin");
+        assert_eq!(halo.chip_family(), "ESP32-S3");
+        assert_ne!(halo, FirmwareTarget::Dial);
+        assert!(FirmwareTarget::ALL.contains(&halo));
+        assert!(!FirmwareTarget::Dial.valid_application_filename("hiphi_halo.bin"));
+        assert!(!halo.valid_application_filename("hiphi_dial.bin"));
     }
 }
 
@@ -340,4 +363,71 @@ pub fn compare_firmware_versions(left: &str, right: &str) -> Option<std::cmp::Or
         parse_firmware_version(left.trim_start_matches('v'))?
             .cmp(&parse_firmware_version(right.trim_start_matches('v'))?),
     )
+}
+
+impl FirmwareChannel {
+    /// The channel a running version belongs to. A prerelease only ever updates within its own
+    /// channel, so an alpha build is never offered a Stable image by mistake. `None` when the
+    /// version is outside the published grammar (for example a local `-dev` build).
+    pub fn for_version(version: &str) -> Option<Self> {
+        let version = version.trim_start_matches('v');
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|channel| channel.matches_version(version))
+    }
+}
+
+/// True when `candidate` is strictly newer than `current`; both must be published versions.
+/// Alpha < beta < stable for the same release, and counters compare numerically.
+pub fn firmware_version_is_newer(candidate: &str, current: &str) -> bool {
+    match (
+        parse_firmware_version(candidate.trim_start_matches('v')),
+        parse_firmware_version(current.trim_start_matches('v')),
+    ) {
+        (Some(candidate), Some(current)) => candidate > current,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod version_order_tests {
+    use super::*;
+
+    #[test]
+    fn a_running_version_names_its_own_channel() {
+        assert_eq!(
+            FirmwareChannel::for_version("2.8.0"),
+            Some(FirmwareChannel::Stable)
+        );
+        assert_eq!(
+            FirmwareChannel::for_version("v2.8.0"),
+            Some(FirmwareChannel::Stable)
+        );
+        assert_eq!(
+            FirmwareChannel::for_version("2.8.0-beta.3"),
+            Some(FirmwareChannel::Beta)
+        );
+        assert_eq!(
+            FirmwareChannel::for_version("2.8.0-alpha.5"),
+            Some(FirmwareChannel::Alpha)
+        );
+        assert_eq!(FirmwareChannel::for_version("2.8.0-dev"), None);
+        assert_eq!(FirmwareChannel::for_version(""), None);
+    }
+
+    #[test]
+    fn newer_means_strictly_newer_with_numeric_counters() {
+        assert!(firmware_version_is_newer("2.8.0-alpha.10", "2.8.0-alpha.9"));
+        assert!(!firmware_version_is_newer(
+            "2.8.0-alpha.9",
+            "2.8.0-alpha.10"
+        ));
+        assert!(!firmware_version_is_newer("2.8.0-alpha.5", "2.8.0-alpha.5"));
+        assert!(firmware_version_is_newer("2.8.0", "2.8.0-beta.2"));
+        assert!(firmware_version_is_newer("2.8.0-beta.1", "2.8.0-alpha.9"));
+        assert!(firmware_version_is_newer("2.9.0-alpha.1", "2.8.0"));
+        assert!(!firmware_version_is_newer("garbage", "2.8.0"));
+        assert!(!firmware_version_is_newer("2.8.1", "garbage"));
+    }
 }

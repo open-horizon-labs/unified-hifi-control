@@ -50,6 +50,7 @@ pub mod mqtt_bootstrap;
 pub mod mqtt_settings;
 pub mod music_details;
 pub mod provider_auth;
+pub mod shortcuts;
 
 const MAX_REMOTE_ARTWORK_BYTES: usize = 10 * 1024 * 1024;
 
@@ -283,6 +284,9 @@ pub struct AppState {
     pub controller_auth: controller_auth::ControllerAuthState,
     pub apple_bridges: apple_bridge::AppleBridgeRegistry,
     pub knobs: KnobStore,
+    /// Pinned Library items and per-controller button maps. Constructed here, like `mcp_refs`, so
+    /// no `AppState::new` call site changes.
+    pub shortcuts: crate::shortcuts::ShortcutStore,
     pub bus: SharedBus,
     pub aggregator: Arc<ZoneAggregator>,
     pub coordinator: Arc<AdapterCoordinator>,
@@ -395,6 +399,7 @@ impl AppState {
                 apple_bridge::AppleBridgeRegistry::default()
             }),
             knobs,
+            shortcuts: crate::shortcuts::ShortcutStore::open_default(),
             bus,
             aggregator,
             coordinator,
@@ -616,98 +621,82 @@ impl AppState {
         let scale = source_dimensions.map_or(ArtworkScale::None, |source| {
             artwork_scale(source, dimensions, resize_policy)
         });
-        if let Some(hit) = self.artwork_output_cache.get(&cache_key) {
-            return Ok(ArtworkResponse {
+        let conversion_source = Arc::clone(&source);
+        let converted = self
+            .artwork_output_cache
+            .get_or_convert(cache_key.clone(), move || {
+                let source = conversion_source;
+                let (target_w, target_h) = dimensions;
+                // The smart RGB565 variant is a capability handshake: older servers
+                // return the source image, allowing firmware to detect and use its
+                // fallback. Conversion failures fall back to the source the same
+                // way, and a fallback is never cached or tagged.
+                let converted: Option<(String, Vec<u8>)> = match output_format {
+                    "rgb565" | "rgb565-smart" => {
+                        jpeg_to_rgb565_with_policy(&source.data, target_w, target_h, resize_policy)
+                            .ok()
+                            .map(|rgb565| ("application/octet-stream".to_string(), rgb565.data))
+                    }
+                    "eink_acep6" => {
+                        match image_to_eink_acep6_with_policy(
+                            &source.data,
+                            target_w,
+                            target_h,
+                            resize_policy,
+                        ) {
+                            Ok(eink) => Some(("application/octet-stream".to_string(), eink.data)),
+                            Err(error) => {
+                                tracing::warn!(
+                                "Frame artwork conversion failed at {target_w}x{target_h}: {error}"
+                            );
+                                None
+                            }
+                        }
+                    }
+                    _ => {
+                        let png = source.content_type == "image/png";
+                        match image_to_display_with_policy(
+                            &source.data,
+                            target_w,
+                            target_h,
+                            resize_policy,
+                            png,
+                        ) {
+                            Ok(data) => Some((
+                                if png { "image/png" } else { "image/jpeg" }.to_string(),
+                                data,
+                            )),
+                            Err(error) => {
+                                tracing::warn!("Raster artwork composition failed: {error}");
+                                None
+                            }
+                        }
+                    }
+                };
+                Ok(converted)
+            })
+            .await?;
+        Ok(match converted {
+            Some(stored) => ArtworkResponse {
                 etag: Some(cache_key.etag()),
                 image: ImageData {
-                    content_type: hit.content_type.clone(),
-                    data: hit.data.clone(),
+                    content_type: stored.content_type.clone(),
+                    data: stored.data.clone(),
                 },
                 source_dimensions,
                 scale,
-            });
-        }
-        static WORKERS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
-            std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
-        let permit = Arc::clone(&WORKERS).acquire_owned().await?;
-        let cache = self.artwork_output_cache.clone();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let fallback = || ImageData {
-                content_type: source.content_type.clone(),
-                data: source.data.clone(),
-            };
-            let (target_w, target_h) = dimensions;
-            // The smart RGB565 variant is a capability handshake: older servers
-            // return the source image, allowing firmware to detect and use its
-            // fallback. Conversion failures fall back to the source the same
-            // way, and a fallback is never cached or tagged.
-            let converted: Option<(String, Vec<u8>)> = match output_format {
-                "rgb565" | "rgb565-smart" => {
-                    jpeg_to_rgb565_with_policy(&source.data, target_w, target_h, resize_policy)
-                        .ok()
-                        .map(|rgb565| ("application/octet-stream".to_string(), rgb565.data))
-                }
-                "eink_acep6" => {
-                    match image_to_eink_acep6_with_policy(
-                        &source.data,
-                        target_w,
-                        target_h,
-                        resize_policy,
-                    ) {
-                        Ok(eink) => Some(("application/octet-stream".to_string(), eink.data)),
-                        Err(error) => {
-                            tracing::warn!(
-                                "Frame artwork conversion failed at {target_w}x{target_h}: {error}"
-                            );
-                            None
-                        }
-                    }
-                }
-                _ => {
-                    let png = source.content_type == "image/png";
-                    match image_to_display_with_policy(
-                        &source.data,
-                        target_w,
-                        target_h,
-                        resize_policy,
-                        png,
-                    ) {
-                        Ok(data) => Some((
-                            if png { "image/png" } else { "image/jpeg" }.to_string(),
-                            data,
-                        )),
-                        Err(error) => {
-                            tracing::warn!("Raster artwork composition failed: {error}");
-                            None
-                        }
-                    }
-                }
-            };
-            Ok(match converted {
-                Some((content_type, data)) => {
-                    let etag = cache_key.etag();
-                    let stored = cache.insert(cache_key, content_type, data);
-                    ArtworkResponse {
-                        etag: Some(etag),
-                        image: ImageData {
-                            content_type: stored.content_type.clone(),
-                            data: stored.data.clone(),
-                        },
-                        source_dimensions,
-                        scale,
-                    }
-                }
-                // The fallback is the unmodified source.
-                None => ArtworkResponse {
-                    etag: None,
-                    image: fallback(),
-                    source_dimensions,
-                    scale: ArtworkScale::None,
+            },
+            // Conversion failures still return untagged, uncached source bytes.
+            None => ArtworkResponse {
+                etag: None,
+                image: ImageData {
+                    content_type: source.content_type.clone(),
+                    data: source.data.clone(),
                 },
-            })
+                source_dimensions,
+                scale: ArtworkScale::None,
+            },
         })
-        .await?
     }
 
     /// Provider bytes for `(zone_id's provider, image_key, provider dims)`,

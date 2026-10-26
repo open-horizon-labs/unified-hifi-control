@@ -22,6 +22,8 @@ make css
 # fullstack build.
 CARGO_BUILD_RUSTC_WRAPPER='' "$DX" build --release --platform web --features web --bin unified-hifi-control
 
+python3 scripts/check-wasm-release.py target/dx/unified-hifi-control/release/web/public
+
 server="$repo_root/target/dx/unified-hifi-control/release/web/server"
 if [[ ! -x "$server" ]]; then
   echo "Dioxus completed without a runnable fullstack server: $server" >&2

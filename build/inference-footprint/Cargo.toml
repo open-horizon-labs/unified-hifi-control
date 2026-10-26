@@ -1,0 +1,20 @@
+[package]
+name = "uhc-inference-size-probe"
+version = "0.1.0"
+edition = "2024"
+[features]
+default = []
+onnx = ["dep:tract-onnx"]
+nnef = ["dep:tract-nnef"]
+convert = ["onnx", "nnef"]
+[dependencies]
+anyhow = "1.0.104"
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+tract-core = { git = "https://github.com/sonos/tract", rev = "9f6e40611e345ff46481388d4d2c591e5e91a278" }
+tract-onnx = { git = "https://github.com/sonos/tract", rev = "9f6e40611e345ff46481388d4d2c591e5e91a278", optional = true }
+tract-nnef = { git = "https://github.com/sonos/tract", rev = "9f6e40611e345ff46481388d4d2c591e5e91a278", optional = true }
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

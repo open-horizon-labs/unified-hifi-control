@@ -1623,20 +1623,67 @@ impl RoonAdapter {
             .unwrap_or_else(|| "http://test.invalid".to_string());
         let shutdown = self.shutdown.read().await.clone();
 
-        run_roon_loop(
-            self.state.clone(),
-            self.bus.clone(),
-            base_url,
-            shutdown,
-            self.knob_store.clone(),
-            self.runtime_bridge.clone(),
+        self.run_with_connection(
+            AdapterContext {
+                bus: self.bus.clone(),
+                shutdown,
+            },
             CoreConnect::Direct {
                 ip,
                 port: port.to_string(),
             },
-            self.state_path.clone(),
+            base_url,
         )
         .await
+    }
+
+    async fn run_with_connection(
+        &self,
+        ctx: AdapterContext,
+        connection: CoreConnect,
+        base_url: String,
+    ) -> Result<()> {
+        // Roon callbacks are the provider's authoritative state observation.  Register one
+        // endpoint for transport/volume writes before consuming that callback stream; it waits
+        // for a matching full-zone callback rather than manufacturing a readback response.
+        let command_shutdown = ctx.shutdown.child_token();
+        let _command_lifetime = command_shutdown.clone().drop_guard();
+        let command_join = self.runtime_bridge.as_ref().and_then(|bridge| {
+            match bridge.commands().register_provider("roon", 16) {
+                Ok(endpoint) => {
+                    let adapter = self.clone();
+                    let bridge = bridge.clone();
+                    let shutdown = command_shutdown.clone();
+                    Some(tokio::spawn(async move {
+                        run_roon_command_endpoint(adapter, endpoint, shutdown, bridge).await;
+                    }))
+                }
+                Err(error) => {
+                    tracing::error!(?error, "Roon reliable endpoint registration failed");
+                    None
+                }
+            }
+        });
+
+        let result = run_roon_loop(
+            self.state.clone(),
+            ctx.bus,
+            base_url,
+            ctx.shutdown.clone(),
+            self.knob_store.clone(),
+            self.runtime_bridge.clone(),
+            connection,
+            self.state_path.clone(),
+        )
+        .await;
+        command_shutdown.cancel();
+        if let Some(join) = command_join {
+            if let Err(error) = join.await {
+                tracing::warn!(%error, "Roon reliable command endpoint failed to join");
+            }
+        }
+        clear_roon_runtime_state(&self.state).await;
+        result
     }
 
     /// Stop the Roon adapter (internal - use Startable trait)
@@ -3300,6 +3347,59 @@ impl RoonAdapter {
         .map_err(|_| error)
     }
 
+    /// Resolve and execute one durable identity under the command endpoint's ownership. A rejected
+    /// session key retries the same semantic location, never its title-only predecessor.
+    async fn play_durable_location(
+        &self,
+        zone_id: &str,
+        location: &CollectionLocation,
+        title: &str,
+        first_exact_match: bool,
+    ) -> Result<Option<String>> {
+        let mut location = location.clone();
+        if let CollectionLocation::Roon { steps, .. } = &mut location {
+            // A mutable position cannot safely identify indistinguishable recordings.
+            for step in steps {
+                step.position = None;
+            }
+        }
+        for attempt in 0..2 {
+            let (session, key, multiple_matches) = self
+                .resolve_collection_location_with_policy(zone_id, &location, first_exact_match)
+                .await
+                .map_err(|error| crate::library_playback::ItemUnavailable(error.to_string()))?;
+            match self
+                .resolve_item_key(
+                    &session,
+                    &key,
+                    strip_roon_prefix(zone_id),
+                    PlayAction::Play,
+                    Some(title),
+                )
+                .await
+            {
+                Ok(_) => {
+                    return Ok(multiple_matches.then(|| {
+                        "Multiple matches found. Sent the first exact match to play.".to_string()
+                    }))
+                }
+                Err(error)
+                    if attempt == 0
+                        && matches!(
+                            RoonBrowseError::from_error(&error).map(|rejection| rejection.kind),
+                            Some(RoonBrowseErrorKind::InvalidItemKey)
+                        ) =>
+                {
+                    continue
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(anyhow::anyhow!(
+            "Roon could not retain the resolved item identity"
+        ))
+    }
+
     /// Re-walk `trail` -- titles from the browse root down to and including
     /// the wanted item -- in a session minted for this walk, and report
     /// `(session_key, item_key)` for the item it lands on.
@@ -3381,6 +3481,17 @@ impl RoonAdapter {
         zone_id: &str,
         location: &CollectionLocation,
     ) -> Result<(String, String)> {
+        self.resolve_collection_location_with_policy(zone_id, location, false)
+            .await
+            .map(|(session, key, _)| (session, key))
+    }
+
+    async fn resolve_collection_location_with_policy(
+        &self,
+        zone_id: &str,
+        location: &CollectionLocation,
+        first_exact_match: bool,
+    ) -> Result<(String, String, bool)> {
         let CollectionLocation::Roon { origin, steps } = location else {
             return Err(anyhow::anyhow!(
                 "collection location is not a Roon location"
@@ -3424,6 +3535,7 @@ impl RoonAdapter {
         };
 
         let mut found_key: Option<String> = None;
+        let mut multiple_matches = false;
         for (depth, step) in steps.iter().enumerate() {
             if let Some(parent_key) = found_key.take() {
                 self.browse(BrowseOpts {
@@ -3434,26 +3546,27 @@ impl RoonAdapter {
                 })
                 .await?;
             }
-            found_key = Some(
-                self.find_location_row(
+            let (matched, multiple) = self
+                .find_location_row(
                     &session_key,
                     step,
                     depth == 0 && matches!(origin, RoonLocationOrigin::BrowseRoot),
+                    first_exact_match,
                 )
-                .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "collection location lost row {:?} at depth {depth}",
-                        step.title
-                    )
-                })?,
-            );
+                .await?;
+            multiple_matches |= multiple;
+            found_key = Some(matched.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "collection location lost row {:?} at depth {depth}",
+                    step.title
+                )
+            })?);
         }
 
         let item_key = found_key.ok_or_else(|| {
             anyhow::anyhow!("collection location resolution produced no final row")
         })?;
-        Ok((session_key, item_key))
+        Ok((session_key, item_key, multiple_matches))
     }
 
     async fn find_location_row(
@@ -3461,7 +3574,8 @@ impl RoonAdapter {
         session_key: &str,
         step: &CollectionStep,
         at_root: bool,
-    ) -> Result<Option<String>> {
+        first_exact_match: bool,
+    ) -> Result<(Option<String>, bool)> {
         let mut offset = 0usize;
         let mut matches = Vec::<(usize, String)>::new();
         loop {
@@ -3493,7 +3607,7 @@ impl RoonAdapter {
             }
         }
 
-        select_location_match(&matches, step)
+        select_location_match_with_policy(&matches, step, first_exact_match)
     }
 
     /// Page through the level `session_key` is currently on, looking for a
@@ -3821,6 +3935,19 @@ impl RoonAdapter {
     }
 }
 
+fn select_location_match_with_policy(
+    matches: &[(usize, String)],
+    step: &CollectionStep,
+    first_exact_match: bool,
+) -> Result<(Option<String>, bool)> {
+    if first_exact_match && matches.len() > 1 {
+        // Rows were collected in provider order, after exact title AND subtitle matching.
+        return Ok((Some(matches[0].1.clone()), true));
+    }
+    let key = select_location_match(matches, step)?;
+    Ok((key, false))
+}
+
 fn select_location_match(
     matches: &[(usize, String)],
     step: &CollectionStep,
@@ -4086,52 +4213,14 @@ impl AdapterLogic for RoonAdapter {
     }
 
     async fn run(&self, ctx: AdapterContext) -> Result<()> {
-        let base_url = {
-            let url = self.base_url.read().await;
-            url.clone()
-                .ok_or_else(|| anyhow::anyhow!("Roon base_url not configured"))?
-        };
-
-        // Roon callbacks are the provider's authoritative state observation.  Register one
-        // endpoint for transport/volume writes before consuming that callback stream; it waits
-        // for a matching full-zone callback rather than manufacturing a readback response.
-        let command_shutdown = ctx.shutdown.child_token();
-        let command_join = self.runtime_bridge.as_ref().and_then(|bridge| {
-            match bridge.commands().register_provider("roon", 16) {
-                Ok(endpoint) => {
-                    let adapter = self.clone();
-                    let bridge = bridge.clone();
-                    let shutdown = command_shutdown.clone();
-                    Some(tokio::spawn(async move {
-                        run_roon_command_endpoint(adapter, endpoint, shutdown, bridge).await;
-                    }))
-                }
-                Err(error) => {
-                    tracing::error!(?error, "Roon reliable endpoint registration failed");
-                    None
-                }
-            }
-        });
-
-        let result = run_roon_loop(
-            self.state.clone(),
-            ctx.bus,
-            base_url,
-            ctx.shutdown.clone(),
-            self.knob_store.clone(),
-            self.runtime_bridge.clone(),
-            CoreConnect::Discovery,
-            self.state_path.clone(),
-        )
-        .await;
-        command_shutdown.cancel();
-        if let Some(join) = command_join {
-            if let Err(error) = join.await {
-                tracing::warn!(%error, "Roon reliable command endpoint failed to join");
-            }
-        }
-        clear_roon_runtime_state(&self.state).await;
-        result
+        let base_url = self
+            .base_url
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Roon base_url not configured"))?;
+        self.run_with_connection(ctx, CoreConnect::Discovery, base_url)
+            .await
     }
 
     async fn handle_command(
@@ -4218,25 +4307,65 @@ async fn run_roon_command_endpoint(
                 continue;
             }
         };
-        let native = match command {
-            RuntimeCommand::Control(command) => {
-                execute_roon_runtime_command(&adapter, target.raw_id(), command).await
+        let native = async {
+            match command {
+                RuntimeCommand::Control(command) => {
+                    execute_roon_runtime_command(&adapter, target.raw_id(), command)
+                        .await
+                        .map(|_| None)
+                }
+                RuntimeCommand::LibraryPlay(request) => match request.target {
+                    crate::library_playback::DurableTarget::Roon { location } => {
+                        adapter
+                            .play_durable_location(
+                                target.as_str(),
+                                &location,
+                                &request.title,
+                                request.first_exact_match,
+                            )
+                            .await
+                    }
+                    _ => Err(anyhow::anyhow!(
+                        "item provider does not match the Roon endpoint"
+                    )),
+                },
+                RuntimeCommand::Hqplayer(_) => Err(anyhow::anyhow!(
+                    "HQPlayer runtime command routed to Roon endpoint"
+                )),
             }
-            RuntimeCommand::Hqplayer(_) => Err(anyhow::anyhow!(
-                "HQPlayer runtime command routed to Roon endpoint"
-            )),
         };
-        if let Err(error) = native {
-            bridge.disarm(command_id).await;
-            permit.complete_native(NativeResult::Failed(error.to_string()));
-            continue;
-        }
-        permit.complete_native(NativeResult::Accepted);
+        let native = match permit.run_native(&shutdown, native).await {
+            crate::bus::runtime::NativeAttempt::Completed(result) => result,
+            crate::bus::runtime::NativeAttempt::Cancelled => {
+                bridge.disarm(command_id).await;
+                break;
+            }
+            crate::bus::runtime::NativeAttempt::TimedOut => {
+                bridge.disarm(command_id).await;
+                continue;
+            }
+        };
+        let notice = match native {
+            Ok(notice) => notice,
+            Err(error) => {
+                bridge.disarm(command_id).await;
+                permit.complete_native(crate::library_playback::native_failure(error));
+                continue;
+            }
+        };
+        permit.complete_native(match notice {
+            Some(notice) => NativeResult::AcceptedWithNotice(notice),
+            None => NativeResult::Accepted,
+        });
 
         // The command ledger independently transitions this command to Indeterminate at the same
         // deadline.  This await only keeps later provider writes out of Roon's uncorrelatable
         // callback window; it never turns a timeout into a failed native operation.
-        match timeout_at(confirm_by, &mut observed).await {
+        let observation = tokio::select! {
+            _ = shutdown.cancelled() => { bridge.disarm(command_id).await; break; }
+            result = timeout_at(confirm_by, &mut observed) => result,
+        };
+        match observation {
             Ok(Ok(())) => {}
             Ok(Err(_)) => tracing::warn!(
                 command_id = command_id.get(),
@@ -4280,7 +4409,7 @@ async fn roon_expectation(
             };
             Ok(RoonObservationExpectation::Playback(expected))
         }
-        RuntimeCommand::Control(Command::Next) => {
+        RuntimeCommand::Control(Command::Next) | RuntimeCommand::LibraryPlay(_) => {
             let previous = zone.now_playing.map(|now_playing| {
                 (
                     now_playing.title,
@@ -5411,6 +5540,28 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn shortcut_policy_picks_first_exact_duplicate_and_reports_it() {
+        let step = CollectionStep::roon("Playlist", Some("127 Tracks".into()), Some(9));
+        let matches = vec![(3, "first".into()), (9, "second".into())];
+        assert_eq!(
+            select_location_match_with_policy(&matches, &step, true).unwrap(),
+            (Some("first".into()), true)
+        );
+        assert_eq!(
+            select_location_match_with_policy(&matches, &step, false).unwrap(),
+            (Some("second".into()), false)
+        );
+        assert_eq!(
+            select_location_match_with_policy(&matches[..1], &step, true).unwrap(),
+            (Some("first".into()), false)
+        );
+        assert_eq!(
+            select_location_match_with_policy(&[], &step, true).unwrap(),
+            (None, false)
+        );
+    }
 
     #[test]
     fn durable_location_uses_unique_semantic_match_even_after_reorder() {

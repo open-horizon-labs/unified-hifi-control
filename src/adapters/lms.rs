@@ -848,23 +848,7 @@ pub struct LmsPlayerInfo {
     pub connected: bool,
 }
 
-/// Type of search result from LMS
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LmsSearchResultType {
-    Album,
-    Artist,
-    Track,
-}
-
-impl std::fmt::Display for LmsSearchResultType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LmsSearchResultType::Album => write!(f, "album"),
-            LmsSearchResultType::Artist => write!(f, "artist"),
-            LmsSearchResultType::Track => write!(f, "track"),
-        }
-    }
-}
+pub use crate::library_playback::identity::{LmsDurableTarget, LmsSearchResultType};
 
 /// A search result from LMS (library or streaming service)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -913,6 +897,19 @@ impl LmsPlayAction {
             LmsPlayAction::Play => "load",
             LmsPlayAction::Queue => "add",
             LmsPlayAction::Insert => "insert",
+        }
+    }
+}
+
+impl LmsDurableTarget {
+    pub fn to_play_target(&self) -> LmsPlayTarget {
+        match self {
+            Self::Library { item, id } => LmsPlayTarget::Library {
+                kind: *item,
+                id: *id,
+            },
+            Self::SavedPlaylist { id } => LmsPlayTarget::SavedPlaylist { id: *id },
+            Self::Url { url } => LmsPlayTarget::Url { url: url.clone() },
         }
     }
 }
@@ -3801,6 +3798,7 @@ impl AdapterLogic for LmsAdapter {
         // protocol serializes its own players adequately, so provider scope is intentional; the
         // correlated readback still targets the exact player and commits one complete Zone.
         let command_shutdown = ctx.shutdown.child_token();
+        let _command_lifetime = command_shutdown.clone().drop_guard();
         let command_join = self.runtime_bridge.as_ref().and_then(|bridge| {
             match bridge.commands().register_provider("lms", 32) {
                 Ok(endpoint) => {
@@ -3937,32 +3935,54 @@ async fn run_lms_command_endpoint(
         };
         let command_id = permit.id();
         let target = permit.request().target.to_string();
+        let target_zone = target.clone();
         let player_id = strip_lms_prefix(&target).to_string();
-        let native = match permit.request().command.clone() {
-            RuntimeCommand::Control(command) => {
-                execute_lms_runtime_command(&adapter, &player_id, command).await
+        let native = async {
+            match permit.request().command.clone() {
+                RuntimeCommand::Control(command) => {
+                    execute_lms_runtime_command(&adapter, &player_id, command).await
+                }
+                RuntimeCommand::LibraryPlay(request) => match request.target {
+                    crate::library_playback::DurableTarget::Lms { target } => {
+                        adapter
+                            .play_target(
+                                &target.to_play_target(),
+                                &target_zone,
+                                LmsPlayAction::Play,
+                                Some(&request.title),
+                            )
+                            .await
+                    }
+                    _ => Err(anyhow!("item provider does not match the LMS endpoint")),
+                },
+                RuntimeCommand::Hqplayer(_) => {
+                    Err(anyhow!("HQPlayer runtime command routed to LMS endpoint"))
+                }
             }
-            RuntimeCommand::Hqplayer(_) => {
-                Err(anyhow!("HQPlayer runtime command routed to LMS endpoint"))
-            }
+        };
+        let native = match permit.run_native(&shutdown, native).await {
+            crate::bus::runtime::NativeAttempt::Completed(result) => result,
+            crate::bus::runtime::NativeAttempt::Cancelled => break,
+            crate::bus::runtime::NativeAttempt::TimedOut => continue,
         };
         if let Err(error) = native {
             permit.complete_native(NativeResult::Failed(error.to_string()));
             continue;
         }
 
+        let confirm_by = permit.request().deadlines.confirm_by;
         permit.complete_native(NativeResult::Accepted);
-        match adapter.coherent_player_readback(&player_id).await {
-            Ok(zone) => {
-                if let Err(error) = bridge.publish_zone(zone, Some(command_id)).await {
-                    tracing::warn!(%error, command_id = command_id.get(), "LMS native write accepted but readback projection could not commit");
-                }
+        let readback = async {
+            let zone = adapter.coherent_player_readback(&player_id).await?;
+            bridge.publish_zone(zone, Some(command_id)).await
+        };
+        match crate::bus::runtime::run_owned_native(confirm_by, &shutdown, readback).await {
+            crate::bus::runtime::NativeAttempt::Completed(Ok(())) => {}
+            crate::bus::runtime::NativeAttempt::Completed(Err(error)) => {
+                tracing::warn!(%error, "LMS accepted the command but its readback could not commit");
             }
-            Err(error) => {
-                // Native acceptance is retained as an explicit indeterminate operation until its
-                // deadline; the command may have applied even though LMS did not serve readback.
-                tracing::warn!(%error, command_id = command_id.get(), "LMS native write accepted but coherent player readback failed");
-            }
+            crate::bus::runtime::NativeAttempt::Cancelled => break,
+            crate::bus::runtime::NativeAttempt::TimedOut => {}
         }
     }
 }

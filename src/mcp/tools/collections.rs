@@ -917,6 +917,7 @@ async fn handle_roon(
                     item_key: item_key.to_string(),
                     multi_session_key: session_key.to_string(),
                     trail,
+                    location: Some(child_location.clone()),
                 };
                 let path = if navigable {
                     Some(

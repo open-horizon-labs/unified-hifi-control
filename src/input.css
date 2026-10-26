@@ -727,6 +727,31 @@
     color: var(--surface-base);
   }
 
+  /* Secondary to Play, same reveal: hidden until the tile is hovered or focused, always shown on
+     touch. Neutral, so the accent stays Play's alone. */
+  .library-tile-pin {
+    @apply absolute bottom-2 left-2 inline-flex size-9 items-center justify-center rounded-full opacity-0 shadow-md transition-opacity;
+    background: color-mix(in srgb, var(--surface-base) 75%, transparent);
+    color: var(--text-primary);
+  }
+  .library-tile:hover .library-tile-pin,
+  .library-tile:focus-within .library-tile-pin {
+    opacity: 1;
+  }
+  @media (hover: none) {
+    .library-tile-pin {
+      opacity: 1;
+    }
+  }
+  .library-tile-pin:hover {
+    color: var(--accent-color);
+  }
+  .library-tile-pin:focus-visible {
+    opacity: 1;
+    outline: 2px solid var(--accent-color);
+    outline-offset: 2px;
+  }
+
   .library-tile-chevron {
     @apply absolute right-2 top-2 inline-flex size-6 items-center justify-center rounded-full;
     background: color-mix(in srgb, var(--surface-base) 65%, transparent);

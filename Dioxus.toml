@@ -15,3 +15,10 @@ style = ["/tailwind.css", "/dx-components-theme.css"]
 
 [web.resource.dev]
 base_path = "/"
+
+# Remove browser debug data after wasm-bindgen, before asset names are hashed.
+[web.wasm_opt]
+level = "s"
+debug = false
+keep_names = false
+extra_features = ["--strip-debug", "--strip-dwarf"]

@@ -12,7 +12,7 @@
 # /apple-touch-icon.png) are implementation details, not API contracts. They use
 # multi-line closures that the route extractor doesn't detect, and they may change
 # with build configuration.
-
+DELETE /api/shortcuts/{id}
 DELETE /hqp/instances/{name}
 DELETE /knob/devices/{knob_id}
 DELETE /mcp
@@ -22,6 +22,7 @@ GET /api/bridges/applemusic/content
 GET /api/bridges/applemusic/status
 GET /api/collections/image
 GET /api/controller/status
+GET /api/controllers/{id}/shortcuts
 GET /api/hiphi/pairing/status
 GET /api/home-assistant/integration
 GET /api/mqtt/status
@@ -30,6 +31,7 @@ GET /api/providers/spotify/account
 GET /api/providers/{provider}/oauth/callback
 GET /api/providers/{provider}/oauth/start
 GET /api/settings
+GET /api/shortcuts
 GET /api/zones/visibility
 GET /apple-touch-icon.png
 GET /assets/{*path}
@@ -95,6 +97,7 @@ GET /upnp/zones
 GET /webmcp-bridge.js
 GET /zones
 GET /zones/{zone_id}/music-details
+PATCH /api/shortcuts/{id}
 POST /admin/fetch-firmware
 POST /api/bridges/applemusic/claim
 POST /api/bridges/applemusic/commands/{command_id}
@@ -107,6 +110,7 @@ POST /api/bridges/applemusic/revoke
 POST /api/bridges/applemusic/state
 POST /api/collections
 POST /api/controller/bootstrap
+POST /api/controllers/{id}/shortcuts/test
 POST /api/hiphi/connection/resume
 POST /api/hiphi/pairing/complete
 POST /api/hiphi/pairing/initiate
@@ -118,6 +122,8 @@ POST /api/providers/{provider}/oauth/revoke
 POST /api/queue
 POST /api/search
 POST /api/settings
+POST /api/shortcuts
+POST /api/shortcuts/{id}/play
 POST /api/zones/name
 POST /api/zones/order
 POST /api/zones/visibility
@@ -144,8 +150,10 @@ POST /hqplayer/outputs/command
 POST /hqplayer/profile
 POST /hqplayer/setting
 POST /hqplayer/volume
+POST /input
 POST /knob/config
 POST /knob/control
+POST /knob/input
 POST /lms/configure
 POST /lms/control
 POST /lms/volume
@@ -157,4 +165,5 @@ POST /roon/play
 POST /roon/play_item
 POST /roon/volume
 POST /upnp/control
+PUT /api/controllers/{id}/shortcuts
 PUT /config/{knob_id}
