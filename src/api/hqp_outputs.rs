@@ -297,7 +297,9 @@ pub async fn submit_hqp_output_command(
     let operation_id = format!("op-{}", ticket.id().get());
     match ticket.wait_for_observable_result().await {
         CommandStatus::Confirmed { .. } => {}
-        CommandStatus::Failed { detail } | CommandStatus::NotDispatched { detail } => {
+        CommandStatus::Failed { detail }
+        | CommandStatus::ItemUnavailable { detail }
+        | CommandStatus::NotDispatched { detail } => {
             let refusal = HqpOutputRefusal::decode(&detail)
                 .unwrap_or(HqpOutputRefusal::Backend { message: detail });
             return Err(HqpOutputServiceError::Refused(refusal));

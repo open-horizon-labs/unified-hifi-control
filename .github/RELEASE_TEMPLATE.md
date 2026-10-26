@@ -139,3 +139,9 @@ Replace `<your-bridge-host>` with your bridge IP or hostname (e.g., `localhost`,
 ## Configuration
 
 Configure all backends (Roon, LMS, HQPlayer, UPnP/OpenHome) via the web UI at `http://<your-bridge-host>:8088`.
+
+---
+
+## Support
+
+If UHC is useful to you, you can [buy me a coffee](https://buymeacoffee.com/muness).

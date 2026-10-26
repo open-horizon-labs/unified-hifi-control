@@ -44,6 +44,10 @@ pub mod components;
 #[path = "firmware/catalog.rs"]
 pub mod firmware_catalog;
 
+// What each controller can be configured with; shared by the server and the settings page.
+#[path = "firmware/settings.rs"]
+pub mod device_settings;
+
 // Server-only modules (excluded from WASM build)
 #[cfg(feature = "server")]
 pub mod adapters;
@@ -69,9 +73,13 @@ pub mod firmware;
 #[cfg(feature = "server")]
 pub mod knobs;
 #[cfg(feature = "server")]
+pub mod library_playback;
+#[cfg(feature = "server")]
 pub mod mcp;
 #[cfg(feature = "server")]
 pub mod mdns;
+#[cfg(feature = "server")]
+pub mod shortcuts;
 // Optional MQTT publisher: exposes UHC zones to Home Assistant (#508).
 #[cfg(feature = "server")]
 pub mod mqtt;

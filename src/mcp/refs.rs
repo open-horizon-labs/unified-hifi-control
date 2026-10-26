@@ -80,6 +80,7 @@ use rand::Rng;
 use tokio::sync::Mutex;
 
 use crate::adapters::lms::LmsPlayTarget;
+use crate::mcp::collection_locations::CollectionLocation;
 use crate::mcp::envelope::Provider;
 
 /// How many refs the table holds before the oldest is evicted to make room.
@@ -148,6 +149,11 @@ pub struct RoonRefTarget {
     /// Titles from the browse root down to and including this item. Empty
     /// when the minting surface could not supply one.
     pub trail: Vec<String>,
+    /// The same walk with each row's subtitle and position, as `hifi_collections` records it.
+    /// `trail` alone cannot tell two albums with one title apart (it takes the first match);
+    /// this can, and is what a durable pin must keep. `None` where the minting surface knew
+    /// only titles (a search hit), which makes the ref unfit to pin.
+    pub location: Option<CollectionLocation>,
 }
 
 /// What a ref resolves to, independent of the opaque token a client holds.
@@ -512,6 +518,7 @@ mod tests {
                 item_key: item_key.to_string(),
                 multi_session_key: session.to_string(),
                 trail: vec![title.to_string()],
+                location: None,
             },
             title: title.to_string(),
         }

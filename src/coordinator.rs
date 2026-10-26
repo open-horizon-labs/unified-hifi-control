@@ -287,8 +287,8 @@ impl AdapterCoordinator {
             .unwrap_or_default();
         for companion in companions {
             if let Err(error) = self.start_adapter_and_track(companion.as_ref()).await {
-                self.stop_adapters_then_flush(
-                    &[adapter],
+                self.stop_adapter_and_companions_then_flush(
+                    adapter,
                     adapter.name(),
                     "companion start failure",
                 )
@@ -312,12 +312,14 @@ impl AdapterCoordinator {
             .get(projection_adapter)
             .cloned()
             .unwrap_or_default();
-        let mut observers: Vec<&dyn Startable> = vec![adapter];
-        observers.extend(
-            companions
-                .iter()
-                .map(|companion| companion.as_ref() as &dyn Startable),
-        );
+        // Retire dependent command ingress before stopping its provider. Reversing startup order
+        // also unwinds partial starts: no companion may outlive a failed provider transition.
+        let mut observers: Vec<&dyn Startable> = companions
+            .iter()
+            .rev()
+            .map(|companion| companion.as_ref() as &dyn Startable)
+            .collect();
+        observers.push(adapter);
         self.stop_adapters_then_flush(&observers, projection_adapter, reason)
             .await;
     }

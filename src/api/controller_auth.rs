@@ -343,6 +343,16 @@ fn is_music_details(path: &str) -> bool {
         .is_some_and(|zone| !zone.is_empty() && !zone.contains('/'))
 }
 
+/// Pinning, renaming, deleting and mapping shortcuts, and the test-press: they decide what a
+/// button plays, so they are owner operations like the playback controls below.
+fn is_shortcut_admin(path: &str) -> bool {
+    path == "/api/shortcuts"
+        || path.starts_with("/api/shortcuts/")
+        || path
+            .strip_prefix("/api/controllers/")
+            .is_some_and(|rest| rest.contains("/shortcuts"))
+}
+
 fn is_protected(path: &str, method: &axum::http::Method) -> bool {
     if is_music_details(path) {
         return true;
@@ -368,11 +378,17 @@ fn is_protected(path: &str, method: &axum::http::Method) -> bool {
     if *method == axum::http::Method::GET || *method == axum::http::Method::HEAD {
         return false;
     }
+    if is_shortcut_admin(path) {
+        return true;
+    }
     matches!(
         path,
         "/control"
             | "/knob/control"
             | "/knob/config"
+            // A remote key that starts a shortcut starts playback, like the two above.
+            | "/knob/input"
+            | "/input"
             | "/roon/control"
             | "/roon/volume"
             | "/roon/play"
@@ -538,6 +554,33 @@ mod tests {
         assert!(is_protected("/api/settings", &axum::http::Method::POST));
         assert!(!is_protected("/roon/zones", &axum::http::Method::GET));
         assert!(is_protected("/roon/control", &axum::http::Method::POST));
+    }
+
+    #[test]
+    fn shortcut_routes_that_change_or_trigger_playback_are_protected() {
+        use axum::http::Method;
+        for (path, method) in [
+            ("/knob/input", Method::POST),
+            ("/input", Method::POST),
+            ("/api/shortcuts", Method::POST),
+            ("/api/shortcuts/sc_ab12", Method::PATCH),
+            ("/api/shortcuts/sc_ab12", Method::DELETE),
+            ("/api/controllers/dial-1/shortcuts", Method::PUT),
+            ("/api/controllers/dial-1/shortcuts/test", Method::POST),
+        ] {
+            assert!(is_protected(path, &method), "{method} {path}");
+        }
+        // Reading what is pinned stays as open as the other LAN pages.
+        assert!(!is_protected("/api/shortcuts", &Method::GET));
+        assert!(!is_protected(
+            "/api/controllers/dial-1/shortcuts",
+            &Method::GET
+        ));
+        // A look-alike path elsewhere is not swept in.
+        assert!(!is_protected(
+            "/api/controllers/dial-1/other",
+            &Method::POST
+        ));
     }
 
     #[test]

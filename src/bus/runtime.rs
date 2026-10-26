@@ -59,6 +59,8 @@ pub enum RuntimeCommand {
     Control(Command),
     /// HQPlayer's semantic pipeline/profile control plane.
     Hqplayer(HqpRuntimeCommand),
+    /// Durable library intent; native resolution stays in the owning adapter.
+    LibraryPlay(Box<crate::library_playback::LibraryPlayRequest>),
 }
 
 impl From<Command> for RuntimeCommand {
@@ -117,6 +119,10 @@ pub enum CommandStatus {
     Failed {
         detail: String,
     },
+    /// A library item's durable identity cannot be resolved; no substitute was dispatched.
+    ItemUnavailable {
+        detail: String,
+    },
     NotDispatched {
         detail: String,
     },
@@ -126,7 +132,10 @@ impl CommandStatus {
     fn is_final(&self) -> bool {
         matches!(
             self,
-            Self::Confirmed { .. } | Self::Failed { .. } | Self::NotDispatched { .. }
+            Self::Confirmed { .. }
+                | Self::Failed { .. }
+                | Self::ItemUnavailable { .. }
+                | Self::NotDispatched { .. }
         )
     }
 }
@@ -144,6 +153,20 @@ impl CommandTicket {
 
     pub fn status(&self) -> CommandStatus {
         self.status.borrow().clone()
+    }
+
+    /// Wait for native acceptance or refusal without inventing confirmation. Reads from the same
+    /// command ledger as confirmed transport operations; no alternate surface-owned result state.
+    pub async fn wait_for_native_result(&mut self) -> CommandStatus {
+        loop {
+            let current = self.status();
+            if !matches!(current, CommandStatus::Queued | CommandStatus::Dispatched) {
+                return current;
+            }
+            if self.status.changed().await.is_err() {
+                return self.status();
+            }
+        }
     }
 
     /// Wait until the operation reaches a final state or becomes indeterminate.
@@ -181,6 +204,7 @@ pub enum CommandSubmissionError {
 pub enum NativeResult {
     /// The provider rejected or failed the attempted command.
     Failed(String),
+    ItemUnavailable(String),
     /// Native I/O was accepted. A matching projection is still required for confirmation.
     Accepted,
 }
@@ -375,6 +399,29 @@ impl EndpointWork {
     }
 }
 
+/// Cancellation or expiry after dispatch is uncertain, rather than a retryable native failure.
+pub enum NativeAttempt<T> {
+    Completed(T),
+    Cancelled,
+    TimedOut,
+}
+
+/// Apply the same owner lifetime to a native attempt and its subsequent readback publication.
+pub async fn run_owned_native<F: std::future::Future>(
+    deadline: Instant,
+    shutdown: &tokio_util::sync::CancellationToken,
+    native: F,
+) -> NativeAttempt<F::Output> {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => NativeAttempt::Cancelled,
+        result = timeout_at(deadline, native) => match result {
+            Ok(result) => NativeAttempt::Completed(result),
+            Err(_) => NativeAttempt::TimedOut,
+        },
+    }
+}
+
 /// The only capability which can report a native result for an admitted endpoint work item.
 pub struct EndpointPermit {
     request: CommandRequest,
@@ -391,6 +438,16 @@ impl EndpointPermit {
         &self.request
     }
 
+    /// Bound a composite native operation (including catalog validation) to its endpoint owner.
+    /// Dropping a cancelled operation prevents a read completing later from initiating a write.
+    pub async fn run_native<F: std::future::Future>(
+        &self,
+        shutdown: &tokio_util::sync::CancellationToken,
+        native: F,
+    ) -> NativeAttempt<F::Output> {
+        run_owned_native(self.request.deadlines.confirm_by, shutdown, native).await
+    }
+
     /// The adapter reports only native fact here. `Accepted` is never confirmation; confirmation
     /// is emitted only by [`ProjectionActor`] after a correlated commit.
     pub fn complete_native(self, result: NativeResult) {
@@ -398,6 +455,9 @@ impl EndpointPermit {
             NativeResult::Failed(detail) => self
                 .inner
                 .set_status(self.id, CommandStatus::Failed { detail }),
+            NativeResult::ItemUnavailable(detail) => self
+                .inner
+                .set_status(self.id, CommandStatus::ItemUnavailable { detail }),
             NativeResult::Accepted => {
                 let _ = self.inner.transition(self.id, |status| match status {
                     CommandStatus::Dispatched => Some(CommandStatus::AwaitingProjection),

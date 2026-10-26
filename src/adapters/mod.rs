@@ -14,6 +14,7 @@ pub mod handle;
 pub mod hegel;
 pub mod homeassistant_devices;
 pub mod hqplayer;
+pub mod library_commands;
 pub mod lms;
 pub mod lms_discovery;
 pub mod lyngdorf;
