@@ -66,7 +66,64 @@ pub struct KnobConfig {
     /// the device via `config_sha`, e.g. from a Home Assistant `select`
     /// entity (#523).
     pub assigned_zone_id: Option<String>,
+
+    // Device-specific settings. Each is omitted from the wire until the owner sets it, and only
+    // controllers whose firmware applies it accept it (see `crate::device_settings`), so a
+    // controller without these serializes -- and hashes -- exactly as it always did.
+    /// Frame: print the controller's IP address on the display.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_ip: Option<bool>,
+    /// Dial and HALO: backlight percentage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brightness: Option<u8>,
+    /// Kizz: body movement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_enabled: Option<bool>,
+    /// Kizz: its own sounds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sound_enabled: Option<bool>,
+    /// Kizz: loudness of its own sounds, 0 Low to 2 High.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sound_volume: Option<u8>,
+
+    /// A pending install request, present only until the controller reports a new version or the
+    /// request expires. It is part of the hash, so the controller refetches its config to see it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub firmware_update: Option<FirmwareUpdateRequest>,
 }
+
+/// A request, made from the settings page, for a controller to install the available firmware.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FirmwareUpdateRequest {
+    /// Always `"install"`; the controller ignores anything else.
+    pub action: String,
+    /// Version the controller was running when asked. A controller already on another version
+    /// treats the request as stale instead of installing again.
+    pub from_version: Option<String>,
+    pub requested_at: DateTime<Utc>,
+}
+
+/// How long an install request stays pending without the controller changing version. Past this
+/// the bridge stops offering it so a failed install is not retried forever on every reboot.
+const FIRMWARE_REQUEST_TTL_MINUTES: i64 = 30;
+
+impl FirmwareUpdateRequest {
+    pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
+        now - self.requested_at > chrono::Duration::minutes(FIRMWARE_REQUEST_TTL_MINUTES)
+    }
+}
+
+/// A requested setting the controller does not have, or a value outside its range.
+#[derive(Debug)]
+pub struct SettingRejected(pub String);
+
+impl std::fmt::Display for SettingRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SettingRejected {}
 
 impl Default for KnobConfig {
     fn default() -> Self {
@@ -110,6 +167,12 @@ impl Default for KnobConfig {
             sleep_poll_stopped_sec: 60,
             volume_step_override: None,
             assigned_zone_id: None,
+            show_ip: None,
+            brightness: None,
+            body_enabled: None,
+            sound_enabled: None,
+            sound_volume: None,
+            firmware_update: None,
         }
     }
 }
@@ -327,8 +390,23 @@ impl KnobStore {
             if let Some(target) = identity {
                 knob.device_type = target.slug().to_string();
             }
+            // An install request ends when the controller reports another version (it took the
+            // update) or when it has gone unanswered for too long. Either way the hash moves so
+            // the controller refetches a config without it.
+            let request_done = knob.config.firmware_update.as_ref().is_some_and(|request| {
+                request.is_expired(Utc::now())
+                    || request
+                        .from_version
+                        .as_ref()
+                        .is_some_and(|from| Some(from) != knob.version.as_ref())
+            });
+            if request_done {
+                knob.config.firmware_update = None;
+                knob.config_sha = compute_sha(&knob.config, &knob.name);
+            }
             let result = knob.clone();
-            let identity_changed = old_version != knob.version || old_identity != knob.device_type;
+            let identity_changed =
+                request_done || old_version != knob.version || old_identity != knob.device_type;
             // Routine polls remain memory-only. Persist newly observed identity,
             // without preventing service of a known config on storage failure.
             if identity_changed {
@@ -444,6 +522,58 @@ impl KnobStore {
             knob.config.assigned_zone_id = if v.is_empty() { None } else { Some(v) };
         }
 
+        // Device-specific settings. Every value is checked against this controller's own
+        // schema before anything is stored; a bad field rejects the whole update.
+        let target = crate::firmware_catalog::FirmwareTarget::parse(&knob.device_type);
+        let reject = |message: String| anyhow::Error::new(SettingRejected(message));
+        let target_for = |key: &str| {
+            target.ok_or_else(|| reject(format!("unknown controller type for \"{key}\"")))
+        };
+        if let Some(v) = updates.show_ip {
+            crate::device_settings::check_toggle(target_for("show_ip")?, "show_ip")
+                .map_err(reject)?;
+            knob.config.show_ip = Some(v);
+        }
+        if let Some(v) = updates.body_enabled {
+            crate::device_settings::check_toggle(target_for("body_enabled")?, "body_enabled")
+                .map_err(reject)?;
+            knob.config.body_enabled = Some(v);
+        }
+        if let Some(v) = updates.sound_enabled {
+            crate::device_settings::check_toggle(target_for("sound_enabled")?, "sound_enabled")
+                .map_err(reject)?;
+            knob.config.sound_enabled = Some(v);
+        }
+        if let Some(v) = updates.brightness {
+            crate::device_settings::check_number(target_for("brightness")?, "brightness", v)
+                .map_err(reject)?;
+            knob.config.brightness = u8::try_from(v).ok();
+        }
+        if let Some(v) = updates.sound_volume {
+            crate::device_settings::check_number(target_for("sound_volume")?, "sound_volume", v)
+                .map_err(reject)?;
+            knob.config.sound_volume = u8::try_from(v).ok();
+        }
+        match updates.firmware_update.as_deref() {
+            None => {}
+            Some("install") => {
+                let Some(version) = knob.version.clone() else {
+                    return Err(reject(
+                        "the controller has not reported its firmware version yet".into(),
+                    ));
+                };
+                knob.config.firmware_update = Some(FirmwareUpdateRequest {
+                    action: "install".into(),
+                    from_version: Some(version),
+                    requested_at: Utc::now(),
+                });
+            }
+            Some("cancel") => knob.config.firmware_update = None,
+            Some(other) => {
+                return Err(reject(format!("unknown firmware_update action \"{other}\"")))
+            }
+        }
+
         // Recompute config hash
         knob.config_sha = compute_sha(&knob.config, &knob.name);
         knob.last_seen = Utc::now();
@@ -539,6 +669,16 @@ pub struct KnobConfigUpdate {
     /// Zone reassignment override (empty string = clear override, device
     /// chooses its own zone again)
     pub assigned_zone_id: Option<String>,
+    /// Device-specific settings; see `crate::device_settings` for who has which. Numbers are
+    /// signed here so a negative request is rejected instead of wrapping.
+    pub show_ip: Option<bool>,
+    pub brightness: Option<i64>,
+    pub body_enabled: Option<bool>,
+    pub sound_enabled: Option<bool>,
+    pub sound_volume: Option<i64>,
+    /// `"install"` asks the controller to install the available firmware; `"cancel"` withdraws
+    /// the request.
+    pub firmware_update: Option<String>,
 }
 
 /// Summary for listing knobs
@@ -604,5 +744,201 @@ mod persistence_tests {
             serde_json::from_slice(&fs::read(store.path.as_ref()).unwrap()).unwrap();
         assert_eq!(current["dial"].name, disk["dial"].name);
         assert_eq!(current["dial"].name, "Installed");
+    }
+}
+
+#[cfg(test)]
+mod device_setting_tests {
+    use super::*;
+    use crate::device_settings::ALL_KEYS;
+
+    fn store() -> (tempfile::TempDir, KnobStore) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = KnobStore {
+            knobs: Arc::new(RwLock::new(HashMap::new())),
+            path: Arc::new(directory.path().join("knobs.json")),
+            load_failed: false,
+        };
+        (directory, store)
+    }
+
+    async fn register(store: &KnobStore, id: &str, device: &str, version: &str) {
+        store
+            .get_or_create_with_device_type(id, Some(version), Some(device))
+            .await
+            .unwrap();
+    }
+
+    fn update(f: impl FnOnce(&mut KnobConfigUpdate)) -> KnobConfigUpdate {
+        let mut update = KnobConfigUpdate::default();
+        f(&mut update);
+        update
+    }
+
+    #[test]
+    fn a_default_config_puts_nothing_new_on_the_wire() {
+        // Installed controllers and Home Assistant parse this payload, and the config hash covers
+        // it: a controller that has none of the new settings must serialize exactly as before.
+        let json = serde_json::to_value(KnobConfig::default()).unwrap();
+        for key in ALL_KEYS.iter().chain(&["firmware_update"]) {
+            assert!(json.get(key).is_none(), "{key} leaked into the default config");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_setting_is_stored_and_changes_the_hash_so_the_device_refetches() {
+        let (_dir, store) = store();
+        register(&store, "d1", "dial", "2.8.0-alpha.5").await;
+        let before = store.get("d1").await.unwrap().config_sha;
+        let knob = store
+            .update_config("d1", update(|u| u.brightness = Some(40)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(knob.config.brightness, Some(40));
+        assert_ne!(knob.config_sha, before);
+        let json = serde_json::to_value(&knob.config).unwrap();
+        assert_eq!(json["brightness"], 40);
+    }
+
+    #[tokio::test]
+    async fn a_controller_cannot_be_given_a_setting_it_does_not_have() {
+        let (_dir, store) = store();
+        register(&store, "f1", "frame", "2.8.0-alpha.5").await;
+        let error = store
+            .update_config("f1", update(|u| u.brightness = Some(40)))
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<SettingRejected>().is_some(), "{error}");
+        assert_eq!(store.get("f1").await.unwrap().config.brightness, None);
+        let accepted = store
+            .update_config("f1", update(|u| u.show_ip = Some(true)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.config.show_ip, Some(true));
+    }
+
+    #[tokio::test]
+    async fn out_of_range_values_never_reach_the_stored_config() {
+        let (_dir, store) = store();
+        register(&store, "d1", "dial", "2.8.0-alpha.5").await;
+        for bad in [0, 4, 101, -1, 100_000] {
+            let error = store
+                .update_config("d1", update(|u| u.brightness = Some(bad)))
+                .await
+                .unwrap_err();
+            assert!(error.downcast_ref::<SettingRejected>().is_some(), "{bad}");
+        }
+        register(&store, "s1", "stackchan", "2.8.0-alpha.5").await;
+        assert!(store
+            .update_config("s1", update(|u| u.sound_volume = Some(3)))
+            .await
+            .is_err());
+        assert_eq!(store.get("d1").await.unwrap().config.brightness, None);
+    }
+
+    #[tokio::test]
+    async fn one_bad_field_rejects_the_whole_update() {
+        let (_dir, store) = store();
+        register(&store, "d1", "dial", "2.8.0-alpha.5").await;
+        let result = store
+            .update_config(
+                "d1",
+                update(|u| {
+                    u.name = Some("Kitchen".into());
+                    u.brightness = Some(500);
+                }),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(store.get("d1").await.unwrap().name, "");
+    }
+
+    #[tokio::test]
+    async fn an_install_request_remembers_the_version_it_was_made_against() {
+        let (_dir, store) = store();
+        register(&store, "f1", "frame", "2.8.0-alpha.4").await;
+        let before = store.get("f1").await.unwrap().config_sha;
+        let knob = store
+            .update_config("f1", update(|u| u.firmware_update = Some("install".into())))
+            .await
+            .unwrap()
+            .unwrap();
+        let request = knob.config.firmware_update.clone().unwrap();
+        assert_eq!(request.action, "install");
+        assert_eq!(request.from_version.as_deref(), Some("2.8.0-alpha.4"));
+        assert_ne!(knob.config_sha, before, "the device must see a changed hash");
+        let json = serde_json::to_value(&knob.config).unwrap();
+        assert_eq!(json["firmware_update"]["action"], "install");
+        assert_eq!(json["firmware_update"]["from_version"], "2.8.0-alpha.4");
+    }
+
+    #[tokio::test]
+    async fn an_install_request_needs_a_known_version_and_a_known_action() {
+        let (_dir, store) = store();
+        store
+            .get_or_create_with_device_type("f1", None, Some("frame"))
+            .await
+            .unwrap();
+        assert!(store
+            .update_config("f1", update(|u| u.firmware_update = Some("install".into())))
+            .await
+            .is_err());
+        register(&store, "f2", "frame", "2.8.0-alpha.4").await;
+        assert!(store
+            .update_config("f2", update(|u| u.firmware_update = Some("reboot".into())))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelling_removes_the_request() {
+        let (_dir, store) = store();
+        register(&store, "f1", "frame", "2.8.0-alpha.4").await;
+        store
+            .update_config("f1", update(|u| u.firmware_update = Some("install".into())))
+            .await
+            .unwrap();
+        let knob = store
+            .update_config("f1", update(|u| u.firmware_update = Some("cancel".into())))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(knob.config.firmware_update.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_request_ends_when_the_device_reports_a_different_version() {
+        let (_dir, store) = store();
+        register(&store, "f1", "frame", "2.8.0-alpha.4").await;
+        store
+            .update_config("f1", update(|u| u.firmware_update = Some("install".into())))
+            .await
+            .unwrap();
+        let pending = store.get("f1").await.unwrap();
+        // Same version polling again keeps the request (and the hash) steady.
+        register(&store, "f1", "frame", "2.8.0-alpha.4").await;
+        let still = store.get("f1").await.unwrap();
+        assert!(still.config.firmware_update.is_some());
+        assert_eq!(still.config_sha, pending.config_sha);
+        // The device came back on the new image: the request is done and the hash moves so the
+        // device refetches a config without it.
+        register(&store, "f1", "frame", "2.8.0-alpha.5").await;
+        let done = store.get("f1").await.unwrap();
+        assert!(done.config.firmware_update.is_none());
+        assert_ne!(done.config_sha, pending.config_sha);
+    }
+
+    #[test]
+    fn an_unanswered_request_expires() {
+        let now = Utc::now();
+        let request = |age_minutes| FirmwareUpdateRequest {
+            action: "install".into(),
+            from_version: Some("2.8.0-alpha.4".into()),
+            requested_at: now - chrono::Duration::minutes(age_minutes),
+        };
+        assert!(!request(5).is_expired(now));
+        assert!(request(31).is_expired(now));
     }
 }
