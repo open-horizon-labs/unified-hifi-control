@@ -26,6 +26,8 @@ pub struct ZonesStripProps {
     /// vocabulary as `/control` (`play_pause`, `next`, `previous`,
     /// `vol_up`, `vol_down`).
     pub on_control: EventHandler<(String, String)>,
+    /// Report actual height, including wrapping and the open picker, to the page layout.
+    pub on_height_change: EventHandler<f64>,
 }
 
 /// Queue transfer is a Music Assistant-only capability today (the backend
@@ -207,6 +209,11 @@ pub fn ZonesStrip(props: ZonesStripProps) -> Element {
 
     rsx! {
         div { class: "zones-strip",
+            onresize: move |event| {
+                if let Ok(size) = event.get_border_box_size() {
+                    props.on_height_change.call(size.height);
+                }
+            },
             // #573 (visual pass V4): Escape closes the zone picker. Key
             // events bubble from whichever picker control has focus, so the
             // strip container is the one place that hears them all.

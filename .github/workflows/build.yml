@@ -933,7 +933,7 @@ jobs:
         env:
           UHC_URL: http://127.0.0.1:8088
         run: |
-          npx playwright test e2e/library_pagination.spec.ts e2e/library_view_toggle.spec.ts \
+          npx playwright test e2e/library_pagination.spec.ts e2e/library_view_toggle.spec.ts e2e/library_footer.spec.ts \
             --project='Desktop Chrome' \
             --reporter=line \
             --output="$RUNNER_TEMP/playwright-test-results"
