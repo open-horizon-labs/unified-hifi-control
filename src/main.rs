@@ -1146,6 +1146,7 @@ mod server {
             // Controller shortcuts: pins from the Library, per-controller maps, and button input.
             .route("/api/shortcuts", get(api::shortcuts::list_handler))
             .route("/api/shortcuts", post(api::shortcuts::pin_handler))
+            .route("/api/shortcuts/{id}/play", post(api::shortcuts::play_handler))
             .route("/api/shortcuts/{id}", patch(api::shortcuts::rename_handler))
             .route("/api/shortcuts/{id}", delete(api::shortcuts::delete_handler))
             .route("/api/controllers/{id}/shortcuts", get(api::shortcuts::controller_get_handler))

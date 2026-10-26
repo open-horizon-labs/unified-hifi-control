@@ -565,6 +565,7 @@ mod tests {
             ("/api/shortcuts", Method::POST),
             ("/api/shortcuts/sc_ab12", Method::PATCH),
             ("/api/shortcuts/sc_ab12", Method::DELETE),
+            ("/api/shortcuts/sc_ab12/play", Method::POST),
             ("/api/controllers/dial-1/shortcuts", Method::PUT),
             ("/api/controllers/dial-1/shortcuts/test", Method::POST),
         ] {

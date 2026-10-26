@@ -1008,6 +1008,8 @@ pub struct ShortcutInfo {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ShortcutsResponse {
     pub shortcuts: Vec<ShortcutInfo>,
+    #[serde(default)]
+    pub next_offset: Option<usize>,
 }
 
 /// `POST /api/shortcuts`.

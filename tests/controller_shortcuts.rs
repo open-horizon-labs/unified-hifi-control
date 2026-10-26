@@ -1042,3 +1042,115 @@ async fn stopping_lms_during_item_validation_cannot_start_playback_after_shutdow
         "validation completing after shutdown must not write the queue: {writes:?}"
     );
 }
+
+// A screen selection is a durable shortcut ID, not a simulated remote button.
+#[tokio::test]
+async fn direct_shortcut_play_needs_no_binding_and_checks_the_displayed_zone() {
+    use axum::extract::Path;
+    use unified_hifi_control::api::shortcuts::{play_handler, PlayRequest};
+    let current = format!("lms:{OTHER_PLAYER}");
+    let h = harness(&[
+        (&format!("lms:{LMS_PLAYER}"), "Living Room"),
+        (&current, "Kitchen"),
+    ])
+    .await;
+    let id = h.pin_kind_of_blue().await;
+    h.controller_reports_zone(&current).await;
+    let mut headers = HeaderMap::new();
+    headers.insert("x-knob-id", HeaderValue::from_static(controller()));
+    h.mock.clear_commands().await;
+    let stale = play_handler(
+        State(h.state.clone()),
+        Path(id.clone()),
+        headers.clone(),
+        Json(PlayRequest {
+            zone_id: format!("lms:{LMS_PLAYER}"),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stale.0, axum::http::StatusCode::CONFLICT);
+    assert!(h.playlist_commands(LMS_PLAYER).await.is_empty());
+    assert!(h.playlist_commands(OTHER_PLAYER).await.is_empty());
+    let result = play_handler(
+        State(h.state.clone()),
+        Path(id.clone()),
+        headers,
+        Json(PlayRequest {
+            zone_id: current.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.0["code"], "accepted");
+    assert!(!h.playlist_commands(OTHER_PLAYER).await.is_empty());
+    assert!(h.playlist_commands(LMS_PLAYER).await.is_empty());
+    h.state.shortcuts.delete(&id).await.unwrap();
+    let deleted = play_handler(
+        State(h.state.clone()),
+        Path(id),
+        HeaderMap::new(),
+        Json(PlayRequest { zone_id: current }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(deleted.0, axum::http::StatusCode::NOT_FOUND);
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn controller_catalog_is_bounded_and_continuable_without_losing_legacy_details() {
+    use axum::extract::Query;
+    use unified_hifi_control::api::shortcuts::{list_handler, ListQuery};
+    let h = harness(&[]).await;
+    for i in 0..25 {
+        h.state
+            .shortcuts
+            .pin(
+                ShortcutTarget::Spotify {
+                    uri: format!("spotify:playlist:{i}"),
+                },
+                format!("Playlist {i:02}"),
+                Some(format!("{i:02} {}", "音".repeat(300))),
+            )
+            .await
+            .unwrap();
+    }
+    let mut ids = std::collections::HashSet::new();
+    let mut offset = 0;
+    loop {
+        let page = list_handler(
+            State(h.state.clone()),
+            Query(ListQuery {
+                offset: Some(offset),
+                limit: Some(usize::MAX),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(page["version"], 1);
+        let rows = page["shortcuts"].as_array().unwrap();
+        assert!(rows.len() <= 12);
+        assert!(serde_json::to_vec(&page).unwrap().len() < 16384);
+        for row in rows {
+            assert!(ids.insert(row["id"].as_str().unwrap().to_string()));
+            assert!(row["name"].as_str().unwrap().chars().count() <= 160);
+        }
+        match page["next_offset"].as_u64() {
+            Some(next) => {
+                assert!(next > offset as u64);
+                offset = next as usize;
+            }
+            None => break,
+        }
+    }
+    assert_eq!(ids.len(), 25);
+    let legacy = list_handler(State(h.state.clone()), Query(ListQuery::default()))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(legacy["shortcuts"].as_array().unwrap().len(), 25);
+    assert!(legacy["shortcuts"][0]["title"].is_string());
+    h.stop().await;
+}

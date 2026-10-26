@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
@@ -60,13 +60,98 @@ async fn view(state: &AppState, shortcut: &Shortcut) -> ShortcutView {
     }
 }
 
-/// `GET /api/shortcuts`
-pub async fn list_handler(State(state): State<AppState>) -> ApiResult {
+#[derive(Deserialize, Default)]
+pub struct ListQuery {
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+/// Legacy callers may omit pagination. Controller projections are bounded to 12 rows.
+pub async fn list_handler(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> ApiResult {
+    let all = state.shortcuts.list().await;
+    let offset = query.offset.unwrap_or(0);
+    let limit = if query.offset.is_some() || query.limit.is_some() {
+        query.limit.unwrap_or(12).clamp(1, 12)
+    } else {
+        all.len()
+    };
+    let paged = query.offset.is_some() || query.limit.is_some();
     let mut shortcuts = Vec::new();
-    for shortcut in state.shortcuts.list().await {
-        shortcuts.push(view(&state, &shortcut).await);
+    for shortcut in all.iter().skip(offset).take(limit) {
+        if paged {
+            shortcuts.push(json!({
+                "id": shortcut.id,
+                "name": shortcut.name.chars().take(160).collect::<String>(),
+                "provider": shortcut.target.provider_label(),
+            }));
+        } else {
+            shortcuts.push(
+                serde_json::to_value(view(&state, shortcut).await)
+                    .map_err(|error| storage_error(error.into()))?,
+            );
+        }
     }
-    Ok(Json(json!({ "shortcuts": shortcuts })))
+    let end = offset.saturating_add(shortcuts.len());
+    let next_offset = if end < all.len() { Some(end) } else { None };
+    Ok(Json(
+        json!({ "version": 1, "shortcuts": shortcuts, "next_offset": next_offset }),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct PlayRequest {
+    /// Explicit target, captured when the listener tapped. Never fall back to another zone.
+    pub zone_id: String,
+}
+
+/// Direct selection and remote bindings share the same durable provider resolver.
+/// Hardware identity adds a current-zone precondition; it is not a button mapping.
+pub async fn play_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<PlayRequest>,
+) -> ApiResult {
+    if req.zone_id.trim().is_empty() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "no_zone",
+            "Choose a zone first.",
+        ));
+    }
+    if let Some(controller_id) = crate::knobs::routes::extract_knob_id(&headers, None) {
+        if state.knobs.get(&controller_id).await.is_none() {
+            return Err(err(
+                StatusCode::NOT_FOUND,
+                "unknown_controller",
+                "Controller is not registered yet.",
+            ));
+        }
+        if resolve::controller_zone(&state, &controller_id)
+            .await
+            .as_deref()
+            != Some(req.zone_id.as_str())
+        {
+            return Err(err(
+                StatusCode::CONFLICT,
+                "zone_changed",
+                "Zone changed. Open Shortcuts again.",
+            ));
+        }
+    }
+    let shortcut = state.shortcuts.get(&id).await.ok_or_else(|| {
+        err(
+            StatusCode::NOT_FOUND,
+            "unknown_shortcut",
+            "Shortcut removed. Refresh Shortcuts.",
+        )
+    })?;
+    Ok(Json(outcome_json(
+        resolve::play(&state, &shortcut, &req.zone_id).await,
+    )))
 }
 
 #[derive(Deserialize)]
