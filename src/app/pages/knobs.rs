@@ -6,7 +6,7 @@ use dioxus::prelude::*;
 
 use crate::app::api::{
     self, FetchFirmwareResponse, FirmwareVersion, KnobConfig, KnobConfigResponse, KnobDevice,
-    KnobDevicesResponse, PowerModeConfig, Zone, ZonesResponse,
+    KnobDevicesResponse, ManagedZone, ManagedZonesResponse, PowerModeConfig, Zone, ZonesResponse,
 };
 use crate::app::components::Layout;
 use crate::app::sse::use_sse;
@@ -70,6 +70,8 @@ pub fn Knobs() -> Element {
 
     // Volume step override (0.0 = use zone default)
     let mut volume_step_override = use_signal(|| 0.0f64);
+    // Zones this controller does not list (per-controller hide list)
+    let mut hidden_zone_ids = use_signal(Vec::<String>::new);
 
     // Firmware fetch state
     let mut fw_fetching = use_signal(|| false);
@@ -86,6 +88,14 @@ pub fn Knobs() -> Element {
     let mut zones =
         use_resource(|| async { api::fetch_json::<ZonesResponse>("/zones").await.ok() });
 
+    // Every zone, hidden ones included: the per-controller hide list is edited against this, not
+    // `/zones`, which already omits zones hidden globally.
+    let mut managed_zones = use_resource(|| async {
+        api::fetch_json::<ManagedZonesResponse>("/api/zones/visibility")
+            .await
+            .ok()
+    });
+
     // Load firmware version resource
     let mut firmware_version = use_resource(|| async {
         api::fetch_json::<FirmwareVersion>("/firmware/version")
@@ -100,6 +110,7 @@ pub fn Knobs() -> Element {
         if sse.should_refresh_knobs() {
             knobs.restart();
             zones.restart();
+            managed_zones.restart();
         }
     });
 
@@ -159,6 +170,7 @@ pub fn Knobs() -> Element {
                         cpu_freq_scaling.set(cfg.cpu_freq_scaling_enabled.unwrap_or(false));
                         sleep_poll_stopped.set(cfg.sleep_poll_stopped_sec.unwrap_or(60));
                         volume_step_override.set(cfg.volume_step_override.unwrap_or(0.0));
+                        hidden_zone_ids.set(cfg.hidden_zone_ids.unwrap_or_default());
                     } else {
                         config_name.set(String::new());
                         config_rotation_charging.set(180);
@@ -200,6 +212,7 @@ pub fn Knobs() -> Element {
                         cpu_freq_scaling.set(false);
                         sleep_poll_stopped.set(60);
                         volume_step_override.set(0.0);
+                        hidden_zone_ids.set(Vec::new());
                     }
                 }
                 Err(e) => {
@@ -231,6 +244,7 @@ pub fn Knobs() -> Element {
             let cpu_fs = cpu_freq_scaling();
             let poll_stopped = sleep_poll_stopped();
             let vol_step = volume_step_override();
+            let hidden_ids = hidden_zone_ids();
 
             save_status.set(Some("Saving...".to_string()));
 
@@ -251,6 +265,7 @@ pub fn Knobs() -> Element {
                     cpu_freq_scaling_enabled: Some(cpu_fs),
                     sleep_poll_stopped_sec: Some(poll_stopped),
                     volume_step_override: Some(vol_step),
+                    hidden_zone_ids: Some(hidden_ids),
                 };
 
                 let url = format!("/knob/config?knob_id={}", urlencoding::encode(&knob_id));
@@ -424,6 +439,22 @@ pub fn Knobs() -> Element {
                     cpu_freq_scaling: cpu_freq_scaling(),
                     sleep_poll_stopped: sleep_poll_stopped(),
                     volume_step_override: volume_step_override(),
+                    managed_zones: managed_zones
+                        .read()
+                        .as_ref()
+                        .and_then(|r| r.as_ref())
+                        .map(|r| r.zones.clone())
+                        .unwrap_or_default(),
+                    hidden_zone_ids: hidden_zone_ids(),
+                    current_zone_id: current_knob_id()
+                        .and_then(|id| {
+                            knobs
+                                .read()
+                                .as_ref()
+                                .and_then(|r| r.as_ref())
+                                .and_then(|r| r.knobs.iter().find(|k| k.knob_id == id).cloned())
+                        })
+                        .and_then(|k| k.status.and_then(|st| st.zone_id)),
                     save_status: save_status(),
                     on_name_change: move |v| config_name.set(v),
                     on_rotation_charging_change: move |v| config_rotation_charging.set(v),
@@ -443,6 +474,7 @@ pub fn Knobs() -> Element {
                     on_cpu_freq_scaling_change: move |v| cpu_freq_scaling.set(v),
                     on_sleep_poll_stopped_change: move |v| sleep_poll_stopped.set(v),
                     on_volume_step_override_change: move |v| volume_step_override.set(v),
+                    on_hidden_zone_ids_change: move |v| hidden_zone_ids.set(v),
                     on_save: save_config,
                     on_close: move |_| modal_open.set(false),
                 }
@@ -575,6 +607,140 @@ fn KnobRow(knob: KnobDevice, zones: Vec<Zone>, on_config: EventHandler<String>) 
                 }
             }
         }
+    }
+}
+
+/// One line per zone this controller can list, hidden ones included.
+///
+/// What it edits is the controller's *own* hide list, which stacks on the global one in Settings:
+/// a zone hidden for every controller is shown here as such and cannot be switched on from this
+/// screen, because that decision belongs to Settings. Hiding is a list filter only (`zone_list`),
+/// so the controller's current zone keeps playing even when it is hidden here; the row says so
+/// rather than leaving a person to wonder why nothing stopped.
+#[component]
+fn ControllerZones(
+    zones: Vec<ManagedZone>,
+    hidden_zone_ids: Vec<String>,
+    current_zone_id: Option<String>,
+    on_change: EventHandler<Vec<String>>,
+) -> Element {
+    let rows = zone_rows(&zones, &hidden_zone_ids);
+    let listed_here = rows
+        .iter()
+        .filter(|r| !r.hidden_everywhere && !r.hidden_here)
+        .count();
+    let total = rows.iter().filter(|r| !r.hidden_everywhere).count();
+    let any_hidden_here = hidden_zone_ids.iter().any(|id| !id.is_empty());
+
+    rsx! {
+        fieldset { class: "mb-6",
+            legend { class: "text-sm font-medium mb-2", "Zones on this controller" }
+            p { class: "text-sm text-muted mb-3",
+                "Untick a zone to keep it out of this controller's zone list. Other controllers are unaffected, and a hidden zone still plays if the controller is already on it."
+            }
+            if rows.is_empty() {
+                p { class: "text-sm text-muted", "No zones discovered yet." }
+            } else {
+                div { class: "bg-elevated rounded-lg p-3",
+                    div { class: "flex items-center justify-between gap-3 mb-2",
+                        span { class: "text-sm text-secondary", "Showing {listed_here} of {total}" }
+                        if any_hidden_here {
+                            button {
+                                r#type: "button",
+                                class: "btn btn-outline btn-sm",
+                                onclick: move |_| on_change.call(Vec::new()),
+                                "Show all"
+                            }
+                        }
+                    }
+                    ul { class: "space-y-1",
+                        for row in rows.iter() {
+                            {
+                                let zone_id = row.zone_id.clone();
+                                let is_current = current_zone_id.as_deref() == Some(row.zone_id.as_str());
+                                let hidden_now = hidden_zone_ids.clone();
+                                let checked = !row.hidden_here && !row.hidden_everywhere;
+                                let disabled = row.hidden_everywhere;
+                                rsx! {
+                                    li { key: "{row.zone_id}", class: "flex flex-wrap items-center gap-x-3 gap-y-1 min-h-11",
+                                        label { class: "flex items-center gap-3 flex-1 min-w-0",
+                                            input {
+                                                r#type: "checkbox",
+                                                class: "checkbox",
+                                                checked: checked,
+                                                disabled: disabled,
+                                                onchange: move |_| {
+                                                    on_change.call(toggled(&hidden_now, &zone_id));
+                                                }
+                                            }
+                                            span { class: "truncate", "{row.label}" }
+                                        }
+                                        if row.hidden_everywhere {
+                                            span { class: "text-xs text-muted", "Hidden for all controllers (Settings)" }
+                                        } else if row.unavailable {
+                                            span { class: "text-xs text-muted", "Not currently available" }
+                                        } else if is_current && row.hidden_here {
+                                            span { class: "text-xs text-muted", "Playing here now; hidden from the list only" }
+                                        } else if is_current {
+                                            span { class: "badge badge-secondary", "This controller's zone" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A zone as the per-controller list shows it.
+#[derive(Debug, Clone, PartialEq)]
+struct ZoneRow {
+    zone_id: String,
+    label: String,
+    hidden_here: bool,
+    hidden_everywhere: bool,
+    /// In this controller's hide list but no longer discovered. Kept visible so the entry can be
+    /// cleared; otherwise a zone that comes back later would still be hidden with no way to see why.
+    unavailable: bool,
+}
+
+/// Rows for every zone the bridge manages, then any hide-list entries it no longer knows.
+fn zone_rows(zones: &[ManagedZone], hidden_here: &[String]) -> Vec<ZoneRow> {
+    let mut rows: Vec<ZoneRow> = zones
+        .iter()
+        .map(|z| ZoneRow {
+            zone_id: z.zone_id.clone(),
+            label: z.qualified_label(),
+            hidden_here: hidden_here.contains(&z.zone_id),
+            hidden_everywhere: z.hidden,
+            unavailable: false,
+        })
+        .collect();
+    for id in hidden_here {
+        if !id.is_empty() && !zones.iter().any(|z| &z.zone_id == id) {
+            rows.push(ZoneRow {
+                zone_id: id.clone(),
+                label: id.clone(),
+                hidden_here: true,
+                hidden_everywhere: false,
+                unavailable: true,
+            });
+        }
+    }
+    rows
+}
+
+/// The hide list with `zone_id` flipped, keeping the order of the rest.
+fn toggled(hidden: &[String], zone_id: &str) -> Vec<String> {
+    if hidden.iter().any(|h| h == zone_id) {
+        hidden.iter().filter(|h| *h != zone_id).cloned().collect()
+    } else {
+        let mut next = hidden.to_vec();
+        next.push(zone_id.to_string());
+        next
     }
 }
 
@@ -726,6 +892,10 @@ fn ConfigModal(
     cpu_freq_scaling: bool,
     sleep_poll_stopped: u32,
     volume_step_override: f64,
+    // Zones offered to this controller
+    managed_zones: Vec<ManagedZone>,
+    hidden_zone_ids: Vec<String>,
+    current_zone_id: Option<String>,
     save_status: Option<String>,
     on_name_change: EventHandler<String>,
     on_rotation_charging_change: EventHandler<i32>,
@@ -745,6 +915,7 @@ fn ConfigModal(
     on_cpu_freq_scaling_change: EventHandler<bool>,
     on_sleep_poll_stopped_change: EventHandler<u32>,
     on_volume_step_override_change: EventHandler<f64>,
+    on_hidden_zone_ids_change: EventHandler<Vec<String>>,
     on_save: EventHandler<()>,
     on_close: EventHandler<()>,
 ) -> Element {
@@ -789,6 +960,13 @@ fn ConfigModal(
                                 value: "{name}",
                                 oninput: move |e| on_name_change.call(e.value())
                             }
+                        }
+
+                        ControllerZones {
+                            zones: managed_zones.clone(),
+                            hidden_zone_ids: hidden_zone_ids.clone(),
+                            current_zone_id: current_zone_id.clone(),
+                            on_change: on_hidden_zone_ids_change,
                         }
 
                         // Power Settings - Side by Side (includes rotation)
@@ -1082,5 +1260,46 @@ mod controller_identity_tests {
             controller_type_name(Some("future-model")),
             "Unknown controller type"
         );
+    }
+}
+
+#[cfg(test)]
+mod controller_zone_tests {
+    use super::{toggled, zone_rows};
+    use crate::app::api::ManagedZone;
+
+    fn zone(id: &str, name: &str, hidden: bool) -> ManagedZone {
+        ManagedZone {
+            zone_id: id.into(),
+            zone_name: name.into(),
+            source: "roon".into(),
+            hidden,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn globally_hidden_zone_is_marked_and_not_a_controller_choice() {
+        let rows = zone_rows(
+            &[zone("roon:a", "A", true), zone("roon:b", "B", false)],
+            &[],
+        );
+        assert!(rows[0].hidden_everywhere && !rows[0].hidden_here);
+        assert!(!rows[1].hidden_everywhere && !rows[1].hidden_here);
+    }
+
+    #[test]
+    fn hide_entry_for_a_zone_no_longer_discovered_stays_listed_so_it_can_be_cleared() {
+        let rows = zone_rows(&[zone("roon:a", "A", false)], &["roon:gone".to_string()]);
+        let gone = rows.iter().find(|r| r.zone_id == "roon:gone").unwrap();
+        assert!(gone.unavailable && gone.hidden_here);
+    }
+
+    #[test]
+    fn toggling_adds_then_removes_without_disturbing_the_rest() {
+        let start = vec!["roon:a".to_string(), "lms:b".to_string()];
+        let added = toggled(&start, "roon:c");
+        assert_eq!(added, ["roon:a", "lms:b", "roon:c"]);
+        assert_eq!(toggled(&added, "roon:a"), ["lms:b", "roon:c"]);
     }
 }

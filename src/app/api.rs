@@ -1708,6 +1708,10 @@ pub struct KnobConfig {
     pub sleep_poll_stopped_sec: Option<u32>,
     /// Volume step override (None/0 = use zone default)
     pub volume_step_override: Option<f64>,
+    /// Zones this controller does not list, beyond the global hide list. `None` on save leaves
+    /// the stored list alone; the server omits the field while it is empty.
+    #[serde(default)]
+    pub hidden_zone_ids: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

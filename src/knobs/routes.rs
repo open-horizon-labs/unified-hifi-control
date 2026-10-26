@@ -166,7 +166,7 @@ pub async fn knob_zones_handler(
             .await
             .map_err(knob_persistence_error)?;
     }
-    let zones = get_all_zones_internal(&state).await;
+    let zones = get_zone_infos(&state, extract_knob_id(&headers, None).as_deref()).await;
     Ok(Json(ZonesResponse { zones }))
 }
 
@@ -272,9 +272,27 @@ pub struct NowPlayingResponse {
     pub zones_sha: Option<String>,
 }
 
-/// Helper to build zone info list for error responses
-async fn get_zone_infos(state: &AppState) -> Vec<ZoneInfo> {
-    get_all_zones_internal(state).await
+/// The zone list one controller is offered: the shared list, minus that controller's own hide list.
+///
+/// A list filter only. The controller's zone is still resolved by ID against the aggregator, so a
+/// zone it hides keeps playing when addressed (see `zone_list`).
+async fn get_zone_infos(state: &AppState, knob_id: Option<&str>) -> Vec<ZoneInfo> {
+    let zones = get_all_zones_internal(state).await;
+    let Some(id) = knob_id else {
+        return zones;
+    };
+    match state.knobs.get(id).await {
+        Some(knob) => without_hidden(zones, &knob.config.hidden_zone_ids),
+        None => zones,
+    }
+}
+
+/// Remove the zones named in `hidden`, preserving order.
+fn without_hidden(mut zones: Vec<ZoneInfo>, hidden: &[String]) -> Vec<ZoneInfo> {
+    if !hidden.is_empty() {
+        zones.retain(|z| !hidden.iter().any(|h| h == &z.zone_id));
+    }
+    zones
 }
 
 /// Compute SHA256 hash of zone list (first 8 hex chars)
@@ -314,7 +332,11 @@ pub async fn knob_now_playing_handler(
     let zone_id = match params.zone_id {
         Some(id) => id,
         None => {
-            let zone_infos = get_zone_infos(&state).await;
+            let zone_infos = get_zone_infos(
+                &state,
+                extract_knob_id(&headers, params.knob_id.as_deref()).as_deref(),
+            )
+            .await;
             let zones_sha = compute_zones_sha(&zone_infos);
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -368,7 +390,7 @@ pub async fn knob_now_playing_handler(
         "/knob/now_playing/image?zone_id={}",
         urlencoding::encode(&zone_id)
     );
-    let zone_infos = get_zone_infos(&state).await;
+    let zone_infos = get_zone_infos(&state, knob_id.as_deref()).await;
 
     // Handle legacy zone_id without prefix (assume Roon)
     let prefixed_zone_id = if !zone_id.contains(':') {
@@ -1670,6 +1692,30 @@ mod tests {
             device: None,
             library_tabs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn controller_hide_list_filters_only_its_own_zones_and_keeps_order() {
+        let zones = vec![
+            make_zone("roon:a", "A"),
+            make_zone("roon:b", "B"),
+            make_zone("lms:c", "C"),
+        ];
+        let kept = without_hidden(zones.clone(), &["roon:b".to_string()]);
+        let ids: Vec<_> = kept.iter().map(|z| z.zone_id.as_str()).collect();
+        assert_eq!(ids, ["roon:a", "lms:c"]);
+
+        // An empty list, or ids naming no listed zone, changes nothing.
+        assert_eq!(without_hidden(zones.clone(), &[]).len(), 3);
+        assert_eq!(without_hidden(zones, &["roon:gone".to_string()]).len(), 3);
+    }
+
+    #[test]
+    fn controller_hide_list_changes_the_zones_sha_the_controller_polls() {
+        let zones = vec![make_zone("roon:a", "A"), make_zone("roon:b", "B")];
+        let shown = compute_zones_sha(&zones);
+        let hidden = compute_zones_sha(&without_hidden(zones, &["roon:b".to_string()]));
+        assert_ne!(shown, hidden);
     }
 
     #[test]
