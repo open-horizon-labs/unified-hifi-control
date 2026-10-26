@@ -185,3 +185,70 @@ crate. Host inference latency, peak memory, target CPU equivalence and broader
 real-artwork quality need separate measurements before making performance claims.
 No domain-expert factual claim is left unresolved; the remaining gaps are build
 and device measurements, not licensing or API approval requests.
+
+## Execute: Pi workload follow-up on #896
+
+**Aim:** Avoid artwork inference and duplicate conversion work when neither is
+needed, while preserving crop geometry, pixel processing, API payloads and cache
+budgets. PR #896 now targets `integration/v4-beta.11`; that base was merged into
+the feature branch without rewriting either branch. The size measurements above
+were made before this beta integration/Pi follow-up and are not measurements of
+the new combined head.
+
+**Delivered:**
+
+- Exact matching aspect ratios bypass model loading, image hashing and inference;
+  the existing full-image resampler handles the resize. Equality uses u64 cross
+  products, preserving distinct aspect ratios without floating-point tolerances.
+- Concurrent requests for a cacheable output share a per-key conversion lock and
+  recheck the output cache before decoding/resampling. Different output keys can
+  still run concurrently. The existing global two-worker bound remains.
+- Cancellation transfers neither a running worker's slot nor its output-key lock
+  to another request. Both are owned by the blocking task until conversion ends.
+- Failures remain untagged/uncached and retryable. Oversized outputs retain the
+  existing serve-without-caching policy; queued requests may reconvert these
+  rather than violating the RAM budget. Completed key locks are weak references,
+  pruned on subsequent acquisition, and do not retain a growing cover history.
+- `artwork-inference-bench` reports model-load time, first inference and warm
+  p50/p95 for 20 uncached runs, using the server's bounded probe dimensions.
+
+### Adversarial verification / risk retirement
+
+| Risk | Disposition | Tempting patch this must fail | Evidence |
+|---|---|---|---|
+| Same-aspect resize still initializes inference | Retired | Cache the inference result but still run once unnecessarily | New test failed with one analysis before fix; now asserts zero analyses and no loaded analyzer for square, wide and tall resize cases, with exact resampler output equality |
+| Optimization disables useful subject-aware crops | Retired | Always bypass inference | Existing crown landscape test requires the face-preserving top crop across display/RGB565 encoding; analysis/crop reference tests remain |
+| Duplicate decoding/resampling survives inference coalescing | Retired | Keep only the analysis mutex or omit the post-lock output-cache check | Eight-request test failed with eight conversions before fix, now requires one conversion and shared result identity |
+| Cancelled caller releases a still-running conversion | Retired | Keep key lock on the async waiter | Gated blocking conversion + aborted waiter + duplicate request test; duplicate must reuse the first result with only one converter call |
+| New global lock serializes unrelated output sizes | Retired | One mutex for every conversion | A blocked output must not prevent a different-size output from completing |
+| Cache failures or leak output identity history | Retired | Retain failed results or strong permanent key locks | Failure/retry and 40-key weak-lock reclamation test |
+| Claim Pi performance from host measurements | Accepted with rationale | Label a desktop timing as Pi timing | No Pi hardware is identified/connected in this session. Hardware latency and peak RSS remain unmeasured; benchmark is a measurement tool, not proof of a Pi budget |
+
+### Pi measurement procedure
+
+Build the example in release mode on a suitable build host, then run the executable
+on the actual Pi. For an ARM64 musl cross build using the repository's existing
+Zig tooling:
+
+```sh
+cargo zigbuild --release --target aarch64-unknown-linux-musl --example artwork-inference-bench
+# Copy target/aarch64-unknown-linux-musl/release/examples/artwork-inference-bench to the Pi.
+# On the Pi, record its model, RAM, OS/architecture and thermal/throttling state:
+/usr/bin/time -v ./artwork-inference-bench
+# Optional provider/local cover:
+/usr/bin/time -v ./artwork-inference-bench /path/to/cover.jpg
+```
+
+Building natively uses `cargo build --release --example artwork-inference-bench`.
+Run `time` on the built executable, not on Cargo: compiler memory is unrelated to
+inference memory. This tool intentionally bypasses the caches to measure the cost
+of a genuine miss. Its peak RSS covers this isolated process, not total running
+UHC memory. Measure HTTP cache-hit/miss latency separately when setting a Pi budget.
+
+**Follow-up checks:** Both new behavior tests were observed failing before the
+fixes (one unnecessary analysis; eight duplicate conversions). The 11 targeted
+artwork tests now pass, including cancellation, independent keys, failure retry,
+lock reclamation and existing crop/cache tests. Standard workspace clippy passes.
+The refreshed beta.11 browser release is 4,742,014 bytes, passes WebAssembly
+validation and contains no debug data under the final-asset audit. Full-workspace
+results and platform/package results are tracked on PR #896.

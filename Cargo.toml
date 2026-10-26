@@ -297,3 +297,8 @@ strip = "none"
 name = "convert-artwork-models"
 path = "examples/convert_artwork_models.rs"
 required-features = ["server"]
+
+[[example]]
+name = "artwork-inference-bench"
+path = "examples/artwork_inference_bench.rs"
+required-features = ["server"]

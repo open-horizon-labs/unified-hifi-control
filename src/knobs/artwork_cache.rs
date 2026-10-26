@@ -30,7 +30,7 @@
 
 use super::image::Rgb565ResizePolicy;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 /// Retained provider bytes. See the module docs for the full budget.
@@ -238,9 +238,12 @@ pub struct CachedOutput {
 }
 
 /// Byte-budgeted LRU of composed artwork for every output format.
+type ConversionFlight = (OutputCacheKey, Weak<tokio::sync::Mutex<()>>);
+
 #[derive(Clone)]
 pub struct ArtworkOutputCache {
     entries: Arc<Mutex<ByteLru<OutputCacheKey, CachedOutput>>>,
+    conversions: Arc<Mutex<Vec<ConversionFlight>>>,
 }
 
 impl Default for ArtworkOutputCache {
@@ -253,7 +256,53 @@ impl ArtworkOutputCache {
     pub fn with_budget(budget: usize) -> Self {
         Self {
             entries: Arc::new(Mutex::new(ByteLru::new(budget))),
+            conversions: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Runs expensive conversion off the reactor, with bounded worker memory.
+    pub async fn get_or_convert<F>(
+        &self,
+        key: OutputCacheKey,
+        convert: F,
+    ) -> anyhow::Result<Option<Arc<CachedOutput>>>
+    where
+        F: FnOnce() -> anyhow::Result<Option<(String, Vec<u8>)>> + Send + 'static,
+    {
+        if let Some(hit) = self.get(&key) {
+            return Ok(Some(hit));
+        }
+        let flight = {
+            let mut flights = locked(&self.conversions);
+            flights.retain(|(_, lock)| lock.strong_count() > 0);
+            if let Some(lock) = flights
+                .iter()
+                .find_map(|(candidate, lock)| (candidate == &key).then(|| lock.upgrade()).flatten())
+            {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                flights.push((key.clone(), Arc::downgrade(&lock)));
+                lock
+            }
+        };
+        let guard = flight.lock_owned().await;
+        // Another worker may have produced this output while we were waiting.
+        if let Some(hit) = self.get(&key) {
+            return Ok(Some(hit));
+        }
+        static WORKERS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
+        let permit = Arc::clone(&WORKERS).acquire_owned().await?;
+        let cache = self.clone();
+        tokio::task::spawn_blocking(move || {
+            // Keep both permits in the blocking task: cancelling the HTTP
+            // waiter must not admit another conversion while this one runs.
+            let _guard = guard;
+            let _permit = permit;
+            Ok(convert()?.map(|(content_type, data)| cache.insert(key, content_type, data)))
+        })
+        .await?
     }
 
     pub fn get(&self, key: &OutputCacheKey) -> Option<Arc<CachedOutput>> {
@@ -292,6 +341,148 @@ mod tests {
             },
             converter_version: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_output_requests_convert_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = ArtworkOutputCache::with_budget(1024);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut jobs = Vec::new();
+        for _ in 0..8 {
+            let cache = cache.clone();
+            let calls = Arc::clone(&calls);
+            jobs.push(tokio::spawn(async move {
+                cache
+                    .get_or_convert(out_key(0, 800), move || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(50));
+                        Ok(Some(("image/png".into(), vec![1; 64])))
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }));
+        }
+        let mut outputs = Vec::new();
+        for job in jobs {
+            outputs.push(job.await.unwrap());
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "duplicate decoding/resampling must be coalesced"
+        );
+        assert!(outputs.iter().all(|value| Arc::ptr_eq(&outputs[0], value)));
+    }
+
+    #[tokio::test]
+    async fn conversion_failure_retries_and_flights_are_reclaimed() {
+        let cache = ArtworkOutputCache::with_budget(1024);
+        assert!(cache
+            .get_or_convert(out_key(0, 800), || Ok(None))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(cache
+            .get_or_convert(out_key(0, 800), || anyhow::bail!("decode failed"))
+            .await
+            .is_err());
+        for i in 0..40 {
+            let result = cache
+                .get_or_convert(out_key(i, 800), || Ok(Some(("image/png".into(), vec![1]))))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.data, vec![1]);
+        }
+        let flights = locked(&cache.conversions);
+        assert!(
+            flights.len() <= 1,
+            "completed cover identities must not accumulate"
+        );
+        assert!(flights.iter().all(|(_, lock)| lock.strong_count() == 0));
+    }
+
+    #[tokio::test]
+    async fn cancellation_keeps_the_running_conversion_single_flight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = ArtworkOutputCache::with_budget(1024);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_cache = cache.clone();
+        let first_calls = Arc::clone(&calls);
+        let first = tokio::spawn(async move {
+            first_cache
+                .get_or_convert(out_key(0, 800), move || {
+                    first_calls.fetch_add(1, Ordering::SeqCst);
+                    let _ = started_tx.send(());
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(Some(("image/png".into(), vec![7])))
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        first.abort();
+        let _ = first.await;
+        let (duplicate_tx, mut duplicate_rx) = tokio::sync::oneshot::channel();
+        let next_cache = cache.clone();
+        let next_calls = Arc::clone(&calls);
+        let next = tokio::spawn(async move {
+            next_cache
+                .get_or_convert(out_key(0, 800), move || {
+                    next_calls.fetch_add(1, Ordering::SeqCst);
+                    let _ = duplicate_tx.send(());
+                    Ok(Some(("image/png".into(), vec![9])))
+                })
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        let premature = tokio::time::timeout(Duration::from_millis(150), &mut duplicate_rx).await;
+        release_tx.send(()).unwrap();
+        let result = next.await.unwrap();
+        assert!(
+            premature.is_err(),
+            "cancelling a waiter must not release a running worker's key"
+        );
+        assert_eq!(result.data, vec![7]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn different_outputs_can_convert_while_one_is_blocked() {
+        let cache = ArtworkOutputCache::with_budget(1024);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_cache = cache.clone();
+        let first = tokio::spawn(async move {
+            first_cache
+                .get_or_convert(out_key(0, 800), move || {
+                    let _ = started_tx.send(());
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(Some(("image/png".into(), vec![1])))
+                })
+                .await
+                .unwrap()
+        });
+        started_rx.await.unwrap();
+        let other = tokio::time::timeout(
+            Duration::from_secs(1),
+            cache.get_or_convert(out_key(0, 400), || Ok(Some(("image/png".into(), vec![2])))),
+        )
+        .await;
+        release_tx.send(()).unwrap();
+        first.await.unwrap();
+        assert_eq!(
+            other
+                .expect("different size must not share a key lock")
+                .unwrap()
+                .unwrap()
+                .data,
+            vec![2]
+        );
     }
 
     #[test]

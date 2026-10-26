@@ -86,7 +86,27 @@ pub(super) fn compose(
     width: u32,
     height: u32,
 ) -> anyhow::Result<DynamicImage> {
-    let analysis = ANALYSIS
+    compose_with_cache(source, width, height, &ANALYSIS)
+}
+fn compose_with_cache(
+    source: &DynamicImage,
+    width: u32,
+    height: u32,
+    cache: &Mutex<AnalysisCache>,
+) -> anyhow::Result<DynamicImage> {
+    // Equal aspect ratios need no crop decision. Use wide multiplication so
+    // dimensions cannot overflow while testing exact equality.
+    if u64::from(source.width()) * u64::from(height)
+        == u64::from(source.height()) * u64::from(width)
+    {
+        return super::image::resample(
+            source,
+            (0, 0, source.width(), source.height()),
+            width,
+            height,
+        );
+    }
+    let analysis = cache
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .analyze(source)?;
@@ -137,6 +157,31 @@ fn compose_analyzed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn matching_aspect_ratio_resizes_without_loading_models() {
+        for (sw, sh, tw, th) in [
+            (240, 240, 120, 120),
+            (240, 120, 480, 240),
+            (120, 240, 60, 120),
+        ] {
+            let source = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                sw,
+                sh,
+                image::Rgba([80, 90, 100, 255]),
+            ));
+            let cache = Mutex::new(AnalysisCache::new());
+            let result = compose_with_cache(&source, tw, th, &cache).unwrap();
+            let expected = super::super::image::resample(&source, (0, 0, sw, sh), tw, th).unwrap();
+            assert_eq!(result.to_rgba8(), expected.to_rgba8());
+            let cache = cache.lock().unwrap();
+            assert_eq!(cache.analyses, 0, "no crop decision is needed");
+            assert!(
+                cache.analyzer.is_none(),
+                "do not even load models for a plain resize"
+            );
+        }
+    }
+
     #[test]
     fn concurrent_requests_share_one_model_analysis() {
         let source = Arc::new(
