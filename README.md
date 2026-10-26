@@ -368,6 +368,10 @@ local runner: it always builds the server and its matching WASM bundle together.
 
 </details>
 
+## Support
+
+If UHC is useful to you, you can [buy me a coffee](https://buymeacoffee.com/muness).
+
 ## License
 
 As of v2.5.0, this project is licensed under the [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/) license.

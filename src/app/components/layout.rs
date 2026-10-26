@@ -114,6 +114,13 @@ pub fn Layout(props: LayoutProps) -> Element {
                     "A HiPhi project"
                 }
                 span { " by {crate::brand::COMPANY_NAME} · Local control, optional Cloud" }
+                span { " · " }
+                a {
+                    href: "https://buymeacoffee.com/muness",
+                    target: "_blank",
+                    rel: "noopener noreferrer",
+                    "Buy me a coffee"
+                }
             }
         }
     }
