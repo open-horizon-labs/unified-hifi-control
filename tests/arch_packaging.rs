@@ -5,6 +5,7 @@ const SERVICE: &str = include_str!("../build/arch/unified-hifi-control.service")
 const INSTALL: &str = include_str!("../build/arch/unified-hifi-control.install");
 const ARCH_DOCS: &str = include_str!("../docs/arch-linux.md");
 const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/build.yml");
+const AUR_WORKFLOW: &str = include_str!("../.github/workflows/publish-aur.yml");
 
 fn checksum_values(name: &str) -> Vec<&str> {
     let declaration = format!("{name}=(");
@@ -107,6 +108,7 @@ fn package_hooks_do_not_restart_services_during_transactions() {
 
 #[test]
 fn release_workflow_publishes_complete_verified_sources() {
+    assert!(RELEASE_WORKFLOW.contains("uses: ./.github/workflows/publish-aur.yml"));
     for required in [
         "sha256sums_x86_64",
         "sha256sums_aarch64",
@@ -116,7 +118,7 @@ fn release_workflow_publishes_complete_verified_sources() {
         "build/arch/REUSE.toml",
     ] {
         assert!(
-            RELEASE_WORKFLOW.contains(required),
+            AUR_WORKFLOW.contains(required),
             "release workflow is missing {required}"
         );
     }
