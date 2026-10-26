@@ -25,10 +25,22 @@ pub fn update_feed(
     Some((target.slug(), channel.slug()))
 }
 
+/// What asking the bridge for a controller's feed produced. Absence of an answer is never read as
+/// "nothing newer": only an image the bridge actually reported can make a controller up to date.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedState {
+    /// No answer yet.
+    Loading,
+    /// The bridge holds this version on the controller's channel.
+    Image(String),
+    /// The bridge has no image for it, or the request failed.
+    Unavailable,
+}
+
 pub fn update_state(
     device_type: Option<&str>,
     running: Option<&str>,
-    available: Option<&str>,
+    feed: &FeedState,
 ) -> UpdateState {
     let Some(running_version) = running else {
         return UpdateState::Unknown("Version not reported");
@@ -39,11 +51,15 @@ pub fn update_state(
     if update_feed(device_type, running).is_none() {
         return UpdateState::Unknown("Local build, not on a release channel");
     }
-    match available {
-        Some(version) if firmware_version_is_newer(version, running_version) => {
-            UpdateState::Available(version.to_string())
+    match feed {
+        FeedState::Loading => UpdateState::Unknown("Checking for updates…"),
+        FeedState::Unavailable => {
+            UpdateState::Unknown("Update check unavailable: no image on this Bridge, or the check failed")
         }
-        _ => UpdateState::UpToDate,
+        FeedState::Image(version) if firmware_version_is_newer(version, running_version) => {
+            UpdateState::Available(version.clone())
+        }
+        FeedState::Image(_) => UpdateState::UpToDate,
     }
 }
 
@@ -84,32 +100,46 @@ mod tests {
 
     #[test]
     fn an_update_is_offered_only_for_a_newer_image_on_the_same_channel() {
-        let state = |avail| update_state(Some("frame"), Some("2.8.0-alpha.4"), avail);
+        let state = |version: &str| {
+            update_state(
+                Some("frame"),
+                Some("2.8.0-alpha.4"),
+                &FeedState::Image(version.into()),
+            )
+        };
         assert_eq!(
-            state(Some("2.8.0-alpha.5")),
+            state("2.8.0-alpha.5"),
             UpdateState::Available("2.8.0-alpha.5".into())
         );
-        assert_eq!(state(Some("2.8.0-alpha.4")), UpdateState::UpToDate);
-        assert_eq!(state(Some("2.8.0-alpha.3")), UpdateState::UpToDate);
-        assert_eq!(state(None), UpdateState::UpToDate);
+        assert_eq!(state("2.8.0-alpha.4"), UpdateState::UpToDate);
+        assert_eq!(state("2.8.0-alpha.3"), UpdateState::UpToDate);
+    }
+
+    #[test]
+    fn a_missing_answer_is_never_reported_as_up_to_date() {
+        // Empty cache, failed request, request still in flight: none of these is a freshness claim.
+        for feed in [FeedState::Loading, FeedState::Unavailable] {
+            let state = update_state(Some("frame"), Some("2.8.0-alpha.4"), &feed);
+            assert!(matches!(state, UpdateState::Unknown(_)), "{feed:?} -> {state:?}");
+        }
     }
 
     #[test]
     fn unknowns_say_why_instead_of_offering_an_update() {
         assert!(matches!(
-            update_state(Some("frame"), None, Some("9.9.9")),
+            update_state(Some("frame"), None, &FeedState::Image("9.9.9".into())),
             UpdateState::Unknown(_)
         ));
         assert!(matches!(
-            update_state(None, Some("2.8.0"), Some("9.9.9")),
+            update_state(None, Some("2.8.0"), &FeedState::Image("9.9.9".into())),
             UpdateState::Unknown(_)
         ));
         assert!(matches!(
-            update_state(Some("future-model"), Some("2.8.0"), Some("9.9.9")),
+            update_state(Some("future-model"), Some("2.8.0"), &FeedState::Image("9.9.9".into())),
             UpdateState::Unknown(_)
         ));
         assert!(matches!(
-            update_state(Some("frame"), Some("2.8.0-dev"), Some("9.9.9")),
+            update_state(Some("frame"), Some("2.8.0-dev"), &FeedState::Image("9.9.9".into())),
             UpdateState::Unknown(_)
         ));
     }

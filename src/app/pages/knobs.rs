@@ -12,7 +12,7 @@ use crate::app::api::{
 };
 use crate::app::components::Layout;
 use super::knobs_model::{
-    device_page_url, power_support, update_feed, update_state, UpdateState,
+    device_page_url, power_support, update_feed, update_state, FeedState, UpdateState,
 };
 use crate::app::sse::use_sse;
 use crate::device_settings::{
@@ -111,7 +111,7 @@ pub fn Knobs() -> Element {
     });
 
     // For each controller, the newest image the bridge holds on that controller's own channel.
-    let available = use_resource(move || {
+    let mut available = use_resource(move || {
         let feeds: HashSet<(&'static str, &'static str)> = knobs
             .read()
             .clone()
@@ -122,12 +122,16 @@ pub fn Knobs() -> Element {
             .filter_map(|knob| update_feed(knob.device_type.as_deref(), knob.version.as_deref()))
             .collect();
         async move {
-            let mut found = HashMap::<(String, String), String>::new();
+            // Every feed gets an explicit outcome; a failed request or an empty cache is
+            // `Unavailable`, never silently dropped.
+            let mut found = HashMap::<(String, String), FeedState>::new();
             for (device, channel) in feeds {
                 let url = format!("/firmware/version?device_type={device}&channel={channel}");
-                if let Ok(resp) = api::fetch_json::<FirmwareVersion>(&url).await {
-                    found.insert((device.to_string(), channel.to_string()), resp.version);
-                }
+                let state = match api::fetch_json::<FirmwareVersion>(&url).await {
+                    Ok(resp) => FeedState::Image(resp.version),
+                    Err(_) => FeedState::Unavailable,
+                };
+                found.insert((device.to_string(), channel.to_string()), state);
             }
             found
         }
@@ -385,6 +389,7 @@ pub fn Knobs() -> Element {
                     if let Some(version) = resp.version {
                         fw_message.set(Some((false, format!("Downloaded v{}", version))));
                         firmware_version.restart();
+                        available.restart();
                     } else if let Some(err) = resp.error {
                         fw_message.set(Some((true, err)));
                     }
@@ -393,6 +398,8 @@ pub fn Knobs() -> Element {
                     fw_message.set(Some((true, e)));
                 }
             }
+            // The refresh may have changed what any controller can install, success or not.
+            available.restart();
             fw_fetching.set(false);
         });
     };
@@ -460,11 +467,13 @@ pub fn Knobs() -> Element {
                                         update: update_state(
                                             knob.device_type.as_deref(),
                                             knob.version.as_deref(),
-                                            update_feed(knob.device_type.as_deref(), knob.version.as_deref())
+                                            // No entry yet means the check is still in flight.
+                                            &update_feed(knob.device_type.as_deref(), knob.version.as_deref())
                                                 .and_then(|(device, channel)| {
                                                     available_images.get(&(device.to_string(), channel.to_string()))
                                                 })
-                                                .map(String::as_str),
+                                                .cloned()
+                                                .unwrap_or(FeedState::Loading),
                                         ),
                                         note: update_notes.read().get(&knob.knob_id).cloned(),
                                         knob: knob.clone(),
