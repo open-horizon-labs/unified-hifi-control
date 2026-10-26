@@ -417,7 +417,9 @@ mod tests {
             first_cache
                 .get_or_convert(out_key(0, 800), move || {
                     first_calls.fetch_add(1, Ordering::SeqCst);
-                    let _ = started_tx.send(());
+                    started_tx
+                        .send(())
+                        .expect("test start waiter must remain alive");
                     release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                     Ok(Some(("image/png".into(), vec![7])))
                 })
@@ -433,7 +435,9 @@ mod tests {
             next_cache
                 .get_or_convert(out_key(0, 800), move || {
                     next_calls.fetch_add(1, Ordering::SeqCst);
-                    let _ = duplicate_tx.send(());
+                    duplicate_tx
+                        .send(())
+                        .expect("test duplicate observer must remain alive");
                     Ok(Some(("image/png".into(), vec![9])))
                 })
                 .await
@@ -460,7 +464,9 @@ mod tests {
         let first = tokio::spawn(async move {
             first_cache
                 .get_or_convert(out_key(0, 800), move || {
-                    let _ = started_tx.send(());
+                    started_tx
+                        .send(())
+                        .expect("test start waiter must remain alive");
                     release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                     Ok(Some(("image/png".into(), vec![1])))
                 })
