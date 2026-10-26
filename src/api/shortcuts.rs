@@ -1,8 +1,8 @@
 //! HTTP surface for controller shortcuts: pinning from the Library, per-controller maps, the
 //! curator's test press, and the endpoint a controller posts its button events to.
 //!
-//! Errors keep one shape, `{ "error_code", "message" }`, with the message already worded for the
-//! person reading it. Nothing here reports a write as saved unless the store confirmed it.
+//! Errors keep one shape, `{ "error", "error_code" }`, with `error` already worded for the person
+//! reading it. Nothing here reports a write as saved unless the store confirmed it.
 
 use std::collections::BTreeMap;
 
@@ -22,10 +22,12 @@ use crate::shortcuts::{
 
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
+/// `error` carries the sentence, the field every client helper already reads from a failed
+/// response; `error_code` is the stable value to branch on.
 fn err(status: StatusCode, code: &str, message: impl Into<String>) -> (StatusCode, Json<Value>) {
     (
         status,
-        Json(json!({ "error_code": code, "message": message.into() })),
+        Json(json!({ "error": message.into(), "error_code": code })),
     )
 }
 

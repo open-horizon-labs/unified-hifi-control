@@ -6,7 +6,8 @@ use dioxus::prelude::*;
 
 use crate::app::api::{
     self, FetchFirmwareResponse, FirmwareVersion, KnobConfig, KnobConfigResponse, KnobDevice,
-    KnobDevicesResponse, ManagedZone, ManagedZonesResponse, PowerModeConfig, Zone, ZonesResponse,
+    KnobDevicesResponse, ManagedZone, ManagedZonesResponse, PowerModeConfig, ShortcutInfo,
+    ShortcutsResponse, Zone, ZonesResponse,
 };
 use crate::app::components::Layout;
 use crate::app::sse::use_sse;
@@ -92,6 +93,13 @@ pub fn Knobs() -> Element {
     // `/zones`, which already omits zones hidden globally.
     let mut managed_zones = use_resource(|| async {
         api::fetch_json::<ManagedZonesResponse>("/api/zones/visibility")
+            .await
+            .ok()
+    });
+
+    // Pinned shortcuts: listed under the controllers table and offered in each controller's map.
+    let mut shortcuts = use_resource(|| async {
+        api::fetch_json::<ShortcutsResponse>("/api/shortcuts")
             .await
             .ok()
     });
@@ -372,6 +380,16 @@ pub fn Knobs() -> Element {
                 }
             }
 
+            PinnedShortcuts {
+                shortcuts: shortcuts
+                    .read()
+                    .as_ref()
+                    .and_then(|r| r.as_ref())
+                    .map(|r| r.shortcuts.clone())
+                    .unwrap_or_default(),
+                on_changed: move |_| shortcuts.restart(),
+            }
+
             // Firmware section
             section { id: "firmware-section", class: "mb-8",
                 div { class: "mb-4",
@@ -445,6 +463,14 @@ pub fn Knobs() -> Element {
                         .and_then(|r| r.as_ref())
                         .map(|r| r.zones.clone())
                         .unwrap_or_default(),
+                    controller_id: current_knob_id().unwrap_or_default(),
+                    shortcuts: shortcuts
+                        .read()
+                        .as_ref()
+                        .and_then(|r| r.as_ref())
+                        .map(|r| r.shortcuts.clone())
+                        .unwrap_or_default(),
+                    on_shortcuts_changed: move |_| shortcuts.restart(),
                     hidden_zone_ids: hidden_zone_ids(),
                     current_zone_id: current_knob_id()
                         .and_then(|id| {
@@ -744,6 +770,521 @@ fn toggled(hidden: &[String], zone_id: &str) -> Vec<String> {
     }
 }
 
+// =============================================================================
+// Shortcuts: what a remote's or controller's buttons play
+// =============================================================================
+
+/// A button as a person names it: "Home, long press". Keys this UI has no friendly name for stay
+/// recognisable (`usage_0192` becomes "Key 0192") so a remote's unusual button is still mappable.
+fn key_label(key: &str) -> String {
+    match key {
+        "play_pause" => "Play/Pause".to_string(),
+        "fast_forward" => "Fast-forward".to_string(),
+        other => match other.strip_prefix("usage_") {
+            Some(code) if !code.is_empty() => format!("Key {code}"),
+            _ => {
+                let spaced = other.replace('_', " ");
+                let mut chars = spaced.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().chain(chars).collect(),
+                    None => String::new(),
+                }
+            }
+        },
+    }
+}
+
+fn gesture_label(gesture: &str) -> &'static str {
+    match gesture {
+        "long" => "long press",
+        "double" => "double press",
+        _ => "press",
+    }
+}
+
+fn event_label(event: &str) -> String {
+    match event.split_once(':') {
+        Some((key, gesture)) => format!("{}, {}", key_label(key), gesture_label(gesture)),
+        None => key_label(event),
+    }
+}
+
+/// Keys that can only carry a shortcut on a long press, and keys that cannot at all, mirroring the
+/// bridge's rules (`crate::shortcuts::event_key`) so the form never offers what the bridge refuses.
+fn gestures_for_key(key: &str) -> &'static [&'static str] {
+    match key {
+        "volume_up" | "volume_down" | "mute" => &[],
+        "play_pause" | "play" | "pause" | "next" | "previous" => &["long"],
+        _ => &["press", "long", "double"],
+    }
+}
+
+/// The chip for one binding: a class, and words, because colour alone is not a state.
+fn binding_chip(status: &str) -> (&'static str, &'static str) {
+    match status {
+        "ok" => ("badge badge-success", "Worked last time"),
+        "untested" => ("badge badge-secondary", "Not tried yet"),
+        "last_failed" => ("badge status-err", "Last press failed"),
+        "no_zone" => ("badge status-err", "No zone yet"),
+        "zone_missing" => ("badge status-err", "Zone unavailable"),
+        "provider_mismatch" => ("badge status-err", "Wrong provider for this zone"),
+        _ => ("badge badge-secondary", "Unknown"),
+    }
+}
+
+/// The sentence under "Plays on", or `None` when the zone is fine and unremarkable.
+fn plays_on_note(plays_on: &api::PlaysOnInfo) -> Option<String> {
+    match plays_on.state.as_str() {
+        "none" => Some(
+            "This controller has no zone yet. Choose one on the controller, or assign one over MQTT, then buttons will play there."
+                .to_string(),
+        ),
+        "missing" => Some(format!(
+            "{} is not available right now, so a press will say so instead of playing somewhere else.",
+            plays_on
+                .zone_id
+                .clone()
+                .unwrap_or_else(|| "The zone".to_string())
+        )),
+        _ if plays_on.hidden_globally => Some(
+            "Hidden for all controllers in Settings. It still plays; it just is not listed."
+                .to_string(),
+        ),
+        _ if plays_on.hidden_here => Some(
+            "Hidden from this controller's zone list above. It still plays; it just is not listed."
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// This controller's button map. Saves each change as it is made (the map lives on the bridge, not
+/// in the device's config), so "Test" always plays what is shown.
+#[component]
+fn ControllerShortcuts(
+    controller_id: String,
+    shortcuts: Vec<ShortcutInfo>,
+    on_changed: EventHandler<()>,
+) -> Element {
+    let url = format!(
+        "/api/controllers/{}/shortcuts",
+        urlencoding::encode(&controller_id)
+    );
+    let fetch_url = url.clone();
+    let mut data = use_resource(move || {
+        let url = fetch_url.clone();
+        async move {
+            api::fetch_json::<api::ControllerShortcutsResponse>(&url)
+                .await
+                .ok()
+        }
+    });
+    // (is_error, text)
+    let mut note = use_signal(|| None::<(bool, String)>);
+    let mut new_key = use_signal(String::new);
+    let mut new_gesture = use_signal(|| "press".to_string());
+    let mut new_shortcut = use_signal(String::new);
+
+    // Replace the whole map, then reload so the chips reflect what the bridge now has. Declared
+    // before the early return below: hooks must run on every render.
+    let save_map = use_callback({
+        let url = url.clone();
+        move |map: std::collections::BTreeMap<String, String>| {
+            let url = url.clone();
+            spawn(async move {
+                let req = api::ControllerMapRequest { bindings: map };
+                match api::put_json::<_, serde_json::Value>(&url, &req).await {
+                    Ok(_) => note.set(Some((false, "Saved.".to_string()))),
+                    Err(message) => note.set(Some((true, message))),
+                }
+                data.restart();
+                on_changed.call(());
+            });
+        }
+    });
+
+    let test_press = use_callback({
+        let url = url.clone();
+        move |event: String| {
+            let url = format!("{url}/test");
+            spawn(async move {
+                let (key, gesture) = event
+                    .split_once(':')
+                    .map(|(k, g)| (k.to_string(), g.to_string()))
+                    .unwrap_or((event.clone(), "press".to_string()));
+                let req = api::ControllerTestRequest { key, gesture };
+                match api::post_json::<_, api::PressOutcomeInfo>(&url, &req).await {
+                    Ok(outcome) => note.set(Some((!outcome.ok, outcome.message))),
+                    Err(message) => note.set(Some((true, message))),
+                }
+                data.restart();
+                on_changed.call(());
+            });
+        }
+    });
+
+    let loaded = data.read().as_ref().and_then(|r| r.clone());
+    let Some(current) = loaded else {
+        return rsx! {
+            div { class: "mt-6 pt-6 border-t border-default",
+                h3 { class: "text-base font-semibold mb-2", "Buttons and shortcuts" }
+                p { class: "text-sm text-muted", aria_busy: "true", "Loading…" }
+            }
+        };
+    };
+
+    let bound: std::collections::BTreeMap<String, String> = current
+        .bindings
+        .iter()
+        .map(|b| (b.event.clone(), b.shortcut_id.clone()))
+        .collect();
+
+    let plays_on = current.plays_on.clone();
+    let zone_text = plays_on
+        .zone_name
+        .clone()
+        .or_else(|| plays_on.zone_id.clone())
+        .unwrap_or_else(|| "no zone yet".to_string());
+    let zone_note = plays_on_note(&plays_on);
+
+    // Events heard recently that nothing is bound to yet: what a person most likely wants to map.
+    let unbound_recent: Vec<api::RecentEventInfo> = current
+        .recent_events
+        .iter()
+        .filter(|e| !bound.contains_key(&e.event) && !e.event.is_empty())
+        .cloned()
+        .collect();
+
+    let chosen_key = new_key();
+    let allowed_gestures = gestures_for_key(chosen_key.trim());
+    let can_add = !chosen_key.trim().is_empty()
+        && allowed_gestures.contains(&new_gesture().as_str())
+        && shortcuts.iter().any(|s| s.id == new_shortcut());
+
+    rsx! {
+        div { class: "mt-6 pt-6 border-t border-default",
+            h3 { class: "text-base font-semibold mb-1", "Buttons and shortcuts" }
+            p { class: "text-sm text-muted mb-3",
+                "Saved as you change them. A press plays the shortcut on this controller's own zone, and says so if it cannot."
+            }
+            p { class: "text-sm mb-1",
+                span { class: "text-secondary", "Plays on: " }
+                span { class: "font-medium", "{zone_text}" }
+            }
+            if let Some(text) = zone_note {
+                p { class: "text-xs text-muted mb-3", "{text}" }
+            }
+
+            if shortcuts.is_empty() {
+                p { class: "text-sm text-muted mb-3",
+                    "Nothing is pinned yet. In the Library, open the "
+                    span { class: "font-medium", "⋯" }
+                    " menu on an album, playlist or station and choose "
+                    span { class: "font-medium", "Pin as shortcut" }
+                    ", then come back here."
+                }
+            }
+
+            if current.bindings.is_empty() {
+                p { class: "text-sm text-muted mb-3", "No buttons are mapped on this controller." }
+            } else {
+                ul { class: "space-y-2 mb-4",
+                    for binding in current.bindings.clone() {
+                        {
+                            let (chip_class, chip_text) = binding_chip(&binding.status);
+                            let event = binding.event.clone();
+                            let label = event_label(&binding.event);
+                            let detail = binding
+                                .last_press
+                                .as_ref()
+                                .filter(|p| !p.ok)
+                                .map(|p| p.message.clone());
+                            let current_id = binding.shortcut_id.clone();
+                            let options = shortcuts.clone();
+                            let bound_for_change = bound.clone();
+                            let bound_for_remove = bound.clone();
+                            let change_event = event.clone();
+                            let remove_event = event.clone();
+                            let test_event = event.clone();
+                            rsx! {
+                                li { key: "{binding.event}", class: "bg-elevated rounded-lg p-3",
+                                    div { class: "flex flex-wrap items-center gap-x-3 gap-y-2",
+                                        span { class: "font-medium min-w-32", "{label}" }
+                                        select {
+                                            class: "input flex-1 min-w-40 text-sm py-1",
+                                            aria_label: "Shortcut for {label}",
+                                            onchange: move |e| {
+                                                let mut next = bound_for_change.clone();
+                                                next.insert(change_event.clone(), e.value());
+                                                save_map(next);
+                                            },
+                                            for option in options {
+                                                option {
+                                                    value: "{option.id}",
+                                                    selected: option.id == current_id,
+                                                    "{option.name}"
+                                                }
+                                            }
+                                        }
+                                        span { class: "{chip_class}", "{chip_text}" }
+                                        button {
+                                            r#type: "button",
+                                            class: "btn btn-outline btn-sm",
+                                            onclick: move |_| test_press(test_event.clone()),
+                                            "Test"
+                                        }
+                                        button {
+                                            r#type: "button",
+                                            class: "btn btn-outline btn-sm",
+                                            aria_label: "Remove {label}",
+                                            onclick: move |_| {
+                                                let mut next = bound_for_remove.clone();
+                                                next.remove(&remove_event);
+                                                save_map(next);
+                                            },
+                                            "Remove"
+                                        }
+                                    }
+                                    if let Some(text) = detail {
+                                        p { class: "text-xs status-err mt-1", "{text}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !shortcuts.is_empty() {
+                div { class: "bg-elevated rounded-lg p-3",
+                    h4 { class: "text-sm font-medium mb-2", "Map a button" }
+                    if !unbound_recent.is_empty() {
+                        div { class: "mb-3",
+                            p { class: "text-xs text-muted mb-1",
+                                "Press a button on the remote, then choose it here:"
+                            }
+                            div { class: "flex flex-wrap gap-2",
+                                for recent in unbound_recent {
+                                    {
+                                        let event = recent.event.clone();
+                                        let label = event_label(&recent.event);
+                                        rsx! {
+                                            button {
+                                                key: "{recent.event}",
+                                                r#type: "button",
+                                                class: "btn btn-outline btn-sm",
+                                                onclick: move |_| {
+                                                    if let Some((key, gesture)) = event.split_once(':') {
+                                                        new_key.set(key.to_string());
+                                                        new_gesture.set(gesture.to_string());
+                                                    }
+                                                },
+                                                "{label}"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    div { class: "flex flex-wrap items-end gap-3",
+                        label { class: "flex flex-col text-xs text-muted",
+                            "Button"
+                            input {
+                                class: "input text-sm py-1 w-40",
+                                r#type: "text",
+                                placeholder: "home, usage_0192…",
+                                value: "{chosen_key}",
+                                oninput: move |e| new_key.set(e.value().to_lowercase()),
+                                // Enter must add the button, not submit the settings form above.
+                                onkeydown: move |e| {
+                                    if e.key() == Key::Enter {
+                                        e.prevent_default();
+                                    }
+                                }
+                            }
+                        }
+                        label { class: "flex flex-col text-xs text-muted",
+                            "Gesture"
+                            select {
+                                class: "input text-sm py-1",
+                                onchange: move |e| new_gesture.set(e.value()),
+                                for gesture in ["press", "long", "double"] {
+                                    option {
+                                        value: "{gesture}",
+                                        selected: new_gesture() == gesture,
+                                        disabled: !allowed_gestures.contains(&gesture) && !chosen_key.trim().is_empty(),
+                                        "{gesture_label(gesture)}"
+                                    }
+                                }
+                            }
+                        }
+                        label { class: "flex flex-col text-xs text-muted flex-1 min-w-40",
+                            "Plays"
+                            select {
+                                class: "input text-sm py-1",
+                                onchange: move |e| new_shortcut.set(e.value()),
+                                option { value: "", selected: new_shortcut().is_empty(), "Choose a shortcut…" }
+                                for option in shortcuts.clone() {
+                                    option {
+                                        value: "{option.id}",
+                                        selected: new_shortcut() == option.id,
+                                        "{option.name}"
+                                    }
+                                }
+                            }
+                        }
+                        button {
+                            r#type: "button",
+                            class: "btn btn-primary btn-sm",
+                            disabled: !can_add,
+                            onclick: {
+                                let bound = bound.clone();
+                                move |_| {
+                                    let key = new_key().trim().to_string();
+                                    let mut next = bound.clone();
+                                    next.insert(format!("{key}:{}", new_gesture()), new_shortcut());
+                                    save_map(next);
+                                    new_key.set(String::new());
+                                    new_shortcut.set(String::new());
+                                }
+                            },
+                            "Add"
+                        }
+                    }
+                    if !chosen_key.trim().is_empty() && allowed_gestures.is_empty() {
+                        p { class: "text-xs status-err mt-2",
+                            "Volume and mute always mean volume and mute, so they cannot start a shortcut."
+                        }
+                    } else if allowed_gestures == ["long"] {
+                        p { class: "text-xs text-muted mt-2",
+                            "This key keeps its normal job on a press, so only a long press can start a shortcut. The normal action still runs first."
+                        }
+                    }
+                }
+            }
+
+            if let Some((is_error, text)) = note() {
+                p {
+                    class: if is_error { "text-sm status-err mt-3" } else { "text-sm text-muted mt-3" },
+                    role: if is_error { "alert" } else { "status" },
+                    "{text}"
+                }
+            }
+        }
+    }
+}
+
+/// Every pinned shortcut, with rename and delete. Deleting unbinds it everywhere, which the
+/// confirmation says before it happens.
+#[component]
+fn PinnedShortcuts(shortcuts: Vec<ShortcutInfo>, on_changed: EventHandler<()>) -> Element {
+    let mut message = use_signal(|| None::<(bool, String)>);
+    let mut confirming = use_signal(|| None::<String>);
+
+    rsx! {
+        section { id: "shortcuts-section", class: "mb-8",
+            div { class: "mb-4",
+                h2 { class: "text-xl font-semibold", "Pinned shortcuts" }
+                p { class: "text-muted text-sm",
+                    "Library items pinned from the Library. Map them to buttons in each controller's configuration."
+                }
+            }
+            div { class: "card p-6",
+                if shortcuts.is_empty() {
+                    p { class: "text-muted",
+                        "Nothing pinned yet. In the Library, use ⋯ → Pin as shortcut on an album, playlist or station."
+                    }
+                } else {
+                    ul { class: "divide-y divide-default",
+                        for shortcut in shortcuts.clone() {
+                            {
+                                let id = shortcut.id.clone();
+                                let rename_id = shortcut.id.clone();
+                                let delete_id = shortcut.id.clone();
+                                let confirm_id = shortcut.id.clone();
+                                let is_confirming = confirming().as_deref() == Some(shortcut.id.as_str());
+                                let result = shortcut.last_press.clone();
+                                rsx! {
+                                    li { key: "{id}", class: "py-3 flex flex-wrap items-center gap-x-4 gap-y-2",
+                                        div { class: "flex-1 min-w-48",
+                                            input {
+                                                class: "input text-sm py-1 w-full",
+                                                aria_label: "Name of shortcut {shortcut.name}",
+                                                value: "{shortcut.name}",
+                                                onchange: move |e| {
+                                                    let name = e.value();
+                                                    let id = rename_id.clone();
+                                                    spawn(async move {
+                                                        let url = format!("/api/shortcuts/{}", urlencoding::encode(&id));
+                                                        let body = serde_json::json!({ "name": name });
+                                                        match api::patch_json::<_, serde_json::Value>(&url, &body).await {
+                                                            Ok(_) => message.set(None),
+                                                            Err(error) => message.set(Some((true, error))),
+                                                        }
+                                                        on_changed.call(());
+                                                    });
+                                                }
+                                            }
+                                            p { class: "text-xs text-muted mt-1",
+                                                "{shortcut.title} · {api::source_label(&shortcut.provider)}"
+                                            }
+                                        }
+                                        if let Some(result) = result {
+                                            span {
+                                                class: if result.ok { "badge badge-success" } else { "badge status-err" },
+                                                title: "{result.message}",
+                                                if result.ok { "Worked last time" } else { "Last press failed" }
+                                            }
+                                        }
+                                        if is_confirming {
+                                            span { class: "text-sm", "Delete and unmap it everywhere?" }
+                                            button {
+                                                r#type: "button",
+                                                class: "btn btn-outline btn-sm",
+                                                onclick: move |_| {
+                                                    let id = delete_id.clone();
+                                                    confirming.set(None);
+                                                    spawn(async move {
+                                                        let url = format!("/api/shortcuts/{}", urlencoding::encode(&id));
+                                                        match api::delete_json::<serde_json::Value>(&url).await {
+                                                            Ok(_) => message.set(None),
+                                                            Err(error) => message.set(Some((true, error))),
+                                                        }
+                                                        on_changed.call(());
+                                                    });
+                                                },
+                                                "Delete"
+                                            }
+                                            button {
+                                                r#type: "button",
+                                                class: "btn btn-outline btn-sm",
+                                                onclick: move |_| confirming.set(None),
+                                                "Keep"
+                                            }
+                                        } else {
+                                            button {
+                                                r#type: "button",
+                                                class: "btn btn-outline btn-sm",
+                                                aria_label: "Delete shortcut {shortcut.name}",
+                                                onclick: move |_| confirming.set(Some(confirm_id.clone())),
+                                                "Delete"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((true, text)) = message() {
+                    p { class: "text-sm status-err mt-3", role: "alert", "{text}" }
+                }
+            }
+        }
+    }
+}
+
 /// Compact power mode input for side-by-side layout
 #[component]
 fn PowerModeInputCompact(
@@ -896,6 +1437,10 @@ fn ConfigModal(
     managed_zones: Vec<ManagedZone>,
     hidden_zone_ids: Vec<String>,
     current_zone_id: Option<String>,
+    // Shortcut map (saved by its own API as it is edited, not by this form's Save)
+    controller_id: String,
+    shortcuts: Vec<ShortcutInfo>,
+    on_shortcuts_changed: EventHandler<()>,
     save_status: Option<String>,
     on_name_change: EventHandler<String>,
     on_rotation_charging_change: EventHandler<i32>,
@@ -1223,6 +1768,13 @@ fn ConfigModal(
                             button { class: "btn btn-primary", r#type: "submit", "Save" }
                         }
                     }
+
+                    ControllerShortcuts {
+                        key: "{controller_id}",
+                        controller_id: controller_id.clone(),
+                        shortcuts: shortcuts.clone(),
+                        on_changed: on_shortcuts_changed,
+                    }
                 }
             }
         }
@@ -1301,5 +1853,85 @@ mod controller_zone_tests {
         let added = toggled(&start, "roon:c");
         assert_eq!(added, ["roon:a", "lms:b", "roon:c"]);
         assert_eq!(toggled(&added, "roon:a"), ["lms:b", "roon:c"]);
+    }
+}
+
+#[cfg(test)]
+mod shortcut_ui_tests {
+    use super::{binding_chip, event_label, gestures_for_key, key_label, plays_on_note};
+    use crate::app::api::PlaysOnInfo;
+
+    #[test]
+    fn buttons_read_as_a_person_would_say_them() {
+        assert_eq!(event_label("home:long"), "Home, long press");
+        assert_eq!(event_label("play_pause:long"), "Play/Pause, long press");
+        assert_eq!(
+            event_label("fast_forward:double"),
+            "Fast-forward, double press"
+        );
+        // A key this UI has no name for is still recognisable and mappable.
+        assert_eq!(event_label("usage_0192:press"), "Key 0192, press");
+        assert_eq!(key_label("preset_1"), "Preset 1");
+        assert_eq!(key_label(""), "");
+    }
+
+    #[test]
+    fn the_form_offers_only_the_gestures_the_bridge_accepts() {
+        assert!(gestures_for_key("volume_up").is_empty());
+        assert!(gestures_for_key("mute").is_empty());
+        assert_eq!(gestures_for_key("next"), ["long"]);
+        assert_eq!(gestures_for_key("play_pause"), ["long"]);
+        assert_eq!(gestures_for_key("home"), ["press", "long", "double"]);
+        assert_eq!(gestures_for_key("usage_0192"), ["press", "long", "double"]);
+    }
+
+    #[test]
+    fn every_failing_state_says_so_in_words() {
+        for status in [
+            "last_failed",
+            "no_zone",
+            "zone_missing",
+            "provider_mismatch",
+        ] {
+            let (class, text) = binding_chip(status);
+            assert!(class.contains("status-err"), "{status}");
+            assert!(!text.is_empty());
+        }
+        assert_eq!(binding_chip("ok").1, "Worked last time");
+        assert_eq!(binding_chip("untested").1, "Not tried yet");
+        // A status from a newer bridge is shown as unknown, never as working.
+        assert_eq!(binding_chip("from_the_future").1, "Unknown");
+        assert!(!binding_chip("from_the_future").0.contains("success"));
+    }
+
+    fn plays_on(state: &str) -> PlaysOnInfo {
+        PlaysOnInfo {
+            zone_id: Some("roon:abc".into()),
+            zone_name: Some("Office".into()),
+            state: state.into(),
+            ..PlaysOnInfo::default()
+        }
+    }
+
+    #[test]
+    fn an_unusable_zone_is_explained_and_never_hints_at_a_fallback() {
+        assert!(plays_on_note(&plays_on("none"))
+            .unwrap()
+            .contains("no zone yet"));
+        let missing = plays_on_note(&plays_on("missing")).unwrap();
+        assert!(
+            missing.contains("roon:abc") && missing.contains("instead of playing somewhere else")
+        );
+        assert!(plays_on_note(&plays_on("ok")).is_none());
+    }
+
+    #[test]
+    fn a_hidden_zone_is_noted_as_still_playing() {
+        let mut here = plays_on("ok");
+        here.hidden_here = true;
+        assert!(plays_on_note(&here).unwrap().contains("still plays"));
+        let mut everywhere = plays_on("ok");
+        everywhere.hidden_globally = true;
+        assert!(plays_on_note(&everywhere).unwrap().contains("still plays"));
     }
 }

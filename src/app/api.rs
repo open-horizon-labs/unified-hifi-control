@@ -979,6 +979,145 @@ pub async fn post_queue_action(req: &QueueRequest) -> Result<Envelope<serde_json
     post_json("/api/queue", req).await
 }
 
+// =============================================================================
+// Controller shortcuts: pins from the Library and per-controller button maps
+// =============================================================================
+
+/// What the bridge last did when a shortcut was pressed.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct LastPressInfo {
+    pub ok: bool,
+    pub code: String,
+    pub message: String,
+}
+
+/// A pinned Library item.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ShortcutInfo {
+    pub id: String,
+    pub name: String,
+    /// The item's own title when it was pinned, for telling two same-named shortcuts apart.
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub last_press: Option<LastPressInfo>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ShortcutsResponse {
+    pub shortcuts: Vec<ShortcutInfo>,
+}
+
+/// `POST /api/shortcuts`.
+#[derive(Clone, Debug, Serialize)]
+pub struct PinShortcutRequest {
+    #[serde(rename = "ref")]
+    pub item_ref: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PinShortcutResponse {
+    pub shortcut: ShortcutInfo,
+    #[serde(default)]
+    pub already_pinned: bool,
+}
+
+/// Where a controller's buttons will play, and whether that is currently possible.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PlaysOnInfo {
+    #[serde(default)]
+    pub zone_id: Option<String>,
+    #[serde(default)]
+    pub zone_name: Option<String>,
+    /// `ok`, `none` (no zone yet) or `missing` (zone not currently discovered).
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub hidden_globally: bool,
+    #[serde(default)]
+    pub hidden_here: bool,
+}
+
+/// One button bound to a shortcut on one controller.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct BindingInfo {
+    /// `<key>:<gesture>`, the key the map is stored under.
+    pub event: String,
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub gesture: String,
+    pub shortcut_id: String,
+    #[serde(default)]
+    pub shortcut_name: String,
+    #[serde(default)]
+    pub provider: String,
+    /// `ok`, `untested`, `last_failed`, `no_zone`, `zone_missing` or `provider_mismatch`.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub last_press: Option<LastPressInfo>,
+}
+
+/// A button event the controller reported recently, mapped or not.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct RecentEventInfo {
+    pub event: String,
+    #[serde(default)]
+    pub code: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ControllerShortcutsResponse {
+    #[serde(default)]
+    pub plays_on: PlaysOnInfo,
+    #[serde(default)]
+    pub bindings: Vec<BindingInfo>,
+    #[serde(default)]
+    pub recent_events: Vec<RecentEventInfo>,
+}
+
+/// `PUT /api/controllers/{id}/shortcuts`: replaces the controller's whole map.
+#[derive(Clone, Debug, Serialize)]
+pub struct ControllerMapRequest {
+    pub bindings: std::collections::BTreeMap<String, String>,
+}
+
+/// `POST /api/controllers/{id}/shortcuts/test`.
+#[derive(Clone, Debug, Serialize)]
+pub struct ControllerTestRequest {
+    pub key: String,
+    pub gesture: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PressOutcomeInfo {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub message: String,
+}
+
+/// `PUT` JSON (client-side only).
+pub async fn put_json<T: Serialize, R: for<'de> Deserialize<'de>>(
+    url: &str,
+    body: &T,
+) -> Result<R, String> {
+    request_json(url, "PUT", body).await
+}
+
+/// `PATCH` JSON (client-side only).
+pub async fn patch_json<T: Serialize, R: for<'de> Deserialize<'de>>(
+    url: &str,
+    body: &T,
+) -> Result<R, String> {
+    request_json(url, "PATCH", body).await
+}
+
 /// `POST /api/play_ref`.
 pub async fn post_play_ref(req: &PlayRefRequest) -> Result<Envelope<serde_json::Value>, String> {
     post_json("/api/play_ref", req).await

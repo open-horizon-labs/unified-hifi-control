@@ -37,7 +37,19 @@ use unified_hifi_control::shortcuts::{ShortcutStore, ShortcutTarget};
 const LMS_PLAYER: &str = "aa:bb:cc:dd:ee:ff";
 const OTHER_PLAYER: &str = "11:22:33:44:55:66";
 const GONE_PLAYER: &str = "de:ad:be:ef:00:01";
-const CONTROLLER: &str = "dial-test";
+/// One controller id per test. Controller settings (assigned zone, hide list) persist in the
+/// config directory every test in this process shares, so a fixed id would let one test's
+/// assignment decide another's outcome depending on run order.
+fn controller() -> &'static str {
+    thread_local! {
+        static ID: &'static str = Box::leak(
+            format!("dial-{:?}", std::thread::current().id())
+                .replace(['(', ')'], "-")
+                .into_boxed_str(),
+        );
+    }
+    ID.with(|id| *id)
+}
 const EVENT: &str = "preset_1:press";
 
 static CONFIG: Once = Once::new();
@@ -148,7 +160,7 @@ async fn harness(zones: &[(&str, &str)]) -> Harness {
 
     state
         .knobs
-        .get_or_create(CONTROLLER, Some("test"))
+        .get_or_create(controller(), Some("test"))
         .await
         .unwrap();
     Harness {
@@ -191,7 +203,7 @@ impl Harness {
         map.insert(EVENT.to_string(), shortcut_id.to_string());
         self.state
             .shortcuts
-            .set_bindings(CONTROLLER, map)
+            .set_bindings(controller(), map)
             .await
             .unwrap();
     }
@@ -200,7 +212,7 @@ impl Harness {
         self.state
             .knobs
             .update_status(
-                CONTROLLER,
+                controller(),
                 KnobStatusUpdate {
                     zone_id: Some(zone_id.to_string()),
                     ..Default::default()
@@ -237,7 +249,7 @@ async fn a_press_plays_the_pinned_item_on_the_controllers_own_zone() {
         .await;
     h.mock.clear_commands().await;
 
-    let outcome = press(&h.state, CONTROLLER, EVENT).await;
+    let outcome = press(&h.state, controller(), EVENT).await;
     assert_eq!(outcome.code, PressCode::Played, "{}", outcome.message);
 
     assert!(
@@ -267,7 +279,7 @@ async fn an_assigned_zone_wins_over_the_zone_the_controller_last_reported() {
     h.state
         .knobs
         .update_config(
-            CONTROLLER,
+            controller(),
             KnobConfigUpdate {
                 assigned_zone_id: Some(format!("lms:{LMS_PLAYER}")),
                 ..Default::default()
@@ -278,7 +290,7 @@ async fn an_assigned_zone_wins_over_the_zone_the_controller_last_reported() {
     h.mock.clear_commands().await;
 
     assert_eq!(
-        press(&h.state, CONTROLLER, EVENT).await.code,
+        press(&h.state, controller(), EVENT).await.code,
         PressCode::Played
     );
     assert!(!h.playlist_commands(LMS_PLAYER).await.is_empty());
@@ -298,7 +310,7 @@ async fn a_zone_hidden_on_this_controller_still_plays() {
     h.state
         .knobs
         .update_config(
-            CONTROLLER,
+            controller(),
             KnobConfigUpdate {
                 hidden_zone_ids: Some(vec![zone_id.clone()]),
                 ..Default::default()
@@ -308,7 +320,7 @@ async fn a_zone_hidden_on_this_controller_still_plays() {
         .unwrap();
     h.mock.clear_commands().await;
 
-    let outcome = press(&h.state, CONTROLLER, EVENT).await;
+    let outcome = press(&h.state, controller(), EVENT).await;
     assert_eq!(outcome.code, PressCode::Played, "{}", outcome.message);
     assert!(!h.playlist_commands(LMS_PLAYER).await.is_empty());
     h.stop().await;
@@ -327,7 +339,7 @@ async fn a_missing_zone_fails_visibly_and_never_falls_back() {
         .await;
     h.mock.clear_commands().await;
 
-    let outcome = press(&h.state, CONTROLLER, EVENT).await;
+    let outcome = press(&h.state, controller(), EVENT).await;
     assert_eq!(outcome.code, PressCode::ZoneMissing);
     assert!(!outcome.ok);
     assert!(
@@ -346,7 +358,7 @@ async fn a_controller_with_no_zone_yet_says_so() {
     let h = harness(&[(&format!("lms:{LMS_PLAYER}"), "Living Room")]).await;
     let id = h.pin_kind_of_blue().await;
     h.bind(&id).await;
-    let outcome = press(&h.state, CONTROLLER, EVENT).await;
+    let outcome = press(&h.state, controller(), EVENT).await;
     assert_eq!(outcome.code, PressCode::NoZone);
     h.stop().await;
 }
@@ -363,7 +375,7 @@ async fn a_shortcut_for_another_provider_is_refused_not_played_anyway() {
     h.controller_reports_zone("roon:abc").await;
     h.mock.clear_commands().await;
 
-    let outcome = press(&h.state, CONTROLLER, EVENT).await;
+    let outcome = press(&h.state, controller(), EVENT).await;
     assert_eq!(outcome.code, PressCode::ProviderMismatch);
     assert!(h.playlist_commands(LMS_PLAYER).await.is_empty());
     h.stop().await;
@@ -381,7 +393,7 @@ async fn an_item_that_vanished_fails_visibly_without_touching_the_queue() {
     h.mock.set_library_albums(vec![]).await;
     h.mock.clear_commands().await;
 
-    let outcome = press(&h.state, CONTROLLER, EVENT).await;
+    let outcome = press(&h.state, controller(), EVENT).await;
     assert!(!outcome.ok, "{}", outcome.message);
     assert_eq!(outcome.code, PressCode::Refused);
     assert!(h.playlist_commands(LMS_PLAYER).await.is_empty());
@@ -395,7 +407,7 @@ async fn an_unbound_button_is_reported_as_unmapped_and_plays_nothing() {
     let h = harness(&[(&zone_id, "Living Room")]).await;
     h.controller_reports_zone(&zone_id).await;
     h.mock.clear_commands().await;
-    let outcome = press(&h.state, CONTROLLER, "preset_9:press").await;
+    let outcome = press(&h.state, controller(), "preset_9:press").await;
     assert_eq!(outcome.code, PressCode::Unmapped);
     assert!(h.playlist_commands(LMS_PLAYER).await.is_empty());
     h.stop().await;
@@ -431,7 +443,7 @@ async fn the_input_endpoint_plays_unmaps_and_rejects_without_inventing_outcomes(
     h.bind(&id).await;
     h.controller_reports_zone(&zone_id).await;
 
-    let (status, body) = post_input(&h, CONTROLLER, "preset_1", "press").await;
+    let (status, body) = post_input(&h, controller(), "preset_1", "press").await;
     assert_eq!(
         (status, body["code"].as_str()),
         (200, Some("played")),
@@ -439,10 +451,10 @@ async fn the_input_endpoint_plays_unmaps_and_rejects_without_inventing_outcomes(
     );
 
     // A transport key's plain press is the controller's own business: unmapped, never an error.
-    let (status, body) = post_input(&h, CONTROLLER, "play_pause", "press").await;
+    let (status, body) = post_input(&h, controller(), "play_pause", "press").await;
     assert_eq!((status, body["code"].as_str()), (200, Some("unmapped")));
 
-    let (status, body) = post_input(&h, CONTROLLER, "Bad Key", "press").await;
+    let (status, body) = post_input(&h, controller(), "Bad Key", "press").await;
     assert_eq!(
         (status, body["error_code"].as_str()),
         (400, Some("bad_key"))
@@ -529,13 +541,13 @@ async fn roon_state(core: &FakeRoonCore) -> (AppState, tempfile::TempDir) {
     }
     state
         .knobs
-        .get_or_create(CONTROLLER, Some("test"))
+        .get_or_create(controller(), Some("test"))
         .await
         .unwrap();
     state
         .knobs
         .update_status(
-            CONTROLLER,
+            controller(),
             KnobStatusUpdate {
                 zone_id: Some(ROON_ZONE.to_string()),
                 ..Default::default()
@@ -598,11 +610,15 @@ async fn a_roon_pin_still_plays_after_the_core_forgets_every_browse_session() {
         .unwrap();
     let mut map = std::collections::BTreeMap::new();
     map.insert(EVENT.to_string(), shortcut.id.clone());
-    state.shortcuts.set_bindings(CONTROLLER, map).await.unwrap();
+    state
+        .shortcuts
+        .set_bindings(controller(), map)
+        .await
+        .unwrap();
 
     core.drop_all_sessions().await;
 
-    let outcome = press(&state, CONTROLLER, EVENT).await;
+    let outcome = press(&state, controller(), EVENT).await;
     assert_eq!(outcome.code, PressCode::Played, "{}", outcome.message);
     assert!(
         core.browsed_titles()
