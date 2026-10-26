@@ -1708,6 +1708,24 @@ pub struct KnobConfig {
     pub sleep_poll_stopped_sec: Option<u32>,
     /// Volume step override (None/0 = use zone default)
     pub volume_step_override: Option<f64>,
+    // Device-specific settings (see `crate::device_settings`). Only keys the owner changed are
+    // sent, so saving an unrelated field never imposes a guessed value on the controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_ip: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brightness: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound_volume: Option<i64>,
+}
+
+/// Partial update asking a controller to install the firmware waiting on the bridge.
+#[derive(Clone, Debug, Serialize)]
+pub struct FirmwareUpdateAction {
+    pub firmware_update: &'static str,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
