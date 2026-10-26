@@ -45,7 +45,7 @@ fn knob_persistence_error(error: anyhow::Error) -> (StatusCode, Json<serde_json:
 }
 
 /// Extract knob ID from headers or query params
-fn extract_knob_id(headers: &HeaderMap, query_knob_id: Option<&str>) -> Option<String> {
+pub(crate) fn extract_knob_id(headers: &HeaderMap, query_knob_id: Option<&str>) -> Option<String> {
     headers
         .get("x-knob-id")
         .or_else(|| headers.get("x-device-id"))

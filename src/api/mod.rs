@@ -50,6 +50,7 @@ pub mod mqtt_bootstrap;
 pub mod mqtt_settings;
 pub mod music_details;
 pub mod provider_auth;
+pub mod shortcuts;
 
 const MAX_REMOTE_ARTWORK_BYTES: usize = 10 * 1024 * 1024;
 
@@ -283,6 +284,9 @@ pub struct AppState {
     pub controller_auth: controller_auth::ControllerAuthState,
     pub apple_bridges: apple_bridge::AppleBridgeRegistry,
     pub knobs: KnobStore,
+    /// Pinned Library items and per-controller button maps. Constructed here, like `mcp_refs`, so
+    /// no `AppState::new` call site changes.
+    pub shortcuts: crate::shortcuts::ShortcutStore,
     pub bus: SharedBus,
     pub aggregator: Arc<ZoneAggregator>,
     pub coordinator: Arc<AdapterCoordinator>,
@@ -395,6 +399,7 @@ impl AppState {
                 apple_bridge::AppleBridgeRegistry::default()
             }),
             knobs,
+            shortcuts: crate::shortcuts::ShortcutStore::open_default(),
             bus,
             aggregator,
             coordinator,
