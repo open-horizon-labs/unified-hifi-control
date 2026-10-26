@@ -4,11 +4,6 @@ permissions:
   contents: read
   packages: read
 
-env:
-  # Faster validation builds; tagged release optimization stays at the reviewed profile.
-  CARGO_PROFILE_RELEASE_LTO: ${{ startsWith(github.ref, 'refs/tags/') && 'true' || 'thin' }}
-  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ startsWith(github.ref, 'refs/tags/') && '1' || '16' }}
-
 on:
   pull_request:
     branches: [master, v3, v4, 'integration/v4-*']
@@ -445,8 +440,12 @@ jobs:
       run: |
         python3 tests/ci_setup_rust_path.py
         python3 tests/fleet_build_cache.py
+        python3 tests/wasm_release.py
+        bash scripts/check-artwork-runtime.sh
     - name: Run clippy
-      run: cargo clippy --workspace -- -D warnings
+      run: |
+        cargo clippy --workspace -- -D warnings
+        cargo clippy -p uhc-artwork-inference -- -D warnings
     - name: Explain blocking lint result
       if: always()
       run: echo 'Blocking lint uses the reviewed rust-toolchain.toml baseline and rejects every warning. Latest-stable findings
@@ -586,7 +585,7 @@ jobs:
           target/dx/
           target/wasm32-unknown-unknown/
         key: wasm-v4-tw4.3.3-${{ hashFiles('rust-toolchain.toml', '.github/actions/setup-rust/action.yml', 'build/prepared-builders/source.yml',
-          '**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/lib.rs', 'src/app/**/*.rs', 'src/components/**/*.rs', 'src/adaptive/**/*.rs',
+          'scripts/check-wasm-release.py', '**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/lib.rs', 'src/app/**/*.rs', 'src/components/**/*.rs', 'src/adaptive/**/*.rs',
           'assets/**', 'src/input.css', 'public/**') }}
         restore-keys: |
           wasm-v4-
@@ -620,14 +619,13 @@ jobs:
       run: make css
     - name: Build WASM assets (ADR 002)
       if: steps.check-cache.outputs.needs_build == 'true'
-      env:
-        CARGO_PROFILE_RELEASE_LTO: 'false'
-        CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
       run: |
         # Version is fetched from server at runtime, no need to bake into WASM
         dx build --fullstack=false --release @client --no-default-features --features web
         echo "Generated assets:"
         find target/dx -name "*.wasm" -o -name "*.js" | head -10
+    - name: Audit final browser assets
+      run: python3 scripts/check-wasm-release.py target/dx/unified-hifi-control/release/web/public
     - name: Report cache status
       run: |
         if [ "${{ steps.check-cache.outputs.needs_build }}" == "false" ]; then

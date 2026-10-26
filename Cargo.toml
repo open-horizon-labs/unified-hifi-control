@@ -27,7 +27,7 @@ server = [
     "dep:image",
     "dep:tempfile",
     "dep:zensally",
-    "dep:zensally-tract",
+    "dep:uhc-artwork-inference",
     "dep:zenlayout",
     "dep:zenresize",
     "dep:resvg",
@@ -219,6 +219,10 @@ required-features = ["server"]
 rustix = { version = "1.1.5", features = ["fs", "process"], optional = true }
 
 [dev-dependencies]
+zensally-tract = { git = "https://github.com/imazen/zensally", rev = "a8888d08c6d4bd1fe0969cdce40da6c01b8032be", default-features = false, features = ["analyzer"] }
+tract-onnx = { git = "https://github.com/sonos/tract", rev = "9f6e40611e345ff46481388d4d2c591e5e91a278" }
+tract-nnef = { git = "https://github.com/sonos/tract", rev = "9f6e40611e345ff46481388d4d2c591e5e91a278" }
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 tokio-test = "0.4.6"
 serial_test = "4.0.1"
 # Client-side transport only, for tests/mcp_hqplayer_control.rs driving the real MCP HTTP
@@ -245,6 +249,7 @@ rumqttd = { version = "0.20.0", default-features = false }
 debug = "line-tables-only"
 
 [profile.release]
+debug = 0
 lto = true
 codegen-units = 1
 strip = true
@@ -261,11 +266,8 @@ git = "https://github.com/imazen/zensally"
 rev = "a8888d08c6d4bd1fe0969cdce40da6c01b8032be"
 features = ["zenlayout"]
 optional = true
-[dependencies.zensally-tract]
-git = "https://github.com/imazen/zensally"
-rev = "a8888d08c6d4bd1fe0969cdce40da6c01b8032be"
-default-features = false
-features = ["analyzer"]
+[dependencies.uhc-artwork-inference]
+path = "crates/artwork-inference"
 optional = true
 [dependencies.zenlayout]
 version = "=0.2.2"
@@ -288,4 +290,10 @@ rumqttc = { git = "https://github.com/open-horizon-labs/rumqtt", rev = "5e07d401
 # dx/wasm-bindgen has processed the module; native release stripping is unchanged.
 [profile.wasm-release]
 inherits = "release"
+debug = 0
 strip = "none"
+
+[[example]]
+name = "convert-artwork-models"
+path = "examples/convert_artwork_models.rs"
+required-features = ["server"]

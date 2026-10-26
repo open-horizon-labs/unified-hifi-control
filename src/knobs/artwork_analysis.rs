@@ -7,9 +7,9 @@ use std::{
     collections::VecDeque,
     sync::{Arc, LazyLock, Mutex},
 };
+use uhc_artwork_inference::ContentAnalyzer;
 use zenlayout::smart_crop::{AspectRatio, CropMode, SmartCropInput};
 use zensally::{ImageRef, PixelFormat};
-use zensally_tract::ContentAnalyzer;
 
 const CAPACITY: usize = 32; // ~2 MiB of 128x128 float heatmaps.
 type Key = [u8; 32];
