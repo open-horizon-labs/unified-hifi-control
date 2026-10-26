@@ -44,6 +44,10 @@ pub mod components;
 #[path = "firmware/catalog.rs"]
 pub mod firmware_catalog;
 
+// What each controller can be configured with; shared by the server and the settings page.
+#[path = "firmware/settings.rs"]
+pub mod device_settings;
+
 // Server-only modules (excluded from WASM build)
 #[cfg(feature = "server")]
 pub mod adapters;

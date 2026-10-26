@@ -2,15 +2,22 @@
 //!
 //! Knob device management using Dioxus resources for async data fetching.
 
+use std::collections::{HashMap, HashSet};
+
 use dioxus::prelude::*;
 
+use super::knobs_model::{
+    device_page_url, power_support, update_feed, update_state, FeedState, UpdateState,
+};
 use crate::app::api::{
-    self, FetchFirmwareResponse, FirmwareVersion, KnobConfig, KnobConfigResponse, KnobDevice,
-    KnobDevicesResponse, ManagedZone, ManagedZonesResponse, PowerModeConfig, ShortcutInfo,
-    ShortcutsResponse, Zone, ZonesResponse,
+    self, FetchFirmwareResponse, FirmwareUpdateAction, FirmwareVersion, KnobConfig,
+    KnobConfigResponse, KnobDevice, KnobDevicesResponse, ManagedZone, ManagedZonesResponse,
+    PowerModeConfig, ShortcutInfo, ShortcutsResponse, Zone, ZonesResponse,
 };
 use crate::app::components::Layout;
 use crate::app::sse::use_sse;
+use crate::device_settings::{device_settings, PowerSupport, SettingKind, SettingSpec, ALL_KEYS};
+use crate::firmware_catalog::FirmwareTarget;
 
 /// Knobs page component.
 #[component]
@@ -74,6 +81,14 @@ pub fn Knobs() -> Element {
     // Zones this controller does not list (per-controller hide list)
     let mut hidden_zone_ids = use_signal(Vec::<String>::new);
 
+    // Device-specific settings: the values shown, and which of them the owner actually changed.
+    // Only changed keys are saved, so an untouched setting keeps the controller's own value.
+    let mut modal_device_type = use_signal(|| None::<String>);
+    let mut device_values = use_signal(HashMap::<String, i64>::new);
+    let mut touched = use_signal(HashSet::<String>::new);
+    // Controllers asked to update during this visit (knob_id -> message).
+    let mut update_notes = use_signal(HashMap::<String, (bool, String)>::new);
+
     // Firmware fetch state
     let mut fw_fetching = use_signal(|| false);
     let mut fw_message = use_signal(|| None::<(bool, String)>); // (is_error, message)
@@ -119,6 +134,33 @@ pub fn Knobs() -> Element {
             .ok()
     });
 
+    // For each controller, the newest image the bridge holds on that controller's own channel.
+    let mut available = use_resource(move || {
+        let feeds: HashSet<(&'static str, &'static str)> = knobs
+            .read()
+            .clone()
+            .flatten()
+            .map(|r| r.knobs)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|knob| update_feed(knob.device_type.as_deref(), knob.version.as_deref()))
+            .collect();
+        async move {
+            // Every feed gets an explicit outcome; a failed request or an empty cache is
+            // `Unavailable`, never silently dropped.
+            let mut found = HashMap::<(String, String), FeedState>::new();
+            for (device, channel) in feeds {
+                let url = format!("/firmware/version?device_type={device}&channel={channel}");
+                let state = match api::fetch_json::<FirmwareVersion>(&url).await {
+                    Ok(resp) => FeedState::Image(resp.version),
+                    Err(_) => FeedState::Unavailable,
+                };
+                found.insert((device.to_string(), channel.to_string()), state);
+            }
+            found
+        }
+    });
+
     // Refresh on SSE events
     let event_count = sse.event_count;
     use_effect(move || {
@@ -132,6 +174,15 @@ pub fn Knobs() -> Element {
 
     // Open config modal
     let open_config = move |knob_id: String| {
+        let device_type = knobs
+            .read()
+            .clone()
+            .flatten()
+            .and_then(|r| r.knobs.into_iter().find(|k| k.knob_id == knob_id))
+            .and_then(|k| k.device_type);
+        modal_device_type.set(device_type);
+        device_values.set(HashMap::new());
+        touched.set(HashSet::new());
         current_knob_id.set(Some(knob_id.clone()));
         modal_open.set(true);
         config_loading.set(true);
@@ -187,6 +238,20 @@ pub fn Knobs() -> Element {
                         sleep_poll_stopped.set(cfg.sleep_poll_stopped_sec.unwrap_or(60));
                         volume_step_override.set(cfg.volume_step_override.unwrap_or(0.0));
                         hidden_zone_ids.set(cfg.hidden_zone_ids.unwrap_or_default());
+                        // Settings the bridge already manages for this controller.
+                        let mut known = HashMap::new();
+                        for (key, value) in [
+                            ("show_ip", cfg.show_ip.map(i64::from)),
+                            ("brightness", cfg.brightness),
+                            ("body_enabled", cfg.body_enabled.map(i64::from)),
+                            ("sound_enabled", cfg.sound_enabled.map(i64::from)),
+                            ("sound_volume", cfg.sound_volume),
+                        ] {
+                            if let Some(value) = value {
+                                known.insert(key.to_string(), value);
+                            }
+                        }
+                        device_values.set(known);
                     } else {
                         config_name.set(String::new());
                         config_rotation_charging.set(180);
@@ -261,6 +326,29 @@ pub fn Knobs() -> Element {
             let poll_stopped = sleep_poll_stopped();
             let vol_step = volume_step_override();
             let hidden_ids = hidden_zone_ids();
+            // Only settings the owner changed, and only ones this controller has.
+            let changed: HashMap<String, i64> = device_values()
+                .into_iter()
+                .filter(|(key, _)| touched().contains(key))
+                .collect();
+            let supported: HashSet<&'static str> = modal_device_type()
+                .as_deref()
+                .and_then(FirmwareTarget::parse)
+                .map(|target| device_settings(target).iter().map(|s| s.key).collect())
+                .unwrap_or_default();
+            let sent = |key: &'static str| {
+                debug_assert!(ALL_KEYS.contains(&key));
+                supported
+                    .contains(key)
+                    .then(|| changed.get(key).copied())
+                    .flatten()
+            };
+            let (show_ip, brightness) = (sent("show_ip").map(|v| v != 0), sent("brightness"));
+            let (body_enabled, sound_enabled, sound_volume) = (
+                sent("body_enabled").map(|v| v != 0),
+                sent("sound_enabled").map(|v| v != 0),
+                sent("sound_volume"),
+            );
 
             save_status.set(Some("Saving...".to_string()));
 
@@ -282,6 +370,11 @@ pub fn Knobs() -> Element {
                     sleep_poll_stopped_sec: Some(poll_stopped),
                     volume_step_override: Some(vol_step),
                     hidden_zone_ids: Some(hidden_ids),
+                    show_ip,
+                    brightness,
+                    body_enabled,
+                    sound_enabled,
+                    sound_volume,
                 };
 
                 let url = format!("/knob/config?knob_id={}", urlencoding::encode(&knob_id));
@@ -298,6 +391,25 @@ pub fn Knobs() -> Element {
         }
     };
 
+    // Ask a controller to install the firmware waiting on the bridge.
+    let request_update = move |knob_id: String| {
+        spawn(async move {
+            let url = format!("/knob/config?knob_id={}", urlencoding::encode(&knob_id));
+            let action = FirmwareUpdateAction {
+                firmware_update: "install",
+            };
+            let note = match api::post_json::<_, serde_json::Value>(&url, &action).await {
+                Ok(_) => (
+                    false,
+                    "Update requested. The controller installs it when it next checks in, then restarts."
+                        .to_string(),
+                ),
+                Err(e) => (true, e),
+            };
+            update_notes.write().insert(knob_id, note);
+        });
+    };
+
     // Fetch firmware handler
     let fetch_firmware = move |_| {
         fw_fetching.set(true);
@@ -309,6 +421,7 @@ pub fn Knobs() -> Element {
                     if let Some(version) = resp.version {
                         fw_message.set(Some((false, format!("Downloaded v{}", version))));
                         firmware_version.restart();
+                        available.restart();
                     } else if let Some(err) = resp.error {
                         fw_message.set(Some((true, err)));
                     }
@@ -317,6 +430,8 @@ pub fn Knobs() -> Element {
                     fw_message.set(Some((true, e)));
                 }
             }
+            // The refresh may have changed what any controller can install, success or not.
+            available.restart();
             fw_fetching.set(false);
         });
     };
@@ -335,6 +450,10 @@ pub fn Knobs() -> Element {
         .map(|r| r.zones)
         .unwrap_or_default();
     let fw_version = firmware_version.read().clone().flatten().map(|r| r.version);
+    let available_images = available.read().clone().unwrap_or_default();
+    let modal_device_url = current_knob_id()
+        .and_then(|id| knobs_list.iter().find(|k| k.knob_id == id))
+        .and_then(|k| device_page_url(k.status.as_ref().and_then(|s| s.ip.as_deref())));
 
     rsx! {
         Layout {
@@ -377,9 +496,22 @@ pub fn Knobs() -> Element {
                             tbody {
                                 for knob in knobs_list {
                                     KnobRow {
+                                        update: update_state(
+                                            knob.device_type.as_deref(),
+                                            knob.version.as_deref(),
+                                            // No entry yet means the check is still in flight.
+                                            &update_feed(knob.device_type.as_deref(), knob.version.as_deref())
+                                                .and_then(|(device, channel)| {
+                                                    available_images.get(&(device.to_string(), channel.to_string()))
+                                                })
+                                                .cloned()
+                                                .unwrap_or(FeedState::Loading),
+                                        ),
+                                        note: update_notes.read().get(&knob.knob_id).cloned(),
                                         knob: knob.clone(),
                                         zones: zones_list.clone(),
                                         on_config: open_config,
+                                        on_update: request_update,
                                     }
                                 }
                             }
@@ -405,7 +537,7 @@ pub fn Knobs() -> Element {
                     p { class: "text-muted text-sm", "Local OTA firmware for registered controllers" }
                 }
                 div { class: "card p-6",
-                    p { class: "mb-4 text-sm text-muted", "OTA availability depends on each controller’s reported device type and a matching application image on this Bridge. The version below is for the legacy knob target. Refresh downloads matching published images into the Bridge cache; it does not flash a controller. Use the firmware site for initial installation and USB-only devices." }
+                    p { class: "mb-4 text-sm text-muted", "Every controller type can update over the air from this Bridge. A controller follows its own release channel (Stable, Beta or Alpha), so an Alpha build is only offered newer Alpha builds. Use Update in the table above to ask a controller to install; it keeps its settings. Refresh downloads the published images into the Bridge cache. A controller that has not yet had its one-time partition reflash needs the firmware site for that first install." }
                     p { class: "mb-4",
                         "Legacy knob image on this Bridge: "
                         span { class: "font-semibold",
@@ -490,6 +622,13 @@ pub fn Knobs() -> Element {
                         })
                         .and_then(|k| k.status.and_then(|st| st.zone_id)),
                     save_status: save_status(),
+                    device_type: modal_device_type(),
+                    device_values: device_values(),
+                    device_url: modal_device_url,
+                    on_device_value: move |(key, value): (String, i64)| {
+                        device_values.write().insert(key.clone(), value);
+                        touched.write().insert(key);
+                    },
                     on_name_change: move |v| config_name.set(v),
                     on_rotation_charging_change: move |v| config_rotation_charging.set(v),
                     on_rotation_not_charging_change: move |v| config_rotation_not_charging.set(v),
@@ -590,7 +729,14 @@ fn controller_type_name(device_type: Option<&str>) -> &'static str {
 
 /// Knob row component
 #[component]
-fn KnobRow(knob: KnobDevice, zones: Vec<Zone>, on_config: EventHandler<String>) -> Element {
+fn KnobRow(
+    knob: KnobDevice,
+    zones: Vec<Zone>,
+    update: UpdateState,
+    note: Option<(bool, String)>,
+    on_config: EventHandler<String>,
+    on_update: EventHandler<String>,
+) -> Element {
     let status = knob.status.as_ref();
     let knob_id = knob.knob_id.clone();
 
@@ -616,11 +762,13 @@ fn KnobRow(knob: KnobDevice, zones: Vec<Zone>, on_config: EventHandler<String>) 
     let ip = status
         .and_then(|s| s.ip.clone())
         .unwrap_or_else(|| "—".to_string());
+    let page_url = device_page_url(status.and_then(|s| s.ip.as_deref()));
 
     let version = knob.version.clone().unwrap_or_else(|| "—".to_string());
     let display_name = knob_display_name(&knob);
     let device_name = controller_type_name(knob.device_type.as_deref());
     let last_seen = format_ago(knob.last_seen.as_deref());
+    let update_knob_id = knob.knob_id.clone();
 
     rsx! {
         tr { class: "border-b border-default",
@@ -628,8 +776,42 @@ fn KnobRow(knob: KnobDevice, zones: Vec<Zone>, on_config: EventHandler<String>) 
                 div { "{display_name}" }
                 div { class: "text-sm text-muted", "{device_name}" }
             }
-            td { class: "py-2", "{version}" }
-            td { class: "py-2", "{ip}" }
+            td { class: "py-2",
+                div { "{version}" }
+                match update {
+                    UpdateState::Available(ref next) => rsx! {
+                        button {
+                            class: "btn btn-outline btn-sm mt-1",
+                            title: "Install {next} on this controller. Settings are kept.",
+                            onclick: move |_| on_update.call(update_knob_id.clone()),
+                            "Update to {next}"
+                        }
+                    },
+                    UpdateState::UpToDate => rsx! {
+                        div { class: "text-xs text-muted", "Up to date" }
+                    },
+                    UpdateState::Unknown(reason) => rsx! {
+                        div { class: "text-xs text-muted", "{reason}" }
+                    },
+                }
+                if let Some((is_err, ref message)) = note {
+                    div { class: if is_err { "text-xs status-err mt-1" } else { "text-xs status-ok mt-1" }, "{message}" }
+                }
+            }
+            td { class: "py-2",
+                if let Some(ref url) = page_url {
+                    a {
+                        class: "link",
+                        href: "{url}",
+                        target: "_blank",
+                        rel: "noopener noreferrer",
+                        title: "Open this controller's own web page",
+                        "{ip}"
+                    }
+                } else {
+                    "{ip}"
+                }
+            }
             td { class: "py-2", "{zone_name}" }
             td { class: "py-2", "{battery}" }
             td { class: "py-2 text-sm text-muted", "{last_seen}" }
@@ -1435,6 +1617,74 @@ fn StateCascadePreview(
     }
 }
 
+/// One schema-driven control. `value` is `None` until the bridge manages the setting; the
+/// control then shows a neutral starting point and says the controller's own value still applies.
+#[component]
+fn DeviceSettingRow(
+    spec: SettingSpec,
+    value: Option<i64>,
+    on_change: EventHandler<(String, i64)>,
+) -> Element {
+    let key = spec.key;
+    let managed = value.is_some();
+    let note = if managed {
+        "Managed from here"
+    } else {
+        "Not set here: the controller keeps its own value until you change this"
+    };
+    rsx! {
+        div { class: "flex items-center justify-between gap-4",
+            div { class: "flex-1 min-w-0",
+                span { class: "block text-sm font-medium", "{spec.label}" }
+                span { class: "block text-xs text-muted", "{spec.help}" }
+                span { class: "block text-xs text-muted", "{note}" }
+            }
+            match spec.kind {
+                SettingKind::Toggle => rsx! {
+                    input {
+                        r#type: "checkbox",
+                        class: "checkbox",
+                        aria_label: "{spec.label}",
+                        checked: value.unwrap_or(0) != 0,
+                        onchange: move |_| on_change.call((key.to_string(), i64::from(value.unwrap_or(0) == 0))),
+                    }
+                },
+                SettingKind::Number { min, max, unit } => rsx! {
+                    div { class: "flex items-center gap-2",
+                        input {
+                            r#type: "range",
+                            aria_label: "{spec.label}",
+                            min: "{min}",
+                            max: "{max}",
+                            value: "{value.unwrap_or(max)}",
+                            oninput: move |e| {
+                                if let Ok(v) = e.value().parse::<i64>() {
+                                    on_change.call((key.to_string(), v.clamp(min, max)));
+                                }
+                            },
+                        }
+                        span { class: "text-sm w-12 text-right", "{value.unwrap_or(max)}{unit}" }
+                    }
+                },
+                SettingKind::Choice(options) => rsx! {
+                    select {
+                        class: "input w-32 text-sm py-1",
+                        aria_label: "{spec.label}",
+                        onchange: move |e| {
+                            if let Ok(v) = e.value().parse::<i64>() {
+                                on_change.call((key.to_string(), v));
+                            }
+                        },
+                        for (option, label) in options.iter().copied() {
+                            option { value: "{option}", selected: value == Some(option), "{label}" }
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
 /// Config modal component
 #[component]
 fn ConfigModal(
@@ -1466,6 +1716,10 @@ fn ConfigModal(
     shortcuts: Vec<ShortcutInfo>,
     on_shortcuts_changed: EventHandler<()>,
     save_status: Option<String>,
+    device_type: Option<String>,
+    device_values: HashMap<String, i64>,
+    device_url: Option<String>,
+    on_device_value: EventHandler<(String, i64)>,
     on_name_change: EventHandler<String>,
     on_rotation_charging_change: EventHandler<i32>,
     on_rotation_not_charging_change: EventHandler<i32>,
@@ -1488,6 +1742,12 @@ fn ConfigModal(
     on_save: EventHandler<()>,
     on_close: EventHandler<()>,
 ) -> Element {
+    let power = power_support(device_type.as_deref());
+    let specs: &'static [SettingSpec] = device_type
+        .as_deref()
+        .and_then(FirmwareTarget::parse)
+        .map(device_settings)
+        .unwrap_or(&[]);
     let medium_step_display = format!("{:.1}", volume_step_override * 3.0);
     let large_step_display = format!("{:.1}", volume_step_override * 5.0);
 
@@ -1538,6 +1798,49 @@ fn ConfigModal(
                             on_change: on_hidden_zone_ids_change,
                         }
 
+                        if let Some(ref url) = device_url {
+                            p { class: "mb-4 text-sm text-muted",
+                                "This controller also serves its own page for Wi-Fi networks, the Hi-Fi Control address and Bluetooth pairing: "
+                                a { class: "link", href: "{url}", target: "_blank", rel: "noopener noreferrer", "{url}" }
+                            }
+                        }
+
+                        if !specs.is_empty() {
+                            fieldset { class: "mb-6",
+                                legend { class: "text-sm font-medium mb-2", "Controller settings" }
+                                p { class: "text-sm text-muted mb-3",
+                                    "Set here, applied when the controller next checks in. A setting you leave alone keeps the controller's own value."
+                                }
+                                div { class: "space-y-4",
+                                    for spec in specs.iter().copied() {
+                                        DeviceSettingRow {
+                                            spec,
+                                            value: device_values.get(spec.key).copied(),
+                                            on_change: on_device_value,
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        match power {
+                            PowerSupport::None => rsx! {
+                                p { class: "mb-6 text-sm text-muted",
+                                    "This controller manages its own display power, so there are no sleep or dim timers to set."
+                                }
+                            },
+                            PowerSupport::ArtOnly => rsx! {
+                                fieldset { class: "mb-6",
+                                    legend { class: "text-sm font-medium mb-2", "Album art" }
+                                    PowerModeInputCompact {
+                                        label: "Album art after",
+                                        hint: "Hide controls and show the cover. 0 = off",
+                                        config: art_mode_battery.clone(),
+                                        on_change: on_art_mode_battery_change,
+                                    }
+                                }
+                            },
+                            PowerSupport::Full => rsx! {
                         // Power Settings - Side by Side (includes rotation)
                         fieldset { class: "mb-6",
                             legend { class: "text-sm font-medium mb-2", "Power Management" }
@@ -1664,6 +1967,9 @@ fn ConfigModal(
                             }
                         }
 
+                            },
+                        }
+
                         // Volume Step Override
                         fieldset { class: "mb-6",
                             legend { class: "text-sm font-medium mb-2", "Volume Step Override" }
@@ -1720,7 +2026,8 @@ fn ConfigModal(
                             }
                         }
 
-                        // Advanced Settings
+                        // Advanced Settings (power behaviour only the full-power controllers apply)
+                        if power == PowerSupport::Full {
                         fieldset { class: "mb-6",
                             legend { class: "text-sm font-medium mb-2", "Advanced Settings" }
 
@@ -1771,6 +2078,8 @@ fn ConfigModal(
                                     }
                                 }
                             }
+                        }
+
                         }
 
                         div { class: "flex items-center gap-4 justify-end",
