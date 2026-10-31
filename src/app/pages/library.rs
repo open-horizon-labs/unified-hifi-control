@@ -604,6 +604,7 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
     let items = use_signal(Vec::<CollectionItem>::new);
     let next_offset = use_signal(|| None::<u32>);
     let mut library_layout = use_signal(LibraryLayout::default);
+    let mut strip_height = use_signal(|| 0.0);
     #[cfg(target_arch = "wasm32")]
     use_effect(move || {
         library_layout.set(load_library_layout());
@@ -1200,6 +1201,7 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
         Layout {
             title: "Library".to_string(),
             nav_active: "library".to_string(),
+            bottom_bar_height: if armed.is_some() && !zones_list().is_empty() { strip_height() } else { 0.0 },
 
             div { class: "library-page",
                 ShortcutsList {
@@ -1306,9 +1308,6 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
 
                 section { class: "library-content", {content} }
             }
-
-            // Bottom padding so the last row isn't hidden behind the fixed strip.
-            div { class: "library-strip-spacer" }
         }
 
         ZonesStrip {
@@ -1317,6 +1316,7 @@ fn Library(source: Option<String>, tab: Option<String>, location: Option<String>
             armed_zone_id: armed,
             on_arm: arm_zone,
             on_control: control,
+            on_height_change: move |height| strip_height.set(height),
         }
     }
 }
