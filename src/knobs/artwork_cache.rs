@@ -46,9 +46,9 @@ pub const SOURCE_CACHE_TTL: Duration = Duration::from_secs(300);
 /// composition changes so older cached bytes and old ETags are abandoned.
 /// 2: linear-light zenresize resampling (#802).
 pub const RASTER_CONVERTER_VERSION: u8 = 2;
-/// Converter revision for packed ACeP6 outputs. 4: the composition before
-/// dithering is resampled in linear light (#802).
-pub const EINK_CONVERTER_VERSION: u8 = 4;
+/// Converter revision for packed ACeP6 outputs. 5: stock measured palette,
+/// panel-range tone compression and float diffusion after zenresize (#906).
+pub const EINK_CONVERTER_VERSION: u8 = 5;
 
 /// LRU bounded by the summed byte size of its values.
 struct ByteLru<K, V> {

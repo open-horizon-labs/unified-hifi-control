@@ -13,6 +13,7 @@
 
 mod artwork_analysis;
 pub mod artwork_cache;
+mod frame_render;
 pub mod image;
 pub mod routes;
 pub mod store;
