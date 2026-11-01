@@ -5,5 +5,3 @@
 - Improve HiPhi Frame artwork with a stock measured six-color palette, tone compression and floating-point Floyd–Steinberg dithering. Replaces the previous ideal-palette renderer while retaining the high-quality resizer. Existing artwork is regenerated with the new converter. No user calibration is required (#907).
 - Repair retrying stable AUR publication after a partial release failure (#904).
 - Align the LMS plugin metadata with the stable v4 release (#902).
-
-The x86_64 QNAP test installer was installed on the maintainer's NAS; the maintainer confirmed the resulting Frame artwork works. Other package builds receive automated checks, without a claim of new physical testing.

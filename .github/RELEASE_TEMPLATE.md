@@ -2,7 +2,7 @@
 
 HiPhi Frame now uses a stock measured six-color palette, tone compression and floating-point Floyd–Steinberg dithering. This replaces the old ideal-palette renderer and retains the high-quality resizer. No calibration is needed. The maintainer confirmed the new artwork on a physical Frame using the x86_64 QNAP installer.
 
-This patch also repairs stable AUR publication retries and aligns LMS plugin metadata with the v4 stable release. Pair with HiPhi firmware v2.8.1 for Frame power checks and refresh diagnostics. Firmware cannot guarantee recovery from a latched PMIC without a full power cycle.
+This patch also repairs stable AUR publication retries and aligns LMS plugin metadata with the v4 stable release. Pair with HiPhi firmware v2.8.1 for Frame power checks and refresh diagnostics.
 
 ## Changes in beta.9
 
