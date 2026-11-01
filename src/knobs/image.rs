@@ -48,86 +48,6 @@ pub enum Rgb565ResizePolicy {
     SmartCover { max_crop_percent: u8 },
 }
 
-const ACEP6_PALETTE: [[u8; 3]; 6] = [
-    [0, 0, 0],
-    [255, 255, 255],
-    [255, 255, 0],
-    [255, 0, 0],
-    [0, 0, 255],
-    [0, 255, 0],
-];
-const ACEP6_PANEL_INDEX: [u8; 6] = [0, 1, 2, 3, 5, 6];
-
-fn nearest_acep6_color(r: u8, g: u8, b: u8) -> usize {
-    ACEP6_PALETTE
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, color)| {
-            let dr = i32::from(r) - i32::from(color[0]);
-            let dg = i32::from(g) - i32::from(color[1]);
-            let db = i32::from(b) - i32::from(color[2]);
-            dr * dr + dg * dg + db * db
-        })
-        .map(|(index, _)| index)
-        .unwrap_or(0)
-}
-
-fn diffuse_channel(channel: &mut u8, error: i32, numerator: i32) {
-    *channel = (i32::from(*channel) + error * numerator / 16).clamp(0, 255) as u8;
-}
-
-/// Reproduce the accepted Frame firmware conversion on the server: ideal
-/// six-color palette, RGB-distance matching, and raster Floyd-Steinberg error
-/// diffusion with each propagated update clamped to a byte.
-fn floyd_steinberg_acep6(rgb: &mut [u8], width: usize, height: usize) -> Vec<u8> {
-    let bytes_per_row = width.div_ceil(2);
-    let mut packed = vec![0u8; bytes_per_row * height];
-
-    for y in 0..height {
-        for x in 0..width {
-            let offset = (y * width + x) * 3;
-            let r = rgb[offset];
-            let g = rgb[offset + 1];
-            let b = rgb[offset + 2];
-            let palette_index = nearest_acep6_color(r, g, b);
-            let chosen = ACEP6_PALETTE[palette_index];
-            let panel_index = ACEP6_PANEL_INDEX[palette_index];
-            let packed_offset = y * bytes_per_row + x / 2;
-            if x % 2 == 0 {
-                packed[packed_offset] = panel_index << 4;
-            } else {
-                packed[packed_offset] |= panel_index;
-            }
-
-            let errors = [
-                i32::from(r) - i32::from(chosen[0]),
-                i32::from(g) - i32::from(chosen[1]),
-                i32::from(b) - i32::from(chosen[2]),
-            ];
-            let mut add_error = |neighbor: usize, weight: i32| {
-                diffuse_channel(&mut rgb[neighbor], errors[0], weight);
-                diffuse_channel(&mut rgb[neighbor + 1], errors[1], weight);
-                diffuse_channel(&mut rgb[neighbor + 2], errors[2], weight);
-            };
-
-            if x + 1 < width {
-                add_error(offset + 3, 7);
-            }
-            if y + 1 < height {
-                let next_row = (y + 1) * width * 3;
-                if x > 0 {
-                    add_error(next_row + (x - 1) * 3, 3);
-                }
-                add_error(next_row + x * 3, 5);
-                if x + 1 < width {
-                    add_error(next_row + (x + 1) * 3, 1);
-                }
-            }
-        }
-    }
-    packed
-}
-
 const GALLERY_MAT: Rgba<u8> = Rgba([248, 250, 251, 255]);
 const GALLERY_KEYLINE: Rgba<u8> = Rgba([23, 37, 54, 255]);
 
@@ -620,8 +540,8 @@ pub fn image_to_eink_acep6_with_policy(
     }
     let image = decode_artwork(image_data)?;
     let resized = resize_with_policy(&image, target_width, target_height, policy);
-    let mut rgb = resized.to_rgb8().into_raw();
-    let data = floyd_steinberg_acep6(&mut rgb, target_width as usize, target_height as usize);
+    let rgb = resized.to_rgb8().into_raw();
+    let data = super::frame_render::render(&rgb, target_width as usize, target_height as usize);
     Ok(EinkAcep6Image {
         data,
         width: target_width,
@@ -1463,9 +1383,25 @@ mod tests {
     }
 
     #[test]
+    fn acep6_matches_physically_preferred_common_input_recipe() {
+        // Independent Python TEST 2 renderer from muness/roon-knob#318.
+        // A multichannel synthetic gradient avoids copyrighted album art.
+        let rgb = include_bytes!("../../tests/fixtures/artwork/frame-906/input.rgb").to_vec();
+        let expected = include_bytes!("../../tests/fixtures/artwork/frame-906/measured.epd");
+        assert_eq!(super::super::frame_render::render(&rgb, 32, 12), expected);
+    }
+
+    #[test]
     fn acep6_packs_left_pixel_into_high_nibble_using_panel_indices() {
         let mut image = image::RgbImage::new(6, 1);
-        for (pixel, color) in image.pixels_mut().zip(ACEP6_PALETTE) {
+        for (pixel, color) in image.pixels_mut().zip([
+            [0, 0, 0],
+            [255, 255, 255],
+            [255, 255, 0],
+            [255, 0, 0],
+            [0, 0, 255],
+            [0, 255, 0],
+        ]) {
             *pixel = image::Rgb(color);
         }
         let mut png = Vec::new();
