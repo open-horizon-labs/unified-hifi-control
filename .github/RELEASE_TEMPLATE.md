@@ -1,3 +1,9 @@
+## v4.0.1: HiPhi Frame artwork
+
+HiPhi Frame now uses a stock measured six-color palette, tone compression and floating-point Floyd–Steinberg dithering. This replaces the old ideal-palette renderer and retains the high-quality resizer. No calibration is needed. The maintainer confirmed the new artwork on a physical Frame using the x86_64 QNAP installer.
+
+This patch also repairs stable AUR publication retries and aligns LMS plugin metadata with the v4 stable release. Pair with HiPhi firmware v2.8.1 for Frame power checks and refresh diagnostics. Firmware cannot guarantee recovery from a latched PMIC without a full power cycle.
+
 ## Changes in beta.9
 
 - Sweep direct Rust and npm dependencies against current stable releases, including major API migrations: Rand 0.10, SHA2 0.11, Ed25519 3, Reqwest 0.13, Syn 3 and MCP SDK 2.0. Refresh the transitive graph and npm lockfile.
