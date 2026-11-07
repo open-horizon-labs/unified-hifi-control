@@ -543,6 +543,7 @@ async fn moving_to_stable_requires_a_supported_device_and_the_exact_confirmed_re
         "withdrawing the validation gate cancels an outstanding test request"
     );
     std::env::set_var(GATE, DEVICE);
+    poll(RUNNING, true).await;
     assert_eq!(
         request(&app, "POST", MOVE, command(RUNNING, "2.8.5"))
             .await
@@ -554,6 +555,7 @@ async fn moving_to_stable_requires_a_supported_device_and_the_exact_confirmed_re
         offered().await.is_null(),
         "Stable is now the running channel"
     );
+    put_image("2.8.6", "hiphi_frame");
     assert_eq!(
         request(
             &app,
