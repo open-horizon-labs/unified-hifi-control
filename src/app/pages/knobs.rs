@@ -479,8 +479,12 @@ pub fn Knobs() -> Element {
                 } else if knobs_list.is_empty() {
                     div { class: "card p-6 text-muted", "No controllers registered. Connect a controller to see it here." }
                 } else {
-                    div { class: "card p-6 overflow-x-auto",
-                        table { class: "w-full",
+                    div {
+                        class: "card p-6 overflow-x-auto",
+                        role: "region",
+                        aria_label: "Registered controllers",
+                        tabindex: "0",
+                        table { class: "w-full min-w-[40rem] [&_th:not(:last-child)]:pr-3 [&_td:not(:last-child)]:pr-3",
                             thead {
                                 tr { class: "border-b border-default",
                                     th { class: "text-left py-2 text-sm", "Name" }
@@ -758,7 +762,7 @@ fn KnobRow(
                 match update {
                     UpdateState::Available(ref next) => rsx! {
                         button {
-                            class: "btn btn-primary btn-sm mt-1",
+                            class: "btn btn-primary btn-sm mt-1 whitespace-nowrap",
                             title: "Install {next} on this controller's current channel",
                             onclick: move |_| on_update.call((
                                 update_knob_id.clone(),
