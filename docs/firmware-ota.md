@@ -41,11 +41,9 @@ Rollback needs the bootloader's rollback setting, which only a USB reflash can c
 
 Use **Refresh OTA images** on the Controllers page to check releases and download available images to the Bridge. **Install firmware via USB** opens the firmware center for the one-time partition update or for changing channels on firmware without switch support.
 
-## Moving to Stable (hardware validation only)
+## Moving to Stable
 
-The action is disabled for public use. For the physical Frame test, set
-`UHC_FRAME_OTA_VALIDATION_DEVICE` to the test controller's exact ID on an
-isolated bridge. The controller must advertise `X-Firmware-Channel-Switch: 1`
+To offer **Move to Stable**, the controller must advertise `X-Firmware-Channel-Switch: 1`
 with its target and running version on its now-playing or configuration poll.
 The bridge only returns a `stable_version` offer for an Alpha or Beta build
 with a newer, matching Stable application in its cache.
@@ -60,9 +58,7 @@ destination in both Stable release metadata and the downloaded image. If a
 newer release has displaced it, the user must confirm again. The successful
 boot's version determines the channel for subsequent ordinary updates.
 
-Before public enablement, record the exact Frame test and release image digests,
-the source and destination boots, retained settings, and a second boot after
-the rollback confirmation window. See
+The physical Frame migration is tracked in
 [the firmware validation issue](https://github.com/muness/roon-knob/issues/333).
 
 ## Device settings

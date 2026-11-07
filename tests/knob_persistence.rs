@@ -410,26 +410,7 @@ async fn moving_to_stable_requires_a_supported_device_and_the_exact_confirmed_re
         )
         .unwrap();
     };
-    const GATE: &str = "UHC_FRAME_OTA_VALIDATION_DEVICE";
-    struct RestoreGate(Option<std::ffi::OsString>);
-    impl Drop for RestoreGate {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(value) => std::env::set_var(GATE, value),
-                None => std::env::remove_var(GATE),
-            }
-        }
-    }
-    let _restore = RestoreGate(std::env::var_os(GATE));
-    std::env::remove_var(GATE);
     put_image("2.8.3", "hiphi_frame");
-    poll(RUNNING, true).await;
-    assert!(
-        offered().await.is_null(),
-        "disabled by default before hardware validation"
-    );
-
-    std::env::set_var(GATE, DEVICE);
     poll(RUNNING, false).await;
     assert!(
         offered().await.is_null(),
@@ -537,13 +518,6 @@ async fn moving_to_stable_requires_a_supported_device_and_the_exact_confirmed_re
         "a newer release must not rewrite an already queued request"
     );
 
-    std::env::remove_var(GATE);
-    assert!(
-        poll(RUNNING, true).await["config"]["firmware_update"].is_null(),
-        "withdrawing the validation gate cancels an outstanding test request"
-    );
-    std::env::set_var(GATE, DEVICE);
-    poll(RUNNING, true).await;
     assert_eq!(
         request(&app, "POST", MOVE, command(RUNNING, "2.8.5"))
             .await
@@ -567,5 +541,49 @@ async fn moving_to_stable_requires_a_supported_device_and_the_exact_confirmed_re
         .0,
         StatusCode::OK,
         "ordinary Update now uses Stable"
+    );
+
+    // A supported target other than Frame can move with its own Stable image.
+    let joy = environment.directory.path().join("firmware/stable/joy");
+    std::fs::create_dir_all(&joy).unwrap();
+    std::fs::write(
+        joy.join("version.json"),
+        r#"{"version":"2.8.6","file":"hiphi_joy.bin"}"#,
+    )
+    .unwrap();
+    let mut image = std::fs::read(stable.join("hiphi_frame.bin")).unwrap();
+    image[80..112].fill(0);
+    image[80..89].copy_from_slice(b"hiphi_joy");
+    image[3] = 0x30; // 8 MiB
+    std::fs::write(joy.join("hiphi_joy.bin"), image).unwrap();
+    let joy_poll = Request::builder()
+        .uri("/config/joy-test")
+        .header("x-device-type", "hiphi-joy")
+        .header("x-knob-version", "2.8.6-beta.1")
+        .header("x-firmware-channel-switch", "1")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(joy_poll).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let (_, list) = request(&app, "GET", "/knob/devices", Value::Null).await;
+    let joy = list["knobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|knob| knob["knob_id"] == "joy-test")
+        .unwrap();
+    assert_eq!(joy["stable_version"], "2.8.6");
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/knob/config?knob_id=joy-test",
+            command("2.8.6-beta.1", "2.8.6")
+        )
+        .await
+        .0,
+        StatusCode::OK
     );
 }

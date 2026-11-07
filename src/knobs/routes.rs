@@ -118,12 +118,10 @@ fn extract_device_type(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Interpret absence as unsupported only on polls where firmware advertises the capability.
-fn reports_channel_switch(headers: &HeaderMap, knob_id: &str) -> bool {
-    // A persisted validation request is withdrawn if the test bridge restarts without the opt-in.
-    is_frame_validation_device(knob_id)
-        && headers
-            .get("x-firmware-channel-switch")
-            .is_some_and(|value| value == "1")
+fn reports_channel_switch(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-firmware-channel-switch")
+        .is_some_and(|value| value == "1")
 }
 
 /// DSP info for zones linked to HQPlayer (iOS compatible)
@@ -388,7 +386,7 @@ pub async fn knob_now_playing_handler(
                 id,
                 knob_version.as_deref(),
                 extract_device_type(&headers),
-                Some(reports_channel_switch(&headers, id)),
+                Some(reports_channel_switch(&headers)),
             )
             .await
             .map_err(knob_persistence_error)?;
@@ -1335,7 +1333,6 @@ pub async fn knob_devices_handler(State(state): State<AppState>) -> Json<serde_j
     let mut knobs = state.knobs.list().await;
     for knob in &mut knobs {
         knob.stable_version = stable_move_offer(
-            &knob.knob_id,
             &knob.device_type,
             knob.version.as_deref(),
             knob.supports_channel_switch,
@@ -1368,26 +1365,12 @@ pub async fn knob_remove_handler(
     }
 }
 
-/// Public rollout is held until a physical Frame has moved from a prerelease to Stable.
-const FRAME_OTA_VALIDATION_DEVICE: &str = "UHC_FRAME_OTA_VALIDATION_DEVICE";
-
-fn is_frame_validation_device(knob_id: &str) -> bool {
-    std::env::var(FRAME_OTA_VALIDATION_DEVICE).ok().as_deref() == Some(knob_id)
-}
-
-fn stable_move_offer(
-    knob_id: &str,
-    device_type: &str,
-    running: Option<&str>,
-    supported: bool,
-) -> Option<String> {
+fn stable_move_offer(device_type: &str, running: Option<&str>, supported: bool) -> Option<String> {
     use crate::firmware_catalog::{FirmwareChannel, FirmwareTarget};
 
     let target = FirmwareTarget::parse(device_type)?;
     let running = running?;
     if !supported
-        || target != FirmwareTarget::Frame
-        || !is_frame_validation_device(knob_id)
         || !matches!(
             FirmwareChannel::for_version(running),
             Some(FirmwareChannel::Alpha | FirmwareChannel::Beta)
@@ -1400,13 +1383,38 @@ fn stable_move_offer(
     let version = info.version.as_deref()?;
     let version = version.strip_prefix('v').unwrap_or(version);
     let offered = install_offer(Some(version), running)?;
-    frame_image_matches(&path, &offered).then_some(offered)
+    stable_image_matches(&path, target, &offered).then_some(offered)
 }
 
 /// Read only the ESP image prefix. Release metadata and filenames do not establish
 /// hardware or version: check the chip, flash size, and embedded application descriptor.
-fn frame_image_matches(path: &std::path::Path, version: &str) -> bool {
+fn stable_image_matches(
+    path: &std::path::Path,
+    target: crate::firmware_catalog::FirmwareTarget,
+    version: &str,
+) -> bool {
+    use crate::firmware_catalog::FirmwareTarget::*;
     use std::io::Read;
+
+    const ESP32: u16 = 0;
+    const ESP32_S3: u16 = 9;
+    const FLASH_8_MIB: u8 = 3;
+    const FLASH_16_MIB: u8 = 4;
+    // These values come from each roon-knob target's CMake project and sdkconfig defaults.
+    let (project, chip, flash_size) = match target {
+        LegacyKnob => return false, // The fallback has no current switch-capable build profile.
+        Dial => ("hiphi_dial", ESP32_S3, FLASH_16_MIB),
+        Frame => ("hiphi_frame", ESP32_S3, FLASH_16_MIB),
+        Halo => ("hiphi_halo", ESP32_S3, FLASH_16_MIB),
+        Tough => ("hiphi_tough", ESP32, FLASH_16_MIB),
+        Joy => ("hiphi_joy", ESP32_S3, FLASH_8_MIB),
+        M5Dial => ("hiphi_m5dial", ESP32_S3, FLASH_8_MIB),
+        Rlcd => ("hiphi_rlcd_42", ESP32_S3, FLASH_16_MIB),
+        Stackchan => ("hiphi_stackchan", ESP32_S3, FLASH_16_MIB),
+        StickS3 => ("hiphi_sticks3", ESP32_S3, FLASH_8_MIB),
+        Stopwatch => ("hiphi_stopwatch", ESP32_S3, FLASH_16_MIB),
+    };
+
     let mut prefix = [0u8; 288]; // 24-byte image header, 8-byte segment header, 256-byte app descriptor
     if std::fs::File::open(path)
         .and_then(|mut file| file.read_exact(&mut prefix))
@@ -1422,12 +1430,12 @@ fn frame_image_matches(path: &std::path::Path, version: &str) -> bool {
     }
     prefix[0] == 0xe9
         && (1..=16).contains(&prefix[1])
-        && prefix[3] >> 4 == 4 // 16 MiB
-        && prefix[12..14] == 9u16.to_le_bytes() // ESP32-S3
+        && prefix[3] >> 4 == flash_size
+        && prefix[12..14] == chip.to_le_bytes()
         && u32::from_le_bytes([prefix[28], prefix[29], prefix[30], prefix[31]]) >= 256
         && prefix[32..36] == 0xabcd5432u32.to_le_bytes()
         && field_matches(&prefix[48..80], version)
-        && field_matches(&prefix[80..112], "hiphi_frame")
+        && field_matches(&prefix[80..112], project)
 }
 
 async fn apply_controller_config(
@@ -1440,7 +1448,6 @@ async fn apply_controller_config(
             .knobs
             .queue_stable_move(knob_id, updates.from_version, updates.to_version, |knob| {
                 stable_move_offer(
-                    knob_id,
                     &knob.device_type,
                     knob.version.as_deref(),
                     knob.supports_channel_switch,
@@ -1538,7 +1545,7 @@ pub async fn knob_config_by_path_handler(
             &knob_id,
             version.as_deref(),
             extract_device_type(&headers),
-            Some(reports_channel_switch(&headers, &knob_id)),
+            Some(reports_channel_switch(&headers)),
         )
         .await
         .map_err(knob_persistence_error)?;
