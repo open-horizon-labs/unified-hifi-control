@@ -127,13 +127,6 @@ pub fn Knobs() -> Element {
         }
     });
 
-    // Load firmware version resource
-    let mut firmware_version = use_resource(|| async {
-        api::fetch_json::<FirmwareVersion>("/firmware/version")
-            .await
-            .ok()
-    });
-
     // For each controller, the newest image the bridge holds on that controller's own channel.
     let mut available = use_resource(move || {
         let feeds: HashSet<(&'static str, &'static str)> = knobs
@@ -391,20 +384,24 @@ pub fn Knobs() -> Element {
         }
     };
 
-    // Ask a controller to install the firmware waiting on the bridge.
-    let request_update = move |knob_id: String| {
+    let request_update = move |(knob_id, action): (String, FirmwareUpdateAction)| {
         spawn(async move {
             let url = format!("/knob/config?knob_id={}", urlencoding::encode(&knob_id));
-            let action = FirmwareUpdateAction {
-                firmware_update: "install",
-            };
             let note = match api::post_json::<_, serde_json::Value>(&url, &action).await {
-                Ok(_) => (
-                    false,
-                    "Update requested. The controller installs it when it next checks in, then restarts."
-                        .to_string(),
-                ),
-                Err(e) => (true, e),
+                Ok(_) => {
+                    let message = match action.to_version {
+                        Some(version) => format!(
+                            "Move to Stable {version} requested. The controller will try to install it at its next check-in."
+                        ),
+                        None => "Update requested. The controller will try to install it at its next check-in.".to_string(),
+                    };
+                    (false, message)
+                }
+                Err(e) => {
+                    knobs.restart();
+                    available.restart();
+                    (true, e)
+                }
             };
             update_notes.write().insert(knob_id, note);
         });
@@ -418,12 +415,14 @@ pub fn Knobs() -> Element {
         spawn(async move {
             match api::post_json::<_, FetchFirmwareResponse>("/admin/fetch-firmware", &()).await {
                 Ok(resp) => {
-                    if let Some(version) = resp.version {
-                        fw_message.set(Some((false, format!("Downloaded v{}", version))));
-                        firmware_version.restart();
-                        available.restart();
-                    } else if let Some(err) = resp.error {
+                    if let Some(err) = resp.error {
                         fw_message.set(Some((true, err)));
+                    } else {
+                        fw_message.set(Some((
+                            false,
+                            resp.message
+                                .unwrap_or_else(|| "Checked for OTA images.".to_string()),
+                        )));
                     }
                 }
                 Err(e) => {
@@ -432,6 +431,7 @@ pub fn Knobs() -> Element {
             }
             // The refresh may have changed what any controller can install, success or not.
             available.restart();
+            knobs.restart();
             fw_fetching.set(false);
         });
     };
@@ -449,7 +449,6 @@ pub fn Knobs() -> Element {
         .flatten()
         .map(|r| r.zones)
         .unwrap_or_default();
-    let fw_version = firmware_version.read().clone().flatten().map(|r| r.version);
     let available_images = available.read().clone().unwrap_or_default();
     let modal_device_url = current_knob_id()
         .and_then(|id| knobs_list.iter().find(|k| k.knob_id == id))
@@ -496,6 +495,7 @@ pub fn Knobs() -> Element {
                             tbody {
                                 for knob in knobs_list {
                                     KnobRow {
+                                        key: "{knob.knob_id}",
                                         update: update_state(
                                             knob.device_type.as_deref(),
                                             knob.version.as_deref(),
@@ -518,6 +518,25 @@ pub fn Knobs() -> Element {
                         }
                     }
                 }
+                div { class: "mt-3 flex flex-wrap items-center gap-x-4 gap-y-1",
+                    button {
+                        class: "btn btn-outline btn-sm",
+                        disabled: fw_fetching(),
+                        aria_busy: fw_fetching(),
+                        onclick: fetch_firmware,
+                        if fw_fetching() { "Refreshing OTA images…" } else { "Refresh OTA images" }
+                    }
+                    a {
+                        class: "link inline-flex min-h-11 items-center text-sm",
+                        href: crate::app::KNOB_FLASHER_URL,
+                        target: "_blank",
+                        rel: "noopener noreferrer",
+                        "Install firmware via USB"
+                    }
+                    if let Some((is_err, ref msg)) = fw_message() {
+                        span { role: "status", class: if is_err { "text-sm status-err" } else { "text-sm status-ok" }, "{msg}" }
+                    }
+                }
             }
 
             PinnedShortcuts {
@@ -528,51 +547,6 @@ pub fn Knobs() -> Element {
                     .map(|r| r.shortcuts.clone())
                     .unwrap_or_default(),
                 on_changed: move |_| shortcuts.restart(),
-            }
-
-            // Firmware section
-            section { id: "firmware-section", class: "mb-8",
-                div { class: "mb-4",
-                    h2 { class: "text-xl font-semibold", "Firmware" }
-                    p { class: "text-muted text-sm", "Local OTA firmware for registered controllers" }
-                }
-                div { class: "card p-6",
-                    p { class: "mb-4 text-sm text-muted", "Every controller type can update over the air from this Bridge. A controller follows its own release channel (Stable, Beta or Alpha), so an Alpha build is only offered newer Alpha builds. Use Update in the table above to ask a controller to install; it keeps its settings. Refresh downloads the published images into the Bridge cache. A controller that has not yet had its one-time partition reflash needs the firmware site for that first install." }
-                    p { class: "mb-4",
-                        "Legacy knob image on this Bridge: "
-                        span { class: "font-semibold",
-                            if let Some(ref v) = fw_version {
-                                "v{v}"
-                            } else {
-                                "Not available"
-                            }
-                        }
-                    }
-                    div { class: "flex flex-col items-stretch gap-3 sm:flex-row sm:items-center sm:gap-4",
-                        button {
-                            id: "fetch-btn",
-                            class: "btn btn-primary",
-                            disabled: fw_fetching(),
-                            aria_busy: if fw_fetching() { "true" } else { "false" },
-                            onclick: fetch_firmware,
-                            "Refresh OTA images"
-                        }
-                        a {
-                            class: "link inline-flex min-h-11 items-center",
-                            href: crate::app::KNOB_FLASHER_URL,
-                            target: "_blank",
-                            rel: "noopener noreferrer",
-                            "Firmware releases and installation"
-                        }
-                        if let Some((is_err, ref msg)) = fw_message() {
-                            if is_err {
-                                span { class: "status-err", "{msg}" }
-                            } else {
-                                span { class: "status-ok", "✓ {msg}" }
-                            }
-                        }
-                    }
-                }
             }
 
             // Config modal
@@ -735,7 +709,7 @@ fn KnobRow(
     update: UpdateState,
     note: Option<(bool, String)>,
     on_config: EventHandler<String>,
-    on_update: EventHandler<String>,
+    on_update: EventHandler<(String, FirmwareUpdateAction)>,
 ) -> Element {
     let status = knob.status.as_ref();
     let knob_id = knob.knob_id.clone();
@@ -769,6 +743,9 @@ fn KnobRow(
     let device_name = controller_type_name(knob.device_type.as_deref());
     let last_seen = format_ago(knob.last_seen.as_deref());
     let update_knob_id = knob.knob_id.clone();
+    let switch_knob_id = knob.knob_id.clone();
+    let switch_from = version.clone();
+    let switch_name = display_name.clone();
 
     rsx! {
         tr { class: "border-b border-default",
@@ -781,9 +758,12 @@ fn KnobRow(
                 match update {
                     UpdateState::Available(ref next) => rsx! {
                         button {
-                            class: "btn btn-outline btn-sm mt-1",
-                            title: "Install {next} on this controller. Settings are kept.",
-                            onclick: move |_| on_update.call(update_knob_id.clone()),
+                            class: "btn btn-primary btn-sm mt-1",
+                            title: "Install {next} on this controller's current channel",
+                            onclick: move |_| on_update.call((
+                                update_knob_id.clone(),
+                                FirmwareUpdateAction::install(),
+                            )),
                             "Update to {next}"
                         }
                     },
@@ -794,8 +774,26 @@ fn KnobRow(
                         div { class: "text-xs text-muted", "{reason}" }
                     },
                 }
+                if let Some(next) = knob.stable_version.clone() {
+                    div {
+                        button {
+                            class: "btn btn-outline btn-sm mt-1 whitespace-nowrap",
+                            onclick: move |_| {
+                                let message = format!(
+                                    "Move {switch_name} to Stable?\n\nCurrent version: {switch_from}\nStable version: {next}\n\nThe controller will restart. Future updates will follow Stable."
+                                );
+                                if super::settings::browser_confirm(&message) {
+                                    on_update.call((switch_knob_id.clone(), FirmwareUpdateAction::move_to_stable(
+                                        switch_from.clone(), next.clone()
+                                    )));
+                                }
+                            },
+                            "Move to Stable"
+                        }
+                    }
+                }
                 if let Some((is_err, ref message)) = note {
-                    div { class: if is_err { "text-xs status-err mt-1" } else { "text-xs status-ok mt-1" }, "{message}" }
+                    div { role: "status", class: if is_err { "text-xs status-err mt-1" } else { "text-xs status-ok mt-1" }, "{message}" }
                 }
             }
             td { class: "py-2",
