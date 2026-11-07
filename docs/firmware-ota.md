@@ -39,6 +39,28 @@ The key exists only while a request is pending and is part of `config_sha`, so t
 
 Rollback needs the bootloader's rollback setting, which only a USB reflash can change; a controller updated only over the air keeps whatever bootloader it already had. The firmware confirms a new image after 45 seconds of uptime.
 
+Use **Refresh OTA images** on the Controllers page to check releases and download available images to the Bridge. **Install firmware via USB** opens the firmware center for the one-time partition update or for changing channels on firmware without switch support.
+
+## Moving to Stable
+
+To offer **Move to Stable**, the controller must advertise `X-Firmware-Channel-Switch: 1`
+with its target and running version on its now-playing or configuration poll.
+The bridge only returns a `stable_version` offer for an Alpha or Beta build
+with a newer, matching Stable application in its cache.
+
+The page shows both versions before confirmation. It posts
+`{"firmware_update":"move_to_stable","from_version":"2.8.3-beta.1","to_version":"2.8.3"}`
+to the selected controller. The bridge rejects stale confirmations, including
+when the cache changed. The queued config uses a distinct
+`action: "move_to_stable"` and includes `device_id`, `from_version`, and
+`to_version`. Firmware checks the device and source, then requires the exact
+destination in both Stable release metadata and the downloaded image. If a
+newer release has displaced it, the user must confirm again. The successful
+boot's version determines the channel for subsequent ordinary updates.
+
+The physical Frame migration is tracked in
+[the firmware validation issue](https://github.com/muness/roon-knob/issues/333).
+
 ## Device settings
 
 Beyond the shared display and power settings, a controller can have settings of its own. The table in `src/firmware/settings.rs` is the single source of truth: the server rejects a setting a controller does not have (`400`, nothing stored) and the Controllers page renders only the controls its firmware applies.

@@ -215,6 +215,7 @@ mod tests {
 
     fn knob_fixture(name: &str) -> Knob {
         Knob {
+            supports_channel_switch: false,
             device_type: "knob".into(),
             name: name.to_string(),
             last_seen: Utc::now(),

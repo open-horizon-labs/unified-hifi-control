@@ -80,6 +80,7 @@ async fn app() -> Router {
     Router::new()
         .route("/zones", get(knobs::knob_zones_handler))
         .route("/knob/devices", get(knobs::knob_devices_handler))
+        .route("/now_playing", get(knobs::knob_now_playing_handler))
         .route(
             "/knob/devices/{knob_id}",
             delete(knobs::knob_remove_handler),
@@ -342,5 +343,247 @@ async fn routine_polls_do_not_rewrite_durable_settings() {
     assert_eq!(
         store.get("dial").await.unwrap().status.battery_level,
         Some(42)
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn moving_to_stable_requires_a_supported_device_and_the_exact_confirmed_release() {
+    const RUNNING: &str = "2.8.3-alpha.1";
+    const DEVICE: &str = "frame-test";
+    const PATH: &str = "/config/frame-test";
+    const MOVE: &str = "/knob/config?knob_id=frame-test";
+
+    let environment = ConfigEnvironment::new();
+    let app = app().await;
+    let poll = |version: &str, supported| {
+        let mut req = Request::builder()
+            .uri(PATH)
+            .header("x-device-type", "hiphi-frame")
+            .header("x-knob-version", version);
+        if supported {
+            req = req.header("x-firmware-channel-switch", "1");
+        }
+        let app = app.clone();
+        async move {
+            let response = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            serde_json::from_slice::<Value>(
+                &axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+        }
+    };
+    let command = |from, to| {
+        serde_json::json!({
+            "firmware_update": "move_to_stable",
+            "from_version": from,
+            "to_version": to
+        })
+    };
+    let offered = || async {
+        let (_, list) = request(&app, "GET", "/knob/devices", Value::Null).await;
+        list["knobs"][0]["stable_version"].clone()
+    };
+    let stable = environment.directory.path().join("firmware/stable/frame");
+    std::fs::create_dir_all(&stable).unwrap();
+    let put_image = |version: &str, project: &str| {
+        // ESP image header, first segment header and embedded app descriptor.
+        let mut image = vec![0u8; 288];
+        image[0] = 0xe9;
+        image[1] = 1;
+        image[3] = 0x40; // 16 MiB
+        image[12..14].copy_from_slice(&9u16.to_le_bytes()); // ESP32-S3
+        image[28..32].copy_from_slice(&256u32.to_le_bytes());
+        image[32..36].copy_from_slice(&0xabcd5432u32.to_le_bytes());
+        image[48..48 + version.len()].copy_from_slice(version.as_bytes());
+        image[80..80 + project.len()].copy_from_slice(project.as_bytes());
+        std::fs::write(stable.join("hiphi_frame.bin"), image).unwrap();
+        std::fs::write(
+            stable.join("version.json"),
+            serde_json::json!({
+                "version": version, "file": "hiphi_frame.bin"
+            })
+            .to_string(),
+        )
+        .unwrap();
+    };
+    put_image("2.8.3", "hiphi_frame");
+    poll(RUNNING, false).await;
+    assert!(
+        offered().await.is_null(),
+        "no advertisement means no switch"
+    );
+    assert_eq!(
+        request(&app, "POST", MOVE, command(RUNNING, "2.8.3"))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+
+    // Devices can retain their config SHA on reboot and advertise through ordinary polling.
+    let now_playing = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/now_playing?zone_id=roon:missing")
+                .header("x-knob-id", DEVICE)
+                .header("x-device-type", "hiphi-frame")
+                .header("x-knob-version", RUNNING)
+                .header("x-firmware-channel-switch", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(now_playing.status(), StatusCode::NOT_FOUND); // no playback zone in fixture
+    assert_eq!(offered().await, "2.8.3");
+
+    std::fs::remove_file(stable.join("hiphi_frame.bin")).unwrap();
+    assert!(
+        offered().await.is_null(),
+        "metadata alone does not make an offer"
+    );
+    assert_eq!(
+        request(&app, "PUT", PATH, command(RUNNING, "2.8.3"))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    put_image("2.8.3", "hiphi_dial");
+    assert!(
+        offered().await.is_null(),
+        "a renamed image for the wrong hardware is not offered"
+    );
+    assert_eq!(
+        request(&app, "POST", MOVE, command(RUNNING, "2.8.3"))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    put_image("2.8.2", "hiphi_frame");
+    assert!(
+        offered().await.is_null(),
+        "an older Stable version is not offered"
+    );
+
+    put_image("2.8.3", "hiphi_frame");
+    assert_eq!(offered().await, "2.8.3");
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            MOVE,
+            serde_json::json!({"firmware_update":"install"})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT,
+        "ordinary Update stays on Alpha"
+    );
+    assert_eq!(
+        request(&app, "POST", MOVE, command("2.8.3-alpha.0", "2.8.3"))
+            .await
+            .0,
+        StatusCode::CONFLICT,
+        "stale source"
+    );
+    put_image("2.8.4", "hiphi_frame");
+    assert_eq!(
+        request(&app, "POST", MOVE, command(RUNNING, "2.8.3"))
+            .await
+            .0,
+        StatusCode::CONFLICT,
+        "the offer changed while confirmation was open"
+    );
+    assert_eq!(
+        request(&app, "POST", MOVE, command(RUNNING, "2.8.4"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    let config = poll(RUNNING, true).await;
+    let pending = &config["config"]["firmware_update"];
+    assert_eq!(pending["action"], "move_to_stable");
+    assert_eq!(pending["device_id"], DEVICE);
+    assert_eq!(pending["from_version"], RUNNING);
+    assert_eq!(pending["to_version"], "2.8.4");
+    put_image("2.8.5", "hiphi_frame");
+    assert_eq!(
+        poll(RUNNING, true).await["config"]["firmware_update"]["to_version"],
+        "2.8.4",
+        "a newer release must not rewrite an already queued request"
+    );
+
+    assert_eq!(
+        request(&app, "POST", MOVE, command(RUNNING, "2.8.5"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert!(poll("2.8.5", true).await["config"]["firmware_update"].is_null());
+    assert!(
+        offered().await.is_null(),
+        "Stable is now the running channel"
+    );
+    put_image("2.8.6", "hiphi_frame");
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            MOVE,
+            serde_json::json!({"firmware_update":"install"})
+        )
+        .await
+        .0,
+        StatusCode::OK,
+        "ordinary Update now uses Stable"
+    );
+
+    // A supported target other than Frame can move with its own Stable image.
+    let joy = environment.directory.path().join("firmware/stable/joy");
+    std::fs::create_dir_all(&joy).unwrap();
+    std::fs::write(
+        joy.join("version.json"),
+        r#"{"version":"2.8.6","file":"hiphi_joy.bin"}"#,
+    )
+    .unwrap();
+    let mut image = std::fs::read(stable.join("hiphi_frame.bin")).unwrap();
+    image[80..112].fill(0);
+    image[80..89].copy_from_slice(b"hiphi_joy");
+    image[3] = 0x30; // 8 MiB
+    std::fs::write(joy.join("hiphi_joy.bin"), image).unwrap();
+    let joy_poll = Request::builder()
+        .uri("/config/joy-test")
+        .header("x-device-type", "hiphi-joy")
+        .header("x-knob-version", "2.8.6-beta.1")
+        .header("x-firmware-channel-switch", "1")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(joy_poll).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let (_, list) = request(&app, "GET", "/knob/devices", Value::Null).await;
+    let joy = list["knobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|knob| knob["knob_id"] == "joy-test")
+        .unwrap();
+    assert_eq!(joy["stable_version"], "2.8.6");
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/knob/config?knob_id=joy-test",
+            command("2.8.6-beta.1", "2.8.6")
+        )
+        .await
+        .0,
+        StatusCode::OK
     );
 }
