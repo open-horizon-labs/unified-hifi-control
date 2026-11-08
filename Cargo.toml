@@ -284,6 +284,9 @@ optional = true
 # bumps it to 0.103 exactly as bytebeamio/rumqtt#1037 does. Drop this patch when a rumqttc release
 # includes #1037. Tracked in #813.
 [patch.crates-io]
+# Share the maintained crop fixes across UHC and Zensally. Remove when published.
+zenlayout = { git = "https://github.com/imazen/zenpipe", rev = "6ed32dea4df1d086b5674dbbc54e53aada14c3f5" }
+
 rumqttc = { git = "https://github.com/open-horizon-labs/rumqtt", rev = "5e07d401a61de5b46d9b08e4c3963efda7470c26" }
 
 # LLVM 23 strips wasm-bindgen metadata with strip=true. Preserve it until
