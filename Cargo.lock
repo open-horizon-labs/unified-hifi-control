@@ -7247,9 +7247,9 @@ dependencies = [
 [[package]]
 name = "zenlayout"
 version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aec3ceb56d867459b47c9bce2953c8d6e73afbc42da705b3eb37d3120c94b1cb"
+source = "git+https://github.com/imazen/zenpipe?rev=6ed32dea4df1d086b5674dbbc54e53aada14c3f5#6ed32dea4df1d086b5674dbbc54e53aada14c3f5"
 dependencies = [
+ "num-traits",
  "whereat",
 ]
 

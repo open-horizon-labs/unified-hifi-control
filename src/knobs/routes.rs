@@ -552,6 +552,9 @@ pub async fn knob_image_handler(
     }
     let resize_policy = Some(match params.scale.as_deref() {
         Some("fit") => crate::knobs::image::Rgb565ResizePolicy::Fit,
+        Some("circle") if target_width == target_height => {
+            crate::knobs::image::Rgb565ResizePolicy::CircleCover
+        }
         _ => crate::knobs::image::Rgb565ResizePolicy::AttentionCover,
     });
 
