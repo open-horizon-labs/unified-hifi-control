@@ -40,6 +40,8 @@ pub enum Rgb565ResizePolicy {
     /// Proportionate fill using cached face/saliency analysis, with libvips fallback.
     #[default]
     AttentionCover,
+    /// Full bleed square crop selected for visibility through a circular display.
+    CircleCover,
     /// Legacy behavior for clients that explicitly need every output pixel filled.
     Exact,
     /// Preserve the complete source and compose unused space as a gallery mat.
@@ -430,7 +432,7 @@ pub fn artwork_scale(
         ((w, h), target)
     };
     let ((crop_w, crop_h), (out_w, out_h)) = match policy {
-        Rgb565ResizePolicy::AttentionCover => cover(),
+        Rgb565ResizePolicy::AttentionCover | Rgb565ResizePolicy::CircleCover => cover(),
         Rgb565ResizePolicy::Exact => (source, target),
         Rgb565ResizePolicy::Fit => fit(),
         Rgb565ResizePolicy::SmartCover { max_crop_percent }
@@ -480,7 +482,10 @@ fn resize_with_policy(
     target_h: u32,
     policy: Rgb565ResizePolicy,
 ) -> DynamicImage {
-    if img.width() == target_w && img.height() == target_h {
+    if img.width() == target_w
+        && img.height() == target_h
+        && policy != Rgb565ResizePolicy::CircleCover
+    {
         return img.clone();
     }
 
@@ -493,6 +498,12 @@ fn resize_with_policy(
                 tracing::warn!("Zensally artwork crop unavailable; trying libvips: {error}");
                 attention_cover(img, target_w, target_h)
             }),
+        ),
+        Rgb565ResizePolicy::CircleCover => attention_or_center(
+            img,
+            target_w,
+            target_h,
+            super::artwork_analysis::compose_circle(img, target_w),
         ),
         Rgb565ResizePolicy::Exact => {
             resample_or_bilinear(img, (0, 0, img.width(), img.height()), target_w, target_h)

@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 use uhc_artwork_inference::ContentAnalyzer;
-use zenlayout::smart_crop::{AspectRatio, CropMode, SmartCropInput};
+use zenlayout::smart_crop::{AspectRatio, CropMode, FocusRect, SmartCropInput};
 use zensally::{ImageRef, PixelFormat};
 
 const CAPACITY: usize = 32; // ~2 MiB of 128x128 float heatmaps.
@@ -154,9 +154,157 @@ fn compose_analyzed(
     )
 }
 
+/// Select a full-bleed crop while accounting for pixels hidden by the panel.
+pub(super) fn compose_circle(source: &DynamicImage, side: u32) -> anyhow::Result<DynamicImage> {
+    let analysis = ANALYSIS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .analyze(source)?;
+    let crop = select_circle_crop(source.width(), source.height(), &analysis);
+    super::image::resample(
+        source,
+        (crop.x, crop.y, crop.width, crop.height),
+        side,
+        side,
+    )
+}
+
+fn select_circle_crop(width: u32, height: u32, analysis: &SmartCropInput) -> zenlayout::Rect {
+    let side = width.min(height);
+    let baseline = zenlayout::Rect {
+        x: (width - side) / 2,
+        y: (height - side) / 2,
+        width: side,
+        height: side,
+    };
+    let faces: Vec<_> = analysis
+        .focus_regions
+        .iter()
+        .filter(|face| face.weight >= 0.5)
+        .collect();
+    if faces.is_empty() {
+        return baseline;
+    }
+
+    let score = |crop| {
+        faces
+            .iter()
+            .map(|face| face_visibility(face, width, height, crop))
+            .collect::<Vec<_>>()
+    };
+    let current = score(baseline);
+    let worst = current.iter().copied().min().unwrap_or(64);
+    // On a 64-point grid, 10 points is roughly 15 percentage points.
+    if worst > 54 {
+        return baseline;
+    }
+
+    let square = AspectRatio { w: 1, h: 1 };
+    let mut best = baseline;
+    let mut best_score = (worst, current.iter().sum::<u32>(), side);
+    for crop in analysis
+        .compute_crops(
+            width,
+            height,
+            &[(square, CropMode::Minimal), (square, CropMode::Maximal)],
+        )
+        .into_iter()
+        .flatten()
+    {
+        if crop.width == 0
+            || crop.width != crop.height
+            || crop.x > width.saturating_sub(crop.width)
+            || crop.y > height.saturating_sub(crop.height)
+            || crop.width > side
+        {
+            continue;
+        }
+        let visible = score(crop);
+        let minimum = visible.iter().copied().min().unwrap_or(0);
+        // Allow at most 3 points (~5 percentage points) of loss for any face.
+        if minimum < worst + 10
+            || visible
+                .iter()
+                .zip(&current)
+                .any(|(new, old)| new + 3 < *old)
+        {
+            continue;
+        }
+        let candidate_score = (minimum, visible.iter().sum::<u32>(), crop.width);
+        if candidate_score > best_score {
+            best_score = candidate_score;
+            best = crop;
+        }
+    }
+    best
+}
+
+fn face_visibility(face: &FocusRect, width: u32, height: u32, crop: zenlayout::Rect) -> u32 {
+    let cx = f64::from(crop.x) + f64::from(crop.width) * 0.5;
+    let cy = f64::from(crop.y) + f64::from(crop.height) * 0.5;
+    let radius_squared = (f64::from(crop.width) * 0.5).powi(2);
+    let mut count = 0;
+    for row in 0..8 {
+        let y = f64::from(height)
+            * (f64::from(face.y1) + f64::from(face.y2 - face.y1) * (f64::from(row) + 0.5) / 8.0)
+            / 100.0;
+        for col in 0..8 {
+            let x = f64::from(width)
+                * (f64::from(face.x1)
+                    + f64::from(face.x2 - face.x1) * (f64::from(col) + 0.5) / 8.0)
+                / 100.0;
+            count += u32::from((x - cx).powi(2) + (y - cy).powi(2) <= radius_squared);
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn face(x1: f32, y1: f32, x2: f32, y2: f32) -> FocusRect {
+        FocusRect {
+            x1,
+            y1,
+            x2,
+            y2,
+            weight: 1.0,
+        }
+    }
+
+    #[test]
+    fn circle_crop_recovers_an_off_center_face_in_a_wide_source() {
+        let analysis = SmartCropInput {
+            focus_regions: vec![face(12.0, 40.0, 20.0, 60.0)],
+            heatmap: None,
+        };
+        let selected = select_circle_crop(200, 100, &analysis);
+        assert_ne!(selected.x, 50);
+        assert_eq!(
+            face_visibility(&analysis.focus_regions[0], 200, 100, selected),
+            64
+        );
+    }
+
+    #[test]
+    fn circle_crop_keeps_full_bleed_when_corner_faces_cannot_both_improve() {
+        let analysis = SmartCropInput {
+            focus_regions: vec![
+                face(1.4, 0.8, 19.3, 24.1),
+                face(65.0, 19.9, 78.2, 38.8),
+                face(33.9, 16.5, 48.5, 35.5),
+                face(50.1, 14.5, 61.5, 32.5),
+                face(84.2, 0.0, 98.8, 15.9),
+            ],
+            heatmap: None,
+        };
+        let crop = select_circle_crop(2048, 2048, &analysis);
+        assert_eq!(
+            (crop.x, crop.y, crop.width, crop.height),
+            (0, 0, 2048, 2048)
+        );
+    }
+
     #[test]
     fn matching_aspect_ratio_resizes_without_loading_models() {
         for (sw, sh, tw, th) in [
