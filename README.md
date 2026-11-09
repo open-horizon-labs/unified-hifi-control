@@ -2,7 +2,7 @@
 
 [![Build](https://github.com/open-horizon-labs/unified-hifi-control/actions/workflows/build.yml/badge.svg?branch=v4)](https://github.com/open-horizon-labs/unified-hifi-control/actions/workflows/build.yml)
 [![GitHub Release](https://img.shields.io/github/v/release/open-horizon-labs/unified-hifi-control)](https://github.com/open-horizon-labs/unified-hifi-control/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/open-horizon-labs/unified-hifi-control/total)](https://github.com/open-horizon-labs/unified-hifi-control/releases)
+[Downloads](https://github.com/open-horizon-labs/unified-hifi-control/releases)
 
 Control your music from a physical knob, an e-paper display, your TV, your wrist, a browser, or an AI assistant. **Unified Hi-Fi Control (UHC)** connects those controls to Roon, Lyrion Music Server (LMS), and OpenHome/UPnP on your home network.
 
@@ -222,8 +222,8 @@ Both are new; see
 [docs/home_assistant_integration.md](docs/home_assistant_integration.md)
 for setup and current limitations.
 
-There's also a Supervisor-managed **Home Assistant add-on** (Tier 1: its own
-tab, no ingress yet) for OS/Supervised/Home Assistant Green installs — no
+There's also a Supervisor-managed **Home Assistant add-on** (with an embedded UI through
+Home Assistant ingress) for OS/Supervised/Home Assistant Green installs — no
 manual container setup required:
 
 [![Add add-on repository to my Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fopen-horizon-labs%2Fuhc-home-assistant-addon)
@@ -250,14 +250,16 @@ repository for install details.
            Knob
 ```
 
-## MCP Server (Claude Integration)
+<a id="mcp-server-claude-integration"></a>
 
-Control your hi-fi with natural language. The bridge includes an MCP server so Claude can search, play, queue music, adjust volume, and switch HQPlayer profiles.
+## MCP Server (AI client integration)
+
+Control your hi-fi with natural language. The bridge includes an MCP server so compatible AI clients can search, play and queue music, adjust volume, and switch HQPlayer profiles. Available operations depend on the music provider.
 
 ### Setup
 
 1. Start the bridge (`docker compose up -d`)
-2. Add to your MCP config (Claude Code, ChatGPT, BoltAI, etc.):
+2. Configure your client to connect to the bridge’s Streamable HTTP endpoint. For clients that use an `mcpServers` JSON configuration, the entry looks like this:
 
 ```json
 {
@@ -306,7 +308,7 @@ Owner/admin operations are excluded by an explicit tool allowlist — see
 
 ### Example Usage
 
-Ask Claude: "Play some jazz piano" or "Queue Hotel California" or "What's playing?" or "Turn the volume down"
+Ask your connected assistant: "Play some jazz piano" or "Queue Hotel California" or "What's playing?" or "Turn the volume down"
 
 <details>
 <summary><strong>Firmware Updates (roon-knob)</strong></summary>
