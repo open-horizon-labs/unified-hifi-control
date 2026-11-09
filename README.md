@@ -4,24 +4,27 @@
 [![GitHub Release](https://img.shields.io/github/v/release/open-horizon-labs/unified-hifi-control)](https://github.com/open-horizon-labs/unified-hifi-control/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/open-horizon-labs/unified-hifi-control/total)](https://github.com/open-horizon-labs/unified-hifi-control/releases)
 
-A [HiPhi project](https://hiphi.audio/) by Open Horizon Labs. Unified Hi-Fi Control is the source-available bridge that runs on your network; HiPhi provides physical controllers and optional Cloud services. Local playback control keeps working without HiPhi Cloud.
+Control your music from a physical knob, an e-paper display, your TV, your wrist, a browser, or an AI assistant. **Unified Hi-Fi Control (UHC)** connects those controls to Roon, Lyrion Music Server (LMS), and OpenHome/UPnP on your home network.
 
-Control your hi-fi system from a hardware controller on your couch, your phone, or compatible AI agents.
+Part of [HiPhi by Open Horizon Labs](https://hiphi.audio/), UHC is free for personal, noncommercial use. Install one bridge and choose the controls that suit each room. Local playback control works without a cloud account; optional [HiPhi Cloud](https://app.hiphi.audio/) adds authenticated remote access and Garmin watch control.
 
-This bridge connects your music sources (Roon, LMS, UPnP) to any control surface you prefer. No vendor lock-in: mix and match sources, add HQPlayer DSP processing, and control it all from one place.
+## Choose how you listen
 
-## Control Surfaces
-
-Once the bridge is running, control your system from:
-
-- **Web UI** — Built-in at `http://your-bridge:8088`
-- **[HiPhi controllers](https://hiphi.audio/#controllers)** — Dial, displays, and remotes for supported hardware. Start with Stable Dial on the Waveshare ESP32-S3 Knob; other controllers and firmware channels have their own hardware and testing requirements.
+- **[HiPhi Dial](https://hiphi.audio/controllers.html#dial)** — Browse your library, start playback, and turn a physical knob for volume.
+- **[HiPhi Frame](https://hiphi.audio/controllers.html#frame)** — Put album art on a color e-paper display. Frame and Dial support BLE media remotes.
+- **[Roku](https://github.com/muness/roon-knob/tree/integration/v2.8.4/roku)** — Album artwork and music controls on your TV, installed through Roku developer mode.
+- **[Garmin watch](https://apps.garmin.com/en-US/apps/c070e7ce-4ea1-4779-853d-56a8b080c1fa)** — Control your home hi-fi from your wrist through HiPhi Cloud. [Connect your bridge](INSTALL.md#hiphi-cloud-and-garmin), then install the Connect IQ app.
+- **Web browser** — Open `http://your-bridge:8088` for the built-in controls.
+- **[MCP-compatible AI clients](#mcp-server-claude-integration)** — Ask an assistant to find music and control playback. Community members have reported success with OpenClaw and Codex across its CLI, desktop app, and VS Code extension in the [Roon discussion](https://community.roonlabs.com/t/ai-assistant-integration-for-roon/314508).
 - **iPhone, iPad & Apple Watch** — In alpha testing. [Request TestFlight access](https://github.com/open-horizon-labs/unified-hifi-control/issues/new?title=Request%20Apple%20Music%20Companion%20TestFlight%20access).
-- **Claude & AI agents** — Via the built-in MCP server (see [MCP Server](#mcp-server-claude-integration) below)
+
+[Get started](INSTALL.md) · [Explore HiPhi](https://hiphi.audio/) · [Support on Buy Me a Coffee](https://buymeacoffee.com/muness)
+
+## Artwork for every screen
+
+UHC adapts album artwork to each display, including the circular Dial and HALO. Face and attention analysis helps keep the subject visible, and cached analysis is shared across display sizes. See [artwork composition](docs/artwork-smartcrop.md) for the implementation and options.
 
 ## Installation
-
-Artwork requested for a display viewport uses embedded Zensally face/saliency analysis and zenlayout composition by default. Analysis is cached across zones, sizes and orientations; no model download or external inference runtime is needed. If analysis or crop placement is unavailable, UHC tries libvips attention, then centered fill. Containers and Linux packages include libvips; standalone installs can provide `vips` on the service PATH for that fallback. Use `scale=fit` to preserve a complete cover. See [artwork composition](docs/artwork-smartcrop.md) for behavior, limits, and deployment details.
 
 See [INSTALL.md](INSTALL.md) for every supported installation and companion path.
 
