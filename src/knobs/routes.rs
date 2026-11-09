@@ -31,7 +31,7 @@ use crate::api::{
 use crate::bus::runtime::{CommandLane, HqpRuntimeCommand, RuntimeCommand};
 use crate::bus::{Command, VolumeControl};
 use crate::knobs::image::placeholder_svg;
-use crate::knobs::store::{KnobConfigUpdate, KnobStatusUpdate};
+use crate::knobs::store::{Knob, KnobConfigUpdate, KnobStatusUpdate, StableMoveRejected};
 
 /// Keep the existing JSON error shape; never report volatile settings as saved.
 fn knob_persistence_error(error: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
@@ -40,6 +40,14 @@ fn knob_persistence_error(error: anyhow::Error) -> (StatusCode, Json<serde_json:
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": rejected.to_string()})),
+        );
+    }
+    if let Some(rejected) = error.downcast_ref::<StableMoveRejected>() {
+        return (
+            StatusCode::CONFLICT,
+            Json(
+                serde_json::json!({"error": rejected.to_string(), "error_code": "STABLE_MOVE_UNAVAILABLE"}),
+            ),
         );
     }
     tracing::warn!(%error, "Controller configuration request failed");
@@ -107,6 +115,13 @@ fn extract_device_type(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.to_str().ok())
         .and_then(crate::firmware_catalog::FirmwareTarget::parse)
         .map(|target| target.slug())
+}
+
+/// Interpret absence as unsupported only on polls where firmware advertises the capability.
+fn reports_channel_switch(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-firmware-channel-switch")
+        .is_some_and(|value| value == "1")
 }
 
 /// DSP info for zones linked to HQPlayer (iOS compatible)
@@ -367,10 +382,11 @@ pub async fn knob_now_playing_handler(
     if let Some(ref id) = knob_id {
         let knob = state
             .knobs
-            .get_or_create_with_device_type(
+            .observe_firmware(
                 id,
                 knob_version.as_deref(),
                 extract_device_type(&headers),
+                Some(reports_channel_switch(&headers)),
             )
             .await
             .map_err(knob_persistence_error)?;
@@ -1307,19 +1323,7 @@ pub async fn knob_config_update_handler(
         )
     })?;
 
-    guard_install_request(&state, &knob_id, &updates).await?;
-
-    let knob = state
-        .knobs
-        .update_config(&knob_id, updates)
-        .await
-        .map_err(knob_persistence_error)?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "knob not found"})),
-            )
-        })?;
+    let knob = apply_controller_config(&state, &knob_id, updates).await?;
 
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -1329,7 +1333,14 @@ pub async fn knob_config_update_handler(
 
 /// GET /knob/devices - List all registered knobs (admin)
 pub async fn knob_devices_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let knobs = state.knobs.list().await;
+    let mut knobs = state.knobs.list().await;
+    for knob in &mut knobs {
+        knob.stable_version = stable_move_offer(
+            &knob.device_type,
+            knob.version.as_deref(),
+            knob.supports_channel_switch,
+        );
+    }
     Json(serde_json::json!({ "knobs": knobs }))
 }
 
@@ -1357,8 +1368,109 @@ pub async fn knob_remove_handler(
     }
 }
 
+fn stable_move_offer(device_type: &str, running: Option<&str>, supported: bool) -> Option<String> {
+    use crate::firmware_catalog::{FirmwareChannel, FirmwareTarget};
+
+    let target = FirmwareTarget::parse(device_type)?;
+    let running = running?;
+    if !supported
+        || !matches!(
+            FirmwareChannel::for_version(running),
+            Some(FirmwareChannel::Alpha | FirmwareChannel::Beta)
+        )
+    {
+        return None;
+    }
+
+    let (path, info) = firmware_artifact(target, FirmwareChannel::Stable)?;
+    let version = info.version.as_deref()?;
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let offered = install_offer(Some(version), running)?;
+    stable_image_matches(&path, target, &offered).then_some(offered)
+}
+
+/// Read only the ESP image prefix. Release metadata and filenames do not establish
+/// hardware or version: check the chip, flash size, and embedded application descriptor.
+fn stable_image_matches(
+    path: &std::path::Path,
+    target: crate::firmware_catalog::FirmwareTarget,
+    version: &str,
+) -> bool {
+    use crate::firmware_catalog::FirmwareTarget::*;
+    use std::io::Read;
+
+    const ESP32: u16 = 0;
+    const ESP32_S3: u16 = 9;
+    const FLASH_8_MIB: u8 = 3;
+    const FLASH_16_MIB: u8 = 4;
+    // These values come from each roon-knob target's CMake project and sdkconfig defaults.
+    let (project, chip, flash_size) = match target {
+        LegacyKnob => return false, // The fallback has no current switch-capable build profile.
+        Dial => ("hiphi_dial", ESP32_S3, FLASH_16_MIB),
+        Frame => ("hiphi_frame", ESP32_S3, FLASH_16_MIB),
+        Halo => ("hiphi_halo", ESP32_S3, FLASH_16_MIB),
+        Tough => ("hiphi_tough", ESP32, FLASH_16_MIB),
+        Joy => ("hiphi_joy", ESP32_S3, FLASH_8_MIB),
+        M5Dial => ("hiphi_m5dial", ESP32_S3, FLASH_8_MIB),
+        Rlcd => ("hiphi_rlcd_42", ESP32_S3, FLASH_16_MIB),
+        Stackchan => ("hiphi_stackchan", ESP32_S3, FLASH_16_MIB),
+        StickS3 => ("hiphi_sticks3", ESP32_S3, FLASH_8_MIB),
+        Stopwatch => ("hiphi_stopwatch", ESP32_S3, FLASH_16_MIB),
+    };
+
+    let mut prefix = [0u8; 288]; // 24-byte image header, 8-byte segment header, 256-byte app descriptor
+    if std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut prefix))
+        .is_err()
+    {
+        return false;
+    }
+    fn field_matches(field: &[u8], expected: &str) -> bool {
+        field
+            .iter()
+            .position(|byte| *byte == 0)
+            .is_some_and(|end| &field[..end] == expected.as_bytes())
+    }
+    prefix[0] == 0xe9
+        && (1..=16).contains(&prefix[1])
+        && prefix[3] >> 4 == flash_size
+        && prefix[12..14] == chip.to_le_bytes()
+        && u32::from_le_bytes([prefix[28], prefix[29], prefix[30], prefix[31]]) >= 256
+        && prefix[32..36] == 0xabcd5432u32.to_le_bytes()
+        && field_matches(&prefix[48..80], version)
+        && field_matches(&prefix[80..112], project)
+}
+
+async fn apply_controller_config(
+    state: &AppState,
+    knob_id: &str,
+    updates: KnobConfigUpdate,
+) -> Result<Knob, (StatusCode, Json<serde_json::Value>)> {
+    let result = if updates.firmware_update.as_deref() == Some("move_to_stable") {
+        state
+            .knobs
+            .queue_stable_move(knob_id, updates.from_version, updates.to_version, |knob| {
+                stable_move_offer(
+                    &knob.device_type,
+                    knob.version.as_deref(),
+                    knob.supports_channel_switch,
+                )
+            })
+            .await
+    } else {
+        guard_install_request(state, knob_id, &updates).await?;
+        state.knobs.update_config(knob_id, updates).await
+    };
+    result.map_err(knob_persistence_error)?.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "knob not found"})),
+        )
+    })
+}
+
 /// The version an install request would deliver: the channel's image, only when it is newer than
-/// what the controller runs. A controller never changes channel and never goes backwards.
+/// what the controller runs. The ordinary install action looks only on the current channel.
 fn install_offer(available: Option<&str>, running: &str) -> Option<String> {
     let available = available?;
     crate::firmware_catalog::firmware_version_is_newer(available, running)
@@ -1432,7 +1544,12 @@ pub async fn knob_config_by_path_handler(
     // Get or create knob (ensures it exists for newly connected devices)
     let knob = state
         .knobs
-        .get_or_create_with_device_type(&knob_id, version.as_deref(), extract_device_type(&headers))
+        .observe_firmware(
+            &knob_id,
+            version.as_deref(),
+            extract_device_type(&headers),
+            Some(reports_channel_switch(&headers)),
+        )
         .await
         .map_err(knob_persistence_error)?;
 
@@ -1455,18 +1572,7 @@ pub async fn knob_config_update_by_path_handler(
     axum::extract::Path(knob_id): axum::extract::Path<String>,
     Json(updates): Json<KnobConfigUpdate>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    guard_install_request(&state, &knob_id, &updates).await?;
-    let knob = state
-        .knobs
-        .update_config(&knob_id, updates)
-        .await
-        .map_err(knob_persistence_error)?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "knob not found"})),
-            )
-        })?;
+    let knob = apply_controller_config(&state, &knob_id, updates).await?;
 
     // Build config response matching Node.js format
     let mut config = serde_json::to_value(&knob.config).unwrap_or_default();
