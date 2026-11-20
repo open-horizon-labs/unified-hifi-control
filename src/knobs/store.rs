@@ -103,11 +103,15 @@ pub struct KnobConfig {
 /// A request, made from the settings page, for a controller to install the available firmware.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FirmwareUpdateRequest {
-    /// Always `"install"`; the controller ignores anything else.
+    /// `"install"` stays on the running channel; `"move_to_stable"` requires exact versions.
     pub action: String,
     /// Version the controller was running when asked. A controller already on another version
     /// treats the request as stale instead of installing again.
     pub from_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_version: Option<String>,
     pub requested_at: DateTime<Utc>,
 }
 
@@ -120,6 +124,10 @@ impl FirmwareUpdateRequest {
         now - self.requested_at > chrono::Duration::minutes(FIRMWARE_REQUEST_TTL_MINUTES)
     }
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("Move to Stable is no longer available with those versions. Check the controller and confirm the current offer.")]
+pub struct StableMoveRejected;
 
 /// A requested setting the controller does not have, or a value outside its range.
 #[derive(Debug)]
@@ -216,6 +224,9 @@ fn canonical_zone_id(id: String) -> Option<String> {
 pub struct Knob {
     #[serde(default = "legacy_device_type")]
     pub device_type: String,
+    /// Observed on a device poll. Do not assume support from persisted or inferred identity.
+    #[serde(skip)]
+    pub supports_channel_switch: bool,
     pub name: String,
     pub last_seen: DateTime<Utc>,
     pub version: Option<String>,
@@ -406,8 +417,21 @@ impl KnobStore {
         version: Option<&str>,
         device_type: Option<&str>,
     ) -> Result<Knob> {
+        self.observe_firmware(knob_id, version, device_type, None)
+            .await
+    }
+
+    /// A capability report applies only to the target and version in that same poll.
+    pub async fn observe_firmware(
+        &self,
+        knob_id: &str,
+        version: Option<&str>,
+        device_type: Option<&str>,
+        channel_switch: Option<bool>,
+    ) -> Result<Knob> {
         self.ensure_loaded()?;
         let identity = device_type.and_then(crate::firmware_catalog::FirmwareTarget::parse);
+        let channel_switch = channel_switch.filter(|_| identity.is_some() && version.is_some());
         let mut knobs = self.knobs.write().await;
         if let Some(knob) = knobs.get_mut(knob_id) {
             let old_version = knob.version.clone();
@@ -419,11 +443,17 @@ impl KnobStore {
             if let Some(target) = identity {
                 knob.device_type = target.slug().to_string();
             }
+            let identity_changed = old_version != knob.version || old_identity != knob.device_type;
+            knob.supports_channel_switch =
+                channel_switch.unwrap_or(!identity_changed && knob.supports_channel_switch);
+
             // An install request ends when the controller reports another version (it took the
             // update) or when it has gone unanswered for too long. Either way the hash moves so
             // the controller refetches a config without it.
             let request_done = knob.config.firmware_update.as_ref().is_some_and(|request| {
                 request.is_expired(Utc::now())
+                    || (request.action == "move_to_stable"
+                        && (old_identity != knob.device_type || channel_switch == Some(false)))
                     || request
                         .from_version
                         .as_ref()
@@ -434,11 +464,9 @@ impl KnobStore {
                 knob.config_sha = compute_sha(&knob.config, &knob.name);
             }
             let result = knob.clone();
-            let identity_changed =
-                request_done || old_version != knob.version || old_identity != knob.device_type;
             // Routine polls remain memory-only. Persist newly observed identity,
             // without preventing service of a known config on storage failure.
-            if identity_changed {
+            if identity_changed || request_done {
                 let candidate = knobs.clone();
                 let _ = self.save_to_disk(&mut knobs, candidate);
             }
@@ -451,6 +479,7 @@ impl KnobStore {
         let knob = Knob {
             device_type: identity
                 .map_or_else(legacy_device_type, |target| target.slug().to_string()),
+            supports_channel_switch: channel_switch.unwrap_or(false),
             name,
             last_seen: Utc::now(),
             version: version.map(|s| s.to_string()),
@@ -597,6 +626,8 @@ impl KnobStore {
                 knob.config.firmware_update = Some(FirmwareUpdateRequest {
                     action: "install".into(),
                     from_version: Some(version),
+                    device_id: None,
+                    to_version: None,
                     requested_at: Utc::now(),
                 });
             }
@@ -623,6 +654,41 @@ impl KnobStore {
         Ok(Some(result))
     }
 
+    /// Validate consent against the same locked controller record used to write the request.
+    /// The firmware validates the selected image again when it receives the job.
+    pub async fn queue_stable_move(
+        &self,
+        knob_id: &str,
+        from_version: Option<String>,
+        to_version: Option<String>,
+        offer: impl FnOnce(&Knob) -> Option<String>,
+    ) -> Result<Option<Knob>> {
+        self.ensure_loaded()?;
+        let mut knobs = self.knobs.write().await;
+        let mut candidate = knobs.clone();
+        let Some(knob) = candidate.get_mut(knob_id) else {
+            return Ok(None);
+        };
+        if from_version.is_none()
+            || from_version != knob.version
+            || to_version.is_none()
+            || to_version != offer(knob)
+        {
+            return Err(StableMoveRejected.into());
+        }
+        knob.config.firmware_update = Some(FirmwareUpdateRequest {
+            action: "move_to_stable".into(),
+            from_version,
+            device_id: Some(knob_id.into()),
+            to_version,
+            requested_at: Utc::now(),
+        });
+        knob.config_sha = compute_sha(&knob.config, &knob.name);
+        let result = knob.clone();
+        self.save_to_disk(&mut knobs, candidate)?;
+        Ok(Some(result))
+    }
+
     /// List all registered knobs
     pub async fn list(&self) -> Vec<KnobSummary> {
         let knobs = self.knobs.read().await;
@@ -631,6 +697,8 @@ impl KnobStore {
             .map(|(id, knob)| KnobSummary {
                 knob_id: id.clone(),
                 device_type: knob.device_type.clone(),
+                supports_channel_switch: knob.supports_channel_switch,
+                stable_version: None,
                 name: knob.name.clone(),
                 last_seen: knob.last_seen,
                 version: knob.version.clone(),
@@ -713,6 +781,9 @@ pub struct KnobConfigUpdate {
     /// `"install"` asks the controller to install the available firmware; `"cancel"` withdraws
     /// the request.
     pub firmware_update: Option<String>,
+    /// Only used for an explicit move to Stable, as shown before confirmation.
+    pub from_version: Option<String>,
+    pub to_version: Option<String>,
     /// Replaces the controller's own hide list (empty list = show every zone again).
     pub hidden_zone_ids: Option<Vec<String>>,
 }
@@ -731,6 +802,10 @@ fn normalize_zone_ids(ids: Vec<String>) -> Vec<String> {
 #[derive(Debug, Serialize)]
 pub struct KnobSummary {
     pub device_type: String,
+    #[serde(skip_serializing)]
+    pub supports_channel_switch: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stable_version: Option<String>,
     pub knob_id: String,
     pub name: String,
     pub last_seen: DateTime<Utc>,
@@ -774,6 +849,7 @@ mod persistence_tests {
             "dial".into(),
             Knob {
                 device_type: "knob".into(),
+                supports_channel_switch: false,
                 name: "Installed".into(),
                 last_seen: Utc::now(),
                 version: None,
@@ -1057,6 +1133,8 @@ mod device_setting_tests {
         let request = |age_minutes| FirmwareUpdateRequest {
             action: "install".into(),
             from_version: Some("2.8.0-alpha.4".into()),
+            device_id: None,
+            to_version: None,
             requested_at: now - chrono::Duration::minutes(age_minutes),
         };
         assert!(!request(5).is_expired(now));

@@ -759,14 +759,14 @@ fn apple_music_live_companion_count(status: Option<&AppleBridgeStatus>) -> usize
 }
 
 #[cfg(target_arch = "wasm32")]
-fn browser_confirm(message: &str) -> bool {
+pub(super) fn browser_confirm(message: &str) -> bool {
     web_sys::window()
         .and_then(|window| window.confirm_with_message(message).ok())
         .unwrap_or(false)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn browser_confirm(_message: &str) -> bool {
+pub(super) fn browser_confirm(_message: &str) -> bool {
     false
 }
 

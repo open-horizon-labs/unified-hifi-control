@@ -1803,6 +1803,7 @@ pub struct KnobDevice {
     pub device_type: Option<String>,
     pub name: Option<String>,
     pub version: Option<String>,
+    pub stable_version: Option<String>,
     pub last_seen: Option<String>,
     pub status: Option<KnobStatus>,
 }
@@ -1870,7 +1871,29 @@ pub struct KnobConfig {
 /// Partial update asking a controller to install the firmware waiting on the bridge.
 #[derive(Clone, Debug, Serialize)]
 pub struct FirmwareUpdateAction {
-    pub firmware_update: &'static str,
+    firmware_update: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_version: Option<String>,
+}
+
+impl FirmwareUpdateAction {
+    pub fn install() -> Self {
+        Self {
+            firmware_update: "install",
+            from_version: None,
+            to_version: None,
+        }
+    }
+
+    pub fn move_to_stable(from_version: String, to_version: String) -> Self {
+        Self {
+            firmware_update: "move_to_stable",
+            from_version: Some(from_version),
+            to_version: Some(to_version),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -1880,7 +1903,7 @@ pub struct FirmwareVersion {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct FetchFirmwareResponse {
-    pub version: Option<String>,
+    pub message: Option<String>,
     pub error: Option<String>,
 }
 
